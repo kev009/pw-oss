@@ -109,6 +109,15 @@ fn odelay(fd: c_int) -> c_int {
   delay
 }
 
+// The fragment size the driver actually granted, which need not match the
+// SETFRAGMENT request: some drivers (e.g. snd_hdspe) force a fixed period.
+// GETBLKSIZE returns EINVAL here, so read GETOSPACE's fragsize field.
+fn blocksize(fd: c_int) -> c_int {
+  let mut info = std::mem::MaybeUninit::<audio_buf_info>::uninit();
+  let err = unsafe { libc::ioctl(fd, SNDCTL_DSP_GETOSPACE, info.as_mut_ptr()) };
+  if err != -1 { unsafe { info.assume_init().fragsize } } else { 0 }
+}
+
 fn get_error(fd: c_int) -> audio_errinfo {
   let mut info = std::mem::MaybeUninit::<audio_errinfo>::uninit();
   unsafe {
@@ -337,6 +346,12 @@ impl DspWriter {
     let odelay = odelay(self.fd);
     assert!(odelay >= 0);
     odelay as u32
+  }
+
+  /// The fragment size the driver actually granted (may differ from what
+  /// SETFRAGMENT asked for; some drivers force a fixed period).
+  pub fn blocksize(&self) -> u32 {
+    blocksize(self.fd).max(0) as u32
   }
 
   pub fn underruns(&self) -> u32 {

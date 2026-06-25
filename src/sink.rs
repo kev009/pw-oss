@@ -706,13 +706,29 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       let period_in_bytes = driver_clock.target_duration as u32 * port_config.stride();
       let desired_delay   = period_in_bytes / 8 * state.oss_delay;
 
-      // FreeBSD often grants a smaller buffer than requested, so size the target
-      // against what we actually got. We write one quantum/cycle on top of what's
-      // queued, so target_delay + period <= granted avoids short-writes and one
-      // quantum queued avoids underrun; both need granted >= 2 * period.
-      let granted = port.dsp.set_buffer_size(period_in_bytes * 2 + desired_delay);
+      // Size the fill to the granted buffer and the device's real fragment. We
+      // write about one quantum per cycle, so if the forced fragment is much
+      // smaller than the quantum (snd_hdspe forces 256 frames) the ring drains
+      // between writes and underruns; keep it near-full then, otherwise
+      // half-full. "Near-full" still leaves headroom for a write that runs a few
+      // frames over a quantum (the resampler's output size varies), or the OSS
+      // write short-writes and drops those frames every cycle.
+      let granted   = port.dsp.set_buffer_size(period_in_bytes * 2 + desired_delay);
+      let blocksize = port.dsp.blocksize();
+      // saturating arithmetic: blocksize/rate_match.size are device-provided and
+      // an overflow here would abort the data loop.
       port.target_delay = if granted >= 2 * period_in_bytes {
-        desired_delay.clamp(period_in_bytes, granted - period_in_bytes)
+        if blocksize > 0 && blocksize.saturating_mul(4) < period_in_bytes {
+          // near-full, leaving headroom for the largest expected write (a quantum,
+          // or the resampler's size if larger) plus one fragment. A chunk over
+          // even that drops the excess: on a buffer this small no target both
+          // avoids underruns and fits an arbitrary write.
+          let rate_match_bytes = if state.rate_match.is_null() { 0 } else { (*state.rate_match).size.saturating_mul(port_config.stride()) };
+          let write_max = period_in_bytes.max(rate_match_bytes);
+          granted.saturating_sub(write_max.saturating_add(blocksize))
+        } else {
+          desired_delay.max(granted / 2).clamp(period_in_bytes, granted - period_in_bytes)
+        }
       } else {
         granted / 2 // buffer too small for two quanta; best-effort, will drop (warned below)
       };
@@ -720,8 +736,8 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       port.dll.init();
       port.dll.set_bw(crate::dll::SPA_DLL_BW_MIN, period_in_bytes, driver_clock.target_rate.denom * port_config.stride());
 
-      crate::warn!(state.log, "{}: buffer requested {}, granted {}, period {}, target delay {}",
-        port.dsp.path, period_in_bytes * 2 + desired_delay, granted, period_in_bytes, port.target_delay);
+      crate::warn!(state.log, "{}: granted {}, blocksize {}, period {}, target delay {}",
+        port.dsp.path, granted, blocksize, period_in_bytes, port.target_delay);
       if granted < 2 * period_in_bytes {
         crate::warn!(state.log, "{}: granted OSS buffer ({}) is smaller than two quanta ({}); \
           audio will glitch. Lower the PipeWire quantum; we set the fragment size \
