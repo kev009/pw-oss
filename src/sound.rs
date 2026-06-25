@@ -227,7 +227,7 @@ pub struct DspWriter {
   prev_ns: u64
 }
 
-const ZEROES: [u8; CHN_2NDBUFMAXSIZE] = [0u8; CHN_2NDBUFMAXSIZE];
+static ZEROES: [u8; CHN_2NDBUFMAXSIZE] = [0u8; CHN_2NDBUFMAXSIZE];
 
 impl DspWriter {
 
