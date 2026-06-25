@@ -21,8 +21,9 @@ const SNDCTL_DSP_GETISPACE:   c_ulong = nix::request_code_read!     (b'P', 13, s
 const SNDCTL_DSP_GETODELAY:   c_ulong = nix::request_code_read!     (b'P', 23, std::mem::size_of::<c_int>());
 const SNDCTL_DSP_GETERROR:    c_ulong = nix::request_code_read!     (b'P', 25, std::mem::size_of::<audio_errinfo>());
 
-const PCM_ENABLE_INPUT:  c_int = 0x00000001;
-const PCM_ENABLE_OUTPUT: c_int = 0x00000002;
+// currently unused
+// const PCM_ENABLE_INPUT:  c_int = 0x00000001;
+// const PCM_ENABLE_OUTPUT: c_int = 0x00000002;
 
 // sys/dev/sound/pcm/channel.h
 const CHN_2NDBUFMAXSIZE: usize = 131072;

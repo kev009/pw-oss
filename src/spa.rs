@@ -31,6 +31,7 @@ pub unsafe fn for_each_hook(head: *mut spa_hook_list, mut apply: impl FnMut(&spa
   }
 }
 
+/* currently unused
 pub unsafe fn dev_emit_result(hooks: &mut spa_hook_list, seq: c_int, res: c_int, type_: u32, result: &spa_result_device_params) {
   for_each_hook(hooks, |entry| {
     let f = entry.cb.funcs.cast::<spa_device_events>().as_ref().expect("hook should be initialized");
@@ -39,7 +40,7 @@ pub unsafe fn dev_emit_result(hooks: &mut spa_hook_list, seq: c_int, res: c_int,
       result_fun(entry.cb.data, seq, res, type_, result as *const _ as *const c_void);
     }
   });
-}
+}*/
 
 pub unsafe fn node_emit_result(hooks: &mut spa_hook_list, seq: c_int, res: c_int, type_: u32, result: &spa_result_node_params) {
   for_each_hook(hooks, |entry| {
@@ -126,9 +127,10 @@ impl Dictionary {
     &mut self.dict as *mut spa_dict
   }
 
+  /* currently unused
   pub fn len(&self) -> u32 {
     self.items.len() as u32
-  }
+  }*/
 
   pub fn add_item<K: Into<DictionaryString>, V: Into<DictionaryString>>(&mut self, key: K, value: V) {
 
@@ -266,6 +268,7 @@ impl NodeInfo {
     self.info.change_mask |= SPA_NODE_CHANGE_MASK_PROPS as u64;
   }
 
+  /* currently unused
   pub fn add_param(&mut self, id: u32, flags: u32) {
     assert!(self.info.n_params < MAX_PARAMS);
     self.params[self.info.n_params as usize] = spa_param_info {
@@ -273,7 +276,7 @@ impl NodeInfo {
     };
     self.info.change_mask |= SPA_NODE_CHANGE_MASK_PARAMS as u64;
     self.info.n_params += 1;
-  }
+  }*/
 
   pub fn replace_change_mask(&mut self, new_mask: u64) -> u64 {
     let old = self.info.change_mask;
@@ -324,10 +327,11 @@ impl PortInfo {
     self.info.change_mask |= SPA_PORT_CHANGE_MASK_RATE as u64;
   }
 
+  /* currently unused
   pub fn add_prop<K: Into<DictionaryString>, V: Into<DictionaryString>>(&mut self, key: K, value: V) {
     self.props.add_item(key, value);
     self.info.change_mask |= SPA_PORT_CHANGE_MASK_PROPS as u64;
-  }
+  }*/
 
   pub fn add_param(&mut self, id: u32, flags: u32) {
     assert!(self.info.n_params < MAX_PARAMS);

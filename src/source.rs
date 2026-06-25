@@ -45,7 +45,7 @@ pub struct PortConfig {
   pub format:    libspa::param::audio::AudioFormat,
   pub rate:      u32,
   pub channels:  u32,
-  pub positions: Vec<u32>,
+  // pub positions: Vec<u32>, // currently unused; consumer is commented out below
   pub stride:    u32
 }
 
@@ -477,13 +477,11 @@ unsafe extern "C" fn port_set_param(object: *mut c_void, direction: spa_directio
             assert_eq!(raw.flags, 0);
 
             let format    = libspa::param::audio::AudioFormat(raw.format);
-            let positions = raw.position.iter().take(raw.channels as usize).copied().collect::<Vec<_>>();
 
             let config = PortConfig {
               format,
               rate:     raw.rate,
               channels: raw.channels,
-              positions,
               stride: match format {
                 libspa::param::audio::AudioFormat::S32LE => 4,
                 libspa::param::audio::AudioFormat::S32BE => 4,

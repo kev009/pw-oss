@@ -4,7 +4,7 @@
 /* SPDX-FileCopyrightText: Copyright © 2019 Wim Taymans */
 /* SPDX-License-Identifier: MIT */
 
-pub const SPA_DLL_BW_MAX: f64 = 0.128;
+// pub const SPA_DLL_BW_MAX: f64 = 0.128; // currently unused
 pub const SPA_DLL_BW_MIN: f64 = 0.016;
 
 #[derive(Default)]
