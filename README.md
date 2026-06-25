@@ -1,3 +1,6 @@
+> A fork of [shkhln/pw-oss](https://github.com/shkhln/pw-oss), maintained for
+> FreeBSD ports packaging (`audio/pipewire-spa-oss-ng`).
+
 This repo contains a very basic FreeBSD sound input/output plugin for PipeWire.
 No other operating systems are supported.
 
@@ -6,8 +9,6 @@ No other operating systems are supported.
 1. The plugin is only sufficiently complete to be used with the
 `node.features.audio.no-dsp=false` Wireplumber setting (which is the default).
 1. There is no multichannel support (for now).
-1. The author is yet to figure out how buffering works,
-which means there are occassional crackling sounds.
 1. No fancy features are planned at all. No bitperfect audio, etc.
 
 ## Usage
@@ -22,7 +23,23 @@ To build and run the project locally:
 
 ## Installation
 
-TBD
+The recommended way is the FreeBSD `audio/pipewire-spa-oss-ng` port/package.  It
+conflicts with `audio/pipewire-spa-oss` as they currently use the same soname.
+
+To install manually after `cargo build --release`, copy the build outputs to the
+system PipeWire/WirePlumber locations (`PREFIX` is `/usr/local`):
+
+| File | Destination |
+|------|-------------|
+| `target/release/libspa_freebsd_oss.so` | `${PREFIX}/lib/spa-0.2/` |
+| `conf/pipewire/pipewire.conf.d/oss.conf` | `${PREFIX}/share/pipewire/pipewire.conf.d/` |
+| `conf/wireplumber/wireplumber.conf.d/oss.conf` | `${PREFIX}/share/wireplumber/wireplumber.conf.d/` |
+| `share/wireplumber/scripts/monitors/oss.lua` | `${PREFIX}/share/wireplumber/scripts/monitors/` |
+
+`conf/pipewire/pipewire.conf.d/exec.conf` is only for the local dev workflow
+(see Usage) and is not installed system-wide.
+
+Restart PipeWire and WirePlumber afterward.
 
 ## License
 
