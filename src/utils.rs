@@ -90,7 +90,7 @@ impl DevdSocket {
   }
 }
 
-pub unsafe fn build_enum_format_info(b: &mut libspa::pod::builder::Builder, mono: bool) -> Result<(), Errno> {
+pub unsafe fn build_enum_format_info(b: &mut libspa::pod::builder::Builder, mono: bool) -> Result<(), rustix::io::Errno> {
 
   use libspa::sys::*;
 
@@ -145,7 +145,7 @@ pub unsafe fn build_enum_format_info(b: &mut libspa::pod::builder::Builder, mono
   Ok(())
 }
 
-pub unsafe fn build_buffers_info(b: &mut libspa::pod::builder::Builder, stride: u32) -> Result<(), Errno> {
+pub unsafe fn build_buffers_info(b: &mut libspa::pod::builder::Builder, stride: u32) -> Result<(), rustix::io::Errno> {
 
   use libspa::sys::*;
 
