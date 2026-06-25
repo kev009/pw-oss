@@ -145,6 +145,48 @@ pub unsafe fn build_enum_format_info(b: &mut libspa::pod::builder::Builder, mono
   Ok(())
 }
 
+pub unsafe fn build_buffers_info(b: &mut libspa::pod::builder::Builder, stride: u32) -> Result<(), Errno> {
+
+  use libspa::sys::*;
+
+  // The point here is dataType = MemPtr: process() maps the buffer memory
+  // directly, so a MemFd/DmaBuf block would be unusable. Sizes are permissive;
+  // the graph's quantum drives the real per-buffer size.
+  let default = 1024 * stride;
+  let max     = 16384 * stride;
+
+  let mut obj    = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
+  let mut choice = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
+
+  b.push_object(&mut obj, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers)?;
+
+  b.add_prop(SPA_PARAM_BUFFERS_buffers, 0)?;
+  b.push_choice(&mut choice, SPA_CHOICE_Range, 0)?;
+  b.add_int(2)?;  b.add_int(1)?;  b.add_int(32)?;   // default, min, max
+  b.pop(choice.assume_init_mut());
+
+  b.add_prop(SPA_PARAM_BUFFERS_blocks, 0)?;
+  b.add_int(1)?;
+
+  b.add_prop(SPA_PARAM_BUFFERS_size, 0)?;
+  b.push_choice(&mut choice, SPA_CHOICE_Range, 0)?;
+  b.add_int(default as i32)?;  b.add_int(stride as i32)?;  b.add_int(max as i32)?;
+  b.pop(choice.assume_init_mut());
+
+  b.add_prop(SPA_PARAM_BUFFERS_stride, 0)?;
+  b.add_int(stride as i32)?;
+
+  b.add_prop(SPA_PARAM_BUFFERS_align, 0)?;
+  b.add_int(16)?;
+
+  b.add_prop(SPA_PARAM_BUFFERS_dataType, 0)?;
+  b.add_int(1i32 << SPA_DATA_MemPtr)?;
+
+  b.pop(obj.assume_init_mut());
+
+  Ok(())
+}
+
 pub fn now_ns(system: &crate::spa::System) -> u64 {
   let mut now = libspa::sys::timespec { tv_sec: 0, tv_nsec: 0 };
   let err = unsafe { system.clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };

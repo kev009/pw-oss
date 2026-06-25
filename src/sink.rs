@@ -245,8 +245,8 @@ unsafe extern "C" fn on_timeout(source: *mut spa_source) {
   (*state.clock).rate      = (*state.clock).target_rate; // ?
   (*state.clock).position += (*state.clock).duration;
   (*state.clock).duration  = duration;
-  (*state.clock).delay     = 0;
-  (*state.clock).rate_diff = 1.0;
+  // .delay and .rate_diff are published from process(), where odelay() and the
+  // DLL correction are known; keep last cycle's values here (set at Start).
   (*state.clock).next_nsec = state.next_time;
 
   let node_callbacks = state.callbacks.funcs.cast::<spa_node_callbacks>().as_ref()
@@ -357,6 +357,12 @@ unsafe extern "C" fn send_command(object: *mut c_void, command: *const spa_comma
 
       for port in &mut state.ports {
         port.xrun_timestamp = 0;
+      }
+
+      // sane clock delay/rate_diff until process() publishes measured values
+      if !state.clock.is_null() {
+        (*state.clock).delay     = 0;
+        (*state.clock).rate_diff = 1.0;
       }
 
       state.started   = true;
@@ -484,7 +490,13 @@ unsafe extern "C" fn port_enum_params(
     match (id, index) {
       (SPA_PARAM_EnumFormat, 0) => crate::utils::build_enum_format_info(&mut builder, false).unwrap(),
       (SPA_PARAM_EnumFormat, _) => return 0,
-      (SPA_PARAM_Buffers, _)    => return -libc::ENOENT,
+      (SPA_PARAM_Buffers, 0) => {
+        match state.ports[port_id as usize].config.as_ref() {
+          Some(cfg) => crate::utils::build_buffers_info(&mut builder, cfg.stride()).unwrap(),
+          None      => return -libc::ENOENT // format not negotiated yet
+        }
+      },
+      (SPA_PARAM_Buffers, _)    => return 0,
       _ => return -libc::EINVAL
     };
 
@@ -615,7 +627,15 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
     assert!(!port.io.is_null());
 
     if (*port.io).status != SPA_STATUS_HAVE_DATA as i32 {
-      return (*port.io).status; //TODO: or continue?
+      // no input this cycle (e.g. draining after stop): keep clock.delay ticking
+      // down (when driving) so the graph's drain completes, and ask for data.
+      if !state.following && !state.clock.is_null() && port.dsp.is_running() {
+        (*state.clock).delay     = port.dsp.odelay() as i64 / port_config.stride() as i64;
+        (*state.clock).rate_diff = 1.0;
+      }
+      (*port.io).status = SPA_STATUS_NEED_DATA as i32;
+      result |= SPA_STATUS_NEED_DATA as i32; // in the return too: the host prefetches only on this bit
+      continue;
     }
 
     // buffer_id, n_datas and the data type all come from the peer. Validate them
@@ -757,6 +777,7 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       }
     }
 
+    let mut corr: f64 = 1.0; // DLL rate correction, published as clock.rate_diff below
     let nbytes = if port.xrun_timestamp != 0 {
 
       let period = driver_clock.target_duration * SPA_NSEC_PER_SEC as u64 / driver_clock.target_rate.denom as u64;
@@ -796,23 +817,30 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
         size as isize
       }
     } else {
-      // PipeWire's ALSA DLL usage is quite a bit more elaborate than this. Should we do something about it?
+      // Always run the DLL so we can publish rate_diff even with no resampler.
+      // err is in bytes (queued - target), matching set_bw's units.
+      let err = (port.dsp.odelay() as isize - port.target_delay as isize) as f64;
+      corr = port.dll.update(err);
+
+      #[cfg(debug_assertions)]
+      eprintln!("{}: corr = {}, err = {}", port.dsp.path, corr, err);
+
+      // the resampler (when present) pulls its input at this corrected rate
       if !state.rate_match.is_null() {
-
-        // drive the resampler so odelay converges to target_delay (err in bytes, like set_bw)
-        let err  = (port.dsp.odelay() as isize - port.target_delay as isize) as f64;
-        let corr = port.dll.update(err /*.clamp(-((period_in_bytes / 8) as f64), (period_in_bytes / 8) as f64)*/);
-
-        #[cfg(debug_assertions)]
-        eprintln!("{}: corr = {}, err = {}", port.dsp.path, corr, err);
-
         (*state.rate_match).rate = corr.clamp(0.99, 1.01);
-
-        //TODO: assign state.clock.delay and state.clock.rate_diff?
       }
 
       port.dsp.write(data_0.data.offset(offset as isize), size)
     };
+
+    // publish device latency (queued frames + resampler delay) and the rate
+    // correction, but only when driving: a follower's clock is unread.
+    if !state.following && !state.clock.is_null() {
+      let stride = port_config.stride() as i64;
+      let resamp = if state.rate_match.is_null() { 0 } else { (*state.rate_match).delay as i64 };
+      (*state.clock).delay     = port.dsp.odelay() as i64 / stride + resamp;
+      (*state.clock).rate_diff = corr;
+    }
 
     if nbytes < size as isize {
       crate::warn!(state.log, "{}: dropped {} bytes", port.dsp.path, if nbytes > 0 { size - nbytes as u32 } else { size });
@@ -820,7 +848,9 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
 
     (*port.io).status = SPA_STATUS_NEED_DATA as i32;
 
-    result |= SPA_STATUS_HAVE_DATA as i32; // those codes don't make any sense
+    // a sink has no output, so the return bit is NEED_DATA ("can accept input
+    // next cycle"), matching the port io status, not HAVE_DATA.
+    result |= SPA_STATUS_NEED_DATA as i32;
   }
 
   result
@@ -1058,6 +1088,9 @@ unsafe extern "C" fn init(
 
   state.port_info.set_flags((SPA_PORT_FLAG_PHYSICAL | SPA_PORT_FLAG_TERMINAL) as u64);
   state.port_info.set_rate(spa_fraction { num: 1, denom: 48000 }); // ?
+
+  // constrain buffer allocation to MemPtr (process() maps it directly)
+  state.port_info.add_param(SPA_PARAM_Buffers, SPA_PARAM_INFO_READ);
 
   //state.port_info.add_param(SPA_PARAM_EnumFormat, SPA_PARAM_INFO_READ);
   //state.port_info.add_param(SPA_PARAM_Format,     SPA_PARAM_INFO_READWRITE);
