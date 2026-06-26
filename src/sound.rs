@@ -20,6 +20,7 @@ const SNDCTL_DSP_GETISPACE:   c_ulong = nix::request_code_read!     (b'P', 13, s
 //const SNDCTL_DSP_SETPLAYVOL:  c_ulong = nix::request_code_readwrite!(b'P', 24, std::mem::size_of::<c_int>());
 const SNDCTL_DSP_GETODELAY:   c_ulong = nix::request_code_read!     (b'P', 23, std::mem::size_of::<c_int>());
 const SNDCTL_DSP_GETERROR:    c_ulong = nix::request_code_read!     (b'P', 25, std::mem::size_of::<audio_errinfo>());
+const SNDCTL_DSP_HALT:        c_ulong = nix::request_code_none!     (b'P',  0); // aka SNDCTL_DSP_RESET
 
 // currently unused
 // const PCM_ENABLE_INPUT:  c_int = 0x00000001;
@@ -264,6 +265,8 @@ impl DspWriter {
 
   pub fn close(&mut self) {
     assert_ne!(self.state, DspState::Closed);
+    // discard the queued buffer so close() doesn't block draining it
+    unsafe { libc::ioctl(self.fd, SNDCTL_DSP_HALT); }
     unsafe { libc::close(self.fd) };
     self.fd    = -1;
     self.state = DspState::Closed;
