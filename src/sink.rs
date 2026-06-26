@@ -612,7 +612,14 @@ unsafe extern "C" fn port_set_param(object: *mut c_void, direction: spa_directio
           }
         };
       } else {
-        state.ports[port_id as usize].config = None;
+        // releasing the format: close the device and drop the buffers (the
+        // Suspend path may have closed the dsp already, hence the guard)
+        let port = &mut state.ports[port_id as usize];
+        if !port.dsp.is_closed() {
+          port.dsp.close();
+        }
+        port.buffers.clear();
+        port.config = None;
       }
 
       // update the port rate and flip Format/Buffers flags to reflect whether a
