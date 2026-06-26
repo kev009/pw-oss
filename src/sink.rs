@@ -51,7 +51,8 @@ pub struct PortConfig {
   pub format:    libspa::param::audio::AudioFormat,
   pub rate:      u32,
   pub channels:  u32,
-  // pub positions: Vec<u32> // currently unused; consumer is commented out
+  pub positions: Vec<u32>, // the negotiated channel positions, replayed in the Format readback
+  pub flags:     u32
 }
 
 impl PortConfig {
@@ -103,6 +104,21 @@ unsafe extern "C" fn add_listener(object: *mut c_void, listener: *mut spa_hook, 
   spa_hook_list_join(&mut state.hooks, save.assume_init_mut());
 
   0
+}
+
+// re-emit port_info to every listener (carrying whatever change_mask the caller
+// set, e.g. RATE/PARAMS), then clear the mask
+unsafe fn emit_port_info(state: &mut State) {
+  crate::spa::for_each_hook(&mut state.hooks, |entry| {
+    let f = entry.cb.funcs.cast::<spa_node_events>().as_ref()
+      .expect("hook should be initialized");
+    if f.version >= SPA_VERSION_NODE_EVENTS {
+      if let Some(port_info_fun) = f.port_info {
+        port_info_fun(entry.cb.data, SPA_DIRECTION_INPUT, 0, state.port_info.raw());
+      }
+    }
+  });
+  let _ = state.port_info.replace_change_mask(0);
 }
 
 unsafe extern "C" fn set_callbacks(object: *mut c_void, callbacks: *const spa_node_callbacks, data: *mut c_void) -> c_int {
@@ -437,25 +453,24 @@ unsafe extern "C" fn remove_port(object: *mut c_void, direction: spa_direction, 
   Ok(())
 }*/
 
-/*unsafe fn build_port_format_info(builder: &mut libspa::pod::builder::Builder, config: &PortConfig, id: u32) {
-
-  assert!(config.positions.len() <= 64);
+// replays the negotiated format exactly, for port_enum_params(Format)
+unsafe fn build_port_format_info(builder: &mut libspa::pod::builder::Builder, config: &PortConfig, id: u32) {
 
   let mut position = [0u32; 64];
-  for i in 0..config.positions.len() {
-    position[i] = config.positions[i];
+  for (slot, &p) in position.iter_mut().zip(config.positions.iter()) {
+    *slot = p;
   }
 
   let mut raw = spa_audio_info_raw {
-    format:   config.format.as_raw(),
-    flags:    0,
+    format:   config.format.0,
+    flags:    config.flags,
     rate:     config.rate,
     channels: config.channels,
     position
   };
 
   spa_format_audio_raw_build(builder.as_raw_ptr(), id, &mut raw);
-}*/
+}
 
 unsafe extern "C" fn port_enum_params(
   object:    *mut c_void,
@@ -490,6 +505,13 @@ unsafe extern "C" fn port_enum_params(
     match (id, index) {
       (SPA_PARAM_EnumFormat, 0) => crate::utils::build_enum_format_info(&mut builder, false).unwrap(),
       (SPA_PARAM_EnumFormat, _) => return 0,
+      (SPA_PARAM_Format, 0) => {
+        match state.ports[port_id as usize].config.as_ref() {
+          Some(cfg) => build_port_format_info(&mut builder, cfg, SPA_PARAM_Format),
+          None      => return -libc::ENOENT // no format negotiated yet
+        }
+      },
+      (SPA_PARAM_Format, _)     => return 0,
       (SPA_PARAM_Buffers, 0) => {
         match state.ports[port_id as usize].config.as_ref() {
           Some(cfg) => crate::utils::build_buffers_info(&mut builder, cfg.stride()).unwrap(),
@@ -550,8 +572,10 @@ unsafe extern "C" fn port_set_param(object: *mut c_void, direction: spa_directio
 
             let config = PortConfig {
               format,
-              rate:     raw.rate,
-              channels: raw.channels
+              rate:      raw.rate,
+              channels:  raw.channels,
+              positions: raw.position[..raw.channels as usize].to_vec(),
+              flags:     raw.flags
             };
 
             crate::debug!(state.log, "reconfiguring with {:?}", config);
@@ -591,7 +615,19 @@ unsafe extern "C" fn port_set_param(object: *mut c_void, direction: spa_directio
         state.ports[port_id as usize].config = None;
       }
 
-      //TODO: emit port info
+      // update the port rate and flip Format/Buffers flags to reflect whether a
+      // format is negotiated, then re-emit so the host re-reads them (PipeWire
+      // ALSA sink pattern)
+      let _ = state.port_info.replace_change_mask(0);
+      if let Some(cfg) = state.ports[port_id as usize].config.as_ref() {
+        state.port_info.set_rate(spa_fraction { num: 1, denom: cfg.rate });
+        state.port_info.set_param_flags(SPA_PARAM_Format,  SPA_PARAM_INFO_READWRITE);
+        state.port_info.set_param_flags(SPA_PARAM_Buffers, SPA_PARAM_INFO_READ);
+      } else {
+        state.port_info.set_param_flags(SPA_PARAM_Format,  SPA_PARAM_INFO_WRITE);
+        state.port_info.set_param_flags(SPA_PARAM_Buffers, 0);
+      }
+      emit_port_info(state);
 
       0
     },
@@ -1092,11 +1128,13 @@ unsafe extern "C" fn init(
   state.port_info.set_flags((SPA_PORT_FLAG_PHYSICAL | SPA_PORT_FLAG_TERMINAL) as u64);
   state.port_info.set_rate(spa_fraction { num: 1, denom: 48000 }); // ?
 
-  // constrain buffer allocation to MemPtr (process() maps it directly)
-  state.port_info.add_param(SPA_PARAM_Buffers, SPA_PARAM_INFO_READ);
+  // advertise the format as writable so the host (re)negotiates it; Buffers is
+  // unreadable until a format is set (it needs the stride). Flags flip in
+  // port_set_param.
+  state.port_info.add_param(SPA_PARAM_EnumFormat, SPA_PARAM_INFO_READ);
+  state.port_info.add_param(SPA_PARAM_Format,     SPA_PARAM_INFO_WRITE);
+  state.port_info.add_param(SPA_PARAM_Buffers,    0);
 
-  //state.port_info.add_param(SPA_PARAM_EnumFormat, SPA_PARAM_INFO_READ);
-  //state.port_info.add_param(SPA_PARAM_Format,     SPA_PARAM_INFO_READWRITE);
   //state.port_info.add_param(SPA_PARAM_PortConfig, SPA_PARAM_INFO_READWRITE);
   //state.port_info.add_param(SPA_PARAM_IO,         SPA_PARAM_INFO_READ);
   //state.port_info.add_param(SPA_PARAM_Buffers,    SPA_PARAM_INFO_WRITE); // ?

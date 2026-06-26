@@ -342,6 +342,19 @@ impl PortInfo {
     self.info.n_params += 1;
   }
 
+  // Change an advertised param's read/write flags. The host re-reads a param when
+  // its flags change, so flipping Format WRITE<->READWRITE around a format
+  // clear/set is what marks the port (re)negotiable.
+  pub fn set_param_flags(&mut self, id: u32, flags: u32) {
+    for p in &mut self.params[0..self.info.n_params as usize] {
+      if p.id == id {
+        p.flags = flags;
+        self.info.change_mask |= SPA_PORT_CHANGE_MASK_PARAMS as u64;
+        return;
+      }
+    }
+  }
+
   pub fn replace_change_mask(&mut self, new_mask: u64) -> u64 {
     let old = self.info.change_mask;
     self.info.change_mask = new_mask;
