@@ -562,11 +562,13 @@ unsafe extern "C" fn port_set_param(object: *mut c_void, direction: spa_directio
             let raw = raw.assume_init();
 
             //TODO: check whether format is supported by OSS
-            //TODO: what should we do with flags?
 
-            assert!(raw.rate > 0);
-            assert!(raw.channels > 0 && raw.channels <= SPA_AUDIO_MAX_CHANNELS);
-            assert_eq!(raw.flags, 0);
+            // reject bad values rather than assert (an FFI panic aborts pipewire);
+            // flags are stored but unused, OSS writes interleaved frames
+            if raw.rate == 0 || raw.channels == 0 || raw.channels > SPA_AUDIO_MAX_CHANNELS {
+              crate::warn!(state.log, "rejecting format: rate={} channels={}", raw.rate, raw.channels);
+              return -libc::EINVAL;
+            }
 
             let format    = libspa::param::audio::AudioFormat(raw.format);
 
