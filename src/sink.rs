@@ -681,9 +681,14 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
 
     let driver_clock = (*state.position).clock;
 
-    // we size target_delay assuming the chunk written each cycle is at most one quantum
-    debug_assert!(size <= driver_clock.target_duration as u32 * port_config.stride(),
-      "chunk size {} exceeds one quantum {}", size, driver_clock.target_duration as u32 * port_config.stride());
+    // the resampler can legitimately hand us a few frames over a quantum; warn
+    // rather than debug_assert!, which would abort the process (panic across the
+    // extern "C" boundary). The write path below caps and drops the excess.
+    #[cfg(debug_assertions)]
+    if size > driver_clock.target_duration as u32 * port_config.stride() {
+      crate::warn!(state.log, "{}: chunk size {} exceeds one quantum {}",
+        port.dsp.path, size, driver_clock.target_duration as u32 * port_config.stride());
+    }
 
     if !port.dsp.is_running() {
 
