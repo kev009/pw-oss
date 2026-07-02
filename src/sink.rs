@@ -558,6 +558,7 @@ unsafe extern "C" fn port_set_param(object: *mut c_void, direction: spa_directio
   #[allow(non_upper_case_globals)]
   match id {
     SPA_PARAM_Format => {
+      let mut res: c_int = 0;
       if !param.is_null() {
         use libspa::param::format::{MediaType, MediaSubtype};
         use libspa::param::format_utils::parse_format;
@@ -605,6 +606,7 @@ unsafe extern "C" fn port_set_param(object: *mut c_void, direction: spa_directio
             // config on the data loop
             let port_idx = port_id as usize;
             let state_ptr: *mut State = state;
+            let res_ref = &mut res;
             crate::utils::block_on_loop(&(*state_ptr).data_loop, state_ptr, move |state| {
 
               let port = &mut state.ports[port_idx];
@@ -613,7 +615,13 @@ unsafe extern "C" fn port_set_param(object: *mut c_void, direction: spa_directio
                 port.dsp.close();
               }
 
-              port.dsp.open().unwrap();
+              // a busy or vanished device must fail negotiation, not abort
+              if let Err(err) = port.dsp.open() {
+                crate::warn!(state.log, "{}: open: {}", port.dsp.path, err);
+                port.config = None;
+                *res_ref = -(err as c_int);
+                return;
+              }
 
               port.dsp.set_format(oss_format);
               port.dsp.set_channels(config.channels);
@@ -659,9 +667,10 @@ unsafe extern "C" fn port_set_param(object: *mut c_void, direction: spa_directio
         state.port_info.set_param_flags(SPA_PARAM_Format,  SPA_PARAM_INFO_WRITE);
         state.port_info.set_param_flags(SPA_PARAM_Buffers, 0);
       }
+      // emit even on failure: the flags derive from the (now cleared) config
       emit_port_info(state);
 
-      0
+      res
     },
     SPA_PARAM_Latency => 0,
     SPA_PARAM_Tag     => 0,
