@@ -455,7 +455,7 @@ unsafe fn update_timers(state: &mut State) {
 
   state.next_time = (now.tv_sec * SPA_NSEC_PER_SEC as i64 + now.tv_nsec) as u64;
 
-  if state.started && !state.following {
+  if state.started && !state.following && !state.position.is_null() {
     #[cfg(debug_assertions)]
     crate::trace!(state.log, "next time {}", state.next_time);
     set_timeout(state, state.next_time);
@@ -1050,8 +1050,8 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
     if !state.position.is_null() {
       let driver_clock = (*state.position).clock;
       if driver_clock.target_rate.denom > 0 {
-        period_in_bytes = (driver_clock.target_duration * rate as u64
-          / driver_clock.target_rate.denom as u64) as u32 * stride;
+        period_in_bytes = crate::utils::device_period_bytes(
+          driver_clock.target_duration, rate, driver_clock.target_rate.denom, stride);
       }
     }
 
@@ -1100,6 +1100,10 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       let len = period_in_bytes.min(data_0.maxsize);
       std::ptr::write_bytes(data_0.data.cast::<u8>(), 0, len as usize);
       len as isize
+    } else if !port.dsp.is_running() {
+      // un-primed and no usable position yet (the prime branch needs a
+      // period): the device is still in setup, where the space ioctls assert
+      EMPTY_CYCLE
     } else {
       // Gate on the queued byte count, not poll: the kernel's poll trigger
       // is one full fragment, which can exceed a small graph period - every
@@ -1121,17 +1125,35 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
           port.bw_fast_until = now + DLL_FAST_NSEC;
         }
         maybe_relax_dll(port, rate, stride, now);
-        let max_err = (port.setup_period as f64 / 2.0).max(256.0 * stride as f64);
         // capture error is inverted vs the sink: a slow device queues less
-        let err = (period_in_bytes as f64 - queued as f64).clamp(-max_err, max_err);
-        corr = port.dll.update(err);
+        let err_raw = period_in_bytes as f64 - queued as f64;
+        if err_raw.abs() > port.setup_period as f64 {
+          // fill snap (see the sink): a level error past one period would
+          // wind the integrator against the +/-1% clamp; the bounded read
+          // above drains genuine backlog, so just relock here
+          port.dll.init();
+          port.dll.set_bw(crate::dll::SPA_DLL_BW_MAX, port.setup_period, rate * stride);
+          port.bw_fast_until = now + DLL_FAST_NSEC;
+        } else {
+          let max_err = (port.setup_period as f64 / 2.0).max(256.0 * stride as f64);
+          corr = port.dll.update(err_raw.clamp(-max_err, max_err));
+        }
 
         #[cfg(debug_assertions)]
-        eprintln!("capture: corr = {}, err = {}", corr, err);
+        eprintln!("capture: corr = {}, err = {}", corr, err_raw);
       }
 
-      // the device can report more queued input than the buffer holds; cap it
-      let ispace = queued.min(data_0.maxsize);
+      // Bounded read: one period, plus only the backlog beyond two periods
+      // (genuine catch-up). Draining everything each cycle turns consumer
+      // backpressure into a permanent extra period of latency (an oversized
+      // chunk holds io.status HAVE_DATA, we skip the device next cycle, it
+      // queues 2 periods, repeat) and pollutes the servo error.
+      let want = if port.setup_period != 0 {
+        port.setup_period.saturating_add(queued.saturating_sub(port.setup_period.saturating_mul(2)))
+      } else {
+        queued
+      };
+      let ispace = want.min(queued).min(data_0.maxsize);
       #[cfg(debug_assertions)]
       crate::trace!(state.log, "ispace: {}", ispace);
       port.dsp.read(data_0.data, ispace as usize)
@@ -1154,11 +1176,11 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       }
     }
 
-    // the dsp is running after ready_for_reading; report overruns to the host
-    // (pw-top's xrun counter); the length isn't known, so pass 0 delay
-    // the freewheel branch above never triggers the device, so it may still
-    // be in setup here
-    let overrun_count = if port.dsp.is_running() { port.dsp.overruns() } else { 0 };
+    // Report overruns to the host (pw-top's xrun counter); the length isn't
+    // known, so pass 0 delay. The freewheel branch never triggers the device
+    // (it may still be in setup), and while freewheeling the ring overruns by
+    // design - the exit path re-primes, so don't flood the counter meanwhile.
+    let overrun_count = if port.dsp.is_running() && !freewheel { port.dsp.overruns() } else { 0 };
     if overrun_count > 0 {
       let now = crate::utils::now_ns(&state.data_system);
       if let Some(suppressed) = port.warn_limit.check(now) {
@@ -1356,7 +1378,9 @@ unsafe extern "C" fn init(
   let data_system = crate::spa::System::wrap(data_system);
 
   let timer_fd = data_system.timerfd_create(libc::CLOCK_MONOTONIC, (SPA_FD_CLOEXEC | SPA_FD_NONBLOCK) as i32);
-  assert!(timer_fd >= 0);
+  if timer_fd < 0 {
+    return timer_fd; // fd exhaustion fails node creation, not the daemon
+  }
 
   let mut dsp_path = None;
 
@@ -1493,7 +1517,10 @@ unsafe extern "C" fn init(
   spa_hook_list_init(&mut state.hooks);
 
   let err = state.data_loop.add_source(&mut state.timer_source);
-  assert!(err >= 0);
+  if err < 0 {
+    state.data_system.close(state.timer_source.fd);
+    return err;
+  }
 
   0
 }

@@ -572,7 +572,7 @@ unsafe fn update_timers(state: &mut State) {
   #[cfg(debug_assertions)]
   crate::trace!(state.log, "update_timers");
 
-  if state.started && !state.following {
+  if state.started && !state.following && !state.position.is_null() {
     state.next_time = crate::utils::now_ns(&state.data_system);
     #[cfg(debug_assertions)]
     crate::trace!(state.log, "next time {}", state.next_time);
@@ -623,12 +623,19 @@ unsafe extern "C" fn set_io(object: *mut c_void, id: u32, data: *mut c_void, siz
       if flipped {
         state.following = following;
 
-        // there are some weird PipeWire xruns on clock changes that are messing up our OSS buffer delay,
-        // we'll just preemptively treat them as OSS underruns for now
+        // a role flip shifts the servo's measurement phase, not the fill:
+        // relock the DLL instead of holding playback like an underrun (the
+        // fill snap in the write path corrects any real level error)
+        let now = crate::utils::now_ns(&state.data_system);
         for port in &mut state.ports {
-          port.xrun_timestamp = crate::utils::now_ns(&state.data_system);
-          #[cfg(debug_assertions)]
-          crate::warn!(state.log, "{}: clock change @ {}", port.dsp.path, port.xrun_timestamp);
+          port.dll.init();
+          if port.setup_period != 0 {
+            if let Some(cfg) = port.config.as_ref() {
+              port.dll.set_bw(crate::dll::SPA_DLL_BW_MAX, port.setup_period, cfg.rate * cfg.stride().max(1));
+              port.bw_fast_until = now + DLL_FAST_NSEC;
+            }
+          }
+          port.was_matching = false;
         }
       }
       // rearm/park only on a real transition (io presence or role); resetting
@@ -1284,7 +1291,7 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
         }
       }
 
-      let desired_delay = period_in_bytes / 8 * state.oss_delay;
+      let desired_delay = (period_in_bytes / 8).saturating_mul(state.oss_delay);
 
       // Size the fill to the granted buffer and the device's real fragment. We
       // write about one quantum per cycle, so if the forced fragment is much
@@ -1293,7 +1300,7 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       // half-full. "Near-full" still leaves headroom for a write that runs a few
       // frames over a quantum (the resampler's output size varies), or the OSS
       // write short-writes and drops those frames every cycle.
-      let granted   = port.dsp.set_buffer_size(period_in_bytes * 2 + desired_delay);
+      let granted   = port.dsp.set_buffer_size(period_in_bytes.saturating_mul(2).saturating_add(desired_delay));
       let blocksize = port.dsp.blocksize();
       // saturating arithmetic: blocksize/rate_match.size are device-provided and
       // an overflow here would abort the data loop.
@@ -1307,7 +1314,8 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
           let write_max = period_in_bytes.max(rate_match_bytes);
           granted.saturating_sub(write_max.saturating_add(blocksize))
         } else {
-          desired_delay.max(granted / 2).clamp(period_in_bytes, granted - period_in_bytes)
+          // calibrated: period/8 per oss.delay step, floored at one period
+          desired_delay.clamp(period_in_bytes, granted - period_in_bytes)
         }
       } else {
         granted / 2 // buffer too small for two quanta; best-effort, will drop (warned below)
@@ -1320,6 +1328,10 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
 
       crate::warn!(state.log, "{}: granted {}, blocksize {}, period {}, target delay {}",
         port.dsp.path, granted, blocksize, period_in_bytes, port.target_delay);
+      if granted < period_in_bytes.saturating_mul(2).saturating_add(desired_delay) && granted >= 2 * period_in_bytes {
+        crate::info!(state.log, "{}: granted {} < requested {}; the oss.delay target is truncated",
+          port.dsp.path, granted, period_in_bytes.saturating_mul(2).saturating_add(desired_delay));
+      }
       if granted < 2 * period_in_bytes {
         crate::warn!(state.log, "{}: granted OSS buffer ({}) is smaller than two quanta ({}); \
           audio will glitch. Lower the PipeWire quantum; we set the fragment size \
@@ -1337,13 +1349,13 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
         }
         if port.xrun_timestamp == 0 {
           port.xrun_timestamp = state.cur_timestamp;
-        }
 
-        // report it to the host (pw-top's xrun counter); the length isn't
-        // known at detection time, so pass 0 delay
-        let node_callbacks = state.callbacks.funcs.cast::<spa_node_callbacks>().as_ref();
-        if let Some(xrun_fun) = node_callbacks.and_then(|c| c.xrun) {
-          xrun_fun(state.callbacks.data, state.cur_timestamp / 1000, 0, std::ptr::null_mut());
+          // report the EVENT to the host (pw-top's xrun counter) once, not
+          // per held cycle; the length isn't known at detection, so 0 delay
+          let node_callbacks = state.callbacks.funcs.cast::<spa_node_callbacks>().as_ref();
+          if let Some(xrun_fun) = node_callbacks.and_then(|c| c.xrun) {
+            xrun_fun(state.callbacks.data, state.cur_timestamp / 1000, 0, std::ptr::null_mut());
+          }
         }
       }
     }
@@ -1351,18 +1363,11 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
     let mut corr: f64 = 1.0; // DLL rate correction, published as clock.rate_diff below
     let nbytes = if port.xrun_timestamp != 0 {
 
-      let period = driver_clock.target_duration * SPA_NSEC_PER_SEC as u64 / driver_clock.target_rate.denom as u64;
-      let diff   = state.cur_timestamp - state.old_timestamp;
-
-      // not sure if that does anything of value
-      /*if !state.clock.is_null() {
-        (*state.clock).xrun += diff;
-      }*/
-
-      // we are going to wait for the appropriate conditions to continue normal playback
-      if driver_clock.nsec > port.xrun_timestamp && driver_clock.flags & SPA_IO_CLOCK_FLAG_XRUN_RECOVER == 0 &&
-        diff >= period && diff < period + 1_000_000 /* ? */
-      {
+      // Recover on the first data cycle past the event (ALSA does the same:
+      // snap the fill, resume immediately). Waiting for a particular process
+      // cadence discards real buffers per failed attempt, and a follower
+      // under a corr-steered driver may never hit a fixed window at all.
+      if driver_clock.nsec > port.xrun_timestamp && driver_clock.flags & SPA_IO_CLOCK_FLAG_XRUN_RECOVER == 0 {
         port.xrun_timestamp = 0;
 
         port.bw_fast_until = state.cur_timestamp + DLL_FAST_NSEC;
@@ -1391,24 +1396,46 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       // published; here the DLL only serves rate matching as a follower on a
       // foreign clock - a same-device follower has nothing to correct, and
       // updating anyway would wind the integrator (ALSA gates the same way)
+      let mut skip_write = false;
       if matching && port.setup_period != 0 {
-        let stride = port_config.stride().max(1);
+        let stride   = port_config.stride().max(1);
+        let cfg_rate = port_config.rate;
         if !port.was_matching {
           // matching just engaged; relock rather than apply stale state
           port.dll.init();
-          port.dll.set_bw(crate::dll::SPA_DLL_BW_MAX, port.setup_period, port_config.rate * stride);
+          port.dll.set_bw(crate::dll::SPA_DLL_BW_MAX, port.setup_period, cfg_rate * stride);
           port.bw_fast_until = state.cur_timestamp + DLL_FAST_NSEC;
         }
-        maybe_relax_dll(port, port_config.rate, stride, state.cur_timestamp);
-        let max_err = (port.setup_period as f64 / 2.0).max(256.0 * stride as f64);
-        let err = (port.dsp.odelay() as f64 - port.target_delay as f64).clamp(-max_err, max_err);
-        corr = port.dll.update(err);
+        maybe_relax_dll(port, cfg_rate, stride, state.cur_timestamp);
+        let odelay  = port.dsp.odelay();
+        let err_raw = odelay as f64 - port.target_delay as f64;
+        if err_raw.abs() > port.setup_period as f64 {
+          // Fill snap (ALSA's max_resync): a level error past one period is
+          // beyond what the +/-1% actuator removes promptly and would wind the
+          // integrator against the clamp. Correct the level directly -
+          // refill on underfill, drain a cycle on overfill - and relock.
+          port.dll.init();
+          port.dll.set_bw(crate::dll::SPA_DLL_BW_MAX, port.setup_period, cfg_rate * stride);
+          port.bw_fast_until = state.cur_timestamp + DLL_FAST_NSEC;
+          if err_raw < 0.0 {
+            port.dsp.write_zeroes(port.target_delay.saturating_sub(odelay));
+          } else {
+            skip_write = true;
+          }
+        } else {
+          let max_err = (port.setup_period as f64 / 2.0).max(256.0 * stride as f64);
+          corr = port.dll.update(err_raw.clamp(-max_err, max_err));
+        }
 
         #[cfg(debug_assertions)]
-        eprintln!("{}: corr = {}, err = {}", port.dsp.path, corr, err);
+        eprintln!("{}: corr = {}, err = {}", port.dsp.path, corr, err_raw);
       }
 
-      port.dsp.write(data_0.data.offset(offset as isize), size)
+      if skip_write {
+        size as isize // consumed; the device drains toward target meanwhile
+      } else {
+        port.dsp.write(data_0.data.offset(offset as isize), size)
+      }
     };
 
     // Rate-match only as a follower on a foreign clock: when driving, the
@@ -1595,7 +1622,9 @@ unsafe extern "C" fn init(
   let data_system = crate::spa::System::wrap(data_system);
 
   let timer_fd = data_system.timerfd_create(libc::CLOCK_MONOTONIC, (SPA_FD_CLOEXEC | SPA_FD_NONBLOCK) as i32);
-  assert!(timer_fd >= 0);
+  if timer_fd < 0 {
+    return timer_fd; // fd exhaustion fails node creation, not the daemon
+  }
 
   let mut dsp_path  = None;
   let mut oss_delay = 10u32; // default fill target: 10/8 of a period
@@ -1761,7 +1790,10 @@ unsafe extern "C" fn init(
   spa_hook_list_init(&mut state.hooks);
 
   let err = state.data_loop.add_source(&mut state.timer_source);
-  assert!(err >= 0);
+  if err < 0 {
+    state.data_system.close(state.timer_source.fd);
+    return err;
+  }
 
   0
 }

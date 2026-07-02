@@ -132,13 +132,14 @@ unsafe extern "C" fn on_devd_event(source: *mut spa_source) {
     return; // the source is only registered when the socket exists
   };
 
-  devd_socket.read_event(|line| {
+  let alive = devd_socket.read_event(|line| {
 
     if !(line.starts_with("+uaudio") || line.starts_with("-uaudio")) {
       return;
     }
 
-    let re = regex::Regex::new(r"^([\+-])(uaudio\d+)").unwrap();
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| regex::Regex::new(r"^([\+-])(uaudio\d+)").unwrap());
     if let Some(groups) = re.captures(line) {
 
       let change = groups.get(1).unwrap();
@@ -173,6 +174,14 @@ unsafe extern "C" fn on_devd_event(source: *mut spa_source) {
       }
     }
   });
+
+  if !alive {
+    // devd restarted or dropped us; deregister or the level-triggered fd
+    // spins the main loop forever. Hotplug stays off until pipewire restarts.
+    crate::warn!(state.log, "devd connection lost; hotplug disabled");
+    state.main_loop.remove_source(&mut state.devd_source);
+    state.devd_socket = None;
+  }
 }
 
 unsafe extern "C" fn init(
@@ -272,7 +281,11 @@ unsafe extern "C" fn init(
 
   if state.devd_socket.is_some() {
     let err = state.main_loop.add_source(&mut state.devd_source);
-    assert!(err >= 0);
+    if err < 0 {
+      // no hotplug then; enumeration still works
+      crate::warn!(state.log, "can't watch devd: {}", err);
+      state.devd_socket = None;
+    }
   }
 
   0

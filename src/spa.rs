@@ -85,6 +85,9 @@ pub unsafe fn for_each_dict_item(dict: &spa_dict, mut apply: impl FnMut(&str, &s
     return;
   }
   for item in std::slice::from_raw_parts(dict.items, dict.n_items as usize) {
+    if item.key.is_null() || item.value.is_null() {
+      continue; // malformed host dict; skip rather than fault
+    }
     // host-supplied strings; don't abort on stray bytes
     let key   = CStr::from_ptr(item.key)  .to_string_lossy();
     let value = CStr::from_ptr(item.value).to_string_lossy();

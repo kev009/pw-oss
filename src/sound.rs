@@ -481,6 +481,11 @@ impl DspWriter {
   }
 
   pub fn write_zeroes(&mut self, mut count: u32) {
+    // even a zero-length prime must leave the writer Running: callers assume
+    // the space/underrun ioctls are usable after priming
+    if self.state == DspState::Setup {
+      self.state = DspState::Running;
+    }
     // chunk from ZEROES (`count` can exceed its len). The fd is O_NONBLOCK, so a
     // short write or EAGAIN is normal; prime best-effort rather than asserting and
     // panicking out of the `extern "C"` callback (which aborts the process).
@@ -575,7 +580,8 @@ pub fn read_pcm_device_description(sysctl: &mut crate::utils::SysctlReader, inde
     if let Ok(idx) = str.parse::<u32>() {
       if let Ok(desc) = sysctl.read_string(format!("dev.uaudio.{}.%desc", idx), 1024) {
         // let's get rid of ", class %d/%d, rev %x.%02x/%x.%02x, addr %d" suffix
-        let re = regex::Regex::new(r"^(.*?), class \d+/\d+, rev [^\s]+, addr \d$").unwrap();
+        static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let re = RE.get_or_init(|| regex::Regex::new(r"^(.*?), class \d+/\d+, rev [^\s]+, addr \d$").unwrap());
         if let Some(groups) = re.captures(&desc) {
           if let Some(str) = groups.get(1) {
             return Some(str.as_str().to_string());

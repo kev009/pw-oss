@@ -92,11 +92,18 @@ impl DevdSocket {
     self.socket.as_raw_fd()
   }
 
-  pub fn read_event(&mut self, mut apply: impl FnMut(&str)) {
-    if let Ok(len) = self.socket.recv(&mut self.buffer) {
-      assert!(len <= self.buffer.len());
-      // devd events should be ASCII, but don't abort on a stray byte
-      apply(&String::from_utf8_lossy(&self.buffer[..len]));
+  // false when the connection is dead (EOF or error): the fd stays readable
+  // forever then, and the caller must deregister it or the loop busy-spins
+  pub fn read_event(&mut self, mut apply: impl FnMut(&str)) -> bool {
+    match self.socket.recv(&mut self.buffer) {
+      Ok(0) => false, // EOF: devd went away (e.g. service devd restart)
+      Ok(len) => {
+        assert!(len <= self.buffer.len());
+        // devd events should be ASCII, but don't abort on a stray byte
+        apply(&String::from_utf8_lossy(&self.buffer[..len]));
+        true
+      },
+      Err(err) => err.kind() == std::io::ErrorKind::WouldBlock
     }
   }
 }
