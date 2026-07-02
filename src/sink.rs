@@ -704,35 +704,20 @@ unsafe extern "C" fn send_command(object: *mut c_void, command: *const spa_comma
       0
     },
     (SPA_TYPE_COMMAND_Node, SPA_NODE_COMMAND_Suspend) => {
-      // swap the devices out on the loop and close them here: HALT+close can
-      // sleep (chn_abort), which would stall every node on the data loop
-      let mut retired: [Option<crate::sound::DspWriter>; MAX_PORTS] = std::default::Default::default();
-      // pre-built here: constructing them in the closure would allocate on
-      // the RT loop
-      let mut replacements: [Option<crate::sound::DspWriter>; MAX_PORTS] =
-        std::array::from_fn(|i| Some(crate::sound::DspWriter::new(&state.ports[i].dsp.path)));
-      {
-        let retired_ref = &mut retired;
-        let replacements_ref = &mut replacements;
-        let state: *mut State = state;
-        if !crate::utils::block_on_loop(&(*state).data_loop, state, move |state| {
-          for (i, port) in state.ports.iter_mut().enumerate() {
-            if !port.dsp.is_closed() {
-              let closed = replacements_ref[i].take().expect("replacement is pre-built");
-              retired_ref[i] = Some(std::mem::replace(&mut port.dsp, closed));
-            }
-          }
-          state.started = false;
-          update_timers(state);
-        }) {
-          return -libc::EIO;
-        }
+      // Quiesce the loop first (blocking), then stop the channels from this
+      // (main) thread - SETTRIGGER's chn_abort can sleep. The fd stays open,
+      // so resume is a re-prime instead of a device rebuild; a driver that
+      // refuses the trigger falls back to the close/rebuild path.
+      let state: *mut State = state;
+      if !crate::utils::block_on_loop(&(*state).data_loop, state, |state| {
+        state.started = false;
+        update_timers(state);
+      }) {
+        return -libc::EIO;
       }
-      for old in retired.iter_mut() {
-        if let Some(dsp) = old.as_mut() {
-          if !dsp.is_closed() {
-            dsp.close(); // off the RT path
-          }
+      for port in &mut (*state).ports {
+        if !port.dsp.is_closed() && !port.dsp.suspend() {
+          port.dsp.close();
         }
       }
       0

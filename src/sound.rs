@@ -16,7 +16,7 @@ const SNDCTL_DSP_SETFRAGMENT: c_ulong = nix::request_code_readwrite!(b'P', 10, s
 const SNDCTL_DSP_GETFMTS:     c_ulong = nix::request_code_read!     (b'P', 11, std::mem::size_of::<c_int>());
 const SNDCTL_DSP_GETOSPACE:   c_ulong = nix::request_code_read!     (b'P', 12, std::mem::size_of::<audio_buf_info>());
 const SNDCTL_DSP_GETISPACE:   c_ulong = nix::request_code_read!     (b'P', 13, std::mem::size_of::<audio_buf_info>());
-//const SNDCTL_DSP_SETTRIGGER:  c_ulong = nix::request_code_write!    (b'P', 16, std::mem::size_of::<c_int>());
+const SNDCTL_DSP_SETTRIGGER:  c_ulong = nix::request_code_write!    (b'P', 16, std::mem::size_of::<c_int>());
 //const SNDCTL_DSP_GETPLAYVOL:  c_ulong = nix::request_code_read!     (b'P', 24, std::mem::size_of::<c_int>());
 //const SNDCTL_DSP_SETPLAYVOL:  c_ulong = nix::request_code_readwrite!(b'P', 24, std::mem::size_of::<c_int>());
 const SNDCTL_DSP_GETODELAY:   c_ulong = nix::request_code_read!     (b'P', 23, std::mem::size_of::<c_int>());
@@ -65,8 +65,9 @@ struct oss_audioinfo {
 const SND_CHN_MAX: c_int = 8;
 
 // currently unused
-// const PCM_ENABLE_INPUT:  c_int = 0x00000001;
-// const PCM_ENABLE_OUTPUT: c_int = 0x00000002;
+#[allow(dead_code)]
+const PCM_ENABLE_INPUT:  c_int = 0x00000001;
+const PCM_ENABLE_OUTPUT: c_int = 0x00000002;
 
 // sys/dev/sound/pcm/channel.h
 const CHN_2NDBUFMAXSIZE: usize = 131072;
@@ -254,12 +255,10 @@ fn set_fragment(fd: c_int, n_frags: u16, frag_size_selector: u16) {
   // size from GETOSPACE, so don't assert the request was honored.
 }
 
-/*fn set_trigger(fd: c_int, mask: c_int) {
-  let mut m = mask as c_int;
-  let err = unsafe { libc::ioctl(fd, SNDCTL_DSP_SETTRIGGER, &mut m) };
-  assert_ne!(err, -1);
-  assert_eq!(m, mask as c_int);
-}*/
+fn set_trigger(fd: c_int, mask: c_int) -> bool {
+  let mut m = mask;
+  unsafe { libc::ioctl(fd, SNDCTL_DSP_SETTRIGGER, &mut m) != -1 }
+}
 
 fn odelay(fd: c_int) -> c_int {
   let mut delay: c_int = -1;
@@ -291,13 +290,14 @@ fn get_error(fd: c_int) -> audio_errinfo {
 pub struct Dsp {
   path:  CString,
   fd:    c_int,
-  state: DspState
+  state: DspState,
+  needs_trigger: bool // trigger-suspended: NOTRIGGER must be cleared on restart
 }
 
 impl Dsp {
 
   pub fn new(path: &str) -> Self {
-    Self { path: CString::new(path).unwrap(), fd: -1, state: DspState::Closed }
+    Self { path: CString::new(path).unwrap(), fd: -1, state: DspState::Closed, needs_trigger: false }
   }
 
   pub fn is_closed(&self) -> bool {
@@ -330,6 +330,7 @@ impl Dsp {
     unsafe { libc::close(self.fd) };
     self.fd    = -1;
     self.state = DspState::Closed;
+    self.needs_trigger = false;
   }
 
   pub fn configure(&mut self, format: u32, channels: u32, rate: u32) -> Result<(), Errno> {
@@ -357,6 +358,22 @@ impl Dsp {
     unsafe { info.assume_init().fragsize.max(0) as u32 }
   }
 
+  // Stop the channel but keep the fd: SETTRIGGER(0) aborts, resets the ring
+  // and clears TRIGGERED, so the next prime retunes and poll() force-starts
+  // the channel again (chn_poll ignores NOTRIGGER). false = driver refused;
+  // the caller falls back to closing.
+  pub fn suspend(&mut self) -> bool {
+    if self.state != DspState::Running {
+      return true; // nothing runs; already primable
+    }
+    if !set_trigger(self.fd, 0) {
+      return false;
+    }
+    self.state = DspState::Setup;
+    self.needs_trigger = true;
+    true
+  }
+
   pub unsafe fn read(&mut self, buf: *mut c_void, count: size_t) -> ssize_t {
     if self.state == DspState::Setup {
       self.state = DspState::Running;
@@ -378,6 +395,12 @@ impl Dsp {
     // capture channel just like select/read do (dsp_poll -> chn_poll)
     let mut pfd = libc::pollfd { fd: self.fd, events: libc::POLLIN, revents: 0 };
     let n = unsafe { libc::poll(&mut pfd, 1, timeout_ms as i32) };
+    // poll force-starts a trigger-suspended channel but leaves NOTRIGGER
+    // set, which would keep the channel from ever auto-restarting; clear it
+    if self.needs_trigger {
+      self.needs_trigger = false;
+      let _ = set_trigger(self.fd, PCM_ENABLE_INPUT);
+    }
     n > 0 && (pfd.revents & libc::POLLIN) != 0
   }
 
@@ -411,6 +434,7 @@ pub struct DspWriter {
   pub path: String,
   fd:      c_int,
   state:   DspState,
+  needs_trigger: bool, // trigger-suspended: writes buffer until armed
   #[cfg(debug_assertions)]
   prev_ns: u64
 }
@@ -424,6 +448,7 @@ impl DspWriter {
       path:    path.to_string(),
       fd:      -1,
       state:   DspState::Closed,
+      needs_trigger: false,
       #[cfg(debug_assertions)]
       prev_ns: 0
     }
@@ -456,6 +481,34 @@ impl DspWriter {
     unsafe { libc::close(self.fd) };
     self.fd    = -1;
     self.state = DspState::Closed;
+    self.needs_trigger = false;
+  }
+
+  // Stop the channel but keep the fd: SETTRIGGER(0) aborts, resets the ring
+  // and sets NOTRIGGER (writes only buffer until armed), and clears
+  // TRIGGERED so the next prime's SETFRAGMENT is legal again; write() and
+  // write_zeroes() arm the channel once the prefill is buffered. false =
+  // driver refused; the caller falls back to closing.
+  pub fn suspend(&mut self) -> bool {
+    if self.state != DspState::Running {
+      return true; // nothing runs; already primable
+    }
+    if !set_trigger(self.fd, 0) {
+      return false;
+    }
+    self.state = DspState::Setup;
+    self.needs_trigger = true;
+    true
+  }
+
+  // start a trigger-suspended channel with whatever is buffered
+  fn arm(&mut self) {
+    if self.needs_trigger {
+      self.needs_trigger = false;
+      if !set_trigger(self.fd, PCM_ENABLE_OUTPUT) {
+        eprintln!("{}: SETTRIGGER(OUTPUT) failed after a trigger suspend", self.path);
+      }
+    }
   }
 
   pub fn configure(&mut self, format: u32, channels: u32, rate: u32) -> Result<(), Errno> {
@@ -479,6 +532,13 @@ impl DspWriter {
   }
 
   pub unsafe fn write(&mut self, buf: *const c_void, count: u32) -> ssize_t {
+    let n = self.write_buffered(buf, count);
+    // a trigger-suspended channel starts once real data is buffered
+    self.arm();
+    n
+  }
+
+  unsafe fn write_buffered(&mut self, buf: *const c_void, count: u32) -> ssize_t {
     if self.state == DspState::Setup {
       self.state = DspState::Running;
     }
@@ -515,7 +575,7 @@ impl DspWriter {
     // panicking out of the `extern "C"` callback (which aborts the process).
     while count > 0 {
       let chunk  = count.min(ZEROES.len() as u32);
-      let nbytes = unsafe { self.write(ZEROES.as_ptr().cast(), chunk) };
+      let nbytes = unsafe { self.write_buffered(ZEROES.as_ptr().cast(), chunk) };
       if nbytes < 0 {
         let errno = Errno::last();
         if errno != Errno::EAGAIN { // EAGAIN is just a full buffer; surface anything else
@@ -546,15 +606,6 @@ impl DspWriter {
     get_error(self.fd).play_underruns.max(0) as u32
   }
 
-  /*pub fn pause(&self) {
-    assert_eq!(self.state, DspState::Running);
-    set_trigger(self.fd, 0);
-  }*/
-
-  /*pub fn resume(&self) {
-    assert_eq!(self.state, DspState::Running);
-    set_trigger(self.fd, PCM_ENABLE_OUTPUT);
-  }*/
 }
 
 impl Drop for DspWriter {
