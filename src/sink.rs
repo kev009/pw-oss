@@ -58,7 +58,8 @@ struct Port {
   dll:            crate::dll::SpaDLL,
   target_delay:   u32, // OSS buffer fill target in bytes, clamped to the granted buffer
   setup_period:   u32, // device bytes per graph cycle the stream was set up for
-  bw_fast_until:  u64, // while nonzero, the DLL runs at BW_MAX for a fast lock
+  bw_adapt:       crate::dll::BwAdapt, // variance-adaptive bandwidth (ALSA scheme)
+  setup_blocksize: u32, // device fragment size (measurement quantization)
   period_mismatch: u32, // consecutive cycles at a different period (debounce)
   resetup_pending: bool, // a main-thread device rebuild is queued; skip cycles
   was_matching:   bool, // rate matching active last cycle (relock on transition)
@@ -425,15 +426,6 @@ unsafe extern "C" fn set_param(object: *mut c_void, id: u32, _flags: u32, param:
 // ALSA adapts the DLL bandwidth continuously from the error variance
 // (alsa-pcm.c, BW_PERIOD); we approximate with two stages: a fast lock at
 // BW_MAX after (re)start, then the low steady-state bandwidth
-const DLL_FAST_NSEC: u64 = 3 * SPA_NSEC_PER_SEC as u64;
-
-fn maybe_relax_dll(port: &mut Port, device_rate: u32, stride: u32, now: u64) {
-  if port.bw_fast_until != 0 && now >= port.bw_fast_until {
-    port.bw_fast_until = 0;
-    port.dll.set_bw(crate::dll::SPA_DLL_BW_MIN, port.setup_period, device_rate * stride);
-  }
-}
-
 unsafe extern "C" fn on_timeout(source: *mut spa_source) {
 
   let state = (*source).data.cast::<State>().as_mut()
@@ -516,20 +508,19 @@ unsafe extern "C" fn on_timeout(source: *mut spa_source) {
       continue; // recovering; process() is discarding buffers, hold the servo
     }
 
-    maybe_relax_dll(port, device_rate, stride, nsec);
-
     // clamp the error so a wakeup-jitter spike can't wind up the integrator
     // against an actuator that moves slowly (ALSA clamps to max_error too)
     let max_err = (port.setup_period as f64 / 2.0).max(256.0 * stride as f64);
     let err = (odelay as f64 - port.target_delay as f64).clamp(-max_err, max_err);
     corr = port.dll.update(err);
+    port.bw_adapt.update(&mut port.dll, err, stride, port.setup_blocksize,
+      nsec, port.setup_period, device_rate * stride);
 
     // a diverged servo must not wedge the graph clock
     if !(0.5..=2.0).contains(&corr) {
       crate::warn!(state.log, "{}: DLL diverged (corr {}); relocking", port.dsp.path, corr);
       port.dll.init();
-      port.dll.set_bw(crate::dll::SPA_DLL_BW_MAX, port.setup_period, device_rate * stride);
-      port.bw_fast_until = nsec + DLL_FAST_NSEC;
+      port.bw_adapt.reset();
       corr = 1.0;
     }
 
@@ -641,15 +632,9 @@ unsafe extern "C" fn set_io(object: *mut c_void, id: u32, data: *mut c_void, siz
         // a role flip shifts the servo's measurement phase, not the fill:
         // relock the DLL instead of holding playback like an underrun (the
         // fill snap in the write path corrects any real level error)
-        let now = crate::utils::now_ns(&state.data_system);
         for port in &mut state.ports {
           port.dll.init();
-          if port.setup_period != 0 {
-            if let Some(cfg) = port.config.as_ref() {
-              port.dll.set_bw(crate::dll::SPA_DLL_BW_MAX, port.setup_period, cfg.rate * cfg.stride().max(1));
-              port.bw_fast_until = now + DLL_FAST_NSEC;
-            }
-          }
+          port.bw_adapt.reset();
           port.was_matching = false;
         }
       }
@@ -1418,10 +1403,10 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
         granted / 2 // buffer too small for two quanta; best-effort, will drop (warned below)
       };
 
-      port.setup_period  = period_in_bytes;
-      port.bw_fast_until = state.cur_timestamp + DLL_FAST_NSEC;
+      port.setup_period    = period_in_bytes;
+      port.setup_blocksize = blocksize;
       port.dll.init();
-      port.dll.set_bw(crate::dll::SPA_DLL_BW_MAX, period_in_bytes, port_config.rate * port_config.stride());
+      port.bw_adapt.reset(); // cold-starts at the granularity cap next servo cycle
 
       crate::warn!(state.log, "{}: granted {}, blocksize {}, period {}, target delay {}",
         port.dsp.path, granted, blocksize, period_in_bytes, port.target_delay);
@@ -1471,9 +1456,8 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       if driver_clock.nsec > port.xrun_timestamp && driver_clock.flags & SPA_IO_CLOCK_FLAG_XRUN_RECOVER == 0 {
         port.xrun_timestamp = 0;
 
-        port.bw_fast_until = state.cur_timestamp + DLL_FAST_NSEC;
         port.dll.init();
-        port.dll.set_bw(crate::dll::SPA_DLL_BW_MAX, period_in_bytes, port_config.rate * port_config.stride());
+        port.bw_adapt.reset();
 
         // buffer's already sized; re-prime only up to target, accounting for what's
         // still queued (a full target_delay would push odelay past the buffer)
@@ -1504,10 +1488,8 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
         if !port.was_matching {
           // matching just engaged; relock rather than apply stale state
           port.dll.init();
-          port.dll.set_bw(crate::dll::SPA_DLL_BW_MAX, port.setup_period, cfg_rate * stride);
-          port.bw_fast_until = state.cur_timestamp + DLL_FAST_NSEC;
+          port.bw_adapt.reset();
         }
-        maybe_relax_dll(port, cfg_rate, stride, state.cur_timestamp);
         let odelay  = port.dsp.odelay();
         let err_raw = odelay as f64 - port.target_delay as f64;
         if err_raw.abs() > port.setup_period as f64 {
@@ -1516,8 +1498,7 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
           // integrator against the clamp. Correct the level directly -
           // refill on underfill, drain a cycle on overfill - and relock.
           port.dll.init();
-          port.dll.set_bw(crate::dll::SPA_DLL_BW_MAX, port.setup_period, cfg_rate * stride);
-          port.bw_fast_until = state.cur_timestamp + DLL_FAST_NSEC;
+          port.bw_adapt.reset();
           if err_raw < 0.0 {
             port.dsp.write_zeroes(port.target_delay.saturating_sub(odelay));
           } else {
@@ -1525,7 +1506,10 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
           }
         } else {
           let max_err = (port.setup_period as f64 / 2.0).max(256.0 * stride as f64);
-          corr = port.dll.update(err_raw.clamp(-max_err, max_err));
+          let err = err_raw.clamp(-max_err, max_err);
+          corr = port.dll.update(err);
+          port.bw_adapt.update(&mut port.dll, err, stride, port.setup_blocksize,
+            state.cur_timestamp, port.setup_period, cfg_rate * stride);
         }
 
         #[cfg(debug_assertions)]
@@ -1842,7 +1826,8 @@ unsafe extern "C" fn init(
         dll:            std::default::Default::default(),
         target_delay:   0,
         setup_period:   0,
-        bw_fast_until:  0,
+        bw_adapt:       std::default::Default::default(),
+        setup_blocksize: 0,
         period_mismatch: 0,
         resetup_pending: false,
         was_matching:   false,

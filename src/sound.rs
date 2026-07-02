@@ -347,6 +347,16 @@ impl Dsp {
     set_fragment(self.fd, 64, 10); // 64 x 1 KiB
   }
 
+  // GETOSPACE requires a write channel, so the shared helper reads 0 on a
+  // capture fd; GETISPACE's fragsize is the capture-side equivalent
+  pub fn blocksize(&self) -> u32 {
+    let mut info = std::mem::MaybeUninit::<audio_buf_info>::uninit();
+    if unsafe { libc::ioctl(self.fd, SNDCTL_DSP_GETISPACE, info.as_mut_ptr()) } == -1 {
+      return 0;
+    }
+    unsafe { info.assume_init().fragsize.max(0) as u32 }
+  }
+
   pub unsafe fn read(&mut self, buf: *mut c_void, count: size_t) -> ssize_t {
     if self.state == DspState::Setup {
       self.state = DspState::Running;

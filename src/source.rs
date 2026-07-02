@@ -55,7 +55,8 @@ struct Port {
   dll:           crate::dll::SpaDLL,
   primed:        bool,
   setup_period:  u32, // device bytes per graph cycle the servo was tuned for
-  bw_fast_until: u64, // while nonzero, the DLL runs at BW_MAX for a fast lock
+  bw_adapt:      crate::dll::BwAdapt, // variance-adaptive bandwidth (ALSA scheme)
+  setup_blocksize: u32, // device fragment size (measurement quantization)
   resetup_pending: bool, // a main-thread device rebuild is queued; skip cycles
   was_matching:  bool, // rate matching active last cycle (relock on transition)
   warn_limit:    crate::utils::RateLimit
@@ -308,15 +309,6 @@ unsafe extern "C" fn set_param(object: *mut c_void, id: u32, _flags: u32, param:
 
 // two-stage DLL bandwidth (see sink.rs: a simplification of ALSA's
 // variance-driven adaptation): fast lock after (re)start, then steady state
-const DLL_FAST_NSEC: u64 = 3 * SPA_NSEC_PER_SEC as u64;
-
-fn maybe_relax_dll(port: &mut Port, device_rate: u32, stride: u32, now: u64) {
-  if port.bw_fast_until != 0 && now >= port.bw_fast_until {
-    port.bw_fast_until = 0;
-    port.dll.set_bw(crate::dll::SPA_DLL_BW_MIN, port.setup_period, device_rate * stride);
-  }
-}
-
 unsafe extern "C" fn on_timeout(source: *mut spa_source) {
 
   let state = (*source).data.cast::<State>().as_mut()
@@ -390,20 +382,19 @@ unsafe extern "C" fn on_timeout(source: *mut spa_source) {
     let resamp = if state.rate_match.is_null() { 0 } else { (*state.rate_match).delay as i64 };
     delay = (queued / stride) as i64 * rate as i64 / device_rate as i64 + resamp;
 
-    maybe_relax_dll(port, device_rate, stride, nsec);
-
     // capture error is inverted vs the sink: a slow device queues less than a
     // period; clamp so wakeup jitter can't wind up the integrator
     let max_err = (port.setup_period as f64 / 2.0).max(256.0 * stride as f64);
     let err = (port.setup_period as f64 - queued as f64).clamp(-max_err, max_err);
     corr = port.dll.update(err);
+    port.bw_adapt.update(&mut port.dll, err, stride, port.setup_blocksize,
+      nsec, port.setup_period, device_rate * stride);
 
     // a diverged servo must not wedge the graph clock
     if !(0.5..=2.0).contains(&corr) {
       crate::warn!(state.log, "capture DLL diverged (corr {}); relocking", corr);
       port.dll.init();
-      port.dll.set_bw(crate::dll::SPA_DLL_BW_MAX, port.setup_period, device_rate * stride);
-      port.bw_fast_until = nsec + DLL_FAST_NSEC;
+      port.bw_adapt.reset();
       corr = 1.0;
     }
 
@@ -558,9 +549,9 @@ unsafe extern "C" fn send_command(object: *mut c_void, command: *const spa_comma
         // the device kept capturing across a Pause; re-prime so the first
         // cycles deliver fresh audio at a known fill, not the paused backlog
         for port in &mut state.ports {
-          port.primed        = false;
-          port.bw_fast_until = 0;
+          port.primed = false;
           port.dll.init();
+          port.bw_adapt.reset();
         }
         state.started   = true;
         state.following = state.node_is_follower();
@@ -1148,10 +1139,9 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
     // isn't SETFRAGMENT-sized), but the DLL gain and target change - ALSA
     // compensates the error by the threshold delta, we relock fast instead
     if port.primed && port.setup_period != 0 && period_in_bytes != 0 && period_in_bytes != port.setup_period {
-      port.setup_period  = period_in_bytes;
-      port.bw_fast_until = crate::utils::now_ns(&state.data_system) + DLL_FAST_NSEC;
+      port.setup_period = period_in_bytes;
       port.dll.init();
-      port.dll.set_bw(crate::dll::SPA_DLL_BW_MAX, period_in_bytes, rate * stride);
+      port.bw_adapt.reset();
     }
 
     let freewheel = !state.position.is_null() &&
@@ -1180,11 +1170,11 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
           backlog -= n as u32;
         }
       }
-      port.primed        = true;
-      port.setup_period  = period_in_bytes;
-      port.bw_fast_until = crate::utils::now_ns(&state.data_system) + DLL_FAST_NSEC;
+      port.primed          = true;
+      port.setup_period    = period_in_bytes;
+      port.setup_blocksize = port.dsp.blocksize();
       port.dll.init();
-      port.dll.set_bw(crate::dll::SPA_DLL_BW_MAX, period_in_bytes, rate * stride);
+      port.bw_adapt.reset(); // cold-starts at the granularity cap next servo cycle
 
       let len = period_in_bytes.min(data_0.maxsize);
       std::ptr::write_bytes(data_0.data.cast::<u8>(), 0, len as usize);
@@ -1210,10 +1200,8 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
         if !port.was_matching {
           // matching just engaged; relock rather than apply stale state
           port.dll.init();
-          port.dll.set_bw(crate::dll::SPA_DLL_BW_MAX, port.setup_period, rate * stride);
-          port.bw_fast_until = now + DLL_FAST_NSEC;
+          port.bw_adapt.reset();
         }
-        maybe_relax_dll(port, rate, stride, now);
         // capture error is inverted vs the sink: a slow device queues less
         let err_raw = period_in_bytes as f64 - queued as f64;
         if err_raw.abs() > port.setup_period as f64 {
@@ -1221,11 +1209,13 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
           // wind the integrator against the +/-1% clamp; the bounded read
           // above drains genuine backlog, so just relock here
           port.dll.init();
-          port.dll.set_bw(crate::dll::SPA_DLL_BW_MAX, port.setup_period, rate * stride);
-          port.bw_fast_until = now + DLL_FAST_NSEC;
+          port.bw_adapt.reset();
         } else {
           let max_err = (port.setup_period as f64 / 2.0).max(256.0 * stride as f64);
-          corr = port.dll.update(err_raw.clamp(-max_err, max_err));
+          let err = err_raw.clamp(-max_err, max_err);
+          corr = port.dll.update(err);
+          port.bw_adapt.update(&mut port.dll, err, stride, port.setup_blocksize,
+            now, port.setup_period, rate * stride);
         }
 
         #[cfg(debug_assertions)]
@@ -1289,7 +1279,7 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       // un-drained backlog becomes permanent capture latency while the
       // integrator winds up against an error the reads can't remove
       port.primed        = false;
-      port.bw_fast_until = 0;
+      port.bw_adapt.reset();
       port.dll.init();
     }
 
@@ -1563,7 +1553,7 @@ unsafe extern "C" fn init(
       data:  std::ptr::null_mut()
     },
 
-    ports: [Port { config: None, buffers: vec![], io: std::ptr::null_mut(), dsp: crate::sound::Dsp::new(&dsp_path), dll: std::default::Default::default(), primed: false, setup_period: 0, bw_fast_until: 0, resetup_pending: false, was_matching: false, warn_limit: crate::utils::RateLimit::new() }; MAX_PORTS],
+    ports: [Port { config: None, buffers: vec![], io: std::ptr::null_mut(), dsp: crate::sound::Dsp::new(&dsp_path), dll: std::default::Default::default(), primed: false, setup_period: 0, bw_adapt: std::default::Default::default(), setup_blocksize: 0, resetup_pending: false, was_matching: false, warn_limit: crate::utils::RateLimit::new() }; MAX_PORTS],
 
     caps,
     caps_fallback,
