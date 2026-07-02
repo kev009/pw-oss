@@ -21,6 +21,7 @@ struct State {
   hooks:          spa_hook_list,
   callbacks:      spa_callbacks,
   ports:          [Port; MAX_PORTS],
+  latency:        [spa_latency_info; 2], // indexed by direction; written by the host, replayed on read
   started:        bool,
   following:      bool,
   active_buffers: usize
@@ -82,6 +83,21 @@ unsafe extern "C" fn add_listener(object: *mut c_void, listener: *mut spa_hook, 
   spa_hook_list_join(&mut state.hooks, save.assume_init_mut());
 
   0
+}
+
+// re-emit port_info to every listener (carrying whatever change_mask the caller
+// set, e.g. PARAMS), then clear the mask
+unsafe fn emit_port_info(state: &mut State) {
+  crate::spa::for_each_hook(&mut state.hooks, |entry| {
+    let f = entry.cb.funcs.cast::<spa_node_events>().as_ref()
+      .expect("hook should be initialized");
+    if f.version >= SPA_VERSION_NODE_EVENTS {
+      if let Some(port_info_fun) = f.port_info {
+        port_info_fun(entry.cb.data, SPA_DIRECTION_OUTPUT, 0, state.port_info.raw());
+      }
+    }
+  });
+  let _ = state.port_info.replace_change_mask(0);
 }
 
 unsafe extern "C" fn set_callbacks(object: *mut c_void, callbacks: *const spa_node_callbacks, data: *mut c_void) -> c_int {
@@ -439,6 +455,8 @@ unsafe extern "C" fn port_enum_params(
       (SPA_PARAM_EnumFormat, 0) => crate::utils::build_enum_format_info(&mut builder, true).unwrap(),
       (SPA_PARAM_EnumFormat, _) => return 0,
       (SPA_PARAM_Buffers, _)    => return -libc::ENOENT,
+      (SPA_PARAM_Latency, 0 | 1) => crate::utils::build_latency_info(&mut builder, &state.latency[index as usize]).unwrap(),
+      (SPA_PARAM_Latency, _)     => return 0,
       _ => return -libc::EINVAL
     };
 
@@ -565,7 +583,26 @@ unsafe extern "C" fn port_set_param(object: *mut c_void, direction: spa_directio
 
       res
     },
-    SPA_PARAM_Latency => 0,
+    SPA_PARAM_Latency => {
+      // the host writes the reverse-direction (here: upstream) latency;
+      // store it and re-emit so it propagates through the graph
+      let other = direction ^ 1;
+      let info = if param.is_null() {
+        crate::utils::latency_info_default(other)
+      } else {
+        match crate::utils::parse_latency_info(param) {
+          Some(info) if info.direction == other => info,
+          _ => return -libc::EINVAL
+        }
+      };
+      state.latency[info.direction as usize] = info;
+
+      let _ = state.port_info.replace_change_mask(0);
+      state.port_info.bump_param(SPA_PARAM_Latency);
+      emit_port_info(state);
+
+      0
+    },
     SPA_PARAM_Tag     => 0,
     _ => unimplemented!()
   }
@@ -877,6 +914,11 @@ unsafe extern "C" fn init(
 
     ports: [Port { config: None, buffers: vec![], io: std::ptr::null_mut(), dsp: crate::sound::Dsp::new(&dsp_path) }; MAX_PORTS],
 
+    latency: [
+      crate::utils::latency_info_default(SPA_DIRECTION_INPUT),
+      crate::utils::latency_info_default(SPA_DIRECTION_OUTPUT)
+    ],
+
     started:   false,
     following: false,
 
@@ -908,6 +950,7 @@ unsafe extern "C" fn init(
   //state.port_info.add_param(SPA_PARAM_PortConfig, SPA_PARAM_INFO_READWRITE);
   //state.port_info.add_param(SPA_PARAM_IO,         SPA_PARAM_INFO_READ);
   //state.port_info.add_param(SPA_PARAM_Buffers,    SPA_PARAM_INFO_WRITE); // ?
+  state.port_info.add_param(SPA_PARAM_Latency,    SPA_PARAM_INFO_READWRITE);
 
   spa_hook_list_init(&mut state.hooks);
 

@@ -355,6 +355,17 @@ impl PortInfo {
     }
   }
 
+  // bump a param's serial so the host re-reads it even when the flags didn't change
+  pub fn bump_param(&mut self, id: u32) {
+    for p in &mut self.params[0..self.info.n_params as usize] {
+      if p.id == id {
+        p.user += 1;
+        self.info.change_mask |= SPA_PORT_CHANGE_MASK_PARAMS as u64;
+        return;
+      }
+    }
+  }
+
   pub fn replace_change_mask(&mut self, new_mask: u64) -> u64 {
     let old = self.info.change_mask;
     self.info.change_mask = new_mask;

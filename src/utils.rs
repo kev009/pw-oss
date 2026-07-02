@@ -221,6 +221,79 @@ pub unsafe fn block_on_loop<T, F: FnOnce(&mut T)>(loop_: &crate::spa::Loop, targ
   assert!(err >= 0);
 }
 
+pub fn latency_info_default(direction: libspa::sys::spa_direction) -> libspa::sys::spa_latency_info {
+  libspa::sys::spa_latency_info {
+    direction,
+    min_quantum: 0.0,
+    max_quantum: 0.0,
+    min_rate:    0,
+    max_rate:    0,
+    min_ns:      0,
+    max_ns:      0
+  }
+}
+
+// spa_latency_parse is static inline C, so reimplemented here
+pub unsafe fn parse_latency_info(param: *const libspa::sys::spa_pod) -> Option<libspa::sys::spa_latency_info> {
+
+  use libspa::sys::*;
+  use libspa::pod::{Value, Object, Pod};
+  use libspa::pod::deserialize::PodDeserializer;
+
+  match PodDeserializer::deserialize_any_from(Pod::from_raw(param).as_bytes()) {
+    Ok((_, Value::Object(Object { type_, properties, .. }))) if type_ == SPA_TYPE_OBJECT_ParamLatency => {
+      let mut info = latency_info_default(SPA_DIRECTION_INPUT);
+      for p in properties {
+        #[allow(non_upper_case_globals)]
+        match (p.key, p.value) {
+          (SPA_PARAM_LATENCY_direction,  Value::Id(v))    => info.direction   = v.0 & 1,
+          (SPA_PARAM_LATENCY_minQuantum, Value::Float(v)) => info.min_quantum = v,
+          (SPA_PARAM_LATENCY_maxQuantum, Value::Float(v)) => info.max_quantum = v,
+          (SPA_PARAM_LATENCY_minRate,    Value::Int(v))   => info.min_rate    = v,
+          (SPA_PARAM_LATENCY_maxRate,    Value::Int(v))   => info.max_rate    = v,
+          (SPA_PARAM_LATENCY_minNs,      Value::Long(v))  => info.min_ns      = v,
+          (SPA_PARAM_LATENCY_maxNs,      Value::Long(v))  => info.max_ns      = v,
+          _ => ()
+        }
+      }
+      Some(info)
+    },
+    _ => None
+  }
+}
+
+// spa_latency_build is static inline C, so reimplemented here
+pub unsafe fn build_latency_info(b: &mut libspa::pod::builder::Builder, info: &libspa::sys::spa_latency_info) -> Result<(), rustix::io::Errno> {
+
+  use libspa::sys::*;
+
+  let mut frame = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
+
+  b.push_object(&mut frame, SPA_TYPE_OBJECT_ParamLatency, SPA_PARAM_Latency)?;
+
+  b.add_prop(SPA_PARAM_LATENCY_direction, 0)?;
+  b.add_id(libspa::utils::Id(info.direction))?;
+
+  b.add_prop(SPA_PARAM_LATENCY_minQuantum, 0)?;
+  b.add_float(info.min_quantum)?;
+  b.add_prop(SPA_PARAM_LATENCY_maxQuantum, 0)?;
+  b.add_float(info.max_quantum)?;
+
+  b.add_prop(SPA_PARAM_LATENCY_minRate, 0)?;
+  b.add_int(info.min_rate)?;
+  b.add_prop(SPA_PARAM_LATENCY_maxRate, 0)?;
+  b.add_int(info.max_rate)?;
+
+  b.add_prop(SPA_PARAM_LATENCY_minNs, 0)?;
+  b.add_long(info.min_ns)?;
+  b.add_prop(SPA_PARAM_LATENCY_maxNs, 0)?;
+  b.add_long(info.max_ns)?;
+
+  b.pop(frame.assume_init_mut());
+
+  Ok(())
+}
+
 pub fn now_ns(system: &crate::spa::System) -> u64 {
   let mut now = libspa::sys::timespec { tv_sec: 0, tv_nsec: 0 };
   let err = unsafe { system.clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
