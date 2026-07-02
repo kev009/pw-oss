@@ -16,6 +16,7 @@ struct State {
   log:            crate::spa::Log,
   clock:          *mut spa_io_clock,
   position:       *mut spa_io_position,
+  rate_match:     *mut spa_io_rate_match,
   timer_source:   spa_source,
   next_time:      u64,
   hooks:          spa_hook_list,
@@ -39,7 +40,8 @@ struct Port {
   config:  Option<PortConfig>,
   buffers: Vec<*mut spa_buffer>,
   io:      *mut spa_io_buffers,
-  dsp:     crate::sound::Dsp
+  dsp:     crate::sound::Dsp,
+  dll:     crate::dll::SpaDLL
 }
 
 #[derive(Debug)]
@@ -225,8 +227,8 @@ unsafe extern "C" fn on_timeout(source: *mut spa_source) {
   (*state.clock).rate      = (*state.clock).target_rate;
   (*state.clock).position += (*state.clock).duration;
   (*state.clock).duration  = duration;
-  (*state.clock).delay     = 0;
-  (*state.clock).rate_diff = 1.0;
+  // .delay and .rate_diff are published from process(), where the queued input
+  // and the DLL correction are known; keep last cycle's values here (set at Start).
   (*state.clock).next_nsec = state.next_time;
 
   let node_callbacks = state.callbacks.funcs.cast::<spa_node_callbacks>().as_ref()
@@ -330,6 +332,11 @@ unsafe extern "C" fn send_command(object: *mut c_void, command: *const spa_comma
     (SPA_TYPE_COMMAND_Node, SPA_NODE_COMMAND_Start) => {
       let state: *mut State = state;
       crate::utils::block_on_loop(&(*state).data_loop, state, |state| {
+        // sane clock delay/rate_diff until process() publishes measured values
+        if !state.clock.is_null() {
+          (*state.clock).delay     = 0;
+          (*state.clock).rate_diff = 1.0;
+        }
         state.started   = true;
         state.following = state.node_is_follower();
         update_timers(state);
@@ -567,6 +574,7 @@ unsafe extern "C" fn port_set_param(object: *mut c_void, direction: spa_directio
               }
 
               port.config = Some(config);
+              port.dll.init(); // fresh device, fresh servo; set_bw happens on the first cycle
               state.active_buffers = 0;
             });
           },
@@ -670,15 +678,58 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       }
     };
 
+    let stride = port.config.as_ref().unwrap().stride.max(1);
+    let rate   = port.config.as_ref().unwrap().rate;
+
+    let mut corr: f64 = 1.0; // DLL rate correction, published below
+    let mut queued_frames: i64 = 0;
+
     let nbytes = if port.dsp.ready_for_reading(1) {
+      let queued = port.dsp.ispace_in_bytes().max(0) as u32;
+      queued_frames = (queued / stride) as i64;
+
+      // We drain the ring every cycle, so the pre-read level is what the device
+      // captured in one period; its deviation from one period is the clock
+      // error. Note the sign: a slow device queues less than a period and must
+      // push corr below 1.0, the inverse of the sink's error.
+      if !state.position.is_null() {
+        let driver_clock = (*state.position).clock;
+        if driver_clock.target_rate.denom > 0 {
+          let period_in_bytes = (driver_clock.target_duration * rate as u64
+            / driver_clock.target_rate.denom as u64) as u32 * stride;
+          if period_in_bytes > 0 {
+            if port.dll.bw() == 0.0 {
+              port.dll.init();
+              port.dll.set_bw(crate::dll::SPA_DLL_BW_MIN, period_in_bytes, driver_clock.target_rate.denom * stride);
+            }
+            let err = (period_in_bytes as i64 - queued as i64) as f64;
+            corr = port.dll.update(err);
+
+            #[cfg(debug_assertions)]
+            eprintln!("capture: corr = {}, err = {}", corr, err);
+          }
+        }
+      }
+
       // the device can report more queued input than the buffer holds; cap it
-      let ispace = (port.dsp.ispace_in_bytes().max(0) as u32).min(data_0.maxsize);
+      let ispace = queued.min(data_0.maxsize);
       #[cfg(debug_assertions)]
       crate::trace!(state.log, "ispace: {}", ispace);
       port.dsp.read(data_0.data, ispace as usize)
     } else {
       -1
     };
+
+    // publish device latency (queued frames) and the rate correction when
+    // driving; hand the correction to the resampler when following. Capture
+    // uses the inverse rate (matching ALSA's update_time).
+    if !state.following && !state.clock.is_null() {
+      (*state.clock).delay     = queued_frames;
+      (*state.clock).rate_diff = corr;
+    }
+    if !state.rate_match.is_null() {
+      (*state.rate_match).rate = (1.0 / corr).clamp(0.99, 1.01);
+    }
 
     // the dsp is running after ready_for_reading; report overruns to the host
     // (pw-top's xrun counter); the length isn't known, so pass 0 delay
@@ -765,7 +816,15 @@ unsafe extern "C" fn port_set_io(object: *mut c_void, direction: spa_direction, 
       }
       0
     },
-    SPA_IO_RateMatch => 0,
+    SPA_IO_RateMatch => {
+      let rate_match = data as *mut spa_io_rate_match;
+      if !rate_match.is_null() {
+        assert_eq!(MAX_PORTS, 1); // the code assumes a single port
+        (*rate_match).flags |= SPA_IO_RATE_MATCH_FLAG_ACTIVE;
+      }
+      state.rate_match = rate_match;
+      0
+    },
     _ => unimplemented!()
   }
 }
@@ -900,8 +959,9 @@ unsafe extern "C" fn init(
     data_system,
     log,
 
-    clock:    std::ptr::null_mut(),
-    position: std::ptr::null_mut(),
+    clock:      std::ptr::null_mut(),
+    position:   std::ptr::null_mut(),
+    rate_match: std::ptr::null_mut(),
 
     timer_source: spa_source {
       loop_: std::ptr::null_mut(),
@@ -927,7 +987,7 @@ unsafe extern "C" fn init(
       data:  std::ptr::null_mut()
     },
 
-    ports: [Port { config: None, buffers: vec![], io: std::ptr::null_mut(), dsp: crate::sound::Dsp::new(&dsp_path) }; MAX_PORTS],
+    ports: [Port { config: None, buffers: vec![], io: std::ptr::null_mut(), dsp: crate::sound::Dsp::new(&dsp_path), dll: std::default::Default::default() }; MAX_PORTS],
 
     caps,
 

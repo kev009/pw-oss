@@ -38,6 +38,11 @@ impl SpaDLL {
   }
 
   #[inline(always)]
+  pub fn bw(&self) -> f64 {
+    self.bw
+  }
+
+  #[inline(always)]
   pub fn update(&mut self, err: f64) -> f64 {
     self.z1 += self.w0 * (self.w1 * err - self.z1);
     self.z2 += self.w0 * (self.z1 - self.z2);
