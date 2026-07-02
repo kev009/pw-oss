@@ -153,9 +153,11 @@ unsafe extern "C" fn set_callbacks(object: *mut c_void, callbacks: *const spa_no
   0
 }
 
-#[allow(unused_variables)]
 unsafe extern "C" fn sync(object: *mut c_void, seq: c_int) -> c_int {
-  unimplemented!()
+  let state = object.cast::<State>().as_mut()
+    .expect("object is not supposed to be null");
+  crate::spa::node_emit_done(&mut state.hooks, seq);
+  0
 }
 
 unsafe extern "C" fn enum_params(object: *mut c_void, seq: c_int, id: u32, start: u32, max: u32, filter: *const spa_pod) -> c_int {
@@ -234,7 +236,9 @@ unsafe extern "C" fn set_param(object: *mut c_void, id: u32, _flags: u32, param:
                 }
               },
               SPA_PROP_params         => (), // ditto
-              _ => unimplemented!()
+              key => {
+                crate::debug!(state.log, "ignoring unknown prop {}", key);
+              }
             }
           }
         },
@@ -252,7 +256,10 @@ unsafe extern "C" fn set_param(object: *mut c_void, id: u32, _flags: u32, param:
         None       => -libc::EINVAL
       }
     },
-    _ => unimplemented!()
+    id => {
+      crate::warn!(state.log, "set_param: unknown param {}", id);
+      -libc::ENOENT
+    }
   }
 }
 
@@ -355,6 +362,10 @@ unsafe extern "C" fn set_io(object: *mut c_void, id: u32, data: *mut c_void, siz
   let state: *mut State = object.cast();
   assert!(!state.is_null());
 
+  if id != SPA_IO_Clock && id != SPA_IO_Position {
+    return -libc::ENOENT;
+  }
+
   // clock/position are read on the data loop; apply the change there
   crate::utils::block_on_loop(&(*state).data_loop, state, |state| {
 
@@ -368,7 +379,7 @@ unsafe extern "C" fn set_io(object: *mut c_void, id: u32, data: *mut c_void, siz
         assert_eq!(size, std::mem::size_of::<spa_io_position>());
         state.position = data.cast();
       },
-      _ => unimplemented!()
+      _ => () // filtered above
     };
 
     if state.started {
@@ -438,14 +449,12 @@ unsafe extern "C" fn send_command(object: *mut c_void, command: *const spa_comma
   }
 }
 
-#[allow(unused_variables)]
-unsafe extern "C" fn add_port(object: *mut c_void, direction: spa_direction, port_id: u32, props: *const spa_dict) -> c_int {
-  unimplemented!()
+unsafe extern "C" fn add_port(_object: *mut c_void, _direction: spa_direction, _port_id: u32, _props: *const spa_dict) -> c_int {
+  -libc::ENOTSUP // the ports are static
 }
 
-#[allow(unused_variables)]
-unsafe extern "C" fn remove_port(object: *mut c_void, direction: spa_direction, port_id: u32) -> c_int {
-  unimplemented!()
+unsafe extern "C" fn remove_port(_object: *mut c_void, _direction: spa_direction, _port_id: u32) -> c_int {
+  -libc::ENOTSUP // the ports are static
 }
 
 //TODO: SPA_PARAM_PORT_CONFIG_MODE_none vs SPA_PARAM_PORT_CONFIG_MODE_passthrough vs SPA_PARAM_PORT_CONFIG_MODE_convert
@@ -695,7 +704,10 @@ unsafe extern "C" fn port_set_param(object: *mut c_void, direction: spa_directio
       0
     },
     SPA_PARAM_Tag     => 0,
-    _ => unimplemented!()
+    id => {
+      crate::warn!(state.log, "port_set_param: unknown param {}", id);
+      -libc::ENOENT
+    }
   }
 }
 
@@ -924,13 +936,12 @@ unsafe extern "C" fn port_set_io(object: *mut c_void, direction: spa_direction, 
       state.rate_match = rate_match;
       0
     },
-    _ => unimplemented!()
+    _ => -libc::ENOENT
   }
 }
 
-#[allow(unused_variables)]
-unsafe extern "C" fn port_reuse_buffer(object: *mut c_void, port_id: u32, buffer_id: u32) -> c_int {
-  unimplemented!()
+unsafe extern "C" fn port_reuse_buffer(_object: *mut c_void, _port_id: u32, _buffer_id: u32) -> c_int {
+  -libc::ENOTSUP // buffers are recycled through io.buffer_id
 }
 
 const NODE_IMPL: spa_node_methods = spa_node_methods {
@@ -959,7 +970,7 @@ unsafe extern "C" fn get_interface(handle: *mut spa_handle, type_: *const c_char
   if spa_streq(type_, SPA_TYPE_INTERFACE_Node.as_ptr().cast()) {
     *interface = &mut state.node as *mut _ as *mut c_void;
   } else {
-    unimplemented!()
+    return -libc::ENOENT;
   }
   0
 }

@@ -13,7 +13,7 @@ struct State {
   hooks:       spa_hook_list,
   pcm_indexes: BTreeMap<String, Vec<u32>>,
   main_loop:   crate::spa::Loop,
-  devd_socket: crate::utils::DevdSocket,
+  devd_socket: Option<crate::utils::DevdSocket>, // None when devd isn't running (no hotplug)
   devd_source: spa_source,
   log:         crate::spa::Log
 }
@@ -95,7 +95,7 @@ unsafe extern "C" fn get_interface(handle: *mut spa_handle, type_: *const c_char
   if spa_streq(type_, SPA_TYPE_INTERFACE_Device.as_ptr().cast()) {
     *interface = &mut state.device as *mut _ as *mut c_void;
   } else {
-    unimplemented!()
+    return -libc::ENOENT;
   }
 
   0
@@ -106,7 +106,9 @@ unsafe extern "C" fn clear(handle: *mut spa_handle) -> c_int {
     .expect("handle is not supposed to be null");
   // clear runs on the main loop's thread, so detach the devd source directly;
   // the socket fd itself is closed by the DevdSocket drop below
-  state.main_loop.remove_source(&mut state.devd_source);
+  if state.devd_socket.is_some() {
+    state.main_loop.remove_source(&mut state.devd_source);
+  }
   std::ptr::drop_in_place(state);
   0
 }
@@ -126,7 +128,11 @@ unsafe extern "C" fn on_devd_event(source: *mut spa_source) {
   let state = (*source).data.cast::<State>().as_mut()
     .expect("(*source).data is not supposed to be null");
 
-  state.devd_socket.read_event(|line| {
+  let Some(devd_socket) = state.devd_socket.as_mut() else {
+    return; // the source is only registered when the socket exists
+  };
+
+  devd_socket.read_event(|line| {
 
     if !(line.starts_with("+uaudio") || line.starts_with("-uaudio")) {
       return;
@@ -192,12 +198,20 @@ unsafe extern "C" fn init(
     }
   };
 
-  let devd_socket = crate::utils::DevdSocket::open().unwrap();
+  // no devd (jails, minimal systems) just means no hotplug
+  let devd_socket = match crate::utils::DevdSocket::open() {
+    Ok(socket) => Some(socket),
+    Err(err)   => {
+      crate::warn!(log, "can't connect to devd, hotplug disabled: {}", err);
+      None
+    }
+  };
+
   let devd_source = spa_source {
     loop_: std::ptr::null_mut(),
     func:  Some(on_devd_event),
     data:  state as *mut _ as *mut c_void,
-    fd:    devd_socket.fd(),
+    fd:    devd_socket.as_ref().map(|s| s.fd()).unwrap_or(-1),
     mask:  SPA_IO_IN,
     rmask: 0,
     priv_: std::ptr::null_mut()
@@ -249,8 +263,10 @@ unsafe extern "C" fn init(
 
   spa_hook_list_init(&mut state.hooks);
 
-  let err = state.main_loop.add_source(&mut state.devd_source);
-  assert!(err >= 0);
+  if state.devd_socket.is_some() {
+    let err = state.main_loop.add_source(&mut state.devd_source);
+    assert!(err >= 0);
+  }
 
   0
 }

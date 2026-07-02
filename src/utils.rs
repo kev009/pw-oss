@@ -85,7 +85,8 @@ impl DevdSocket {
   pub fn read_event(&mut self, mut apply: impl FnMut(&str)) {
     if let Ok(len) = self.socket.recv(&mut self.buffer) {
       assert!(len <= self.buffer.len());
-      apply(std::str::from_utf8(&self.buffer[..len]).unwrap());
+      // devd events should be ASCII, but don't abort on a stray byte
+      apply(&String::from_utf8_lossy(&self.buffer[..len]));
     }
   }
 }

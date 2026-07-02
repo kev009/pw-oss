@@ -31,7 +31,6 @@ pub unsafe fn for_each_hook(head: *mut spa_hook_list, mut apply: impl FnMut(&spa
   }
 }
 
-/* currently unused
 pub unsafe fn dev_emit_result(hooks: &mut spa_hook_list, seq: c_int, res: c_int, type_: u32, result: &spa_result_device_params) {
   for_each_hook(hooks, |entry| {
     let f = entry.cb.funcs.cast::<spa_device_events>().as_ref().expect("hook should be initialized");
@@ -40,7 +39,18 @@ pub unsafe fn dev_emit_result(hooks: &mut spa_hook_list, seq: c_int, res: c_int,
       result_fun(entry.cb.data, seq, res, type_, result as *const _ as *const c_void);
     }
   });
-}*/
+}
+
+// sync() replies with an empty result carrying the sequence number
+pub unsafe fn node_emit_done(hooks: &mut spa_hook_list, seq: c_int) {
+  for_each_hook(hooks, |entry| {
+    let f = entry.cb.funcs.cast::<spa_node_events>().as_ref().expect("hook should be initialized");
+    assert!(f.version >= SPA_VERSION_NODE_EVENTS);
+    if let Some(result_fun) = f.result {
+      result_fun(entry.cb.data, seq, 0, 0, std::ptr::null());
+    }
+  });
+}
 
 pub unsafe fn node_emit_result(hooks: &mut spa_hook_list, seq: c_int, res: c_int, type_: u32, result: &spa_result_node_params) {
   for_each_hook(hooks, |entry| {
@@ -206,6 +216,18 @@ impl DeviceInfo {
     };
     self.info.change_mask |= SPA_DEVICE_CHANGE_MASK_PARAMS as u64;
     self.info.n_params += 1;
+  }
+
+  // flip a param's serial so consumers re-read it even when the read/write
+  // flags didn't change
+  pub fn bump_param(&mut self, id: u32) {
+    for p in &mut self.params[0..self.info.n_params as usize] {
+      if p.id == id {
+        p.flags ^= SPA_PARAM_INFO_SERIAL;
+        self.info.change_mask |= SPA_DEVICE_CHANGE_MASK_PARAMS as u64;
+        return;
+      }
+    }
   }
 
   pub fn replace_change_mask(&mut self, new_mask: u64) -> u64 {

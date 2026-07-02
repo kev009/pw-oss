@@ -9,7 +9,98 @@ struct State {
   dev_info:    crate::spa::DeviceInfo,
   hooks:       spa_hook_list,
   pcm_devices: Vec<crate::sound::PcmDevice>,
-  description: String
+  description: String,
+  profile:     u32, // 0 = off, 1 = default
+  log:         crate::spa::Log
+}
+
+// emit (or, with present = false, retract) the node object for every pcm device
+unsafe fn emit_objects(f: &spa_device_events, data: *mut c_void, pcm_devices: &[crate::sound::PcmDevice], description: &str, present: bool) {
+
+  let Some(obj_info_fun) = f.object_info else {
+    return;
+  };
+
+  for device in pcm_devices {
+    for (rec, enabled) in [(false, device.play), (true, device.rec)] {
+
+      if !enabled {
+        continue;
+      }
+
+      let id = device.index * 2 + rec as u32;
+
+      if !present {
+        obj_info_fun(data, id, std::ptr::null());
+        continue;
+      }
+
+      let mut dict = crate::spa::Dictionary::new();
+
+      dict.add_item(SPA_KEY_NODE_NAME.as_ptr(), format!("pcm{}.{}", device.index, if rec { "rec" } else { "play" }));
+
+      if device.desc == description && !device.location.is_empty() {
+        dict.add_item(SPA_KEY_NODE_DESCRIPTION.as_ptr(), format!("{} @ {}", device.desc, device.location));
+      } else {
+        dict.add_item(SPA_KEY_NODE_DESCRIPTION.as_ptr(), device.desc.as_str());
+      }
+
+      dict.add_item(crate::keys::OSS_DSP_PATH, format!("/dev/dsp{}", device.index));
+
+      let obj_info = spa_device_object_info {
+        version:      SPA_VERSION_DEVICE_OBJECT_INFO,
+        type_:        SPA_TYPE_INTERFACE_Node.as_ptr().cast(),
+        factory_name: if rec { c"freebsd-oss.source".as_ptr() } else { c"freebsd-oss.sink".as_ptr() },
+        change_mask:  crate::spa::SPA_DEVICE_OBJECT_CHANGE_MASK_ALL as u64,
+        flags:        0,
+        props:        dict.raw()
+      };
+
+      obj_info_fun(data, id, &obj_info);
+    }
+  }
+}
+
+// re-emit dev_info to every listener (carrying whatever change_mask the caller
+// set, e.g. PARAMS), then clear the mask
+unsafe fn emit_device_info(state: &mut State) {
+  crate::spa::for_each_hook(&mut state.hooks, |entry| {
+    let f = entry.cb.funcs.cast::<spa_device_events>().as_ref()
+      .expect("hook should be initialized");
+    assert!(f.version >= SPA_VERSION_DEVICE_EVENTS);
+    if let Some(info_fun) = f.info {
+      info_fun(entry.cb.data, state.dev_info.raw());
+    }
+  });
+  let _ = state.dev_info.replace_change_mask(0);
+}
+
+unsafe fn build_profile_info(b: &mut libspa::pod::builder::Builder, id: u32, index: u32) -> Result<(), rustix::io::Errno> {
+
+  let (name, description, priority) = if index == 0 {
+    ("off", "Off", 0)
+  } else {
+    ("default", "Default", 100)
+  };
+
+  let mut frame = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
+
+  b.push_object(&mut frame, SPA_TYPE_OBJECT_ParamProfile, id)?;
+
+  b.add_prop(SPA_PARAM_PROFILE_index, 0)?;
+  b.add_int(index as i32)?;
+  b.add_prop(SPA_PARAM_PROFILE_name, 0)?;
+  b.add_string(name)?;
+  b.add_prop(SPA_PARAM_PROFILE_description, 0)?;
+  b.add_string(description)?;
+  b.add_prop(SPA_PARAM_PROFILE_priority, 0)?;
+  b.add_int(priority)?;
+  b.add_prop(SPA_PARAM_PROFILE_available, 0)?;
+  b.add_id(libspa::utils::Id(SPA_PARAM_AVAILABILITY_yes))?;
+
+  b.pop(frame.assume_init_mut());
+
+  Ok(())
 }
 
 unsafe extern "C" fn add_listener(object: *mut c_void, listener: *mut spa_hook, events: *const spa_device_events, data: *mut c_void) -> c_int {
@@ -33,64 +124,7 @@ unsafe extern "C" fn add_listener(object: *mut c_void, listener: *mut spa_hook, 
       let _ = state.dev_info.replace_change_mask(old_mask);
     }
 
-    for device in &state.pcm_devices {
-
-      if device.play {
-
-        let mut dict = crate::spa::Dictionary::new();
-
-        dict.add_item(SPA_KEY_NODE_NAME.as_ptr(), format!("pcm{}.play", device.index));
-
-        if device.desc == state.description && !device.location.is_empty() {
-          dict.add_item(SPA_KEY_NODE_DESCRIPTION.as_ptr(), format!("{} @ {}", device.desc, device.location));
-        } else {
-          dict.add_item(SPA_KEY_NODE_DESCRIPTION.as_ptr(), device.desc.as_str());
-        }
-
-        dict.add_item(crate::keys::OSS_DSP_PATH, format!("/dev/dsp{}", device.index));
-
-        let obj_info = spa_device_object_info {
-          version:      SPA_VERSION_DEVICE_OBJECT_INFO,
-          type_:        SPA_TYPE_INTERFACE_Node.as_ptr().cast(),
-          factory_name: c"freebsd-oss.sink".as_ptr(),
-          change_mask:  crate::spa::SPA_DEVICE_OBJECT_CHANGE_MASK_ALL as u64,
-          flags:        0,
-          props:        dict.raw()
-        };
-
-        if let Some(obj_info_fun) = f.object_info {
-          obj_info_fun(entry.cb.data, device.index * 2, &obj_info);
-        }
-      }
-
-      if device.rec {
-
-        let mut dict = crate::spa::Dictionary::new();
-
-        dict.add_item(SPA_KEY_NODE_NAME.as_ptr(), format!("pcm{}.rec", device.index));
-
-        if device.desc == state.description && !device.location.is_empty() {
-          dict.add_item(SPA_KEY_NODE_DESCRIPTION.as_ptr(), format!("{} @ {}", device.desc, device.location));
-        } else {
-          dict.add_item(SPA_KEY_NODE_DESCRIPTION.as_ptr(), device.desc.as_str());
-        }
-
-        dict.add_item(crate::keys::OSS_DSP_PATH, format!("/dev/dsp{}", device.index));
-
-        let obj_info = spa_device_object_info {
-          version:      SPA_VERSION_DEVICE_OBJECT_INFO,
-          type_:        SPA_TYPE_INTERFACE_Node.as_ptr().cast(),
-          factory_name: c"freebsd-oss.source".as_ptr(),
-          change_mask:  crate::spa::SPA_DEVICE_OBJECT_CHANGE_MASK_ALL as u64,
-          flags:        0,
-          props:        dict.raw()
-        };
-
-        if let Some(obj_info_fun) = f.object_info {
-          obj_info_fun(entry.cb.data, device.index * 2 + 1, &obj_info);
-        }
-      }
-    }
+    emit_objects(f, entry.cb.data, &state.pcm_devices, &state.description, state.profile != 0);
   });
 
   spa_hook_list_join(&mut state.hooks, save.assume_init_mut());
@@ -113,7 +147,7 @@ unsafe extern "C" fn sync(object: *mut c_void, seq: c_int) -> c_int {
   0
 }
 
-/*unsafe extern "C" fn enum_params(object: *mut c_void, seq: c_int, id: u32, start: u32, max: u32, filter: *const spa_pod) -> c_int {
+unsafe extern "C" fn enum_params(object: *mut c_void, seq: c_int, id: u32, start: u32, max: u32, filter: *const spa_pod) -> c_int {
 
   let state = object.cast::<State>().as_mut()
     .expect("object is not supposed to be null");
@@ -128,17 +162,16 @@ unsafe extern "C" fn sync(object: *mut c_void, seq: c_int) -> c_int {
   while count < max {
 
     use libspa::pod::builder::Builder;
-    use libspa::pod::builder::builder_add;
 
     let mut builder = Builder::new(&mut buffer);
 
     #[allow(non_upper_case_globals)]
     match (id, index) {
-      (SPA_PARAM_EnumProfile, _) => return 0,
-      (SPA_PARAM_Profile, _)     => return 0,
-      (SPA_PARAM_EnumRoute, _)   => return 0,
-      (SPA_PARAM_Route, _)       => return 0,
-      _ => unimplemented!()
+      (SPA_PARAM_EnumProfile, 0 | 1) => build_profile_info(&mut builder, SPA_PARAM_EnumProfile, index).unwrap(),
+      (SPA_PARAM_EnumProfile, _)     => return 0,
+      (SPA_PARAM_Profile, 0)         => build_profile_info(&mut builder, SPA_PARAM_Profile, state.profile).unwrap(),
+      (SPA_PARAM_Profile, _)         => return 0,
+      _ => return -libc::ENOENT
     };
 
     let mut result = spa_result_device_params { id, index, next: index + 1, param: std::ptr::null_mut() };
@@ -152,18 +185,71 @@ unsafe extern "C" fn sync(object: *mut c_void, seq: c_int) -> c_int {
   }
 
   0
-}*/
+}
 
-#[allow(unused_variables)]
-unsafe extern "C" fn set_param(object: *mut c_void, id: u32, flags: u32, param: *const spa_pod) -> c_int {
-  unimplemented!()
+unsafe extern "C" fn set_param(object: *mut c_void, id: u32, _flags: u32, param: *const spa_pod) -> c_int {
+
+  let state = object.cast::<State>().as_mut()
+    .expect("object is not supposed to be null");
+
+  #[allow(non_upper_case_globals)]
+  match id {
+    SPA_PARAM_Profile => {
+
+      if param.is_null() {
+        return -libc::EINVAL;
+      }
+
+      use libspa::pod::{Value, Object, Pod};
+      use libspa::pod::deserialize::PodDeserializer;
+
+      let mut index = None;
+      match PodDeserializer::deserialize_any_from(Pod::from_raw(param).as_bytes()) {
+        Ok((_, Value::Object(Object { type_, properties, .. }))) if type_ == SPA_TYPE_OBJECT_ParamProfile => {
+          for p in properties {
+            #[allow(non_upper_case_globals)]
+            match (p.key, p.value) {
+              (SPA_PARAM_PROFILE_index, Value::Int(v)) if (0..=1).contains(&v) => index = Some(v as u32),
+              _ => ()
+            }
+          }
+        },
+        _ => return -libc::EINVAL
+      }
+
+      let Some(index) = index else {
+        return -libc::EINVAL;
+      };
+
+      if state.profile != index {
+        state.profile = index;
+        crate::info!(state.log, "profile -> {}", if index == 0 { "off" } else { "default" });
+
+        // add or remove the nodes, then re-announce the Profile param
+        crate::spa::for_each_hook(&mut state.hooks, |entry| {
+          let f = entry.cb.funcs.cast::<spa_device_events>().as_ref()
+            .expect("hook should be initialized");
+          assert!(f.version >= SPA_VERSION_DEVICE_EVENTS);
+          emit_objects(f, entry.cb.data, &state.pcm_devices, &state.description, index != 0);
+        });
+
+        let _ = state.dev_info.replace_change_mask(0);
+        state.dev_info.bump_param(SPA_PARAM_Profile);
+        emit_device_info(state);
+      }
+
+      0
+    },
+    // Route lands together with mixer/hardware volume support
+    _ => -libc::ENOTSUP
+  }
 }
 
 const DEVICE_IMPL: spa_device_methods = spa_device_methods {
   version:           SPA_VERSION_DEVICE_METHODS,
   add_listener:      Some(add_listener),
   sync:              Some(sync),
-  enum_params:       None, //Some(enum_params),
+  enum_params:       Some(enum_params),
   set_param:         Some(set_param),
 };
 
@@ -174,7 +260,7 @@ unsafe extern "C" fn get_interface(handle: *mut spa_handle, type_: *const c_char
   if spa_streq(type_, SPA_TYPE_INTERFACE_Device.as_ptr().cast()) {
     *interface = &mut state.device as *mut _ as *mut c_void;
   } else {
-    unimplemented!()
+    return -libc::ENOENT;
   }
   0
 }
@@ -287,7 +373,9 @@ unsafe extern "C" fn init(
     },
 
     pcm_devices,
-    description: common_desc
+    description: common_desc,
+    profile:     1, // default on until a session manager decides otherwise
+    log
   });
 
   state.dev_info.fix_pointers();
@@ -299,8 +387,7 @@ unsafe extern "C" fn init(
   state.dev_info.add_prop(SPA_KEY_DEVICE_DESCRIPTION.as_ptr(), state.description.as_str());
   state.dev_info.add_param(SPA_PARAM_EnumProfile, SPA_PARAM_INFO_READ);
   state.dev_info.add_param(SPA_PARAM_Profile,     SPA_PARAM_INFO_READWRITE);
-  state.dev_info.add_param(SPA_PARAM_EnumRoute,   SPA_PARAM_INFO_READ);
-  state.dev_info.add_param(SPA_PARAM_Route,       SPA_PARAM_INFO_READWRITE);
+  // EnumRoute/Route land together with mixer/hardware volume support
 
   spa_hook_list_init(&mut state.hooks);
 
