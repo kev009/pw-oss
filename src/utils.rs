@@ -90,9 +90,62 @@ impl DevdSocket {
   }
 }
 
-pub unsafe fn build_enum_format_info(b: &mut libspa::pod::builder::Builder, mono: bool) -> Result<(), rustix::io::Errno> {
+// sys/dev/sound/pcm/matrix.h interleave order; note 5.1/7.1 put FC/LF after
+// the rears, unlike WAV/ALSA
+pub fn channel_positions(channels: u32) -> Option<&'static [u32]> {
+  use libspa::sys::*;
+  static C1: [u32; 1] = [SPA_AUDIO_CHANNEL_MONO];
+  static C2: [u32; 2] = [SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR];
+  static C4: [u32; 4] = [SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR,
+                         SPA_AUDIO_CHANNEL_RL, SPA_AUDIO_CHANNEL_RR];
+  static C6: [u32; 6] = [SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR,
+                         SPA_AUDIO_CHANNEL_RL, SPA_AUDIO_CHANNEL_RR,
+                         SPA_AUDIO_CHANNEL_FC, SPA_AUDIO_CHANNEL_LFE];
+  static C8: [u32; 8] = [SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR,
+                         SPA_AUDIO_CHANNEL_RL, SPA_AUDIO_CHANNEL_RR,
+                         SPA_AUDIO_CHANNEL_FC, SPA_AUDIO_CHANNEL_LFE,
+                         SPA_AUDIO_CHANNEL_SL, SPA_AUDIO_CHANNEL_SR];
+  match channels {
+    1 => Some(&C1),
+    2 => Some(&C2),
+    4 => Some(&C4),
+    6 => Some(&C6),
+    8 => Some(&C8),
+    _ => None
+  }
+}
+
+// One EnumFormat result per channel count the device grants, with the kernel's
+// interleave order as the position array. Returns false when `index` is past
+// the last result.
+pub unsafe fn build_enum_format_info(b: &mut libspa::pod::builder::Builder, caps: &crate::sound::DspCaps, index: u32) -> Result<bool, rustix::io::Errno> {
 
   use libspa::sys::*;
+
+  // formats supported by both us and the device, best first
+  let all = [
+    (crate::sound::AFMT_S32_LE, SPA_AUDIO_FORMAT_S32_LE),
+    (crate::sound::AFMT_S32_BE, SPA_AUDIO_FORMAT_S32_BE),
+    (crate::sound::AFMT_S16_LE, SPA_AUDIO_FORMAT_S16_LE),
+    (crate::sound::AFMT_S16_BE, SPA_AUDIO_FORMAT_S16_BE)
+  ];
+  let mut formats = all.iter().filter(|(m, _)| caps.formats & m != 0).map(|(_, f)| *f).collect::<Vec<_>>();
+  if formats.is_empty() {
+    // the device only does formats we don't (e.g. S24); the kernel converts
+    formats = all.iter().map(|(_, f)| *f).collect();
+  }
+
+  // counts with a defined kernel interleave order, within the granted range
+  let mut counts = [1u32, 2, 4, 6, 8].iter().copied()
+    .filter(|c| *c >= caps.min_channels && *c <= caps.max_channels)
+    .collect::<Vec<_>>();
+  if counts.is_empty() {
+    counts.push(caps.max_channels); // no standard count fits; goes unpositioned
+  }
+
+  let Some(&channels) = counts.get(index as usize) else {
+    return Ok(false);
+  };
 
   let mut outer = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
   let mut inner = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
@@ -106,43 +159,39 @@ pub unsafe fn build_enum_format_info(b: &mut libspa::pod::builder::Builder, mono
   b.add_id(libspa::utils::Id(SPA_MEDIA_SUBTYPE_raw))?;
 
   b.add_prop(SPA_FORMAT_AUDIO_format, 0)?;
-  b.push_choice(&mut inner, SPA_CHOICE_Enum, 0)?;
-  for fmt in [
-    SPA_AUDIO_FORMAT_S32,
-    SPA_AUDIO_FORMAT_S32_OE,
-    SPA_AUDIO_FORMAT_S16,
-    SPA_AUDIO_FORMAT_S16_OE
-  ] {
-    b.add_id(libspa::utils::Id(fmt))?;
+  if formats.len() == 1 {
+    b.add_id(libspa::utils::Id(formats[0]))?;
+  } else {
+    b.push_choice(&mut inner, SPA_CHOICE_Enum, 0)?;
+    for fmt in &formats {
+      b.add_id(libspa::utils::Id(*fmt))?;
+    }
+    b.pop(inner.assume_init_mut());
   }
-  b.pop(inner.assume_init_mut());
 
   b.add_prop(SPA_FORMAT_AUDIO_rate, 0)?;
-  b.push_choice(&mut inner, SPA_CHOICE_Range, 0)?;
-  b.add_int( 48000)?;
-  b.add_int(     1)?;
-  b.add_int(192000)?;
-  b.pop(inner.assume_init_mut());
-
-  if !mono {
-    b.add_prop(SPA_FORMAT_AUDIO_channels, 0)?;
-    b.push_choice(&mut inner, SPA_CHOICE_Range, 0)?;
-    b.add_int(2)?;
-    b.add_int(1)?;
-    b.add_int(SPA_AUDIO_MAX_CHANNELS as i32)?;
-    b.pop(inner.assume_init_mut());
-
-    b.add_prop(SPA_FORMAT_AUDIO_position, 0)?;
-    b.add_array(std::mem::size_of_val(&SPA_AUDIO_CHANNEL_FL) as u32, SPA_TYPE_Id, 2,
-      [SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR].as_ptr().cast())?;
+  if caps.min_rate == caps.max_rate {
+    b.add_int(caps.min_rate as i32)?;
   } else {
-    b.add_prop(SPA_FORMAT_AUDIO_channels, 0)?;
-    b.add_int(1)?;
+    b.push_choice(&mut inner, SPA_CHOICE_Range, 0)?;
+    b.add_int(48000.clamp(caps.min_rate as i32, caps.max_rate as i32))?;
+    b.add_int(caps.min_rate as i32)?;
+    b.add_int(caps.max_rate as i32)?;
+    b.pop(inner.assume_init_mut());
+  }
+
+  b.add_prop(SPA_FORMAT_AUDIO_channels, 0)?;
+  b.add_int(channels as i32)?;
+
+  if let Some(positions) = channel_positions(channels) {
+    b.add_prop(SPA_FORMAT_AUDIO_position, 0)?;
+    b.add_array(std::mem::size_of::<u32>() as u32, SPA_TYPE_Id,
+      positions.len() as u32, positions.as_ptr().cast())?;
   }
 
   b.pop(outer.assume_init_mut());
 
-  Ok(())
+  Ok(true)
 }
 
 pub unsafe fn build_buffers_info(b: &mut libspa::pod::builder::Builder, stride: u32) -> Result<(), rustix::io::Errno> {

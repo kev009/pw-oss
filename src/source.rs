@@ -21,6 +21,7 @@ struct State {
   hooks:          spa_hook_list,
   callbacks:      spa_callbacks,
   ports:          [Port; MAX_PORTS],
+  caps:           crate::sound::DspCaps,
   latency:        [spa_latency_info; 2], // indexed by direction; written by the host, replayed on read
   started:        bool,
   following:      bool,
@@ -452,8 +453,11 @@ unsafe extern "C" fn port_enum_params(
 
     #[allow(non_upper_case_globals)]
     match (id, index) {
-      (SPA_PARAM_EnumFormat, 0) => crate::utils::build_enum_format_info(&mut builder, true).unwrap(),
-      (SPA_PARAM_EnumFormat, _) => return 0,
+      (SPA_PARAM_EnumFormat, i) => {
+        if !crate::utils::build_enum_format_info(&mut builder, &state.caps, i).unwrap() {
+          return 0;
+        }
+      },
       (SPA_PARAM_Buffers, _)    => return -libc::ENOENT,
       (SPA_PARAM_Latency, 0 | 1) => crate::utils::build_latency_info(&mut builder, &state.latency[index as usize]).unwrap(),
       (SPA_PARAM_Latency, _)     => return 0,
@@ -527,7 +531,7 @@ unsafe extern "C" fn port_set_param(object: *mut c_void, direction: spa_directio
               format,
               rate:     raw.rate,
               channels: raw.channels,
-              stride:   bytes_per_sample // mono; per-sample == per-frame
+              stride:   bytes_per_sample * raw.channels // bytes per interleaved frame
             };
 
             crate::debug!(state.log, "reconfiguring with {:?}", config);
@@ -856,6 +860,12 @@ unsafe extern "C" fn init(
 
   let dsp_path = dsp_path.unwrap();
 
+  let caps = crate::sound::probe_caps(&dsp_path, false).unwrap_or_else(|| {
+    crate::warn!(log, "{}: can't probe device caps; using fallback", dsp_path);
+    crate::sound::DspCaps::fallback()
+  });
+  crate::debug!(log, "{}: {:?}", dsp_path, caps);
+
   let state = handle.cast::<State>().as_mut()
     .expect("handle is not supposed to be null");
 
@@ -913,6 +923,8 @@ unsafe extern "C" fn init(
     },
 
     ports: [Port { config: None, buffers: vec![], io: std::ptr::null_mut(), dsp: crate::sound::Dsp::new(&dsp_path) }; MAX_PORTS],
+
+    caps,
 
     latency: [
       crate::utils::latency_info_default(SPA_DIRECTION_INPUT),

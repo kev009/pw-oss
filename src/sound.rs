@@ -13,6 +13,7 @@ const SNDCTL_DSP_SPEED:       c_ulong = nix::request_code_readwrite!(b'P',  2, s
 const SNDCTL_DSP_SETFMT:      c_ulong = nix::request_code_readwrite!(b'P',  5, std::mem::size_of::<c_int>());
 const SNDCTL_DSP_CHANNELS:    c_ulong = nix::request_code_readwrite!(b'P',  6, std::mem::size_of::<c_int>());
 const SNDCTL_DSP_SETFRAGMENT: c_ulong = nix::request_code_readwrite!(b'P', 10, std::mem::size_of::<c_int>());
+const SNDCTL_DSP_GETFMTS:     c_ulong = nix::request_code_read!     (b'P', 11, std::mem::size_of::<c_int>());
 const SNDCTL_DSP_GETOSPACE:   c_ulong = nix::request_code_read!     (b'P', 12, std::mem::size_of::<audio_buf_info>());
 const SNDCTL_DSP_GETISPACE:   c_ulong = nix::request_code_read!     (b'P', 13, std::mem::size_of::<audio_buf_info>());
 //const SNDCTL_DSP_SETTRIGGER:  c_ulong = nix::request_code_write!    (b'P', 16, std::mem::size_of::<c_int>());
@@ -57,6 +58,69 @@ enum DspState {
   Closed,
   Setup,
   Running
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DspCaps {
+  pub formats:      u32, // AFMT_* mask
+  pub min_channels: u32,
+  pub max_channels: u32,
+  pub min_rate:     u32,
+  pub max_rate:     u32
+}
+
+impl DspCaps {
+
+  // used when the device can't be probed (e.g. busy); conservative
+  pub fn fallback() -> Self {
+    Self {
+      formats:      AFMT_S16_LE | AFMT_S16_BE | AFMT_S32_LE | AFMT_S32_BE,
+      min_channels: 1,
+      max_channels: 2,
+      min_rate:     8000,
+      max_rate:     192000
+    }
+  }
+}
+
+// Ask the device what it actually supports: OSS grants the nearest supported
+// value, so requesting the extremes yields the ranges. Uses a transient open;
+// the caller falls back if the device is busy.
+pub fn probe_caps(path: &str, play: bool) -> Option<DspCaps> {
+
+  let cpath = CString::new(path).ok()?;
+  let mode  = if play { libc::O_WRONLY } else { libc::O_RDONLY };
+  let fd    = unsafe { libc::open(cpath.as_ptr(), mode | libc::O_NONBLOCK) };
+  if fd == -1 {
+    return None;
+  }
+
+  let mut formats: c_int = 0;
+  let formats_ok = unsafe { libc::ioctl(fd, SNDCTL_DSP_GETFMTS, &mut formats) } != -1;
+
+  let probe = |req: c_ulong, val: c_int| -> c_int {
+    let mut v = val;
+    if unsafe { libc::ioctl(fd, req, &mut v) } == -1 { -1 } else { v }
+  };
+
+  let min_channels = probe(SNDCTL_DSP_CHANNELS, 1);
+  let max_channels = probe(SNDCTL_DSP_CHANNELS, 64);
+  let min_rate     = probe(SNDCTL_DSP_SPEED, 8000);
+  let max_rate     = probe(SNDCTL_DSP_SPEED, 192000);
+
+  unsafe { libc::close(fd) };
+
+  if !formats_ok || min_channels < 1 || max_channels < min_channels || min_rate < 1 || max_rate < min_rate {
+    return None;
+  }
+
+  Some(DspCaps {
+    formats:      formats as u32,
+    min_channels: min_channels as u32,
+    max_channels: max_channels as u32,
+    min_rate:     min_rate as u32,
+    max_rate:     max_rate as u32
+  })
 }
 
 fn set_format(fd: c_int, format: u32) {

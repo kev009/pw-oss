@@ -8,8 +8,7 @@ No other operating systems are supported.
 
 1. The plugin is only sufficiently complete to be used with the
 `node.features.audio.no-dsp=false` Wireplumber setting (which is the default).
-1. There is no multichannel support (for now).
-1. No fancy features are planned at all. No bitperfect audio, etc.
+1. No bitperfect audio (for now).
 
 ## Usage
 

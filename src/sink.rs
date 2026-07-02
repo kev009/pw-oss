@@ -22,6 +22,7 @@ struct State {
   hooks:         spa_hook_list,
   callbacks:     spa_callbacks,
   ports:         [Port; MAX_PORTS],
+  caps:          crate::sound::DspCaps,
   latency:       [spa_latency_info; 2], // indexed by direction; written by the host, replayed on read
   started:       bool,
   following:     bool,
@@ -515,8 +516,11 @@ unsafe extern "C" fn port_enum_params(
 
     #[allow(non_upper_case_globals)]
     match (id, index) {
-      (SPA_PARAM_EnumFormat, 0) => crate::utils::build_enum_format_info(&mut builder, false).unwrap(),
-      (SPA_PARAM_EnumFormat, _) => return 0,
+      (SPA_PARAM_EnumFormat, i) => {
+        if !crate::utils::build_enum_format_info(&mut builder, &state.caps, i).unwrap() {
+          return 0;
+        }
+      },
       (SPA_PARAM_Format, 0) => {
         match state.ports[port_id as usize].config.as_ref() {
           Some(cfg) => build_port_format_info(&mut builder, cfg, SPA_PARAM_Format),
@@ -1123,6 +1127,12 @@ unsafe extern "C" fn init(
 
   let dsp_path = dsp_path.unwrap();
 
+  let caps = crate::sound::probe_caps(&dsp_path, true).unwrap_or_else(|| {
+    crate::warn!(log, "{}: can't probe device caps; using fallback", dsp_path);
+    crate::sound::DspCaps::fallback()
+  });
+  crate::debug!(log, "{}: {:?}", dsp_path, caps);
+
   let state = handle.cast::<State>().as_mut()
     .expect("handle is not supposed to be null");
 
@@ -1192,6 +1202,8 @@ unsafe extern "C" fn init(
       };
       MAX_PORTS
     ],
+
+    caps,
 
     latency: [
       crate::utils::latency_info_default(SPA_DIRECTION_INPUT),
