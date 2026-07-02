@@ -41,7 +41,8 @@ struct Port {
   buffers: Vec<*mut spa_buffer>,
   io:      *mut spa_io_buffers,
   dsp:     crate::sound::Dsp,
-  dll:     crate::dll::SpaDLL
+  dll:     crate::dll::SpaDLL,
+  primed:  bool
 }
 
 #[derive(Debug)]
@@ -575,6 +576,7 @@ unsafe extern "C" fn port_set_param(object: *mut c_void, direction: spa_directio
 
               port.config = Some(config);
               port.dll.init(); // fresh device, fresh servo; set_bw happens on the first cycle
+              port.primed = false;
               state.active_buffers = 0;
             });
           },
@@ -684,31 +686,56 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
     let mut corr: f64 = 1.0; // DLL rate correction, published below
     let mut queued_frames: i64 = 0;
 
-    let nbytes = if port.dsp.ready_for_reading(1) {
+    // one period in device bytes (0 while position is absent)
+    let mut period_in_bytes = 0u32;
+    if !state.position.is_null() {
+      let driver_clock = (*state.position).clock;
+      if driver_clock.target_rate.denom > 0 {
+        period_in_bytes = (driver_clock.target_duration * rate as u64
+          / driver_clock.target_rate.denom as u64) as u32 * stride;
+      }
+    }
+
+    let nbytes = if !port.primed && period_in_bytes > 0 {
+      // Capture analogue of the sink's zero priming: trigger the device,
+      // discard any backlog so the fill level starts out known, and hand the
+      // graph one period of silence while the ring fills. Don't wait for real
+      // data: an empty first cycle reads as a missed deadline to the graph.
+      if port.dsp.ready_for_reading(1) {
+        let mut backlog = port.dsp.ispace_in_bytes().max(0) as u32;
+        while backlog > 0 {
+          let chunk = backlog.min(data_0.maxsize);
+          let n = port.dsp.read(data_0.data, chunk as usize);
+          if n <= 0 {
+            break;
+          }
+          backlog -= n as u32;
+        }
+      }
+      port.primed = true;
+      port.dll.init(); // servo starts fresh on the next cycle
+
+      let len = period_in_bytes.min(data_0.maxsize);
+      std::ptr::write_bytes(data_0.data.cast::<u8>(), 0, len as usize);
+      len as isize
+    } else if port.dsp.ready_for_reading(1) {
       let queued = port.dsp.ispace_in_bytes().max(0) as u32;
       queued_frames = (queued / stride) as i64;
 
-      // We drain the ring every cycle, so the pre-read level is what the device
-      // captured in one period; its deviation from one period is the clock
-      // error. Note the sign: a slow device queues less than a period and must
-      // push corr below 1.0, the inverse of the sink's error.
-      if !state.position.is_null() {
-        let driver_clock = (*state.position).clock;
-        if driver_clock.target_rate.denom > 0 {
-          let period_in_bytes = (driver_clock.target_duration * rate as u64
-            / driver_clock.target_rate.denom as u64) as u32 * stride;
-          if period_in_bytes > 0 {
-            if port.dll.bw() == 0.0 {
-              port.dll.init();
-              port.dll.set_bw(crate::dll::SPA_DLL_BW_MIN, period_in_bytes, driver_clock.target_rate.denom * stride);
-            }
-            let err = (period_in_bytes as i64 - queued as i64) as f64;
-            corr = port.dll.update(err);
-
-            #[cfg(debug_assertions)]
-            eprintln!("capture: corr = {}, err = {}", corr, err);
-          }
+      // We drain the ring every cycle, so the pre-read level is what the
+      // device captured in one period; its deviation from one period is the
+      // clock error. Note the sign: a slow device queues less than a period
+      // and must push corr below 1.0, the inverse of the sink's error.
+      if period_in_bytes > 0 {
+        if port.dll.bw() == 0.0 {
+          port.dll.init();
+          port.dll.set_bw(crate::dll::SPA_DLL_BW_MIN, period_in_bytes, rate * stride);
         }
+        let err = (period_in_bytes as i64 - queued as i64) as f64;
+        corr = port.dll.update(err);
+
+        #[cfg(debug_assertions)]
+        eprintln!("capture: corr = {}, err = {}", corr, err);
       }
 
       // the device can report more queued input than the buffer holds; cap it
@@ -987,7 +1014,7 @@ unsafe extern "C" fn init(
       data:  std::ptr::null_mut()
     },
 
-    ports: [Port { config: None, buffers: vec![], io: std::ptr::null_mut(), dsp: crate::sound::Dsp::new(&dsp_path), dll: std::default::Default::default() }; MAX_PORTS],
+    ports: [Port { config: None, buffers: vec![], io: std::ptr::null_mut(), dsp: crate::sound::Dsp::new(&dsp_path), dll: std::default::Default::default(), primed: false }; MAX_PORTS],
 
     caps,
 
