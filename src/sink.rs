@@ -179,6 +179,34 @@ unsafe extern "C" fn sync(object: *mut c_void, seq: c_int) -> c_int {
   0
 }
 
+unsafe fn build_oss_delay_prop_info(b: &mut libspa::pod::builder::Builder, current: u32) -> Result<(), rustix::io::Errno> {
+
+  let mut outer = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
+  let mut inner = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
+
+  b.push_object(&mut outer, SPA_TYPE_OBJECT_PropInfo, SPA_PARAM_PropInfo)?;
+
+  b.add_prop(SPA_PROP_INFO_name, 0)?;
+  b.add_string("oss.delay")?;
+
+  b.add_prop(SPA_PROP_INFO_description, 0)?;
+  b.add_string("OSS buffer fill target (1/8ths of a period)")?;
+
+  b.add_prop(SPA_PROP_INFO_type, 0)?;
+  b.push_choice(&mut inner, SPA_CHOICE_Range, 0)?;
+  b.add_int(current as i32)?;
+  b.add_int(0)?;
+  b.add_int(1024)?;
+  b.pop(inner.assume_init_mut());
+
+  b.add_prop(SPA_PROP_INFO_params, 0)?;
+  b.add_bool(true)?; // settable through the Props params struct
+
+  b.pop(outer.assume_init_mut());
+
+  Ok(())
+}
+
 unsafe extern "C" fn enum_params(object: *mut c_void, seq: c_int, id: u32, start: u32, max: u32, filter: *const spa_pod) -> c_int {
 
   let state = object.cast::<State>().as_mut()
@@ -200,8 +228,9 @@ unsafe extern "C" fn enum_params(object: *mut c_void, seq: c_int, id: u32, start
     #[allow(non_upper_case_globals)]
     match (id, index) {
       (SPA_PARAM_PropInfo, 0)       => crate::utils::build_latency_offset_prop_info(&mut builder).unwrap(),
+      (SPA_PARAM_PropInfo, 1)       => build_oss_delay_prop_info(&mut builder, state.oss_delay).unwrap(),
       (SPA_PARAM_PropInfo, _)       => return 0,
-      (SPA_PARAM_Props, 0)          => crate::utils::build_latency_offset_props(&mut builder, state.process_latency.ns).unwrap(),
+      (SPA_PARAM_Props, 0)          => crate::utils::build_latency_offset_props(&mut builder, state.process_latency.ns, Some(state.oss_delay)).unwrap(),
       (SPA_PARAM_Props, _)          => return 0,
       (SPA_PARAM_ProcessLatency, 0) => crate::utils::build_process_latency_info(&mut builder, &state.process_latency).unwrap(),
       (SPA_PARAM_ProcessLatency, _) => return 0,
@@ -263,6 +292,10 @@ unsafe extern "C" fn set_param(object: *mut c_void, id: u32, _flags: u32, param:
                         (Value::String(s), Value::Int(x)) if s == "oss.delay" && *x >= 0 => {
                           // cap it: period/8 * oss_delay runs in the RT path and must not overflow
                           state.oss_delay = (*x as u32).min(1024);
+                          // announce the new value so Props readback stays fresh
+                          let _ = state.node_info.replace_change_mask(0);
+                          state.node_info.bump_param(SPA_PARAM_Props);
+                          emit_node_info(state);
                         },
                         _ => ()
                       }

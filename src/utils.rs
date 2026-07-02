@@ -432,7 +432,7 @@ pub unsafe fn build_latency_offset_prop_info(b: &mut libspa::pod::builder::Build
   Ok(())
 }
 
-pub unsafe fn build_latency_offset_props(b: &mut libspa::pod::builder::Builder, ns: i64) -> Result<(), rustix::io::Errno> {
+pub unsafe fn build_latency_offset_props(b: &mut libspa::pod::builder::Builder, ns: i64, oss_delay: Option<u32>) -> Result<(), rustix::io::Errno> {
 
   use libspa::sys::*;
 
@@ -442,6 +442,16 @@ pub unsafe fn build_latency_offset_props(b: &mut libspa::pod::builder::Builder, 
 
   b.add_prop(SPA_PROP_latencyOffsetNsec, 0)?;
   b.add_long(ns)?;
+
+  // custom key/value props ride in the params struct
+  if let Some(delay) = oss_delay {
+    let mut inner = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
+    b.add_prop(SPA_PROP_params, 0)?;
+    b.push_struct(&mut inner)?;
+    b.add_string("oss.delay")?;
+    b.add_int(delay as i32)?;
+    b.pop(inner.assume_init_mut());
+  }
 
   b.pop(frame.assume_init_mut());
 

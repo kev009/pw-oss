@@ -182,7 +182,7 @@ unsafe extern "C" fn enum_params(object: *mut c_void, seq: c_int, id: u32, start
     match (id, index) {
       (SPA_PARAM_PropInfo, 0)       => crate::utils::build_latency_offset_prop_info(&mut builder).unwrap(),
       (SPA_PARAM_PropInfo, _)       => return 0,
-      (SPA_PARAM_Props, 0)          => crate::utils::build_latency_offset_props(&mut builder, state.process_latency.ns).unwrap(),
+      (SPA_PARAM_Props, 0)          => crate::utils::build_latency_offset_props(&mut builder, state.process_latency.ns, None).unwrap(),
       (SPA_PARAM_Props, _)          => return 0,
       (SPA_PARAM_ProcessLatency, 0) => crate::utils::build_process_latency_info(&mut builder, &state.process_latency).unwrap(),
       (SPA_PARAM_ProcessLatency, _) => return 0,
