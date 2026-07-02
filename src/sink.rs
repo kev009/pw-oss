@@ -1424,7 +1424,11 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       port.dsp.write_zeroes(port.target_delay);
     } else {
       let underrun_count = port.dsp.underruns();
-      if underrun_count > 0 {
+      // The vchan mixer counts a momentarily-short child as an xrun and pads
+      // it with silence (feeder_mixer.c); with the fill still healthy that's
+      // accounting noise, not a dropout - only a genuinely low fill (under a
+      // period at wakeup) is a real underrun worth recovery and reporting.
+      if underrun_count > 0 && port.dsp.odelay() < period_in_bytes.max(port.dsp.blocksize()) {
         if let Some(suppressed) = port.warn_limit.check(state.cur_timestamp) {
           crate::warn!(state.log, "{}: OSS reported {:3} underruns @ {} (+{} warnings suppressed)",
             port.dsp.path, underrun_count, state.cur_timestamp, suppressed);
