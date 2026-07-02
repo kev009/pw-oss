@@ -1,0 +1,1385 @@
+// The shared node core. sink.rs and source.rs are the same SPA node modulo
+// direction: everything direction-agnostic lives here once, generic over
+// `Direction`, and the genuinely direction-specific logic (the process() data
+// path, the servo error sign, priming/recovery semantics, the oss.delay prop)
+// is supplied through the `Direction` hooks each module implements. The
+// extern "C" vtable entries are generic and monomorphized per direction.
+
+use std::mem::MaybeUninit;
+use std::os::raw::{c_char, c_int, c_void};
+
+use libspa::sys::*;
+
+pub(crate) const MAX_PORTS: usize = 1;
+
+// the shared surface of sound::Dsp/sound::DspWriter used by the generic core;
+// the direction-specific ops (write/odelay vs read/ispace) stay on the
+// concrete types and are used from the Direction hooks
+pub(crate) trait DeviceOps {
+  fn new(path: &str) -> Self;
+  fn is_closed(&self) -> bool;
+  fn close(&mut self);
+  fn suspend(&mut self) -> bool;
+}
+
+impl DeviceOps for crate::sound::Dsp {
+  fn new(path: &str) -> Self    { crate::sound::Dsp::new(path) }
+  fn is_closed(&self) -> bool   { crate::sound::Dsp::is_closed(self) }
+  fn close(&mut self)           { crate::sound::Dsp::close(self) }
+  fn suspend(&mut self) -> bool { crate::sound::Dsp::suspend(self) }
+}
+
+impl DeviceOps for crate::sound::DspWriter {
+  fn new(path: &str) -> Self    { crate::sound::DspWriter::new(path) }
+  fn is_closed(&self) -> bool   { crate::sound::DspWriter::is_closed(self) }
+  fn close(&mut self)           { crate::sound::DspWriter::close(self) }
+  fn suspend(&mut self) -> bool { crate::sound::DspWriter::suspend(self) }
+}
+
+// the negotiated format as the generic core needs it; the concrete PortConfig
+// types (whose Debug readback differs) stay per direction
+pub(crate) trait ConfigOps: std::fmt::Debug + Clone {
+  fn rate(&self) -> u32;
+  fn channels(&self) -> u32;
+  fn stride(&self) -> u32;
+  fn format_raw(&self) -> u32;
+  fn flags(&self) -> u32;
+  fn positions(&self) -> &[u32];
+}
+
+// outcome of a per-(id, index) node param build (the enum_params hook)
+pub(crate) enum ParamBuild {
+  Built,     // a pod was written into the builder
+  Exhausted, // no more values for this param id
+  Unknown    // unknown param id
+}
+
+pub(crate) trait Direction: Sized + 'static {
+
+  /// the port direction from the graph's perspective
+  const DIRECTION: spa_direction;
+  /// probe_caps()/install direction flag
+  const PLAYBACK: bool;
+  const MEDIA_CLASS: &'static str;
+  /// status a driving node passes to ready(): a playback driver signals
+  /// NEED_DATA; a capture driver signals HAVE_DATA (alsa-pcm.c capture_ready)
+  const READY_STATUS: i32;
+  /// historical prefix of the unknown-command warning ("oss-source: " there)
+  const CMD_WARN_PREFIX: &'static str;
+
+  type Device: DeviceOps;
+  type Config: ConfigOps;
+  type Ext: Default;     // direction-specific State fields
+  type PortExt: Default; // direction-specific Port fields
+
+  // init: direction-specific node property keys (e.g. the sink's oss.delay)
+  fn info_item(ext: &mut Self::Ext, key: &str, value: &str);
+  // init: after the info dict is parsed (e.g. latching the oss.delay default)
+  fn ext_ready(ext: &mut Self::Ext);
+
+  // enum_params: build one node param pod for (id, index)
+  unsafe fn build_node_param(state: &mut State<Self>, b: &mut libspa::pod::builder::Builder, id: u32, index: u32) -> ParamBuild;
+  // set_param(Props) with a NULL pod: reset the props to their defaults
+  unsafe fn reset_props(state: &mut State<Self>) -> c_int;
+  // set_param(Props): the SPA_PROP_params property (the sink's oss.delay)
+  unsafe fn set_props_params(state: &mut State<Self>, value: &libspa::pod::Value) -> c_int;
+
+  // port_set_param(Format): validate the format and build the config
+  unsafe fn parse_config(state: &mut State<Self>, raw: &spa_audio_info_raw) -> Result<Self::Config, c_int>;
+  // used from the main thread only; returns 0 or -errno with the device closed
+  fn try_open_configure(dsp: &mut Self::Device, config: &Self::Config, log: &crate::spa::Log) -> c_int;
+  // install_device: direction-specific resets inside the loop-side swap
+  unsafe fn on_device_swapped(state: &mut State<Self>, port_idx: usize);
+  // port_use_buffers: direction-specific resets inside the loop-side swap
+  unsafe fn on_buffers_swapped(state: &mut State<Self>);
+
+  // send_command(Start): direction-specific resets, on the data loop
+  unsafe fn on_start_loop(state: &mut State<Self>);
+  // send_command(Suspend): direction-specific resets, on the data loop
+  unsafe fn on_suspend_loop(state: &mut State<Self>);
+  // set_io: the driver/follower role flipped on a live node
+  unsafe fn on_role_flip(state: &mut State<Self>);
+
+  unsafe fn update_timers(state: &mut State<Self>);
+  // on_timeout: debug-build cycle tracing (the sink prints one line)
+  unsafe fn debug_cycle(state: &State<Self>, now: u64, nsec: u64);
+  // on_timeout: run the DLL servo; returns (corr, delay) for the clock
+  unsafe fn timeout_servo(state: &mut State<Self>, nsec: u64, rate: u32) -> (f64, i64);
+
+  // process(): the direction-specific data path over the ports
+  unsafe fn process_ports(state: &mut State<Self>) -> c_int;
+
+  const NODE_METHODS: spa_node_methods = spa_node_methods {
+    version:           SPA_VERSION_NODE_METHODS,
+    add_listener:      Some(add_listener::<Self>),
+    set_callbacks:     Some(set_callbacks::<Self>),
+    sync:              Some(sync::<Self>),
+    enum_params:       Some(enum_params::<Self>),
+    set_param:         Some(set_param::<Self>),
+    set_io:            Some(set_io::<Self>),
+    send_command:      Some(send_command::<Self>),
+    add_port:          Some(add_port),
+    remove_port:       Some(remove_port),
+    port_enum_params:  Some(port_enum_params::<Self>),
+    port_set_param:    Some(port_set_param::<Self>),
+    port_use_buffers:  Some(port_use_buffers::<Self>),
+    port_set_io:       Some(port_set_io::<Self>),
+    port_reuse_buffer: Some(port_reuse_buffer),
+    process:           Some(process::<Self>),
+  };
+}
+
+#[repr(C)]
+pub(crate) struct State<D: Direction> {
+  pub handle:        spa_handle,
+  pub node:          spa_node,
+  pub node_info:     crate::spa::NodeInfo,
+  pub port_info:     crate::spa::PortInfo,
+  pub data_loop:     crate::spa::Loop,
+  pub data_system:   crate::spa::System,
+  pub log:           crate::spa::Log,
+  pub clock:         *mut spa_io_clock,
+  pub position:      *mut spa_io_position,
+  pub rate_match:    *mut spa_io_rate_match,
+  pub clock_name:    std::ffi::CString, // stamped into spa_io_clock.name
+  pub main_loop:     Option<crate::spa::Loop>, // for deferring device rebuilds off the data loop
+  pub dsp_path:      String,
+  pub timer_source:  spa_source,
+  pub next_time:     u64,
+  pub hooks:         spa_hook_list,
+  pub callbacks:     spa_callbacks,
+  pub ports:         [Port<D>; MAX_PORTS],
+  pub caps:          crate::sound::DspCaps,
+  pub caps_fallback: bool, // init-time probe failed (busy device); re-probe lazily
+  pub loop_thread:   std::sync::atomic::AtomicUsize, // thread process()/on_timeout run on (0 = unseen)
+  pub latency:       [spa_latency_info; 2], // indexed by direction; written by the host, replayed on read
+  pub process_latency: spa_process_latency_info,
+  pub started:       bool,
+  pub clearing:      bool, // teardown in progress; queued tasks must no-op
+  pub following:     bool,
+  pub ext:           D::Ext // direction-specific fields (see sink.rs/source.rs)
+}
+
+impl<D: Direction> State<D> {
+
+  fn node_is_follower(&self) -> bool {
+    !self.clock.is_null() && !self.position.is_null() && unsafe { (*self.position).clock.id != (*self.clock).id }
+  }
+}
+
+pub(crate) struct Port<D: Direction> {
+  pub config:          Option<D::Config>,
+  pub buffers:         Vec<*mut spa_buffer>,
+  pub io:              *mut spa_io_buffers,
+  pub dsp:             D::Device,
+  pub dll:             crate::dll::SpaDLL,
+  pub setup_period:    u32, // device bytes per graph cycle the stream/servo was set up for
+  pub bw_adapt:        crate::dll::BwAdapt, // variance-adaptive bandwidth (ALSA scheme)
+  pub setup_blocksize: u32, // device fragment size (measurement quantization)
+  pub resetup_pending: bool, // a main-thread device rebuild is queued; skip cycles
+  pub was_matching:    bool, // rate matching active last cycle (relock on transition)
+  pub warn_limit:      crate::utils::RateLimit,
+  pub ext:             D::PortExt // direction-specific fields (see sink.rs/source.rs)
+}
+
+unsafe extern "C" fn add_listener<D: Direction>(object: *mut c_void, listener: *mut spa_hook, events: *const spa_node_events, data: *mut c_void) -> c_int {
+
+  let state = object.cast::<State<D>>().as_mut()
+    .expect("object is not supposed to be null");
+
+  let mut save = MaybeUninit::<spa_hook_list>::uninit();
+  spa_hook_list_isolate(&mut state.hooks, save.as_mut_ptr(), listener, events.cast(), data);
+
+  // note that this only iterates over the newly added listener
+  crate::spa::for_each_hook(&mut state.hooks, |entry| {
+
+    let f = entry.cb.funcs.cast::<spa_node_events>().as_ref()
+      .expect("we just assigned events to this very hook by calling spa_hook_list_isolate");
+
+    assert!(f.version >= SPA_VERSION_NODE_EVENTS);
+
+    if let Some(node_info_fun) = f.info {
+      let old_mask = state.node_info.replace_change_mask(crate::spa::SPA_NODE_CHANGE_MASK_ALL as u64);
+      node_info_fun(entry.cb.data, state.node_info.raw());
+      let _ = state.node_info.replace_change_mask(old_mask);
+    }
+
+    if let Some(port_info_fun) = f.port_info {
+      let old_mask = state.port_info.replace_change_mask(crate::spa::SPA_PORT_CHANGE_MASK_ALL as u64);
+      port_info_fun(entry.cb.data, D::DIRECTION, 0, state.port_info.raw());
+      let _ = state.port_info.replace_change_mask(old_mask);
+    }
+  });
+
+  spa_hook_list_join(&mut state.hooks, save.assume_init_mut());
+
+  0
+}
+
+// re-emit node_info to every listener (carrying whatever change_mask the caller
+// set, e.g. PARAMS), then clear the mask
+pub(crate) unsafe fn emit_node_info<D: Direction>(state: &mut State<D>) {
+  crate::spa::for_each_hook(&mut state.hooks, |entry| {
+    let f = entry.cb.funcs.cast::<spa_node_events>().as_ref()
+      .expect("hook should be initialized");
+    if f.version >= SPA_VERSION_NODE_EVENTS {
+      if let Some(node_info_fun) = f.info {
+        node_info_fun(entry.cb.data, state.node_info.raw());
+      }
+    }
+  });
+  let _ = state.node_info.replace_change_mask(0);
+}
+
+// the process latency (user-set latency offset) shifts the node's reported
+// latency, so a change re-emits the Props/ProcessLatency node params and the
+// port Latency param
+pub(crate) unsafe fn handle_process_latency<D: Direction>(state: &mut State<D>, info: spa_process_latency_info) {
+
+  let ns_changed = state.process_latency.ns != info.ns;
+  if state.process_latency.quantum == info.quantum &&
+     state.process_latency.rate    == info.rate && !ns_changed {
+    return;
+  }
+
+  state.process_latency = info;
+
+  let _ = state.node_info.replace_change_mask(0);
+  if ns_changed {
+    state.node_info.bump_param(SPA_PARAM_Props);
+  }
+  state.node_info.bump_param(SPA_PARAM_ProcessLatency);
+  emit_node_info(state);
+
+  let _ = state.port_info.replace_change_mask(0);
+  state.port_info.bump_param(SPA_PARAM_Latency);
+  emit_port_info(state);
+}
+
+// re-emit port_info to every listener (carrying whatever change_mask the caller
+// set, e.g. RATE/PARAMS), then clear the mask
+pub(crate) unsafe fn emit_port_info<D: Direction>(state: &mut State<D>) {
+  crate::spa::for_each_hook(&mut state.hooks, |entry| {
+    let f = entry.cb.funcs.cast::<spa_node_events>().as_ref()
+      .expect("hook should be initialized");
+    if f.version >= SPA_VERSION_NODE_EVENTS {
+      if let Some(port_info_fun) = f.port_info {
+        port_info_fun(entry.cb.data, D::DIRECTION, 0, state.port_info.raw());
+      }
+    }
+  });
+  let _ = state.port_info.replace_change_mask(0);
+}
+
+unsafe extern "C" fn set_callbacks<D: Direction>(object: *mut c_void, callbacks: *const spa_node_callbacks, data: *mut c_void) -> c_int {
+  let state: *mut State<D> = object.cast();
+  assert!(!state.is_null());
+  // read by on_timeout/process on the data loop
+  if !crate::utils::block_on_loop(&(*state).data_loop, state, |state| {
+    state.callbacks.funcs = callbacks as *const c_void;
+    state.callbacks.data  = data;
+  }) {
+    return -libc::EIO;
+  }
+  0
+}
+
+unsafe extern "C" fn sync<D: Direction>(object: *mut c_void, seq: c_int) -> c_int {
+  let state = object.cast::<State<D>>().as_mut()
+    .expect("object is not supposed to be null");
+  crate::spa::node_emit_done(&mut state.hooks, seq);
+  0
+}
+
+unsafe extern "C" fn enum_params<D: Direction>(object: *mut c_void, seq: c_int, id: u32, start: u32, max: u32, filter: *const spa_pod) -> c_int {
+
+  let state = object.cast::<State<D>>().as_mut()
+    .expect("object is not supposed to be null");
+
+  if max == 0 {
+    return 0;
+  }
+
+  let mut buffer  = vec![];
+  let mut fbuffer = vec![]; // spa_pod_filter output; kept apart from the source pod (see spa::filter_pod)
+
+  let mut index = start;
+  let mut count = 0;
+
+  while count < max {
+
+    use libspa::pod::builder::Builder;
+
+    let mut builder = Builder::new(&mut buffer);
+
+    match D::build_node_param(state, &mut builder, id, index) {
+      ParamBuild::Built     => (),
+      ParamBuild::Exhausted => return 0,
+      ParamBuild::Unknown   => return -libc::ENOENT // unknown param id (ALSA convention)
+    }
+
+    drop(builder); // its borrow of `buffer` must end before we take the source pointer
+
+    let mut result = spa_result_node_params { id, index, next: index + 1, param: std::ptr::null_mut() };
+
+    if let Some(param) = crate::spa::filter_pod(&mut fbuffer, buffer.as_mut_ptr() as *mut spa_pod, filter) {
+      result.param = param;
+      crate::spa::node_emit_result(&mut state.hooks, seq, 0, SPA_RESULT_TYPE_NODE_PARAMS, &result);
+      count += 1;
+    }
+
+    index += 1;
+  }
+
+  0
+}
+
+unsafe extern "C" fn set_param<D: Direction>(object: *mut c_void, id: u32, _flags: u32, param: *const spa_pod) -> c_int {
+
+  let state = object.cast::<State<D>>().as_mut()
+    .expect("object is not supposed to be null");
+
+  use libspa::pod::{Value, Object, Pod};
+  use libspa::pod::deserialize::PodDeserializer;
+
+  #[allow(non_upper_case_globals)]
+  match id {
+    SPA_PARAM_Props => {
+      if param.is_null() {
+        // a NULL pod resets the props to their defaults
+        return D::reset_props(state);
+      }
+      match PodDeserializer::deserialize_any_from(Pod::from_raw(param).as_bytes()) {
+        Ok((_, Value::Object(Object { type_, properties, .. }))) if type_ == SPA_TYPE_OBJECT_Props => {
+          for property in properties {
+            match property.key {
+              // there is no way adapter is actually supposed to pass all those properties (or parameters?) to us,
+              // it's probably a bug
+              SPA_PROP_volume         => (), // fuck it
+              SPA_PROP_mute           => (), // ditto
+              SPA_PROP_channelVolumes => (), // ditto
+              SPA_PROP_channelMap     => (), // ditto
+              SPA_PROP_monitorMute    => (), // ditto
+              SPA_PROP_monitorVolumes => (), // ditto
+              SPA_PROP_softMute       => (), // ditto
+              SPA_PROP_softVolumes    => (), // ditto
+              SPA_PROP_latencyOffsetNsec => {
+                if let Value::Long(ns) = property.value {
+                  let mut info = state.process_latency;
+                  info.ns = ns;
+                  handle_process_latency(state, info);
+                }
+              },
+              SPA_PROP_params         => {
+                let res = D::set_props_params(state, &property.value);
+                if res != 0 {
+                  return res;
+                }
+              },
+              key => {
+                crate::debug!(state.log, "ignoring unknown prop {}", key);
+              }
+            }
+          }
+        },
+        _ => return -libc::EINVAL
+      }
+      0
+    },
+    SPA_PARAM_ProcessLatency => {
+      if param.is_null() {
+        handle_process_latency(state, crate::utils::process_latency_default());
+        return 0;
+      }
+      match crate::utils::parse_process_latency_info(param) {
+        Some(info) => { handle_process_latency(state, info); 0 },
+        None       => -libc::EINVAL
+      }
+    },
+    id => {
+      crate::warn!(state.log, "set_param: unknown param {}", id);
+      -libc::ENOENT
+    }
+  }
+}
+
+// ALSA adapts the DLL bandwidth continuously from the error variance
+// (alsa-pcm.c, BW_PERIOD); we approximate with two stages: a fast lock at
+// BW_MAX after (re)start, then the low steady-state bandwidth
+unsafe extern "C" fn on_timeout<D: Direction>(source: *mut spa_source) {
+
+  let state = (*source).data.cast::<State<D>>().as_mut()
+    .expect("(*source).data is not supposed to be null");
+
+  #[cfg(debug_assertions)]
+  crate::trace!(state.log, "on_timeout");
+
+  let mut expirations = 0;
+  if state.data_system.timerfd_read(state.timer_source.fd, &mut expirations) < 0 {
+    // disarmed (Pause/Suspend) in this same wakeup; nothing to read
+    return;
+  }
+
+  // after the drain: the source is level-triggered, so bailing with the fd
+  // readable would busy-spin the loop; the one-shot timer is only re-armed
+  // by set_timeout below, so returning here really does park it
+  if !check_loop_identity(state) {
+    return;
+  }
+
+  // stopped between the timer firing and this callback; don't signal ready()
+  // into a node being reconfigured, and don't re-arm
+  if !state.started || state.following {
+    return;
+  }
+
+  if state.position.is_null() || state.clock.is_null() {
+    return; // ios cleared while the timer was armed; skip the cycle
+  }
+
+  let now = crate::utils::now_ns(&state.data_system);
+
+  // resync after a long stall instead of replaying a burst of stale cycles
+  // (ALSA snaps when more than a second behind)
+  if now.saturating_sub(state.next_time) > SPA_NSEC_PER_SEC as u64 {
+    crate::warn!(state.log, "timer stalled ({} ns behind); resyncing", now - state.next_time);
+    state.next_time = now;
+  }
+
+  let nsec = state.next_time;
+
+  D::debug_cycle(state, now, nsec);
+
+  let duration = (*state.position).clock.target_duration;
+  let rate     = (*state.position).clock.target_rate.denom;
+  if duration == 0 || rate == 0 {
+    // malformed position: idle-tick, and advance next_time so the deadline
+    // isn't stale when the position recovers
+    state.next_time = nsec + SPA_NSEC_PER_SEC as u64 / 100;
+    set_timeout(state, state.next_time);
+    return;
+  }
+
+  let (corr, delay) = D::timeout_servo(state, nsec, rate);
+
+  // steer the timer by the correction so the published clock genuinely follows
+  // the device (ALSA warps next_time the same way); this also closes the loop
+  // in passthrough setups where no resampler consumes a rate_match
+  state.next_time = nsec + (duration as f64 * SPA_NSEC_PER_SEC as f64 / (rate as f64 * corr)) as u64;
+
+  (*state.clock).nsec      = nsec;
+  (*state.clock).rate      = (*state.clock).target_rate;
+  (*state.clock).position += (*state.clock).duration;
+  (*state.clock).duration  = duration;
+  (*state.clock).delay     = delay;
+  (*state.clock).rate_diff = corr;
+  (*state.clock).next_nsec = state.next_time;
+
+  let Some(node_callbacks) = state.callbacks.funcs.cast::<spa_node_callbacks>().as_ref() else {
+    set_timeout(state, state.next_time);
+    return; // no callbacks (yet, or cleared); keep the clock ticking
+  };
+  if let Some(ready_fun) = node_callbacks.ready {
+    let err = ready_fun(state.callbacks.data, D::READY_STATUS);
+    #[cfg(debug_assertions)]
+    crate::trace!(state.log, "ready -> {}", err);
+    #[cfg(not(debug_assertions))]
+    let _ = err;
+  }
+
+  set_timeout(state, state.next_time);
+}
+
+pub(crate) unsafe fn set_timeout<D: Direction>(state: &mut State<D>, next_time: u64) {
+
+  #[cfg(debug_assertions)]
+  crate::trace!(state.log, "set_timeout {}", next_time);
+
+  let timerspec = itimerspec {
+    it_value: timespec {
+      tv_sec:  (next_time / SPA_NSEC_PER_SEC as u64) as i64,
+      tv_nsec: (next_time % SPA_NSEC_PER_SEC as u64) as i64
+    },
+    it_interval: timespec { tv_sec: 0, tv_nsec: 0 }
+  };
+
+  state.data_system.timerfd_settime(state.timer_source.fd, SPA_FD_TIMER_ABSTIME as i32, &timerspec, std::ptr::null_mut());
+}
+
+unsafe extern "C" fn set_io<D: Direction>(object: *mut c_void, id: u32, data: *mut c_void, size: usize) -> c_int {
+
+  let state: *mut State<D> = object.cast();
+  assert!(!state.is_null());
+
+  #[allow(non_upper_case_globals)]
+  let min_size = match id {
+    SPA_IO_Clock    => std::mem::size_of::<spa_io_clock>(),
+    SPA_IO_Position => std::mem::size_of::<spa_io_position>(),
+    _ => return -libc::ENOENT
+  };
+  // NULL/0 clears the area; only a non-empty-but-short one is an error
+  if !data.is_null() && size < min_size {
+    return -libc::EINVAL;
+  }
+
+  // clock/position are read on the data loop; apply the change there
+  let applied = crate::utils::block_on_loop(&(*state).data_loop, state, |state| {
+
+    let was_armed = !state.clock.is_null() && !state.position.is_null();
+
+    #[allow(non_upper_case_globals)]
+    match id {
+      SPA_IO_Clock    => {
+        state.clock = data.cast(); // null clears
+        // identify our clock so same-device followers can skip rate matching
+        crate::utils::set_clock_name(state.clock, &state.clock_name);
+      },
+      SPA_IO_Position => state.position = data.cast(), // null clears
+      _ => () // filtered above
+    };
+
+    if state.started {
+      let armed     = !state.clock.is_null() && !state.position.is_null();
+      let following = state.node_is_follower();
+      let flipped   = state.following != following;
+      if flipped {
+        state.following = following;
+        D::on_role_flip(state);
+      }
+      // rearm/park only on a real transition (io presence or role); resetting
+      // the timer phase on every re-point causes cycle bunching
+      if flipped || was_armed != armed {
+        D::update_timers(state);
+      }
+    }
+  });
+  if !applied {
+    return -libc::EIO;
+  }
+
+  0
+}
+
+unsafe extern "C" fn send_command<D: Direction>(object: *mut c_void, command: *const spa_command) -> c_int {
+
+  let state = object.cast::<State<D>>().as_mut()
+    .expect("object is not supposed to be null");
+
+  assert!(!command.is_null());
+  let body = (*command).body.body;
+
+  crate::debug!(state.log, "received command: {}", crate::utils::spa_command_to_str(&body));
+
+  #[allow(non_upper_case_globals)]
+  match (body.type_, body.id) {
+    (SPA_TYPE_COMMAND_Node, SPA_NODE_COMMAND_Start) => {
+      if state.ports.iter().any(|p| p.config.is_none() || p.buffers.is_empty()) {
+        return -libc::EIO; // not negotiated yet (ALSA rejects this too)
+      }
+      let state: *mut State<D> = state;
+      if !crate::utils::block_on_loop(&(*state).data_loop, state, |state| {
+
+        // sane clock delay/rate_diff until process() publishes measured values
+        if !state.clock.is_null() {
+          (*state.clock).delay     = 0;
+          (*state.clock).rate_diff = 1.0;
+        }
+
+        D::on_start_loop(state);
+
+        state.started   = true;
+        state.following = state.node_is_follower();
+
+        D::update_timers(state);
+      }) {
+        return -libc::EIO;
+      }
+      0
+    },
+    (SPA_TYPE_COMMAND_Node, SPA_NODE_COMMAND_Pause) => {
+      let state: *mut State<D> = state;
+      if !crate::utils::block_on_loop(&(*state).data_loop, state, |state| {
+        state.started = false;
+        D::update_timers(state);
+      }) {
+        return -libc::EIO;
+      }
+      0
+    },
+    (SPA_TYPE_COMMAND_Node, SPA_NODE_COMMAND_Suspend) => {
+      // Quiesce the loop first (blocking), then stop the channels from this
+      // (main) thread - SETTRIGGER's chn_abort can sleep. The fd stays open,
+      // so resume is a re-prime instead of a device rebuild; a driver that
+      // refuses the trigger falls back to the close/rebuild path.
+      let state: *mut State<D> = state;
+      if !crate::utils::block_on_loop(&(*state).data_loop, state, |state| {
+        state.started = false;
+        D::update_timers(state);
+        D::on_suspend_loop(state);
+      }) {
+        return -libc::EIO;
+      }
+      for port in &mut (*state).ports {
+        if !port.dsp.is_closed() && !port.dsp.suspend() {
+          port.dsp.close();
+        }
+      }
+      0
+    },
+    (SPA_TYPE_COMMAND_Node, SPA_NODE_COMMAND_ParamBegin | SPA_NODE_COMMAND_ParamEnd) => 0, // we don't care
+    (cmd_type, cmd_id) => {
+      crate::warn!(state.log, "{}unknown command: {}, {}", D::CMD_WARN_PREFIX, cmd_type, cmd_id);
+      -libc::ENOTSUP
+    }
+  }
+}
+
+unsafe extern "C" fn add_port(_object: *mut c_void, _direction: spa_direction, _port_id: u32, _props: *const spa_dict) -> c_int {
+  -libc::ENOTSUP // the ports are static
+}
+
+unsafe extern "C" fn remove_port(_object: *mut c_void, _direction: spa_direction, _port_id: u32) -> c_int {
+  -libc::ENOTSUP // the ports are static
+}
+
+//TODO: SPA_PARAM_PORT_CONFIG_MODE_none vs SPA_PARAM_PORT_CONFIG_MODE_passthrough vs SPA_PARAM_PORT_CONFIG_MODE_convert
+/*unsafe fn build_port_config_info(builder: &mut libspa::pod::builder::Builder, config: &PortConfig, id: u32) -> Result<(), Errno> {
+
+  let mut frame = MaybeUninit::<spa_pod_frame>::uninit();
+
+  builder.push_object(&mut frame, SPA_TYPE_OBJECT_ParamPortConfig, SPA_PARAM_PortConfig)?;
+
+  builder.add_prop(SPA_PARAM_PORT_CONFIG_direction, 0)?;
+  builder.add_id(libspa::utils::Id(D::DIRECTION))?;
+
+  builder.add_prop(SPA_PARAM_PORT_CONFIG_mode, 0)?;
+  builder.add_id(libspa::utils::Id(SPA_PARAM_PORT_CONFIG_MODE_none))?;
+
+  builder.add_prop(SPA_PARAM_PORT_CONFIG_monitor, 0)?;
+  builder.add_bool(false)?;
+
+  builder.add_prop(SPA_PARAM_PORT_CONFIG_control, 0)?;
+  builder.add_bool(false)?;
+
+  builder.add_prop(SPA_PARAM_PORT_CONFIG_format, 0)?;
+  build_port_format_info(builder, config, id);
+
+  builder.pop(frame.assume_init_mut());
+
+  Ok(())
+}*/
+
+// replays the negotiated format exactly, for port_enum_params(Format)
+unsafe fn build_port_format_info<C: ConfigOps>(builder: &mut libspa::pod::builder::Builder, config: &C, id: u32) {
+
+  let mut position = [0u32; 64];
+  for (slot, &p) in position.iter_mut().zip(config.positions().iter()) {
+    *slot = p;
+  }
+
+  let raw = spa_audio_info_raw {
+    format:   config.format_raw(),
+    flags:    config.flags(),
+    rate:     config.rate(),
+    channels: config.channels(),
+    position
+  };
+
+  spa_format_audio_raw_build(builder.as_raw_ptr(), id, &raw);
+}
+
+unsafe extern "C" fn port_enum_params<D: Direction>(
+  object:    *mut c_void,
+  seq:       c_int,
+  direction: spa_direction,
+  port_id:   u32,
+  id:        u32,
+  start:     u32,
+  max:       u32,
+  filter:    *const spa_pod
+) -> c_int
+{
+  let state = object.cast::<State<D>>().as_mut()
+    .expect("object is not supposed to be null");
+
+  if direction != D::DIRECTION || (port_id as usize) >= MAX_PORTS {
+    return -libc::EINVAL;
+  }
+  if max == 0 {
+    return 0;
+  }
+
+  let mut buffer  = vec![];
+  let mut fbuffer = vec![]; // spa_pod_filter output; kept apart from the source pod (see spa::filter_pod)
+
+  let mut index = start;
+  let mut count = 0;
+
+  while count < max {
+
+    use libspa::pod::builder::Builder;
+
+    let mut builder = Builder::new(&mut buffer);
+
+    #[allow(non_upper_case_globals)]
+    match (id, index) {
+      (SPA_PARAM_EnumFormat, i) => {
+        if state.caps_fallback {
+          // the init-time probe hit a busy device and baked in fallback
+          // caps; retry now (main thread, transient open)
+          if let Some(caps) = crate::sound::probe_caps(&state.dsp_path.clone(), D::PLAYBACK) {
+            crate::info!(state.log, "re-probed caps: {:?}", caps);
+            state.caps = caps;
+            state.caps_fallback = false;
+          }
+        }
+        if !crate::utils::build_enum_format_info(&mut builder, &state.caps, i).unwrap() {
+          return 0;
+        }
+      },
+      (SPA_PARAM_Format, 0) => {
+        match state.ports[port_id as usize].config.as_ref() {
+          Some(cfg) => build_port_format_info(&mut builder, cfg, SPA_PARAM_Format),
+          None      => return -libc::ENOENT // no format negotiated yet
+        }
+      },
+      (SPA_PARAM_Format, _)     => return 0,
+      (SPA_PARAM_Buffers, 0) => {
+        match state.ports[port_id as usize].config.as_ref() {
+          Some(cfg) => crate::utils::build_buffers_info(&mut builder, cfg.stride()).unwrap(),
+          None      => return -libc::ENOENT // format not negotiated yet
+        }
+      },
+      (SPA_PARAM_Buffers, _)    => return 0,
+      (SPA_PARAM_Latency, 0 | 1) => {
+        let mut info = state.latency[index as usize];
+        // the process latency shifts what we report toward the peer (upstream
+        // for the sink, downstream for the source)
+        if info.direction == D::DIRECTION {
+          crate::utils::process_latency_info_add(&state.process_latency, &mut info);
+        }
+        crate::utils::build_latency_info(&mut builder, &info).unwrap()
+      },
+      (SPA_PARAM_Latency, _)     => return 0,
+      _ => return -libc::ENOENT // unknown param id (ALSA convention)
+    };
+
+    drop(builder); // its borrow of `buffer` must end before we take the source pointer
+
+    let mut result = spa_result_node_params { id, index, next: index + 1, param: std::ptr::null_mut() };
+
+    if let Some(param) = crate::spa::filter_pod(&mut fbuffer, buffer.as_mut_ptr() as *mut spa_pod, filter) {
+      result.param = param;
+      crate::spa::node_emit_result(&mut state.hooks, seq, 0, SPA_RESULT_TYPE_NODE_PARAMS, &result);
+      count += 1;
+    }
+
+    index += 1;
+  }
+
+  0
+}
+
+unsafe extern "C" fn port_set_param<D: Direction>(object: *mut c_void, direction: spa_direction, port_id: u32, id: u32, _flags: u32, param: *const spa_pod) -> c_int {
+
+  let state = object.cast::<State<D>>().as_mut()
+    .expect("object is not supposed to be null");
+
+  if direction != D::DIRECTION || (port_id as usize) >= MAX_PORTS {
+    return -libc::EINVAL;
+  }
+
+  #[allow(non_upper_case_globals)]
+  match id {
+    SPA_PARAM_Format => {
+      let mut res: c_int = 0;
+      if !param.is_null() {
+        use libspa::param::format::{MediaType, MediaSubtype};
+        use libspa::param::format_utils::parse_format;
+
+        match parse_format(libspa::pod::Pod::from_raw(param)) {
+          Ok((MediaType::Audio, MediaSubtype::Raw)) => {
+            let mut raw = MaybeUninit::<spa_audio_info_raw>::uninit();
+            if spa_format_audio_raw_parse(param, raw.as_mut_ptr()) < 0 {
+              crate::warn!(state.log, "spa_format_audio_raw_parse failed");
+              return -libc::EINVAL;
+            }
+
+            let raw = raw.assume_init();
+
+            //TODO: check whether format is supported by OSS
+
+            // reject bad values rather than assert (an FFI panic aborts pipewire);
+            // flags are stored but unused, OSS writes interleaved frames
+            if raw.rate == 0 || raw.channels == 0 || raw.channels > SPA_AUDIO_MAX_CHANNELS {
+              crate::warn!(state.log, "rejecting format: rate={} channels={}", raw.rate, raw.channels);
+              return -libc::EINVAL;
+            }
+
+            let config = match D::parse_config(state, &raw) {
+              Ok(config) => config,
+              Err(err)   => return err
+            };
+
+            res = install_device(state, port_id as usize, config);
+            if res == -libc::EINVAL || res == -libc::ENOTSUP {
+              // the device rejected caps-derived values: the snapshot may be
+              // stale (vchans/bitperfect toggled at runtime); re-probe and
+              // re-announce EnumFormat so the host renegotiates from reality
+              if let Some(caps) = crate::sound::probe_caps(&state.dsp_path.clone(), D::PLAYBACK) {
+                crate::info!(state.log, "re-probed caps after rejection: {:?}", caps);
+                state.caps = caps;
+                state.caps_fallback = false;
+                state.port_info.bump_param(SPA_PARAM_EnumFormat);
+              }
+            }
+          },
+          Ok((t, st)) => {
+            crate::warn!(state.log, "unknown media type combination: {:?}, {:?}", t, st);
+            return -libc::ENOENT;
+          },
+          Err(err) => {
+            crate::warn!(state.log, "parse_format failed: {}", err);
+            return -libc::EINVAL
+          }
+        };
+      } else {
+        // releasing the format: close the device and drop the buffers (the
+        // Suspend path may have closed the dsp already, hence the guard); all
+        // three are read by process(), so do it from the data loop
+        let port_idx = port_id as usize;
+        let state_ptr: *mut State<D> = state;
+        if !crate::utils::block_on_loop(&(*state_ptr).data_loop, state_ptr, move |state| {
+          let port = &mut state.ports[port_idx];
+          if !port.dsp.is_closed() {
+            port.dsp.close();
+          }
+          port.buffers.clear();
+          port.config = None;
+        }) {
+          return -libc::EIO; // the loop still holds the buffers; freeing them would dangle
+        }
+      }
+
+      // update the port rate and flip Format/Buffers flags to reflect whether a
+      // format is negotiated, then re-emit so the host re-reads them (PipeWire
+      // ALSA sink/source pattern)
+      let _ = state.port_info.replace_change_mask(0);
+      if let Some(cfg) = state.ports[port_id as usize].config.as_ref() {
+        state.port_info.set_rate(spa_fraction { num: 1, denom: cfg.rate() });
+        state.port_info.set_param_flags(SPA_PARAM_Format,  SPA_PARAM_INFO_READWRITE);
+        state.port_info.set_param_flags(SPA_PARAM_Buffers, SPA_PARAM_INFO_READ);
+      } else {
+        state.port_info.set_param_flags(SPA_PARAM_Format,  SPA_PARAM_INFO_WRITE);
+        state.port_info.set_param_flags(SPA_PARAM_Buffers, 0);
+      }
+      // emit even on failure: the flags derive from the (now cleared) config
+      emit_port_info(state);
+
+      res
+    },
+    SPA_PARAM_Latency => {
+      // the host writes the reverse-direction latency (downstream for the
+      // sink, upstream for the source); store it and re-emit so it propagates
+      // through the graph
+      let other = direction ^ 1;
+      let info = if param.is_null() {
+        crate::utils::latency_info_default(other)
+      } else {
+        match crate::utils::parse_latency_info(param) {
+          Some(info) if info.direction == other => info,
+          _ => return -libc::EINVAL
+        }
+      };
+      state.latency[info.direction as usize] = info;
+
+      let _ = state.port_info.replace_change_mask(0);
+      state.port_info.bump_param(SPA_PARAM_Latency);
+      emit_port_info(state);
+
+      0
+    },
+    SPA_PARAM_Tag     => 0,
+    id => {
+      crate::warn!(state.log, "port_set_param: unknown param {}", id);
+      -libc::ENOENT
+    }
+  }
+}
+
+// Open and configure on the calling (main) thread - device opens can sleep for
+// tens of ms and must stay off the shared data loop - then swap only the
+// pointers there and close the old device back here. Exclusive devices
+// (bitperfect, vchans off) allow a single open per direction, so EBUSY retires
+// the old device first and retries, accepting a brief gap (the v0.9.1 order).
+// On failure the port is left cleared.
+pub(crate) unsafe fn install_device<D: Direction>(state: &mut State<D>, port_idx: usize, config: D::Config) -> c_int {
+
+  let mut new_dsp = D::Device::new(&state.dsp_path);
+  let mut res = D::try_open_configure(&mut new_dsp, &config, &state.log);
+
+  if res == -libc::EBUSY {
+    let mut retired = None;
+    {
+      let retired_ref = &mut retired;
+      let closed = D::Device::new(&state.dsp_path);
+      let state_ptr: *mut State<D> = state;
+      if !crate::utils::block_on_loop(&(*state_ptr).data_loop, state_ptr, move |state| {
+        *retired_ref = Some(std::mem::replace(&mut state.ports[port_idx].dsp, closed));
+        // a cycle landing in this window must skip, not queue a rebuild of
+        // the device we are about to install (cleared by the final swap)
+        state.ports[port_idx].resetup_pending = true;
+      }) {
+        return -libc::EIO;
+      }
+    }
+    drop(retired); // closes the old fd here, off the RT path
+    res = D::try_open_configure(&mut new_dsp, &config, &state.log);
+  }
+
+  let ok = res == 0;
+  let mut old_dsp = None;
+  let swapped = {
+    let old_ref = &mut old_dsp;
+    let state_ptr: *mut State<D> = state;
+    crate::utils::block_on_loop(&(*state_ptr).data_loop, state_ptr, move |state| {
+      let port = &mut state.ports[port_idx];
+      // new_dsp is a closed writer/reader when negotiation failed above
+      *old_ref = Some(std::mem::replace(&mut port.dsp, new_dsp));
+      port.config = if ok { Some(config) } else { None };
+      port.resetup_pending = false;
+      port.was_matching    = false; // force a relock when matching resumes
+      D::on_device_swapped(state, port_idx);
+    })
+  };
+  drop(old_dsp); // ditto
+
+  if !swapped {
+    return -libc::EIO; // the swap never ran; the port keeps its old state
+  }
+  res
+}
+
+// A device rebuild the HOST didn't initiate just failed and cleared the
+// config: flip the param flags and re-emit port info so the session manager
+// renegotiates, instead of stranding a silently dead node (port_set_param
+// does the same for host-initiated failures).
+unsafe fn emit_format_lost<D: Direction>(state: &mut State<D>) {
+  let _ = state.port_info.replace_change_mask(0);
+  state.port_info.set_param_flags(SPA_PARAM_Format,  SPA_PARAM_INFO_WRITE);
+  state.port_info.set_param_flags(SPA_PARAM_Buffers, 0);
+  // the EnumFormat serial flip is what audioadapter actually reacts to: only
+  // an EnumFormat flags change sets its recheck_format (audioadapter.c
+  // follower_port_info), so without it the adapter keeps have_format=true
+  // and never re-issues set_param(Format)
+  state.port_info.bump_param(SPA_PARAM_EnumFormat);
+  emit_port_info(state);
+}
+
+// runs on the main thread (queued from the data loop via invoke_on_loop)
+pub(crate) unsafe fn resetup_task<D: Direction>(state: &mut State<D>, port_idx: usize) {
+  if state.clearing {
+    return; // teardown is flushing us out; don't touch the device
+  }
+  // consume-or-bail: an intervening install_device (renegotiation) already
+  // cleared the flag, making this task stale
+  let mut still_pending = false;
+  {
+    let pending_ref = &mut still_pending;
+    let state_ptr: *mut State<D> = state;
+    crate::utils::block_on_loop(&(*state_ptr).data_loop, state_ptr, move |state| {
+      *pending_ref = state.ports[port_idx].resetup_pending;
+    });
+  }
+  if !still_pending {
+    return;
+  }
+  // config only mutates from main-thread calls, which are serialized with us
+  match state.ports[port_idx].config.clone() {
+    Some(config) => {
+      if install_device(state, port_idx, config) != 0 {
+        emit_format_lost(state);
+      }
+    },
+    None => {
+      let state_ptr: *mut State<D> = state;
+      crate::utils::block_on_loop(&(*state_ptr).data_loop, state_ptr, move |state| {
+        state.ports[port_idx].resetup_pending = false;
+      });
+    }
+  }
+}
+
+// PipeWire doesn't contract that the DataLoop in spa_support (where our timer
+// lives and every marshaled mutation runs) is the loop process() is driven
+// from; under multi-data-loop configs (context.num-data-loops > 1) the two
+// are independent acquires and can diverge, breaking every serialization
+// invariant here. Detect it and refuse to process rather than corrupt; the
+// remedy is pinning node.loop.name for this node.
+unsafe fn check_loop_identity<D: Direction>(state: &mut State<D>) -> bool {
+  use std::sync::atomic::Ordering;
+  let tid = libc::pthread_self() as usize;
+  let seen = match state.loop_thread.compare_exchange(0, tid, Ordering::Relaxed, Ordering::Relaxed) {
+    Ok(_) => tid,
+    Err(seen) => seen
+  };
+  if seen == tid {
+    return true;
+  }
+  if seen != usize::MAX && state.loop_thread.swap(usize::MAX, Ordering::Relaxed) != usize::MAX {
+    crate::warn!(state.log, "process() and our data loop run on different threads \
+      (multi-data-loop config?); pin node.loop.name for this node. Disabling processing.");
+  }
+  false
+}
+
+unsafe extern "C" fn process<D: Direction>(object: *mut c_void) -> c_int {
+
+  let state = object.cast::<State<D>>().as_mut()
+    .expect("object is not supposed to be null");
+
+  // a cycle that was already signaled when we paused can still land here; drop
+  // it instead of assert!()ing, which aborts the daemon across extern "C"
+  if !state.started || state.position.is_null() {
+    return SPA_STATUS_OK as i32;
+  }
+
+  if !check_loop_identity(state) {
+    return SPA_STATUS_OK as i32;
+  }
+
+  D::process_ports(state)
+}
+
+unsafe extern "C" fn port_use_buffers<D: Direction>(object: *mut c_void, direction: spa_direction, port_id: u32, flags: u32, buffers: *mut *mut spa_buffer, n_buffers: u32) -> c_int {
+
+  let state = object.cast::<State<D>>().as_mut()
+    .expect("object is not supposed to be null");
+
+  if direction != D::DIRECTION || (port_id as usize) >= MAX_PORTS {
+    return -libc::EINVAL;
+  }
+  let _ = flags;
+
+  let new_buffers = if !buffers.is_null() && n_buffers > 0 {
+    std::slice::from_raw_parts(buffers, n_buffers as usize).to_vec()
+  } else {
+    vec![]
+  };
+
+  // process() walks this vec on the data loop; swap it there
+  let port_idx = port_id as usize;
+  let state_ptr: *mut State<D> = state;
+  if !crate::utils::block_on_loop(&(*state_ptr).data_loop, state_ptr, move |state| {
+    state.ports[port_idx].buffers = new_buffers;
+    D::on_buffers_swapped(state);
+  }) {
+    return -libc::EIO; // keeping stale host buffer pointers would be a UAF
+  }
+
+  0
+}
+
+unsafe extern "C" fn port_set_io<D: Direction>(object: *mut c_void, direction: spa_direction, port_id: u32, id: u32, data: *mut c_void, _size: usize) -> c_int {
+
+  if direction != D::DIRECTION || (port_id as usize) >= MAX_PORTS {
+    return -libc::EINVAL;
+  }
+
+  let state = object.cast::<State<D>>().as_mut()
+    .expect("object is not supposed to be null");
+
+  #[allow(non_upper_case_globals)]
+  match id {
+    SPA_IO_Buffers | SPA_IO_RateMatch => (),
+    _ => return -libc::ENOENT
+  }
+
+  // these pointers are dereferenced by process() on the data loop
+  let state: *mut State<D> = state;
+  let applied = crate::utils::block_on_loop(&(*state).data_loop, state, |state| {
+    #[allow(non_upper_case_globals)]
+    match id {
+      SPA_IO_Buffers   => state.ports[port_id as usize].io = data.cast(), // null clears
+      // you'd think RateMatch would be a node parameter instead; ACTIVE is
+      // managed per cycle in process(), only set while matching
+      SPA_IO_RateMatch => state.rate_match = data as *mut spa_io_rate_match,
+      _ => ()
+    }
+  });
+  if !applied {
+    return -libc::EIO;
+  }
+
+  0
+}
+
+unsafe extern "C" fn port_reuse_buffer(_object: *mut c_void, _port_id: u32, _buffer_id: u32) -> c_int {
+  -libc::ENOTSUP // buffers are recycled through io.buffer_id
+}
+
+unsafe extern "C" fn get_interface<D: Direction>(handle: *mut spa_handle, type_: *const c_char, interface: *mut *mut c_void) -> c_int {
+  let state = handle.cast::<State<D>>().as_mut()
+    .expect("handle is not supposed to be null");
+  assert!(!interface.is_null());
+  if spa_streq(type_, SPA_TYPE_INTERFACE_Node.as_ptr().cast()) {
+    *interface = &mut state.node as *mut _ as *mut c_void;
+  } else {
+    return -libc::ENOENT;
+  }
+  0
+}
+
+unsafe extern "C" fn clear<D: Direction>(handle: *mut spa_handle) -> c_int {
+  let state: *mut State<D> = handle.cast();
+  assert!(!state.is_null());
+
+  // A queued resetup_task holds this state pointer; a blocking self-invoke
+  // on the main loop flushes all pending queue items (in submission order)
+  // before we free anything, and `clearing` makes the flushed tasks no-op.
+  (*state).clearing = true;
+  if let Some(main_loop) = (*state).main_loop.as_ref() {
+    crate::utils::block_on_loop(main_loop, state, |_| {});
+  }
+
+  // the data loop still holds the timer source; detach it there before the
+  // state is freed, then close the timerfd
+  if !crate::utils::block_on_loop(&(*state).data_loop, state, |state| {
+    state.data_loop.remove_source(&mut state.timer_source);
+  }) {
+    // freeing the state now would leave the loop a dangling source; a clean
+    // abort beats a use-after-free on the next timer tick
+    eprintln!("freebsd-oss: can't detach the timer source; aborting");
+    std::process::abort();
+  }
+  (*state).data_system.close((*state).timer_source.fd);
+
+  std::ptr::drop_in_place(state);
+  0
+}
+
+pub(crate) unsafe extern "C" fn get_size<D: Direction>(_factory: *const spa_handle_factory, _params: *const spa_dict) -> usize {
+  std::mem::size_of::<State<D>>()
+}
+
+pub(crate) unsafe extern "C" fn init<D: Direction>(
+  _factory:  *const spa_handle_factory,
+  handle:    *mut   spa_handle,
+  info:      *const spa_dict,
+  support:   *const spa_support,
+  n_support: u32
+) -> c_int
+{
+  let log = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Log.as_ptr().cast()) as *mut spa_log;
+  let log = crate::spa::Log::wrap(log);
+
+  let data_loop   = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_DataLoop  .as_ptr().cast()) as *mut spa_loop;
+  let data_system = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_DataSystem.as_ptr().cast()) as *mut spa_system;
+  let main_loop   = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Loop      .as_ptr().cast()) as *mut spa_loop;
+
+  if data_loop.is_null() || data_system.is_null() {
+    return -libc::EINVAL;
+  }
+
+  let data_loop   = crate::spa::Loop  ::wrap(data_loop);
+  let data_system = crate::spa::System::wrap(data_system);
+
+  let timer_fd = data_system.timerfd_create(libc::CLOCK_MONOTONIC, (SPA_FD_CLOEXEC | SPA_FD_NONBLOCK) as i32);
+  if timer_fd < 0 {
+    return timer_fd; // fd exhaustion fails node creation, not the daemon
+  }
+
+  let mut dsp_path = None;
+  let mut ext      = D::Ext::default();
+
+  if let Some(info) = info.as_ref() {
+    #[cfg(debug_assertions)]
+    crate::spa::dump_spa_dict(info);
+
+    //TODO: would be better with an iterator
+    crate::spa::for_each_dict_item(info, |key, value| {
+      if key == crate::keys::OSS_DSP_PATH {
+        dsp_path = Some(value.to_string());
+      } else {
+        D::info_item(&mut ext, key, value);
+      }
+    });
+  }
+  D::ext_ready(&mut ext);
+
+  let Some(dsp_path) = dsp_path else {
+    data_system.close(timer_fd);
+    crate::error!(log, "{} missing from the node properties", crate::keys::OSS_DSP_PATH);
+    return -libc::EINVAL;
+  };
+
+  let mut caps_fallback = false;
+  let caps = crate::sound::probe_caps(&dsp_path, D::PLAYBACK).unwrap_or_else(|| {
+    crate::warn!(log, "{}: can't probe device caps; using fallback", dsp_path);
+    caps_fallback = true;
+    crate::sound::DspCaps::fallback()
+  });
+  crate::debug!(log, "{}: {:?}", dsp_path, caps);
+
+  let state = handle.cast::<State<D>>().as_mut()
+    .expect("handle is not supposed to be null");
+
+  let node_methods: &'static spa_node_methods = &D::NODE_METHODS;
+
+  std::ptr::write(state, State {
+
+    handle: spa_handle {
+      version:       SPA_VERSION_HANDLE,
+      get_interface: Some(get_interface::<D>),
+      clear:         Some(clear::<D>)
+    },
+
+    node: spa_node {
+      iface: spa_interface {
+        type_:   SPA_TYPE_INTERFACE_Node.as_ptr().cast(),
+        version: SPA_VERSION_NODE,
+        cb: spa_callbacks {
+          funcs: node_methods as *const _ as *const c_void,
+          data:  state as *mut _ as *mut c_void
+        }
+      }
+    },
+
+    node_info: crate::spa::NodeInfo::new(),
+    port_info: crate::spa::PortInfo::new(),
+
+    data_loop,
+    data_system,
+    log,
+
+    clock:      std::ptr::null_mut(),
+    position:   std::ptr::null_mut(),
+    rate_match: std::ptr::null_mut(),
+    clock_name: std::ffi::CString::new(format!("freebsd-oss.{}", dsp_path.trim_start_matches("/dev/"))).unwrap_or_default(),
+    main_loop:  if main_loop.is_null() { None } else { Some(crate::spa::Loop::wrap(main_loop)) },
+    dsp_path:   dsp_path.clone(),
+
+    timer_source: spa_source {
+      loop_: std::ptr::null_mut(),
+      func:  Some(on_timeout::<D>),
+      data:  state as *mut _ as *mut c_void,
+      fd:    timer_fd,
+      mask:  SPA_IO_IN,
+      rmask: 0,
+      priv_: std::ptr::null_mut()
+    },
+
+    next_time: 0,
+
+    hooks: spa_hook_list {
+      list: spa_list {
+        next: std::ptr::null_mut(),
+        prev: std::ptr::null_mut()
+      }
+    },
+
+    callbacks: spa_callbacks {
+      funcs: std::ptr::null(),
+      data:  std::ptr::null_mut()
+    },
+
+    ports: [
+      Port {
+        config:          None,
+        buffers:         vec![],
+        io:              std::ptr::null_mut(),
+        dsp:             D::Device::new(&dsp_path),
+        dll:             std::default::Default::default(),
+        setup_period:    0,
+        bw_adapt:        std::default::Default::default(),
+        setup_blocksize: 0,
+        resetup_pending: false,
+        was_matching:    false,
+        warn_limit:      crate::utils::RateLimit::new(),
+        ext:             std::default::Default::default()
+      };
+      MAX_PORTS
+    ],
+
+    caps,
+    caps_fallback,
+    loop_thread: std::sync::atomic::AtomicUsize::new(0),
+
+    latency: [
+      crate::utils::latency_info_default(SPA_DIRECTION_INPUT),
+      crate::utils::latency_info_default(SPA_DIRECTION_OUTPUT)
+    ],
+
+    process_latency: crate::utils::process_latency_default(),
+
+    started:   false,
+    clearing:  false,
+    following: false,
+
+    ext
+  });
+
+  state.node_info.fix_pointers();
+
+  if D::DIRECTION == SPA_DIRECTION_INPUT {
+    state.node_info.set_max_input_ports(1);
+  } else {
+    state.node_info.set_max_output_ports(1);
+  }
+  state.node_info.set_flags(SPA_NODE_FLAG_RT as u64); // ?
+
+  state.node_info.add_prop(SPA_KEY_MEDIA_CLASS.as_ptr(), D::MEDIA_CLASS);
+  state.node_info.add_prop(SPA_KEY_NODE_DRIVER.as_ptr(), "true");
+
+  //state.node_info.add_param(SPA_PARAM_IO,             SPA_PARAM_INFO_READ);
+  //state.node_info.add_param(SPA_PARAM_EnumFormat,     SPA_PARAM_INFO_READ);
+  //state.node_info.add_param(SPA_PARAM_EnumPortConfig, SPA_PARAM_INFO_READ);
+  //state.node_info.add_param(SPA_PARAM_PortConfig,     SPA_PARAM_INFO_READ);
+  state.node_info.add_param(SPA_PARAM_PropInfo,       SPA_PARAM_INFO_READ);
+  state.node_info.add_param(SPA_PARAM_Props,          SPA_PARAM_INFO_READWRITE);
+  state.node_info.add_param(SPA_PARAM_ProcessLatency, SPA_PARAM_INFO_READWRITE);
+
+  state.port_info.fix_pointers();
+
+  state.port_info.set_flags((SPA_PORT_FLAG_PHYSICAL | SPA_PORT_FLAG_TERMINAL) as u64);
+  state.port_info.set_rate(spa_fraction { num: 1, denom: 48000 }); // ?
+
+  // advertise the format as writable so the host (re)negotiates it; Buffers is
+  // unreadable until a format is set (it needs the stride). Flags flip in
+  // port_set_param.
+  state.port_info.add_param(SPA_PARAM_EnumFormat, SPA_PARAM_INFO_READ);
+  state.port_info.add_param(SPA_PARAM_Format,     SPA_PARAM_INFO_WRITE);
+  state.port_info.add_param(SPA_PARAM_Buffers,    0);
+  state.port_info.add_param(SPA_PARAM_Latency,    SPA_PARAM_INFO_READWRITE);
+
+  //state.port_info.add_param(SPA_PARAM_PortConfig, SPA_PARAM_INFO_READWRITE);
+  //state.port_info.add_param(SPA_PARAM_IO,         SPA_PARAM_INFO_READ);
+  //state.port_info.add_param(SPA_PARAM_Buffers,    SPA_PARAM_INFO_WRITE); // ?
+
+  spa_hook_list_init(&mut state.hooks);
+
+  let err = state.data_loop.add_source(&mut state.timer_source);
+  if err < 0 {
+    state.data_system.close(state.timer_source.fd);
+    // the host won't call clear() after a failed init; free what we built
+    std::ptr::drop_in_place(state);
+    return err;
+  }
+
+  0
+}
+
+const INTERFACE_INFO: [spa_interface_info; 1] = [
+  spa_interface_info {
+    type_: SPA_TYPE_INTERFACE_Node.as_ptr().cast()
+  }
+];
+
+pub(crate) unsafe extern "C" fn enum_interface_info(_factory: *const spa_handle_factory, info: *mut *const spa_interface_info, index: *mut u32) -> c_int {
+  assert!(!info .is_null());
+  assert!(!index.is_null());
+  match *index {
+    0 => { *info = &INTERFACE_INFO[0]; *index += 1; 1 }
+    _ => 0
+  }
+}
