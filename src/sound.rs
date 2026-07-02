@@ -13,6 +13,7 @@ const SNDCTL_DSP_SPEED:       c_ulong = nix::request_code_readwrite!(b'P',  2, s
 const SNDCTL_DSP_SETFMT:      c_ulong = nix::request_code_readwrite!(b'P',  5, std::mem::size_of::<c_int>());
 const SNDCTL_DSP_CHANNELS:    c_ulong = nix::request_code_readwrite!(b'P',  6, std::mem::size_of::<c_int>());
 const SNDCTL_DSP_SETFRAGMENT: c_ulong = nix::request_code_readwrite!(b'P', 10, std::mem::size_of::<c_int>());
+const SNDCTL_DSP_LOW_WATER:   c_ulong = nix::request_code_write!    (b'P', 34, std::mem::size_of::<c_int>());
 const SNDCTL_DSP_GETFMTS:     c_ulong = nix::request_code_read!     (b'P', 11, std::mem::size_of::<c_int>());
 const SNDCTL_DSP_GETOSPACE:   c_ulong = nix::request_code_read!     (b'P', 12, std::mem::size_of::<audio_buf_info>());
 const SNDCTL_DSP_GETISPACE:   c_ulong = nix::request_code_read!     (b'P', 13, std::mem::size_of::<audio_buf_info>());
@@ -518,12 +519,19 @@ impl Dsp {
     set_value(self.fd, SNDCTL_DSP_SPEED,    rate,     feeder_rate_round())
   }
 
-  // Size the capture ring into small fragments: the kernel's poll trigger is
-  // one fragment (chn_polltrigger, lw = blksz), and the hw.snd.latency default
-  // can exceed a small graph period, which would make every poll come up empty.
+  // Size the capture ring into small fragments and make poll byte-accurate.
+  // Small fragments set the DMA delivery granularity (the servo's measurement
+  // quantization); the hw.snd.latency default can exceed a small graph
+  // period. The low-water mark then decouples the poll trigger from the
+  // GRANTED fragment size (chn_polltrigger fires at lw, which SETFRAGMENT
+  // resets to blksz - so the order here matters, and the mark survives a
+  // trigger suspend since chn_resetbuf doesn't touch it).
   pub fn set_small_fragments(&mut self) {
     assert_eq!(self.state, DspState::Setup);
     set_fragment(self.fd, 64, 10); // 64 x 1 KiB
+    let mut lw: c_int = 1;
+    // best-effort: without it, poll readiness is merely fragment-coarse
+    let _ = unsafe { libc::ioctl(self.fd, SNDCTL_DSP_LOW_WATER, &mut lw) };
   }
 
   // GETOSPACE requires a write channel, so the shared helper reads 0 on a
