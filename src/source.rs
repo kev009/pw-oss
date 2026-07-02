@@ -634,6 +634,20 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       -1
     };
 
+    // the dsp is running after ready_for_reading; report overruns to the host
+    // (pw-top's xrun counter); the length isn't known, so pass 0 delay
+    let overrun_count = port.dsp.overruns();
+    if overrun_count > 0 {
+      let now = crate::utils::now_ns(&state.data_system);
+      crate::warn!(state.log, "OSS reported {:3} overruns @ {}", overrun_count, now);
+      let node_callbacks = state.callbacks.funcs.cast::<spa_node_callbacks>().as_ref()
+        .expect("callbacks should be initialized");
+      assert!(node_callbacks.version >= SPA_VERSION_NODE_CALLBACKS);
+      if let Some(xrun_fun) = node_callbacks.xrun {
+        xrun_fun(state.callbacks.data, now / 1000, 0, std::ptr::null_mut());
+      }
+    }
+
     if nbytes != -1 {
       #[cfg(debug_assertions)]
       if state.log.log_level() >= SPA_LOG_LEVEL_TRACE {

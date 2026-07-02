@@ -857,10 +857,18 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
     } else {
       let underrun_count = port.dsp.underruns();
       if underrun_count > 0 {
-        //TODO: spa_node_call_xrun?
         crate::warn!(state.log, "{}: OSS reported {:3} underruns @ {}", port.dsp.path, underrun_count, state.cur_timestamp);
         if port.xrun_timestamp == 0 {
           port.xrun_timestamp = state.cur_timestamp;
+        }
+
+        // report it to the host (pw-top's xrun counter); the length isn't
+        // known at detection time, so pass 0 delay
+        let node_callbacks = state.callbacks.funcs.cast::<spa_node_callbacks>().as_ref()
+          .expect("callbacks should be initialized");
+        assert!(node_callbacks.version >= SPA_VERSION_NODE_CALLBACKS);
+        if let Some(xrun_fun) = node_callbacks.xrun {
+          xrun_fun(state.callbacks.data, state.cur_timestamp / 1000, 0, std::ptr::null_mut());
         }
       }
     }

@@ -219,6 +219,13 @@ impl Dsp {
       0
     }
   }
+
+  pub fn overruns(&self) -> u32 {
+    assert_eq!(self.state, DspState::Running);
+    let oruns = get_error(self.fd).rec_overruns;
+    assert!(oruns >= 0);
+    oruns as u32
+  }
 }
 
 pub struct DspWriter {
