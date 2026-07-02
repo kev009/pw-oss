@@ -514,6 +514,43 @@ pub fn device_period_bytes(target_duration: u64, device_rate: u32, graph_rate: u
   (target_duration * device_rate as u64 / graph_rate as u64) as u32 * stride
 }
 
+// Fire-and-forget: queue `f` to run once on the given loop (from any thread;
+// non-blocking, RT-safe on the caller side). The closure is boxed and freed
+// after it runs. Returns false when it could not even be queued.
+pub unsafe fn invoke_on_loop<T, F: FnOnce(&mut T)>(loop_: &crate::spa::Loop, target: *mut T, f: F) -> bool {
+
+  struct Ctx<T, F> {
+    target: *mut T,
+    f:      F
+  }
+
+  unsafe extern "C" fn trampoline<T, F: FnOnce(&mut T)>(
+    _loop:     *mut libspa::sys::spa_loop,
+    _async:    bool,
+    _seq:      u32,
+    _data:     *const std::os::raw::c_void,
+    _size:     usize,
+    user_data: *mut std::os::raw::c_void
+  ) -> std::os::raw::c_int
+  {
+    let ctx = Box::from_raw(user_data.cast::<Ctx<T, F>>());
+    let target = ctx.target;
+    let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      (ctx.f)(target.as_mut().expect("target is not supposed to be null"));
+    }));
+    if ok.is_err() { -libc::ECANCELED } else { 0 }
+  }
+
+  let ctx = Box::into_raw(Box::new(Ctx { target, f }));
+  let err = loop_.invoke(Some(trampoline::<T, F>), 0, std::ptr::null(), 0, false,
+    ctx as *mut std::os::raw::c_void);
+  if err < 0 {
+    drop(Box::from_raw(ctx));
+    return false;
+  }
+  true
+}
+
 // at most one message a second from a per-cycle warn site, with a count of
 // what went unsaid (ALSA uses spa_ratelimit for the same purpose)
 pub struct RateLimit {

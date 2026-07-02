@@ -18,6 +18,8 @@ struct State {
   position:       *mut spa_io_position,
   rate_match:     *mut spa_io_rate_match,
   clock_name:     std::ffi::CString, // stamped into spa_io_clock.name
+  main_loop:      Option<crate::spa::Loop>, // for deferring device rebuilds off the data loop
+  dsp_path:       String,
   timer_source:   spa_source,
   next_time:      u64,
   hooks:          spa_hook_list,
@@ -47,10 +49,11 @@ struct Port {
   primed:        bool,
   setup_period:  u32, // device bytes per graph cycle the servo was tuned for
   bw_fast_until: u64, // while nonzero, the DLL runs at BW_MAX for a fast lock
+  resetup_pending: bool, // a main-thread device rebuild is queued; skip cycles
   warn_limit:    crate::utils::RateLimit
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PortConfig {
   pub format:    libspa::param::audio::AudioFormat,
   pub rate:      u32,
@@ -58,6 +61,19 @@ pub struct PortConfig {
   pub positions: Vec<u32>, // the negotiated channel positions, replayed in the Format readback
   pub flags:     u32,
   pub stride:    u32
+}
+
+impl PortConfig {
+
+  fn oss_format(&self) -> u32 {
+    match self.format {
+      libspa::param::audio::AudioFormat::S32LE => crate::sound::AFMT_S32_LE,
+      libspa::param::audio::AudioFormat::S32BE => crate::sound::AFMT_S32_BE,
+      libspa::param::audio::AudioFormat::S16LE => crate::sound::AFMT_S16_LE,
+      libspa::param::audio::AudioFormat::S16BE => crate::sound::AFMT_S16_BE,
+      _ => unreachable!() // rejected at negotiation
+    }
+  }
 }
 
 unsafe extern "C" fn add_listener(object: *mut c_void, listener: *mut spa_hook, events: *const spa_node_events, data: *mut c_void) -> c_int {
@@ -343,7 +359,7 @@ unsafe extern "C" fn on_timeout(source: *mut spa_source) {
     let Some(cfg) = port.config.as_ref() else { continue };
     let stride      = cfg.stride.max(1);
     let device_rate = cfg.rate.max(1);
-    if !port.dsp.is_running() || !port.primed || port.setup_period == 0 {
+    if !port.dsp.is_running() || !port.primed || port.setup_period == 0 || port.resetup_pending {
       continue;
     }
 
@@ -737,41 +753,8 @@ unsafe extern "C" fn port_set_param(object: *mut c_void, direction: spa_directio
 
             crate::debug!(state.log, "reconfiguring with {:?}", config);
 
-            // the host renegotiates on a live node; swap the device and
-            // config on the data loop
-            let port_idx = port_id as usize;
-            let state_ptr: *mut State = state;
-            let res_ref = &mut res;
-            crate::utils::block_on_loop(&(*state_ptr).data_loop, state_ptr, move |state| {
-
-              let port = &mut state.ports[port_idx];
-
-              if !port.dsp.is_closed() {
-                port.dsp.close();
-              }
-
-              // a busy or vanished device must fail negotiation, not abort
-              if let Err(err) = port.dsp.open() {
-                crate::warn!(state.log, "dsp open: {}", err);
-                port.config = None;
-                *res_ref = -(err as c_int);
-                return;
-              }
-
-              // ditto for a device that won't take the format exactly
-              if let Err(err) = port.dsp.configure(oss_format, config.channels, config.rate) {
-                crate::warn!(state.log, "device rejected {:?}: {}", config, err);
-                port.dsp.close();
-                port.config = None;
-                *res_ref = -(err as c_int);
-                return;
-              }
-
-              port.config = Some(config);
-              port.dll.init(); // fresh device, fresh servo; set_bw happens on the first cycle
-              port.primed = false;
-              state.active_buffers = 0;
-            });
+            let _ = oss_format;
+            res = install_device(state, port_id as usize, config);
           },
           Ok((t, st)) => {
             crate::warn!(state.log, "unknown media type combination: {:?}, {:?}", t, st);
@@ -842,6 +825,85 @@ unsafe extern "C" fn port_set_param(object: *mut c_void, direction: spa_directio
   }
 }
 
+// used from the main thread only; returns 0 or -errno with the device closed
+fn try_open_configure(dsp: &mut crate::sound::Dsp, config: &PortConfig, log: &crate::spa::Log) -> c_int {
+  // a busy or vanished device must fail negotiation, not abort
+  if let Err(err) = dsp.open() {
+    crate::warn!(log, "dsp open: {}", err);
+    return -(err as c_int);
+  }
+  // ditto for a device that won't take the format exactly
+  if let Err(err) = dsp.configure(config.oss_format(), config.channels, config.rate) {
+    crate::warn!(log, "device rejected {:?}: {}", config, err);
+    dsp.close();
+    return -(err as c_int);
+  }
+  0
+}
+
+// see the sink's install_device: main-thread open/configure, loop-side swap,
+// EBUSY falls back to retiring the old device first (exclusive devices)
+unsafe fn install_device(state: &mut State, port_idx: usize, config: PortConfig) -> c_int {
+
+  let mut new_dsp = crate::sound::Dsp::new(&state.dsp_path);
+  let mut res = try_open_configure(&mut new_dsp, &config, &state.log);
+
+  if res == -libc::EBUSY {
+    let mut retired = None;
+    {
+      let retired_ref = &mut retired;
+      let closed = crate::sound::Dsp::new(&state.dsp_path);
+      let state_ptr: *mut State = state;
+      if !crate::utils::block_on_loop(&(*state_ptr).data_loop, state_ptr, move |state| {
+        *retired_ref = Some(std::mem::replace(&mut state.ports[port_idx].dsp, closed));
+      }) {
+        return -libc::EIO;
+      }
+    }
+    drop(retired); // closes the old fd here, off the RT path
+    res = try_open_configure(&mut new_dsp, &config, &state.log);
+  }
+
+  let ok = res == 0;
+  let mut old_dsp = None;
+  let swapped = {
+    let old_ref = &mut old_dsp;
+    let state_ptr: *mut State = state;
+    crate::utils::block_on_loop(&(*state_ptr).data_loop, state_ptr, move |state| {
+      let port = &mut state.ports[port_idx];
+      // new_dsp is a closed reader when negotiation failed above
+      *old_ref = Some(std::mem::replace(&mut port.dsp, new_dsp));
+      port.config = if ok { Some(config) } else { None };
+      port.dll.init(); // fresh device, fresh servo
+      port.primed          = false;
+      port.resetup_pending = false;
+      state.active_buffers = 0;
+    })
+  };
+  drop(old_dsp); // ditto
+
+  if !swapped {
+    return -libc::EIO; // the swap never ran; the port keeps its old state
+  }
+  res
+}
+
+// runs on the main thread (queued from the data loop via invoke_on_loop)
+unsafe fn resetup_task(state: &mut State, port_idx: usize) {
+  // config only mutates from main-thread calls, which are serialized with us
+  match state.ports[port_idx].config.clone() {
+    Some(config) => {
+      let _ = install_device(state, port_idx, config);
+    },
+    None => {
+      let state_ptr: *mut State = state;
+      crate::utils::block_on_loop(&(*state_ptr).data_loop, state_ptr, move |state| {
+        state.ports[port_idx].resetup_pending = false;
+      });
+    }
+  }
+}
+
 unsafe extern "C" fn process(object: *mut c_void) -> c_int {
 
   let state = object.cast::<State>().as_mut()
@@ -852,10 +914,23 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
   }
 
   let mut result = SPA_STATUS_OK as i32;
+  let state_ptr: *mut State = state;
 
-  for port in &mut state.ports {
+  for (port_idx, port) in state.ports.iter_mut().enumerate() {
 
     if port.config.is_none() {
+      continue;
+    }
+
+    if port.resetup_pending {
+      continue; // the main thread is rebuilding the device
+    }
+
+    if port.dsp.is_closed() {
+      // Suspend closed the device but the host restarted without a fresh
+      // format; rebuild off-loop instead of tripping the dsp state asserts
+      port.resetup_pending = state.main_loop.as_ref().is_some_and(|main_loop|
+        crate::utils::invoke_on_loop(main_loop, state_ptr, move |state| resetup_task(state, port_idx)));
       continue;
     }
 
@@ -1176,6 +1251,7 @@ unsafe extern "C" fn init(
 
   let data_loop   = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_DataLoop  .as_ptr().cast()) as *mut spa_loop;
   let data_system = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_DataSystem.as_ptr().cast()) as *mut spa_system;
+  let main_loop   = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Loop      .as_ptr().cast()) as *mut spa_loop;
 
   if data_loop.is_null() || data_system.is_null() {
     return -libc::EINVAL;
@@ -1245,6 +1321,8 @@ unsafe extern "C" fn init(
     position:   std::ptr::null_mut(),
     rate_match: std::ptr::null_mut(),
     clock_name: std::ffi::CString::new(format!("freebsd-oss.{}", dsp_path.trim_start_matches("/dev/"))).unwrap_or_default(),
+    main_loop:  if main_loop.is_null() { None } else { Some(crate::spa::Loop::wrap(main_loop)) },
+    dsp_path:   dsp_path.clone(),
 
     timer_source: spa_source {
       loop_: std::ptr::null_mut(),
@@ -1270,7 +1348,7 @@ unsafe extern "C" fn init(
       data:  std::ptr::null_mut()
     },
 
-    ports: [Port { config: None, buffers: vec![], io: std::ptr::null_mut(), dsp: crate::sound::Dsp::new(&dsp_path), dll: std::default::Default::default(), primed: false, setup_period: 0, bw_fast_until: 0, warn_limit: crate::utils::RateLimit::new() }; MAX_PORTS],
+    ports: [Port { config: None, buffers: vec![], io: std::ptr::null_mut(), dsp: crate::sound::Dsp::new(&dsp_path), dll: std::default::Default::default(), primed: false, setup_period: 0, bw_fast_until: 0, resetup_pending: false, warn_limit: crate::utils::RateLimit::new() }; MAX_PORTS],
 
     caps,
 

@@ -344,6 +344,15 @@ impl Dsp {
   }
 }
 
+impl Drop for Dsp {
+
+  fn drop(&mut self) {
+    if !self.is_closed() {
+      self.close();
+    }
+  }
+}
+
 pub struct DspWriter {
   pub path: String,
   fd:      c_int,
