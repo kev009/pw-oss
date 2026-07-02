@@ -73,6 +73,16 @@ impl PortConfig {
   fn stride(&self) -> u32 {
     self.bytes_per_sample() * self.channels
   }
+
+  fn oss_format(&self) -> u32 {
+    match self.format {
+      libspa::param::audio::AudioFormat::S32LE => crate::sound::AFMT_S32_LE,
+      libspa::param::audio::AudioFormat::S32BE => crate::sound::AFMT_S32_BE,
+      libspa::param::audio::AudioFormat::S16LE => crate::sound::AFMT_S16_LE,
+      libspa::param::audio::AudioFormat::S16BE => crate::sound::AFMT_S16_BE,
+      _ => unreachable!() // rejected at negotiation
+    }
+  }
 }
 
 unsafe extern "C" fn add_listener(object: *mut c_void, listener: *mut spa_hook, events: *const spa_node_events, data: *mut c_void) -> c_int {
@@ -289,13 +299,37 @@ unsafe extern "C" fn set_param(object: *mut c_void, id: u32, _flags: u32, param:
                     for kv in values.chunks(2) {
                       match (&kv[0], &kv[1]) {
                         // pw-cli set-param <object-id> Props '{ "params": ["oss.delay", 8]}'
-                        (Value::String(s), Value::Int(x)) if s == "oss.delay" && *x >= 0 => {
+                        (Value::String(s), Value::Int(x)) if s == crate::keys::OSS_DELAY && *x >= 0 => {
                           // cap it: period/8 * oss_delay runs in the RT path and must not overflow
                           state.oss_delay = (*x as u32).min(1024);
                           // announce the new value so Props readback stays fresh
                           let _ = state.node_info.replace_change_mask(0);
                           state.node_info.bump_param(SPA_PARAM_Props);
                           emit_node_info(state);
+
+                          // apply immediately: reopen the device so the next
+                          // cycle re-sizes the buffer and re-primes with the
+                          // new target (a brief gap, like a format change)
+                          let state_ptr: *mut State = state;
+                          crate::utils::block_on_loop(&(*state_ptr).data_loop, state_ptr, |state| {
+                            for port in &mut state.ports {
+                              let Some(cfg) = port.config.as_ref() else { continue };
+                              if !port.dsp.is_running() {
+                                continue; // not streaming; picked up at start
+                              }
+                              port.dsp.close();
+                              if port.dsp.open().is_err() ||
+                                 port.dsp.configure(cfg.oss_format(), cfg.channels, cfg.rate).is_err() {
+                                crate::warn!(state.log, "{}: reopen for oss.delay failed", port.dsp.path);
+                                if !port.dsp.is_closed() {
+                                  port.dsp.close();
+                                }
+                                port.config = None;
+                                continue;
+                              }
+                              port.xrun_timestamp = 0;
+                            }
+                          });
                         },
                         _ => ()
                       }
@@ -1229,7 +1263,8 @@ unsafe extern "C" fn init(
   let timer_fd = data_system.timerfd_create(libc::CLOCK_MONOTONIC, (SPA_FD_CLOEXEC | SPA_FD_NONBLOCK) as i32);
   assert!(timer_fd >= 0);
 
-  let mut dsp_path = None;
+  let mut dsp_path  = None;
+  let mut oss_delay = 10u32; // default fill target: 10/8 of a period
 
   if let Some(info) = info.as_ref() {
     #[cfg(debug_assertions)]
@@ -1239,6 +1274,11 @@ unsafe extern "C" fn init(
     crate::spa::for_each_dict_item(info, |key, value| {
       if key == crate::keys::OSS_DSP_PATH {
         dsp_path = Some(value.to_string());
+      } else if key == crate::keys::OSS_DELAY {
+        // per-device default, e.g. from a wireplumber node rule
+        if let Ok(v) = value.parse::<u32>() {
+          oss_delay = v.min(1024);
+        }
       }
     });
   }
@@ -1336,7 +1376,7 @@ unsafe extern "C" fn init(
     cur_timestamp: 0,
     old_timestamp: 0,
 
-    oss_delay: 10 // eh, whatever
+    oss_delay
   });
 
   state.node_info.fix_pointers();

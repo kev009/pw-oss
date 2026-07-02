@@ -1,11 +1,16 @@
 log = Log.open_topic("s-monitors")
 
+rules = Conf.get_section_as_json("monitor.oss.rules", Json.Array {})
+
 function createNode(parent, id, obj_type, factory, properties)
   -- supposedly mandatory props
   properties["device.id"]    = parent["bound-id"]
   properties["factory.name"] = factory
   -- monitors/alsa.lua does this, so...
   properties["node.pause-on-idle"] = false
+  -- apply properties from monitor.oss.rules in the JSON .conf files
+  -- (e.g. matching node.name to set oss.delay per device)
+  properties = JsonUtils.match_rules_update_properties(rules, properties)
 
   local node = Node("adapter", properties)
   node:activate(Feature.Proxy.BOUND | Feature.PipewireObject.PARAM_FORMAT | Feature.PipewireObject.PARAM_PORT_CONFIG)
