@@ -77,10 +77,14 @@ pub unsafe fn node_emit_result(hooks: &mut spa_hook_list, seq: c_int, res: c_int
 }
 
 pub unsafe fn for_each_dict_item(dict: &spa_dict, mut apply: impl FnMut(&str, &str)) {
+  if dict.n_items == 0 || dict.items.is_null() {
+    return;
+  }
   for item in std::slice::from_raw_parts(dict.items, dict.n_items as usize) {
-    let key   = CStr::from_ptr(item.key)  .to_str().unwrap();
-    let value = CStr::from_ptr(item.value).to_str().unwrap();
-    apply(key, value);
+    // host-supplied strings; don't abort on stray bytes
+    let key   = CStr::from_ptr(item.key)  .to_string_lossy();
+    let value = CStr::from_ptr(item.value).to_string_lossy();
+    apply(&key, &value);
   }
 }
 
@@ -542,9 +546,10 @@ impl Log {
   }
 
   pub fn log(&self, level: spa_log_level, file: &str, line: c_int, func: &str, msg: &str) {
-    let file = CString::new(file).unwrap();
-    let func = CString::new(func).unwrap();
-    let msg  = CString::new(msg) .unwrap();
+    let file = CString::new(file).unwrap(); // ours, no interior NULs
+    let func = CString::new(func).unwrap(); // ditto
+    // the message can carry host-derived strings; don't abort on an interior NUL
+    let msg  = CString::new(msg).unwrap_or_else(|_| c"<message contained NUL>".to_owned());
     unsafe {
       if let Some(logt) = self.methods.logt {
         logt(self.logger.iface.cb.data, level, std::ptr::addr_of!(LOG_TOPIC),

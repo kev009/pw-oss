@@ -145,7 +145,14 @@ unsafe extern "C" fn on_devd_event(source: *mut spa_source) {
       let driver = groups.get(2).unwrap();
 
       if change.as_str() == "+" {
-        state.pcm_indexes = crate::sound::group_pcm_devices_by_parent(&crate::sound::read_sndstat().unwrap());
+        let indexes = match crate::sound::read_sndstat() {
+          Ok(indexes) => indexes,
+          Err(err)    => {
+            crate::warn!(state.log, "can't re-read sndstat: {}", err);
+            return;
+          }
+        };
+        state.pcm_indexes = crate::sound::group_pcm_devices_by_parent(&indexes);
         if let Some(indexes) = state.pcm_indexes.get(driver.as_str()) {
           crate::info!(state.log, "registering {} ({:?})", driver.as_str(), indexes);
           crate::spa::for_each_hook(&mut state.hooks, |entry| {

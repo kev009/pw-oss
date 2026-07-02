@@ -139,16 +139,17 @@ fn set_value(fd: c_int, req: c_ulong, value: u32) -> Result<(), Errno> {
 fn ospace_in_bytes(fd: c_int) -> c_int {
   let mut info = std::mem::MaybeUninit::<audio_buf_info>::uninit();
   unsafe {
-    let err = libc::ioctl(fd, SNDCTL_DSP_GETOSPACE, info.as_mut_ptr());
-    assert_ne!(err, -1);
+    if libc::ioctl(fd, SNDCTL_DSP_GETOSPACE, info.as_mut_ptr()) == -1 {
+      return 0; // e.g. the device was unplugged mid-stream
+    }
     info.assume_init().bytes
   }
 }
 
 fn set_fragment(fd: c_int, n_frags: u16, frag_size_selector: u16) {
   let mut s = ((n_frags as u32) << 16) | frag_size_selector as u32;
-  let err = unsafe { libc::ioctl(fd, SNDCTL_DSP_SETFRAGMENT, &mut s) };
-  assert_ne!(err, -1);
+  // best-effort: the caller reads the real grant back via GETOSPACE
+  let _ = unsafe { libc::ioctl(fd, SNDCTL_DSP_SETFRAGMENT, &mut s) };
   // FreeBSD can grant a smaller layout than requested. The caller reads the real
   // size from GETOSPACE, so don't assert the request was honored.
 }
@@ -162,8 +163,9 @@ fn set_fragment(fd: c_int, n_frags: u16, frag_size_selector: u16) {
 
 fn odelay(fd: c_int) -> c_int {
   let mut delay: c_int = -1;
-  let err = unsafe { libc::ioctl(fd, SNDCTL_DSP_GETODELAY, &mut delay) };
-  assert_ne!(err, -1);
+  if unsafe { libc::ioctl(fd, SNDCTL_DSP_GETODELAY, &mut delay) } == -1 {
+    return 0; // e.g. the device was unplugged mid-stream
+  }
   delay
 }
 
@@ -177,10 +179,11 @@ fn blocksize(fd: c_int) -> c_int {
 }
 
 fn get_error(fd: c_int) -> audio_errinfo {
-  let mut info = std::mem::MaybeUninit::<audio_errinfo>::uninit();
+  let mut info = std::mem::MaybeUninit::<audio_errinfo>::zeroed();
   unsafe {
-    let err = libc::ioctl(fd, SNDCTL_DSP_GETERROR, info.as_mut_ptr());
-    assert_ne!(err, -1);
+    if libc::ioctl(fd, SNDCTL_DSP_GETERROR, info.as_mut_ptr()) == -1 {
+      return std::mem::zeroed(); // e.g. the device was unplugged mid-stream
+    }
     info.assume_init()
   }
 }
@@ -273,9 +276,7 @@ impl Dsp {
 
   pub fn overruns(&self) -> u32 {
     assert_eq!(self.state, DspState::Running);
-    let oruns = get_error(self.fd).rec_overruns;
-    assert!(oruns >= 0);
-    oruns as u32
+    get_error(self.fd).rec_overruns.max(0) as u32
   }
 }
 
@@ -397,9 +398,7 @@ impl DspWriter {
 
   pub fn odelay(&self) -> u32 {
     assert_eq!(self.state, DspState::Running);
-    let odelay = odelay(self.fd);
-    assert!(odelay >= 0);
-    odelay as u32
+    odelay(self.fd).max(0) as u32
   }
 
   /// The fragment size the driver actually granted (may differ from what
@@ -410,9 +409,7 @@ impl DspWriter {
 
   pub fn underruns(&self) -> u32 {
     assert_eq!(self.state, DspState::Running);
-    let uruns = get_error(self.fd).play_underruns;
-    assert!(uruns >= 0);
-    uruns as u32
+    get_error(self.fd).play_underruns.max(0) as u32
   }
 
   /*pub fn pause(&self) {
@@ -468,7 +465,7 @@ pub struct PcmDevice {
 
 pub fn read_pcm_device_description(sysctl: &mut crate::utils::SysctlReader, index: u32) -> Option<String> {
 
-  let parent = sysctl.read_string(format!("dev.pcm.{}.%parent", index), 1024).unwrap();
+  let parent = sysctl.read_string(format!("dev.pcm.{}.%parent", index), 1024).ok()?; // the device can detach mid-enumeration
   if let Some(str) = parent.strip_prefix("uaudio") {
     if let Ok(idx) = str.parse::<u32>() {
       if let Ok(desc) = sysctl.read_string(format!("dev.uaudio.{}.%desc", idx), 1024) {

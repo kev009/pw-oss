@@ -29,7 +29,8 @@ struct State {
   following:     bool,
   cur_timestamp: u64,  // method invocation timestamp for `process`
   old_timestamp: u64,
-  oss_delay:     u32 // additional delay in 1/8ths of period
+  oss_delay:     u32, // additional delay in 1/8ths of period
+  oss_delay_default: u32 // init-time value, restored by a NULL Props reset
 }
 
 impl State {
@@ -222,7 +223,9 @@ unsafe extern "C" fn enum_params(object: *mut c_void, seq: c_int, id: u32, start
   let state = object.cast::<State>().as_mut()
     .expect("object is not supposed to be null");
 
-  assert_ne!(max, 0);
+  if max == 0 {
+    return 0;
+  }
 
   let mut buffer  = vec![];
   let mut fbuffer = vec![]; // spa_pod_filter output; kept apart from the source pod (see spa::filter_pod)
@@ -275,7 +278,12 @@ unsafe extern "C" fn set_param(object: *mut c_void, id: u32, _flags: u32, param:
   #[allow(non_upper_case_globals)]
   match id {
     SPA_PARAM_Props => {
-      assert!(!param.is_null());
+      if param.is_null() {
+        // a NULL pod resets the props to their defaults
+        state.oss_delay = state.oss_delay_default;
+        handle_process_latency(state, crate::utils::process_latency_default());
+        return 0;
+      }
       match PodDeserializer::deserialize_any_from(Pod::from_raw(param).as_bytes()) {
         Ok((_, Value::Object(Object { type_, properties, .. }))) if type_ == SPA_TYPE_OBJECT_Props => {
           for property in properties {
@@ -391,7 +399,9 @@ unsafe extern "C" fn on_timeout(source: *mut spa_source) {
 
   let nsec = state.next_time;
 
-  assert!(!state.position.is_null());
+  if state.position.is_null() || state.clock.is_null() {
+    return; // ios cleared while the timer was armed; skip the cycle
+  }
 
   #[cfg(debug_assertions)]
   {
@@ -405,8 +415,6 @@ unsafe extern "C" fn on_timeout(source: *mut spa_source) {
 
   state.next_time = nsec + duration * SPA_NSEC_PER_SEC as u64 / rate as u64;
 
-  assert!(!state.clock.is_null());
-
   (*state.clock).nsec      = nsec;
   (*state.clock).rate      = (*state.clock).target_rate; // ?
   (*state.clock).position += (*state.clock).duration;
@@ -415,9 +423,10 @@ unsafe extern "C" fn on_timeout(source: *mut spa_source) {
   // DLL correction are known; keep last cycle's values here (set at Start).
   (*state.clock).next_nsec = state.next_time;
 
-  let node_callbacks = state.callbacks.funcs.cast::<spa_node_callbacks>().as_ref()
-    .expect("callbacks should be initialized");
-  assert!(node_callbacks.version >= SPA_VERSION_NODE_CALLBACKS);
+  let Some(node_callbacks) = state.callbacks.funcs.cast::<spa_node_callbacks>().as_ref() else {
+    set_timeout(state, state.next_time);
+    return; // no callbacks (yet, or cleared); keep the clock ticking
+  };
   if let Some(ready_fun) = node_callbacks.ready {
     let err = ready_fun(state.callbacks.data, SPA_STATUS_NEED_DATA as i32);
     #[cfg(debug_assertions)]
@@ -468,8 +477,15 @@ unsafe extern "C" fn set_io(object: *mut c_void, id: u32, data: *mut c_void, siz
   let state: *mut State = object.cast();
   assert!(!state.is_null());
 
-  if id != SPA_IO_Clock && id != SPA_IO_Position {
-    return -libc::ENOENT;
+  #[allow(non_upper_case_globals)]
+  let min_size = match id {
+    SPA_IO_Clock    => std::mem::size_of::<spa_io_clock>(),
+    SPA_IO_Position => std::mem::size_of::<spa_io_position>(),
+    _ => return -libc::ENOENT
+  };
+  // NULL/0 clears the area; only a non-empty-but-short one is an error
+  if !data.is_null() && size < min_size {
+    return -libc::EINVAL;
   }
 
   // clock/position are read on the data loop; apply the change there
@@ -477,14 +493,8 @@ unsafe extern "C" fn set_io(object: *mut c_void, id: u32, data: *mut c_void, siz
 
     #[allow(non_upper_case_globals)]
     match id {
-      SPA_IO_Clock    => {
-        assert_eq!(size, std::mem::size_of::<spa_io_clock>());
-        state.clock = data.cast();
-      },
-      SPA_IO_Position => {
-        assert_eq!(size, std::mem::size_of::<spa_io_position>());
-        state.position = data.cast();
-      },
+      SPA_IO_Clock    => state.clock    = data.cast(), // null clears
+      SPA_IO_Position => state.position = data.cast(), // ditto
       _ => () // filtered above
     };
 
@@ -521,6 +531,9 @@ unsafe extern "C" fn send_command(object: *mut c_void, command: *const spa_comma
   #[allow(non_upper_case_globals)]
   match (body.type_, body.id) {
     (SPA_TYPE_COMMAND_Node, SPA_NODE_COMMAND_Start) => {
+      if state.ports.iter().any(|p| p.config.is_none() || p.buffers.is_empty()) {
+        return -libc::EIO; // not negotiated yet (ALSA rejects this too)
+      }
       let state: *mut State = state;
       crate::utils::block_on_loop(&(*state).data_loop, state, |state| {
 
@@ -641,9 +654,12 @@ unsafe extern "C" fn port_enum_params(
   let state = object.cast::<State>().as_mut()
     .expect("object is not supposed to be null");
 
-  assert_eq!(direction, SPA_DIRECTION_INPUT);
-  assert!((port_id as usize) < MAX_PORTS);
-  assert_ne!(max, 0);
+  if direction != SPA_DIRECTION_INPUT || (port_id as usize) >= MAX_PORTS {
+    return -libc::EINVAL;
+  }
+  if max == 0 {
+    return 0;
+  }
 
   let mut buffer  = vec![];
   let mut fbuffer = vec![]; // spa_pod_filter output; kept apart from the source pod (see spa::filter_pod)
@@ -711,9 +727,9 @@ unsafe extern "C" fn port_set_param(object: *mut c_void, direction: spa_directio
   let state = object.cast::<State>().as_mut()
     .expect("object is not supposed to be null");
 
-  assert_eq!(direction, SPA_DIRECTION_INPUT);
-  assert!((port_id as usize) < MAX_PORTS);
-  //assert_eq!(flags, 0);
+  if direction != SPA_DIRECTION_INPUT || (port_id as usize) >= MAX_PORTS {
+    return -libc::EINVAL;
+  }
 
   #[allow(non_upper_case_globals)]
   match id {
@@ -876,7 +892,7 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
 
   // a cycle that was already signaled when we paused can still land here; drop
   // it instead of assert!()ing, which aborts the daemon across extern "C"
-  if !state.started {
+  if !state.started || state.position.is_null() {
     return SPA_STATUS_OK as i32;
   }
 
@@ -893,8 +909,9 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
 
     let port_config = port.config.as_ref().unwrap();
 
-    assert!(!port.buffers.is_empty());
-    assert!(!port.io.is_null());
+    if port.buffers.is_empty() || port.io.is_null() {
+      continue; // not (fully) negotiated yet
+    }
 
     if (*port.io).status != SPA_STATUS_HAVE_DATA as i32 {
       // no input this cycle (e.g. draining after stop): keep clock.delay ticking
@@ -1051,10 +1068,8 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
 
         // report it to the host (pw-top's xrun counter); the length isn't
         // known at detection time, so pass 0 delay
-        let node_callbacks = state.callbacks.funcs.cast::<spa_node_callbacks>().as_ref()
-          .expect("callbacks should be initialized");
-        assert!(node_callbacks.version >= SPA_VERSION_NODE_CALLBACKS);
-        if let Some(xrun_fun) = node_callbacks.xrun {
+        let node_callbacks = state.callbacks.funcs.cast::<spa_node_callbacks>().as_ref();
+        if let Some(xrun_fun) = node_callbacks.and_then(|c| c.xrun) {
           xrun_fun(state.callbacks.data, state.cur_timestamp / 1000, 0, std::ptr::null_mut());
         }
       }
@@ -1144,12 +1159,12 @@ unsafe extern "C" fn port_use_buffers(object: *mut c_void, direction: spa_direct
   let state = object.cast::<State>().as_mut()
     .expect("object is not supposed to be null");
 
-  assert_eq!(direction, SPA_DIRECTION_INPUT);
-  assert!((port_id as usize) < MAX_PORTS);
-  assert_eq!(flags, 0);
+  if direction != SPA_DIRECTION_INPUT || (port_id as usize) >= MAX_PORTS {
+    return -libc::EINVAL;
+  }
+  let _ = flags;
 
-  let new_buffers = if !buffers.is_null() {
-    assert!(n_buffers > 0);
+  let new_buffers = if !buffers.is_null() && n_buffers > 0 {
     std::slice::from_raw_parts(buffers, n_buffers as usize).to_vec()
   } else {
     vec![]
@@ -1167,8 +1182,9 @@ unsafe extern "C" fn port_use_buffers(object: *mut c_void, direction: spa_direct
 
 unsafe extern "C" fn port_set_io(object: *mut c_void, direction: spa_direction, port_id: u32, id: u32, data: *mut c_void, _size: usize) -> c_int {
 
-  assert_eq!(direction, SPA_DIRECTION_INPUT);
-  assert!((port_id as usize) < MAX_PORTS);
+  if direction != SPA_DIRECTION_INPUT || (port_id as usize) >= MAX_PORTS {
+    return -libc::EINVAL;
+  }
 
   let state = object.cast::<State>().as_mut()
     .expect("object is not supposed to be null");
@@ -1291,7 +1307,10 @@ unsafe extern "C" fn init(
     });
   }
 
-  let dsp_path = dsp_path.unwrap();
+  let Some(dsp_path) = dsp_path else {
+    crate::error!(log, "{} missing from the node properties", crate::keys::OSS_DSP_PATH);
+    return -libc::EINVAL;
+  };
 
   let caps = crate::sound::probe_caps(&dsp_path, true).unwrap_or_else(|| {
     crate::warn!(log, "{}: can't probe device caps; using fallback", dsp_path);
@@ -1384,7 +1403,8 @@ unsafe extern "C" fn init(
     cur_timestamp: 0,
     old_timestamp: 0,
 
-    oss_delay
+    oss_delay,
+    oss_delay_default: oss_delay
   });
 
   state.node_info.fix_pointers();
