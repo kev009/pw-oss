@@ -70,6 +70,16 @@ Devices without a usable control get no route and keep the WirePlumber node
 softvol. WirePlumber persists route volumes under the route name and restores
 them on login (`device.restore-routes`, default true).
 
+A capture device whose mixer offers more than one recording source (`mic`,
+`line`, ...) exposes one selectable route per source, so the input can be
+switched from `pavucontrol`/`wpctl` and the choice is persisted by
+WirePlumber like any other port. Selecting a route writes the OSS recording
+source; changes made with `mixer(8) recsrc` are reflected within a second.
+Each source uses its own level control when it has one, the shared `rec`
+(RECLEV) control otherwise - sources sharing `rec` share their volume - and
+sources with no hardware control get a software route volume (applied in
+the graph, still selectable and persisted like any other route).
+
 Log verbosity follows the `spa.oss` topic, e.g.
 `PIPEWIRE_DEBUG='spa.oss:3' pipewire`.
 

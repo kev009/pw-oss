@@ -3,16 +3,21 @@ use std::os::raw::{c_char, c_int, c_uint, c_void};
 use libspa::sys::*;
 
 // One hardware route per (pcm device, direction) that has a usable mixer
-// control. The shadow fields mirror the kernel mixer state; the poll timer
-// and set_param keep them in sync so re-emissions never report placeholders.
+// control - except capture with a multi-source RECMASK, which gets one
+// selectable route per source (the acp port model). The shadow fields mirror
+// the kernel mixer state; the poll timer and set_param keep them in sync so
+// re-emissions never report placeholders.
 struct RouteState {
   node_id: u32,    // our node object id (index * 2 + rec)
   rec:     bool,
   name:    String, // stable, never localized: WirePlumber's persistence key
   description: String,
+  priority: i32,
   mixer:   usize,  // index into State::mixers
-  control: c_uint, // mixer device selected by mixer::{output,input}_control
+  control: Option<c_uint>, // mixer level control; None = no volume props
   follows_recsrc: bool, // control derives from RECSRC; re-resolve on change
+  source:  Option<c_uint>, // the RECSRC bit this route selects (multi-source)
+  active:  bool,   // currently routed to its node; only active routes emit Route pods
   levels:  (u32, u32), // shadow OSS levels, 0-100 each
   mute:    bool,
   save:    bool    // echoed back in the Route pod, never interpreted
@@ -20,7 +25,8 @@ struct RouteState {
 
 struct MixerHandle {
   mixer:   crate::mixer::Mixer,
-  counter: c_int // modify_counter baseline for external-change detection
+  counter: c_int, // modify_counter baseline for external-change detection
+  recsrc:  u32    // RECSRC shadow; polled by value (the counter never ticks for it)
 }
 
 #[repr(C)]
@@ -101,9 +107,10 @@ unsafe fn emit_objects(f: &spa_device_events, data: *mut c_void, pcm_devices: &[
       // Only nodes with a hardware route get linked to it; the rest (no
       // mixer, or no usable control - the bitperfect-purist case included)
       // keep the session manager's node softvol as their only volume.
-      if routes.iter().any(|r| r.node_id == id) {
+      let route_count = routes.iter().filter(|r| r.node_id == id).count();
+      if route_count > 0 {
         dict.add_item("card.profile.device", format!("{}", id));
-        dict.add_item("device.routes", "1");
+        dict.add_item("device.routes", format!("{}", route_count));
       }
 
       let obj_info = spa_device_object_info {
@@ -224,7 +231,7 @@ unsafe fn build_route_info(b: &mut libspa::pod::builder::Builder, id: u32,
   b.add_prop(SPA_PARAM_ROUTE_description, 0)?;
   b.add_string(&route.description)?;
   b.add_prop(SPA_PARAM_ROUTE_priority, 0)?;
-  b.add_int(100)?;
+  b.add_int(route.priority)?;
   b.add_prop(SPA_PARAM_ROUTE_available, 0)?;
   b.add_id(libspa::utils::Id(SPA_PARAM_AVAILABILITY_yes))?;
 
@@ -240,31 +247,46 @@ unsafe fn build_route_info(b: &mut libspa::pod::builder::Builder, id: u32,
     b.add_prop(SPA_PARAM_ROUTE_device, 0)?;
     b.add_int(route.node_id as i32)?;
 
-    b.add_prop(SPA_PARAM_ROUTE_props, 0)?;
-    b.push_object(&mut inner, SPA_TYPE_OBJECT_Props, id)?;
+    // Volume writers (pulse, the session manager) direct volume at the card
+    // whenever an ACTIVE Route exists, regardless of props presence
+    // (pulse-server.c:3004-3010 gates on active_port) - so even a source
+    // with no level control must carry props, backed by a soft shadow that
+    // audioconvert applies (the acp softvol model). The HARDWARE flag and
+    // unity softVolumes apply only when a real control exists.
+    {
+      let hw = route.control.is_some();
+      let flag = if hw { SPA_POD_PROP_FLAG_HARDWARE } else { 0 };
+      b.add_prop(SPA_PARAM_ROUTE_props, 0)?;
+      b.push_object(&mut inner, SPA_TYPE_OBJECT_Props, id)?;
 
-    b.add_prop(SPA_PROP_mute, SPA_POD_PROP_FLAG_HARDWARE)?;
-    b.add_bool(route.mute)?;
+      b.add_prop(SPA_PROP_mute, flag)?;
+      b.add_bool(route.mute)?;
 
-    let volumes = [oss_to_linear(route.levels.0), oss_to_linear(route.levels.1)];
-    b.add_prop(SPA_PROP_channelVolumes, SPA_POD_PROP_FLAG_HARDWARE)?;
-    b.add_array(std::mem::size_of::<f32>() as u32, SPA_TYPE_Float, ROUTE_CHANNELS, volumes.as_ptr().cast())?;
+      let volumes = [oss_to_linear(route.levels.0), oss_to_linear(route.levels.1)];
+      b.add_prop(SPA_PROP_channelVolumes, flag)?;
+      b.add_array(std::mem::size_of::<f32>() as u32, SPA_TYPE_Float, ROUTE_CHANNELS, volumes.as_ptr().cast())?;
 
-    b.add_prop(SPA_PROP_volumeBase, SPA_POD_PROP_FLAG_READONLY)?;
-    b.add_float(1.0)?;
-    b.add_prop(SPA_PROP_volumeStep, SPA_POD_PROP_FLAG_READONLY)?;
-    b.add_float(1.0 / 101.0)?;
+      b.add_prop(SPA_PROP_volumeBase, SPA_POD_PROP_FLAG_READONLY)?;
+      b.add_float(1.0)?;
+      b.add_prop(SPA_PROP_volumeStep, SPA_POD_PROP_FLAG_READONLY)?;
+      b.add_float(1.0 / 101.0)?;
 
-    b.add_prop(SPA_PROP_channelMap, 0)?;
-    b.add_array(std::mem::size_of::<u32>() as u32, SPA_TYPE_Id, ROUTE_CHANNELS, ROUTE_MAP.as_ptr().cast())?;
+      b.add_prop(SPA_PROP_channelMap, 0)?;
+      b.add_array(std::mem::size_of::<u32>() as u32, SPA_TYPE_Id, ROUTE_CHANNELS, ROUTE_MAP.as_ptr().cast())?;
 
-    // the hardware does the attenuation; the node's software volume must
-    // stay at unity or the signal is attenuated twice
-    let soft = [1.0f32; ROUTE_CHANNELS as usize];
-    b.add_prop(SPA_PROP_softVolumes, 0)?;
-    b.add_array(std::mem::size_of::<f32>() as u32, SPA_TYPE_Float, ROUTE_CHANNELS, soft.as_ptr().cast())?;
+      // with hardware attenuation the node's software volume must stay at
+      // unity or the signal is attenuated twice; a soft route IS the
+      // software volume, so it mirrors the levels
+      let soft: [f32; ROUTE_CHANNELS as usize] = if hw {
+        [1.0; ROUTE_CHANNELS as usize]
+      } else {
+        [oss_to_linear(route.levels.0), oss_to_linear(route.levels.1)]
+      };
+      b.add_prop(SPA_PROP_softVolumes, 0)?;
+      b.add_array(std::mem::size_of::<f32>() as u32, SPA_TYPE_Float, ROUTE_CHANNELS, soft.as_ptr().cast())?;
 
-    b.pop(inner.assume_init_mut());
+      b.pop(inner.assume_init_mut());
+    }
 
     b.add_prop(SPA_PARAM_ROUTE_profile, 0)?;
     b.add_int(state.profile as i32)?;
@@ -278,7 +300,7 @@ unsafe fn build_route_info(b: &mut libspa::pod::builder::Builder, id: u32,
 }
 
 unsafe fn build_object_config(b: &mut libspa::pod::builder::Builder, node_id: u32,
-                              volume: Option<(u32, u32)>, mute: Option<bool>) -> Result<(), rustix::io::Errno> {
+                              volume: Option<((u32, u32), bool)>, mute: Option<bool>) -> Result<(), rustix::io::Errno> {
 
   let mut frame = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
   let mut inner = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
@@ -291,13 +313,15 @@ unsafe fn build_object_config(b: &mut libspa::pod::builder::Builder, node_id: u3
   b.add_prop(SPA_EVENT_DEVICE_Props, 0)?;
   b.push_object(&mut inner, SPA_TYPE_OBJECT_Props, SPA_EVENT_DEVICE_Props)?;
 
-  if let Some((left, right)) = volume {
+  if let Some(((left, right), hw)) = volume {
     let volumes = [oss_to_linear(left), oss_to_linear(right)];
     b.add_prop(SPA_PROP_channelVolumes, 0)?;
     b.add_array(std::mem::size_of::<f32>() as u32, SPA_TYPE_Float, ROUTE_CHANNELS, volumes.as_ptr().cast())?;
     b.add_prop(SPA_PROP_channelMap, 0)?;
     b.add_array(std::mem::size_of::<u32>() as u32, SPA_TYPE_Id, ROUTE_CHANNELS, ROUTE_MAP.as_ptr().cast())?;
-    let soft = [1.0f32; ROUTE_CHANNELS as usize];
+    // hardware attenuation keeps the node at unity; a soft route IS the
+    // node's software volume, so audioconvert applies the levels
+    let soft: [f32; ROUTE_CHANNELS as usize] = if hw { [1.0; 2] } else { volumes };
     b.add_prop(SPA_PROP_softVolumes, 0)?;
     b.add_array(std::mem::size_of::<f32>() as u32, SPA_TYPE_Float, ROUTE_CHANNELS, soft.as_ptr().cast())?;
   }
@@ -323,11 +347,12 @@ unsafe fn emit_object_config(state: &mut State, pos: usize, volume: bool) {
 
   let route = &state.routes[pos];
   let (node_id, levels, mute) = (route.node_id, route.levels, route.mute);
+  let hw = route.control.is_some();
 
   let mut buffer = vec![];
   let mut builder = libspa::pod::builder::Builder::new(&mut buffer);
   let built = if volume {
-    build_object_config(&mut builder, node_id, Some(levels), None)
+    build_object_config(&mut builder, node_id, Some((levels, hw)), None)
   } else {
     build_object_config(&mut builder, node_id, None, Some(mute))
   };
@@ -365,15 +390,17 @@ fn resolve_recsrc(state: &mut State, pos: usize) {
   }
   let mi = state.routes[pos].mixer;
   if let Some((control, true)) = state.mixers[mi].mixer.input_control() {
-    state.routes[pos].control = control;
+    state.routes[pos].control = Some(control);
   }
 }
 
 // pull the hardware state into a route's shadow (no emissions)
 fn refresh_route_shadow(state: &mut State, pos: usize) {
   resolve_recsrc(state, pos);
-  let mi      = state.routes[pos].mixer;
-  let control = state.routes[pos].control;
+  let mi = state.routes[pos].mixer;
+  let Some(control) = state.routes[pos].control else {
+    return; // nothing to shadow for a control-less source route
+  };
   if let Some(levels) = state.mixers[mi].mixer.level(control) {
     state.routes[pos].levels = levels;
   }
@@ -382,13 +409,46 @@ fn refresh_route_shadow(state: &mut State, pos: usize) {
   }
 }
 
+// Value-poll RECSRC and move the active flag to the route backing the
+// current source; the kernel never ticks modify_counter for RECSRC writes
+// (mixer_setrecsrc, mixer.c:334-361), so external mixer(8) changes are only
+// visible this way. Multiple set bits collapse to the lowest (the v1
+// single-route convention). Returns the newly active route when it moved.
+fn sync_recsrc(state: &mut State, mi: usize) -> Option<usize> {
+  if !state.routes.iter().any(|r| r.mixer == mi && r.source.is_some()) {
+    return None;
+  }
+  let recsrc = state.mixers[mi].mixer.recsrc()?;
+  if recsrc == state.mixers[mi].recsrc {
+    return None;
+  }
+  state.mixers[mi].recsrc = recsrc;
+  let masked = recsrc & state.mixers[mi].mixer.recmask();
+  if masked == 0 {
+    return None; // keep the current selection rather than guessing
+  }
+  let bit = masked.trailing_zeros();
+  let pos = state.routes.iter().position(|r| r.mixer == mi && r.source == Some(bit))?;
+  if state.routes[pos].active {
+    return None; // an extra bit appeared; the winning source is unchanged
+  }
+  for route in state.routes.iter_mut() {
+    if route.mixer == mi && route.source.is_some() {
+      route.active = route.source == Some(bit);
+    }
+  }
+  refresh_route_shadow(state, pos);
+  Some(pos)
+}
+
 unsafe fn poll_mixers(state: &mut State) {
 
   if state.profile == 0 {
     return; // nodes are retracted under the Off profile; nothing to announce
   }
 
-  let mut changed: Vec<(usize, bool, bool)> = vec![]; // (route, volume, mute)
+  let mut changed:  Vec<(usize, bool, bool)> = vec![]; // (route, volume, mute)
+  let mut switched: Vec<usize> = vec![];
 
   for mi in 0..state.mixers.len() {
 
@@ -402,12 +462,21 @@ unsafe fn poll_mixers(state: &mut State) {
     // still tracked for log/debug value.
     state.mixers[mi].counter = counter;
 
+    // recsrc first: it refreshes the new active route's shadow, so the
+    // value diff below won't double-report the same movement
+    if let Some(pos) = sync_recsrc(state, mi) {
+      crate::info!(state.log, "recording source changed externally: route {}", state.routes[pos].name);
+      switched.push(pos);
+    }
+
     for pos in 0..state.routes.len() {
       if state.routes[pos].mixer != mi {
         continue;
       }
       resolve_recsrc(state, pos);
-      let control = state.routes[pos].control;
+      let Some(control) = state.routes[pos].control else {
+        continue; // control-less source routes carry no volume state
+      };
       let mut vol_changed  = false;
       let mut mute_changed = false;
       if let Some(levels) = state.mixers[mi].mixer.level(control) {
@@ -422,7 +491,9 @@ unsafe fn poll_mixers(state: &mut State) {
           mute_changed = true;
         }
       }
-      if vol_changed || mute_changed {
+      // inactive routes still track the hardware (their level shows again on
+      // the next switch), but a change there is observable in no pod
+      if (vol_changed || mute_changed) && state.routes[pos].active {
         crate::info!(state.log, "route {} changed externally: levels {:?}, mute {}",
           state.routes[pos].name, state.routes[pos].levels, state.routes[pos].mute);
         changed.push((pos, vol_changed, mute_changed));
@@ -430,11 +501,19 @@ unsafe fn poll_mixers(state: &mut State) {
     }
   }
 
-  if changed.is_empty() {
+  if changed.is_empty() && switched.is_empty() {
     return;
   }
 
   announce_route_change(state);
+
+  for pos in switched {
+    // the node's effective input volume is the new source's control now
+    if state.routes[pos].control.is_some() {
+      emit_object_config(state, pos, true);
+      emit_object_config(state, pos, false);
+    }
+  }
 
   for (pos, vol_changed, mute_changed) in changed {
     if vol_changed {
@@ -526,6 +605,14 @@ unsafe extern "C" fn enum_params(object: *mut c_void, seq: c_int, id: u32, start
 
     use libspa::pod::builder::Builder;
 
+    // only the active route becomes a Route pod; inactive selectable sources
+    // exist as EnumRoute only (acp emits one Route per device with the
+    // active port's index, alsa-acp-device.c:582-600)
+    if id == SPA_PARAM_Route && (index as usize) < state.routes.len() && !state.routes[index as usize].active {
+      index += 1;
+      continue;
+    }
+
     let mut builder = Builder::new(&mut buffer);
 
     #[allow(non_upper_case_globals)]
@@ -570,16 +657,24 @@ unsafe fn apply_route_props(state: &mut State, pos: usize, props: libspa::pod::O
   // the cached control may lag a recording-source change by up to a poll
   // tick; a write must target the CURRENT source
   resolve_recsrc(state, pos);
-  let mi      = state.routes[pos].mixer;
+  let mi = state.routes[pos].mixer;
+  // a control-less route is a soft one: writes land in the shadow only, and
+  // emit_object_config pushes them into the node's softVolumes
   let control = state.routes[pos].control;
 
   for p in props.properties {
     #[allow(non_upper_case_globals)]
     match (p.key, p.value) {
       (SPA_PROP_mute, Value::Bool(mute)) => {
-        if mute != state.routes[pos].mute && state.mixers[mi].mixer.set_muted(control, mute) {
-          state.routes[pos].mute = mute;
-          *mute_changed = true;
+        if mute != state.routes[pos].mute {
+          let applied = match control {
+            Some(c) => state.mixers[mi].mixer.set_muted(c, mute),
+            None    => true // soft route: the shadow is the state
+          };
+          if applied {
+            state.routes[pos].mute = mute;
+            *mute_changed = true;
+          }
         }
       },
       (SPA_PROP_channelVolumes, Value::ValueArray(ValueArray::Float(v))) if !v.is_empty() => {
@@ -589,9 +684,15 @@ unsafe fn apply_route_props(state: &mut State, pos: usize, props: libspa::pod::O
         // are hard to attribute after the fact (PIPEWIRE_DEBUG=spa.oss:4)
         crate::debug!(state.log, "route {} channelVolumes {:?}", state.routes[pos].name, v);
         let levels = (linear_to_oss(v[0]), linear_to_oss(v[1 % v.len()]));
-        if levels != state.routes[pos].levels && state.mixers[mi].mixer.set_level(control, levels.0, levels.1) {
-          state.routes[pos].levels = levels;
-          *vol_changed = true;
+        if levels != state.routes[pos].levels {
+          let applied = match control {
+            Some(c) => state.mixers[mi].mixer.set_level(c, levels.0, levels.1),
+            None    => true
+          };
+          if applied {
+            state.routes[pos].levels = levels;
+            *vol_changed = true;
+          }
         }
       },
       _ => ()
@@ -656,6 +757,11 @@ unsafe extern "C" fn set_param(object: *mut c_void, id: u32, _flags: u32, param:
         // unseen; refresh every shadow BEFORE the bump re-announces Route
         // pods, or consumers read stale volumes for up to a tick.
         if index != 0 {
+          // the recording source may have moved too; re-derive the active
+          // routes before their shadows are read
+          for mi in 0..state.mixers.len() {
+            let _ = sync_recsrc(state, mi);
+          }
           for pos in 0..state.routes.len() {
             refresh_route_shadow(state, pos);
           }
@@ -722,6 +828,12 @@ unsafe extern "C" fn set_param(object: *mut c_void, id: u32, _flags: u32, param:
       // durable name instead of winning and then failing the device check.
       let pos = index
         .filter(|i| *i < state.routes.len() && state.routes[*i].node_id == device)
+        // sibling source routes share node_id, so a stale index passes the
+        // device filter; the durable name wins whenever it disagrees
+        .filter(|i| match name.as_deref() {
+          Some(nm) => state.routes[*i].name == nm,
+          None     => true
+        })
         .or_else(|| name.as_deref().and_then(|n|
           state.routes.iter().position(|r| r.name == n && r.node_id == device)));
       let Some(pos) = pos else {
@@ -730,6 +842,28 @@ unsafe extern "C" fn set_param(object: *mut c_void, id: u32, _flags: u32, param:
 
       let save_changed = state.routes[pos].save != save;
       state.routes[pos].save = save;
+
+      // Selecting an inactive source route is a port switch: write RECSRC
+      // with that source's bit. The kernel may strip it or fall back
+      // (mixer.c:347-357) and the driver decides what it really applied, so
+      // the readback in sync_recsrc names the route that became active.
+      let mut switched = None;
+      if state.routes[pos].source.is_some() && !state.routes[pos].active {
+        let mi  = state.routes[pos].mixer;
+        let bit = state.routes[pos].source.unwrap_or(0);
+        if state.mixers[mi].mixer.set_recsrc(1 << bit) {
+          switched = sync_recsrc(state, mi);
+          if switched != Some(pos) {
+            crate::info!(state.log, "kernel did not move the recording source to route {}",
+              state.routes[pos].name);
+            // re-announce even so: the session manager applied the switch
+            // optimistically and must re-read what really happened
+            announce_route_change(state);
+          }
+        } else {
+          crate::warn!(state.log, "can't select the recording source for route {}", state.routes[pos].name);
+        }
+      }
 
       // a port-switch message carries no props and must not touch the volume
       let mut vol_changed  = false;
@@ -747,8 +881,27 @@ unsafe extern "C" fn set_param(object: *mut c_void, id: u32, _flags: u32, param:
 
       // bump only on an observable change: every spurious serial flip costs
       // the session manager a full param re-enumeration
-      if vol_changed || mute_changed || save_changed {
+      if vol_changed || mute_changed || save_changed || switched.is_some() {
         announce_route_change(state);
+      }
+
+      // A switch changes which control feeds the node, so push the newly
+      // active route's state unless the props above already did. Props that
+      // rode a DEFLECTED switch were applied to a now-inactive route; the
+      // active gate keeps them off the node.
+      if vol_changed && !state.routes[pos].active {
+        vol_changed  = false;
+        mute_changed = false;
+      }
+      if let Some(active_pos) = switched {
+        {
+          if !(active_pos == pos && vol_changed) {
+            emit_object_config(state, active_pos, true);
+          }
+          if !(active_pos == pos && mute_changed) {
+            emit_object_config(state, active_pos, false);
+          }
+        }
       }
 
       if vol_changed {
@@ -806,6 +959,24 @@ unsafe extern "C" fn get_size(_factory: *const spa_handle_factory, _params: *con
   std::mem::size_of::<State>()
 }
 
+// loosely mirror acp's analog input ordering: mic on top, then line, then
+// the rest in a stable bit-derived order
+fn source_priority(dev: c_uint) -> i32 {
+  match dev {
+    crate::mixer::SOUND_MIXER_MIC  => 100,
+    crate::mixer::SOUND_MIXER_LINE => 90,
+    _ => 80 - dev as i32
+  }
+}
+
+fn capitalize(s: &str) -> String {
+  let mut chars = s.chars();
+  match chars.next() {
+    Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+    None        => String::new()
+  }
+}
+
 // Discover the usable hardware controls and read their ACTUAL state before
 // anything is emitted: reporting 1.0 placeholders and correcting later is a
 // classic volume-jump source.
@@ -823,6 +994,10 @@ fn probe_routes(pcm_devices: &[crate::sound::PcmDevice]) -> (Vec<RouteState>, Ve
       continue; // no mixer device: the node keeps its softvol
     };
 
+    // one read shared by the route active flags and the poll shadow: a
+    // RECSRC change between two reads would mismark the active route
+    let probe_recsrc = mixer.recsrc().unwrap_or(0);
+
     let mixer_index = mixers.len();
     let mut used = false;
 
@@ -830,6 +1005,51 @@ fn probe_routes(pcm_devices: &[crate::sound::PcmDevice]) -> (Vec<RouteState>, Ve
       if !enabled {
         continue;
       }
+
+      // A multi-source RECMASK becomes one selectable route per source (the
+      // acp port model). Single-source and no-recmask devices keep the v1
+      // single route below - its name is WirePlumber's persistence key and
+      // must not churn.
+      if rec && mixer.recmask().count_ones() >= 2 {
+        let recmask = mixer.recmask();
+        let recsrc  = probe_recsrc & recmask;
+        // multiple set bits: the lowest wins, matching the v1 convention
+        let current = if recsrc != 0 { recsrc.trailing_zeros() } else { recmask.trailing_zeros() };
+        for dev_bit in 0..crate::mixer::SOUND_MIXER_NRDEVICES {
+          if recmask & (1 << dev_bit) == 0 {
+            continue;
+          }
+          let control = mixer.source_volume_control(dev_bit);
+          let levels  = control.and_then(|c| mixer.level(c));
+          let control = control.filter(|_| levels.is_some());
+          let mute    = control.and_then(|c| mixer.muted(c)).unwrap_or(false);
+          let src     = crate::mixer::SOUND_DEVICE_NAMES[dev_bit as usize];
+          let (name, description) = if device_count == 1 {
+            (format!("oss-input-{}", src), capitalize(src))
+          } else {
+            (format!("oss-input-pcm{}-{}", device.index, src),
+             format!("{} (pcm{})", capitalize(src), device.index))
+          };
+          routes.push(RouteState {
+            node_id: device.index * 2 + 1,
+            rec: true,
+            name,
+            description,
+            priority: source_priority(dev_bit),
+            mixer: mixer_index,
+            control,
+            follows_recsrc: false,
+            source: Some(dev_bit),
+            active: dev_bit == current,
+            levels: levels.unwrap_or((100, 100)), // soft shadow starts at unity
+            mute,
+            save: false
+          });
+          used = true;
+        }
+        continue;
+      }
+
       let picked = if rec { mixer.input_control() } else { mixer.output_control().map(|c| (c, false)) };
       let Some((control, follows_recsrc)) = picked else {
         continue; // no usable control for this direction
@@ -858,9 +1078,12 @@ fn probe_routes(pcm_devices: &[crate::sound::PcmDevice]) -> (Vec<RouteState>, Ve
         rec,
         name,
         description,
+        priority: 100,
         mixer: mixer_index,
-        control,
+        control: Some(control),
         follows_recsrc,
+        source: None,
+        active: true,
         levels,
         mute,
         save: false
@@ -870,7 +1093,7 @@ fn probe_routes(pcm_devices: &[crate::sound::PcmDevice]) -> (Vec<RouteState>, Ve
 
     if used {
       let counter = mixer.modify_counter().unwrap_or(0);
-      mixers.push(MixerHandle { mixer, counter });
+      mixers.push(MixerHandle { mixer, counter, recsrc: probe_recsrc });
     }
   }
 

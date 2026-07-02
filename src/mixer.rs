@@ -15,14 +15,26 @@ use std::os::raw::{c_char, c_int, c_uint, c_ulong};
 
 pub const SOUND_MIXER_VOLUME: c_uint = 0;
 pub const SOUND_MIXER_PCM:    c_uint = 4;
+pub const SOUND_MIXER_LINE:   c_uint = 6;
+pub const SOUND_MIXER_MIC:    c_uint = 7;
 pub const SOUND_MIXER_RECLEV: c_uint = 11;
 pub const SOUND_MIXER_IGAIN:  c_uint = 12;
 
-const SOUND_MIXER_NRDEVICES: c_uint = 25;
+pub const SOUND_MIXER_NRDEVICES: c_uint = 25;
+
 const SOUND_MIXER_MUTE:      c_uint = 28;
 const SOUND_MIXER_RECSRC:    c_uint = 0xff;
 const SOUND_MIXER_DEVMASK:   c_uint = 0xfe;
 const SOUND_MIXER_RECMASK:   c_uint = 0xfd;
+
+// sys/soundcard.h SOUND_DEVICE_NAMES, indexed by mixer device number: the
+// stable identifiers mixer(8) exposes; capture route names derive from them
+pub const SOUND_DEVICE_NAMES: [&str; SOUND_MIXER_NRDEVICES as usize] = [
+  "vol", "bass", "treble", "synth", "pcm", "speaker", "line",
+  "mic", "cd", "mix", "pcm2", "rec", "igain", "ogain",
+  "line1", "line2", "line3", "dig1", "dig2", "dig3",
+  "phin", "phout", "video", "radio", "monitor"
+];
 
 // sys/soundcard.h mixer_info; the ioctl encodes the size
 #[repr(C)]
@@ -63,8 +75,13 @@ impl Mixer {
     let mut mixer = Self { fd, devmask: 0, recmask: 0 };
     let devmask = mixer.read_int(SOUND_MIXER_DEVMASK)?; // Drop closes fd on the error path
     mixer.devmask = devmask as u32;
-    mixer.recmask = mixer.read_int(SOUND_MIXER_RECMASK).unwrap_or(0) as u32;
+    mixer.recmask = mixer.read_int(SOUND_MIXER_RECMASK).unwrap_or(0) as u32
+                    & ((1 << SOUND_MIXER_NRDEVICES) - 1);
     Some(mixer)
+  }
+
+  pub fn recmask(&self) -> u32 {
+    self.recmask
   }
 
   fn read_int(&self, dev: c_uint) -> Option<c_int> {
@@ -113,6 +130,27 @@ impl Mixer {
       return Some((SOUND_MIXER_IGAIN, false));
     }
     None
+  }
+
+  // volume control for one selectable recording source: the source's own
+  // level control when it has one, else the shared ADC-side RECLEV
+  pub fn source_volume_control(&self, dev: c_uint) -> Option<c_uint> {
+    [dev, SOUND_MIXER_RECLEV].into_iter().find(|d| self.has(*d))
+  }
+
+  // current recording source mask; the kernel keeps it inside recdevs and
+  // non-empty whenever recdevs is (mixer_setrecsrc, mixer.c:347-357)
+  pub fn recsrc(&self) -> Option<u32> {
+    self.read_int(SOUND_MIXER_RECSRC).map(|v| v as u32)
+  }
+
+  // Mask write: the kernel strips non-recdevs bits, falls back MIC ->
+  // MONITOR -> LINE -> lowest recdevs bit when the result is empty, and
+  // stores whatever the driver actually applied (mixer.c:334-361), so a
+  // caller must read back to learn the outcome. mixer_setrecsrc never ticks
+  // modify_counter - RECSRC changes have to be polled by value.
+  pub fn set_recsrc(&self, mask: u32) -> bool {
+    self.write_int(SOUND_MIXER_RECSRC, mask as c_int)
   }
 
   // (left, right), each 0-100; the kernel reports the logical level even
