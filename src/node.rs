@@ -339,8 +339,7 @@ unsafe extern "C" fn set_param<D: Direction>(object: *mut c_void, id: u32, _flag
   let state = object.cast::<State<D>>().as_mut()
     .expect("object is not supposed to be null");
 
-  use libspa::pod::{Value, Object, Pod};
-  use libspa::pod::deserialize::PodDeserializer;
+  use libspa::pod::{Value, Object};
 
   #[allow(non_upper_case_globals)]
   match id {
@@ -349,8 +348,8 @@ unsafe extern "C" fn set_param<D: Direction>(object: *mut c_void, id: u32, _flag
         // a NULL pod resets the props to their defaults
         return D::reset_props(state);
       }
-      match PodDeserializer::deserialize_any_from(Pod::from_raw(param).as_bytes()) {
-        Ok((_, Value::Object(Object { type_, properties, .. }))) if type_ == SPA_TYPE_OBJECT_Props => {
+      match crate::utils::deserialize_pod(param) {
+        Some((_, Value::Object(Object { type_, properties, .. }))) if type_ == SPA_TYPE_OBJECT_Props => {
           for property in properties {
             match property.key {
               // there is no way adapter is actually supposed to pass all those properties (or parameters?) to us,

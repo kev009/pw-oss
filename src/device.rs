@@ -358,6 +358,10 @@ unsafe fn announce_route_change(state: &mut State) {
 // value diff is what prevents spurious re-emissions either way.
 unsafe fn poll_mixers(state: &mut State) {
 
+  if state.profile == 0 {
+    return; // nodes are retracted under the Off profile; nothing to announce
+  }
+
   let mut changed: Vec<(usize, bool, bool)> = vec![]; // (route, volume, mute)
 
   for mi in 0..state.mixers.len() {
@@ -569,8 +573,7 @@ unsafe extern "C" fn set_param(object: *mut c_void, id: u32, _flags: u32, param:
   let state = object.cast::<State>().as_mut()
     .expect("object is not supposed to be null");
 
-  use libspa::pod::{Value, Pod};
-  use libspa::pod::deserialize::PodDeserializer;
+  use libspa::pod::Value;
 
   #[allow(non_upper_case_globals)]
   match id {
@@ -582,8 +585,8 @@ unsafe extern "C" fn set_param(object: *mut c_void, id: u32, _flags: u32, param:
       if param.is_null() {
         index = Some(1); // a NULL pod resets to the boot default (on)
       } else {
-        match PodDeserializer::deserialize_any_from(Pod::from_raw(param).as_bytes()) {
-        Ok((_, Value::Object(o))) if o.type_ == SPA_TYPE_OBJECT_ParamProfile => {
+        match crate::utils::deserialize_pod(param) {
+        Some((_, Value::Object(o))) if o.type_ == SPA_TYPE_OBJECT_ParamProfile => {
           for p in o.properties {
             #[allow(non_upper_case_globals)]
             match (p.key, p.value) {
@@ -646,8 +649,8 @@ unsafe extern "C" fn set_param(object: *mut c_void, id: u32, _flags: u32, param:
         return -libc::EINVAL;
       }
 
-      let object = match PodDeserializer::deserialize_any_from(Pod::from_raw(param).as_bytes()) {
-        Ok((_, Value::Object(o))) if o.type_ == SPA_TYPE_OBJECT_ParamRoute => o,
+      let object = match crate::utils::deserialize_pod(param) {
+        Some((_, Value::Object(o))) if o.type_ == SPA_TYPE_OBJECT_ParamRoute => o,
         _ => return -libc::EINVAL
       };
 
@@ -974,12 +977,17 @@ unsafe extern "C" fn init(
   if !state.routes.is_empty() {
     if let (Some(main_loop), Some(system)) = (&state.main_loop, &state.system) {
       let fd = system.timerfd_create(libc::CLOCK_MONOTONIC, (SPA_FD_CLOEXEC | SPA_FD_NONBLOCK) as c_int);
+      if fd < 0 {
+        crate::warn!(state.log, "can't create the mixer poll timer; external volume changes won't be noticed");
+      }
       if fd >= 0 {
         let timerspec = itimerspec {
           it_value:    timespec { tv_sec: 1, tv_nsec: 0 },
           it_interval: timespec { tv_sec: 1, tv_nsec: 0 }
         };
-        system.timerfd_settime(fd, 0, &timerspec, std::ptr::null_mut());
+        if system.timerfd_settime(fd, 0, &timerspec, std::ptr::null_mut()) < 0 {
+          crate::warn!(state.log, "can't arm the mixer poll timer");
+        }
         state.timer_source.fd = fd;
         if main_loop.add_source(&mut state.timer_source) >= 0 {
           state.timer_added = true;

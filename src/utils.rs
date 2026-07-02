@@ -333,11 +333,10 @@ pub fn latency_info_default(direction: libspa::sys::spa_direction) -> libspa::sy
 pub unsafe fn parse_latency_info(param: *const libspa::sys::spa_pod) -> Option<libspa::sys::spa_latency_info> {
 
   use libspa::sys::*;
-  use libspa::pod::{Value, Object, Pod};
-  use libspa::pod::deserialize::PodDeserializer;
+  use libspa::pod::{Value, Object};
 
-  match PodDeserializer::deserialize_any_from(Pod::from_raw(param).as_bytes()) {
-    Ok((_, Value::Object(Object { type_, properties, .. }))) if type_ == SPA_TYPE_OBJECT_ParamLatency => {
+  match crate::utils::deserialize_pod(param) {
+    Some((_, Value::Object(Object { type_, properties, .. }))) if type_ == SPA_TYPE_OBJECT_ParamLatency => {
       let mut info = latency_info_default(SPA_DIRECTION_INPUT);
       for p in properties {
         #[allow(non_upper_case_globals)]
@@ -398,11 +397,10 @@ pub fn process_latency_default() -> libspa::sys::spa_process_latency_info {
 pub unsafe fn parse_process_latency_info(param: *const libspa::sys::spa_pod) -> Option<libspa::sys::spa_process_latency_info> {
 
   use libspa::sys::*;
-  use libspa::pod::{Value, Object, Pod};
-  use libspa::pod::deserialize::PodDeserializer;
+  use libspa::pod::{Value, Object};
 
-  match PodDeserializer::deserialize_any_from(Pod::from_raw(param).as_bytes()) {
-    Ok((_, Value::Object(Object { type_, properties, .. }))) if type_ == SPA_TYPE_OBJECT_ParamProcessLatency => {
+  match crate::utils::deserialize_pod(param) {
+    Some((_, Value::Object(Object { type_, properties, .. }))) if type_ == SPA_TYPE_OBJECT_ParamProcessLatency => {
       let mut info = process_latency_default();
       for p in properties {
         #[allow(non_upper_case_globals)]
@@ -545,6 +543,20 @@ pub fn device_period_bytes(target_duration: u64, device_rate: u32, graph_rate: u
   (target_duration.saturating_mul(device_rate as u64) / graph_rate as u64)
     .saturating_mul(stride as u64)
     .min(u32::MAX as u64) as u32
+}
+
+// Deserialize a host-supplied pod without trusting it: libspa's
+// deserializer divides by a pod-declared child size (Choice pods) and
+// pre-allocates from declared lengths, so a hostile pod can panic it -
+// which must not unwind across our extern "C" boundaries.
+pub unsafe fn deserialize_pod(param: *const libspa::sys::spa_pod)
+  -> Option<(&'static [u8], libspa::pod::Value)>
+{
+  use libspa::pod::deserialize::PodDeserializer;
+  let bytes = libspa::pod::Pod::from_raw(param).as_bytes();
+  std::panic::catch_unwind(|| {
+    PodDeserializer::deserialize_any_from(bytes).ok()
+  }).ok().flatten()
 }
 
 // Fire-and-forget: queue `f` to run once on the given loop (from any thread;
