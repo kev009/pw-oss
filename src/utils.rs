@@ -508,6 +508,31 @@ pub fn device_period_bytes(target_duration: u64, device_rate: u32, graph_rate: u
   (target_duration * device_rate as u64 / graph_rate as u64) as u32 * stride
 }
 
+// at most one message a second from a per-cycle warn site, with a count of
+// what went unsaid (ALSA uses spa_ratelimit for the same purpose)
+pub struct RateLimit {
+  last:       u64,
+  suppressed: u32
+}
+
+impl RateLimit {
+
+  pub const fn new() -> Self {
+    Self { last: 0, suppressed: 0 }
+  }
+
+  // Some(previously suppressed count) when the caller may log now
+  pub fn check(&mut self, now: u64) -> Option<u32> {
+    if now.saturating_sub(self.last) >= 1_000_000_000 {
+      self.last = now;
+      Some(std::mem::take(&mut self.suppressed))
+    } else {
+      self.suppressed += 1;
+      None
+    }
+  }
+}
+
 pub fn now_ns(system: &crate::spa::System) -> u64 {
   let mut now = libspa::sys::timespec { tv_sec: 0, tv_nsec: 0 };
   let err = unsafe { system.clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };

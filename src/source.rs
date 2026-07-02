@@ -46,7 +46,8 @@ struct Port {
   dll:           crate::dll::SpaDLL,
   primed:        bool,
   setup_period:  u32, // device bytes per graph cycle the servo was tuned for
-  bw_fast_until: u64  // while nonzero, the DLL runs at BW_MAX for a fast lock
+  bw_fast_until: u64, // while nonzero, the DLL runs at BW_MAX for a fast lock
+  warn_limit:    crate::utils::RateLimit
 }
 
 #[derive(Debug)]
@@ -385,7 +386,9 @@ unsafe extern "C" fn on_timeout(source: *mut spa_source) {
     return; // no callbacks (yet, or cleared); keep the clock ticking
   };
   if let Some(ready_fun) = node_callbacks.ready {
-    let err = ready_fun(state.callbacks.data, SPA_STATUS_NEED_DATA as i32);
+    // a capture driver signals HAVE_DATA (alsa-pcm.c capture_ready); the
+    // NEED_DATA form is for playback drivers
+    let err = ready_fun(state.callbacks.data, SPA_STATUS_HAVE_DATA as i32);
     #[cfg(debug_assertions)]
     crate::trace!(state.log, "ready -> {}", err);
     #[cfg(not(debug_assertions))]
@@ -857,6 +860,12 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       continue; // not (fully) negotiated yet
     }
 
+    if (*port.io).status == SPA_STATUS_HAVE_DATA as i32 {
+      // a pending buffer the peer hasn't consumed yet: report HAVE_DATA, or
+      // the adapter treats the cycle as empty (alsa-pcm-source.c does this)
+      result |= SPA_STATUS_HAVE_DATA as i32;
+      continue;
+    }
     if (*port.io).status != SPA_STATUS_OK as i32 && (*port.io).status != SPA_STATUS_NEED_DATA as i32 {
       continue;
     }
@@ -915,7 +924,17 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       port.dll.set_bw(crate::dll::SPA_DLL_BW_MAX, period_in_bytes, rate * stride);
     }
 
-    let nbytes = if !port.primed && period_in_bytes > 0 {
+    let freewheel = !state.position.is_null() &&
+      (*state.position).clock.flags & SPA_IO_CLOCK_FLAG_FREEWHEEL != 0;
+
+    let nbytes = if freewheel && period_in_bytes > 0 {
+      // freewheeling: hand out silence without touching the device (ALSA
+      // skips its reads); the ring overflows meanwhile and the overrun
+      // recovery re-primes when realtime resumes
+      let len = period_in_bytes.min(data_0.maxsize);
+      std::ptr::write_bytes(data_0.data.cast::<u8>(), 0, len as usize);
+      len as isize
+    } else if !port.primed && period_in_bytes > 0 {
       // Capture analogue of the sink's zero priming: trigger the device,
       // discard any backlog so the fill level starts out known, and hand the
       // graph one period of silence while the ring fills. Don't wait for real
@@ -982,10 +1001,14 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
 
     // the dsp is running after ready_for_reading; report overruns to the host
     // (pw-top's xrun counter); the length isn't known, so pass 0 delay
-    let overrun_count = port.dsp.overruns();
+    // the freewheel branch above never triggers the device, so it may still
+    // be in setup here
+    let overrun_count = if port.dsp.is_running() { port.dsp.overruns() } else { 0 };
     if overrun_count > 0 {
       let now = crate::utils::now_ns(&state.data_system);
-      crate::warn!(state.log, "OSS reported {:3} overruns @ {}", overrun_count, now);
+      if let Some(suppressed) = port.warn_limit.check(now) {
+        crate::warn!(state.log, "OSS reported {:3} overruns @ {} (+{} warnings suppressed)", overrun_count, now, suppressed);
+      }
       let node_callbacks = state.callbacks.funcs.cast::<spa_node_callbacks>().as_ref();
       if let Some(xrun_fun) = node_callbacks.and_then(|c| c.xrun) {
         xrun_fun(state.callbacks.data, now / 1000, 0, std::ptr::null_mut());
@@ -1242,7 +1265,7 @@ unsafe extern "C" fn init(
       data:  std::ptr::null_mut()
     },
 
-    ports: [Port { config: None, buffers: vec![], io: std::ptr::null_mut(), dsp: crate::sound::Dsp::new(&dsp_path), dll: std::default::Default::default(), primed: false, setup_period: 0, bw_fast_until: 0 }; MAX_PORTS],
+    ports: [Port { config: None, buffers: vec![], io: std::ptr::null_mut(), dsp: crate::sound::Dsp::new(&dsp_path), dll: std::default::Default::default(), primed: false, setup_period: 0, bw_fast_until: 0, warn_limit: crate::utils::RateLimit::new() }; MAX_PORTS],
 
     caps,
 

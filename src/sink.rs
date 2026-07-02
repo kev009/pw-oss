@@ -50,7 +50,8 @@ struct Port {
   dll:            crate::dll::SpaDLL,
   target_delay:   u32, // OSS buffer fill target in bytes, clamped to the granted buffer
   setup_period:   u32, // device bytes per graph cycle the stream was set up for
-  bw_fast_until:  u64  // while nonzero, the DLL runs at BW_MAX for a fast lock
+  bw_fast_until:  u64, // while nonzero, the DLL runs at BW_MAX for a fast lock
+  warn_limit:     crate::utils::RateLimit
 }
 
 #[derive(Debug)]
@@ -976,6 +977,17 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
   state.old_timestamp = state.cur_timestamp;
   state.cur_timestamp = crate::utils::now_ns(&state.data_system);
 
+  // freewheeling: the graph runs faster than realtime, so consume the input
+  // without touching the device (ALSA discards the same way)
+  if (*state.position).clock.flags & SPA_IO_CLOCK_FLAG_FREEWHEEL != 0 {
+    for port in &mut state.ports {
+      if !port.io.is_null() {
+        (*port.io).status = SPA_STATUS_NEED_DATA as i32;
+      }
+    }
+    return SPA_STATUS_HAVE_DATA as i32;
+  }
+
   let mut result = SPA_STATUS_OK as i32;
 
   for port in &mut state.ports {
@@ -1158,7 +1170,10 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
     } else {
       let underrun_count = port.dsp.underruns();
       if underrun_count > 0 {
-        crate::warn!(state.log, "{}: OSS reported {:3} underruns @ {}", port.dsp.path, underrun_count, state.cur_timestamp);
+        if let Some(suppressed) = port.warn_limit.check(state.cur_timestamp) {
+          crate::warn!(state.log, "{}: OSS reported {:3} underruns @ {} (+{} warnings suppressed)",
+            port.dsp.path, underrun_count, state.cur_timestamp, suppressed);
+        }
         if port.xrun_timestamp == 0 {
           port.xrun_timestamp = state.cur_timestamp;
         }
@@ -1243,7 +1258,10 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
     }
 
     if nbytes < size as isize {
-      crate::warn!(state.log, "{}: dropped {} bytes", port.dsp.path, if nbytes > 0 { size - nbytes as u32 } else { size });
+      if let Some(suppressed) = port.warn_limit.check(state.cur_timestamp) {
+        crate::warn!(state.log, "{}: dropped {} bytes (+{} warnings suppressed)",
+          port.dsp.path, if nbytes > 0 { size - nbytes as u32 } else { size }, suppressed);
+      }
     }
 
     (*port.io).status = SPA_STATUS_NEED_DATA as i32;
@@ -1484,7 +1502,8 @@ unsafe extern "C" fn init(
         dll:            std::default::Default::default(),
         target_delay:   0,
         setup_period:   0,
-        bw_fast_until:  0
+        bw_fast_until:  0,
+        warn_limit:     crate::utils::RateLimit::new()
       };
       MAX_PORTS
     ],

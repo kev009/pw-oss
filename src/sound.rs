@@ -319,16 +319,12 @@ impl Dsp {
 
     assert_eq!(self.state, DspState::Running);
 
-    let mut read_fds = std::mem::MaybeUninit::<libc::fd_set>::uninit();
-    unsafe {
-      libc::FD_ZERO(read_fds.as_mut_ptr());
-      libc::FD_SET(self.fd, read_fds.as_mut_ptr());
-    }
-
-    let mut timeout = libc::timeval { tv_sec: 0, tv_usec: timeout_ms as i64 * 1000 };
-
-    let ndesc = unsafe { libc::select(self.fd + 1, read_fds.assume_init_mut(), std::ptr::null_mut(), std::ptr::null_mut(), &mut timeout) };
-    ndesc != -1 && ndesc > 0
+    // poll(2), not select(2): FD_SET writes out of bounds past FD_SETSIZE
+    // (1024) fds, which a busy daemon can reach; poll also triggers the
+    // capture channel just like select/read do (dsp_poll -> chn_poll)
+    let mut pfd = libc::pollfd { fd: self.fd, events: libc::POLLIN, revents: 0 };
+    let n = unsafe { libc::poll(&mut pfd, 1, timeout_ms as i32) };
+    n > 0 && (pfd.revents & libc::POLLIN) != 0
   }
 
   pub fn ispace_in_bytes(&mut self) -> c_int {
@@ -411,7 +407,9 @@ impl DspWriter {
   /// requested; size the target delay to the return value, not `len`.
   pub fn set_buffer_size(&mut self, len: u32) -> u32 {
     assert_eq!(self.state, DspState::Setup);
-    set_fragment(self.fd, len.div_ceil(1024) as u16, 10);
+    // the fragment count field is 16 bits; an extreme oss.delay x quantum
+    // request must clamp, not truncate
+    set_fragment(self.fd, len.div_ceil(1024).min(u16::MAX as u32) as u16, 10);
     // nothing's written yet, so GETOSPACE reports the granted buffer size
     let granted = ospace_in_bytes(self.fd);
     if granted > 0 { granted as u32 } else { len }
