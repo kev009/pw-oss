@@ -491,7 +491,17 @@ pub struct Log {
   methods: &'static spa_log_methods // ditto
 }
 
-//TODO: spa_log_topic?
+// registered once with the host logger so PIPEWIRE_DEBUG topic patterns
+// (e.g. PIPEWIRE_DEBUG=spa.oss:4) apply; the logger writes the level back
+static mut LOG_TOPIC: spa_log_topic = spa_log_topic {
+  version:          0,
+  topic:            c"spa.oss".as_ptr(),
+  level:            SPA_LOG_LEVEL_NONE,
+  has_custom_level: false
+};
+
+static LOG_TOPIC_INIT: std::sync::Once = std::sync::Once::new();
+
 impl Log {
 
   pub unsafe fn wrap(log: *mut spa_log) -> Self {
@@ -500,19 +510,36 @@ impl Log {
     let methods = logger.iface.cb.funcs.cast::<spa_log_methods>().as_ref()
       .expect("log methods should be initialized");
     assert!(methods.version >= SPA_VERSION_LOG_METHODS);
+
+    LOG_TOPIC_INIT.call_once(|| {
+      if let Some(topic_init) = methods.topic_init {
+        topic_init(logger.iface.cb.data, std::ptr::addr_of_mut!(LOG_TOPIC));
+      }
+    });
+
     Self { logger, methods }
   }
 
   pub fn log_level(&self) -> spa_log_level {
-    self.logger.level
+    let topic = std::ptr::addr_of!(LOG_TOPIC);
+    unsafe {
+      if (*topic).has_custom_level { (*topic).level } else { self.logger.level }
+    }
   }
 
   pub fn log(&self, level: spa_log_level, file: &str, line: c_int, func: &str, msg: &str) {
-    let log  = self.methods.log.expect("log should be initialized");
     let file = CString::new(file).unwrap();
     let func = CString::new(func).unwrap();
     let msg  = CString::new(msg) .unwrap();
-    unsafe { log(self.logger.iface.cb.data, level, file.as_ptr(), line, func.as_ptr(), c"%s".as_ptr(), msg.as_ptr()); }
+    unsafe {
+      if let Some(logt) = self.methods.logt {
+        logt(self.logger.iface.cb.data, level, std::ptr::addr_of!(LOG_TOPIC),
+          file.as_ptr(), line, func.as_ptr(), c"%s".as_ptr(), msg.as_ptr());
+      } else {
+        let log = self.methods.log.expect("log should be initialized");
+        log(self.logger.iface.cb.data, level, file.as_ptr(), line, func.as_ptr(), c"%s".as_ptr(), msg.as_ptr());
+      }
+    }
   }
 }
 
