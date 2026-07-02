@@ -187,6 +187,40 @@ pub unsafe fn build_buffers_info(b: &mut libspa::pod::builder::Builder, stride: 
   Ok(())
 }
 
+// run `f` on the data loop and wait for it; serializes main-thread
+// reconfiguration against process()/on_timeout() (runs inline when already on
+// the loop thread)
+pub unsafe fn block_on_loop<T, F: FnOnce(&mut T)>(loop_: &crate::spa::Loop, target: *mut T, f: F) {
+
+  struct Ctx<T, F> {
+    target: *mut T,
+    f:      Option<F>
+  }
+
+  unsafe extern "C" fn trampoline<T, F: FnOnce(&mut T)>(
+    _loop:     *mut libspa::sys::spa_loop,
+    _async:    bool,
+    _seq:      u32,
+    _data:     *const std::os::raw::c_void,
+    _size:     usize,
+    user_data: *mut std::os::raw::c_void
+  ) -> std::os::raw::c_int
+  {
+    let ctx = user_data.cast::<Ctx<T, F>>().as_mut()
+      .expect("user_data is not supposed to be null");
+    let f = ctx.f.take()
+      .expect("the invoked function only runs once");
+    f(ctx.target.as_mut().expect("target is not supposed to be null"));
+    0
+  }
+
+  // blocking, so `ctx` outlives the call
+  let mut ctx = Ctx { target, f: Some(f) };
+  let err = loop_.invoke(Some(trampoline::<T, F>), 0, std::ptr::null(), 0, true,
+    &mut ctx as *mut _ as *mut std::os::raw::c_void);
+  assert!(err >= 0);
+}
+
 pub fn now_ns(system: &crate::spa::System) -> u64 {
   let mut now = libspa::sys::timespec { tv_sec: 0, tv_nsec: 0 };
   let err = unsafe { system.clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };

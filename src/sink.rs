@@ -236,8 +236,16 @@ unsafe extern "C" fn on_timeout(source: *mut spa_source) {
   crate::trace!(state.log, "on_timeout");
 
   let mut expirations = 0;
-  let err = state.data_system.timerfd_read(state.timer_source.fd, &mut expirations);
-  assert_ne!(err, -1);
+  if state.data_system.timerfd_read(state.timer_source.fd, &mut expirations) < 0 {
+    // disarmed (Pause/Suspend) in this same wakeup; nothing to read
+    return;
+  }
+
+  // stopped between the timer firing and this callback; don't signal ready()
+  // into a node being reconfigured, and don't re-arm
+  if !state.started || state.following {
+    return;
+  }
 
   let nsec = state.next_time;
 
@@ -295,14 +303,11 @@ unsafe fn set_timeout(state: &mut State, next_time: u64) {
   state.data_system.timerfd_settime(state.timer_source.fd, SPA_FD_TIMER_ABSTIME as i32, &timerspec, std::ptr::null_mut());
 }
 
-#[allow(unused_variables)]
-unsafe extern "C" fn set_timers(loop_: *mut spa_loop, async_: bool, seq: u32, data: *const c_void, size: usize, user_data: *mut c_void) -> c_int {
-
-  let state = user_data.cast::<State>().as_mut()
-    .expect("user_data is not supposed to be null");
+// data loop only
+unsafe fn update_timers(state: &mut State) {
 
   #[cfg(debug_assertions)]
-  crate::trace!(state.log, "set_timers");
+  crate::trace!(state.log, "update_timers");
 
   if state.started && !state.following {
     state.next_time = crate::utils::now_ns(&state.data_system);
@@ -314,45 +319,45 @@ unsafe extern "C" fn set_timers(loop_: *mut spa_loop, async_: bool, seq: u32, da
     crate::trace!(state.log, "next time {}", 0);
     set_timeout(state, 0);
   }
-
-  0
 }
 
 unsafe extern "C" fn set_io(object: *mut c_void, id: u32, data: *mut c_void, size: usize) -> c_int {
 
-  let state = object.cast::<State>().as_mut()
-    .expect("object is not supposed to be null");
+  let state: *mut State = object.cast();
+  assert!(!state.is_null());
 
-  #[allow(non_upper_case_globals)]
-  match id {
-    SPA_IO_Clock    => {
-      assert_eq!(size, std::mem::size_of::<spa_io_clock>());
-      state.clock = data.cast();
-    },
-    SPA_IO_Position => {
-      assert_eq!(size, std::mem::size_of::<spa_io_position>());
-      state.position = data.cast();
-    },
-    _ => unimplemented!()
-  };
+  // clock/position are read on the data loop; apply the change there
+  crate::utils::block_on_loop(&(*state).data_loop, state, |state| {
 
-  if state.started {
-    let following = state.node_is_follower();
-    if state.following != following {
-      state.following = following;
-      //TODO: do we just ignore the result of this function?
-      let user_data = state as *mut _ as *mut c_void;
-      let _ = state.data_loop.invoke(Some(set_timers), 0, std::ptr::null(), 0, true, user_data);
+    #[allow(non_upper_case_globals)]
+    match id {
+      SPA_IO_Clock    => {
+        assert_eq!(size, std::mem::size_of::<spa_io_clock>());
+        state.clock = data.cast();
+      },
+      SPA_IO_Position => {
+        assert_eq!(size, std::mem::size_of::<spa_io_position>());
+        state.position = data.cast();
+      },
+      _ => unimplemented!()
+    };
 
-      // there are some weird PipeWire xruns on clock changes that are messing up our OSS buffer delay,
-      // we'll just preemptively treat them as OSS underruns for now
-      for port in &mut state.ports {
-        port.xrun_timestamp = crate::utils::now_ns(&state.data_system);
-        #[cfg(debug_assertions)]
-        crate::warn!(state.log, "{}: clock change @ {}", port.dsp.path, port.xrun_timestamp);
+    if state.started {
+      let following = state.node_is_follower();
+      if state.following != following {
+        state.following = following;
+        update_timers(state);
+
+        // there are some weird PipeWire xruns on clock changes that are messing up our OSS buffer delay,
+        // we'll just preemptively treat them as OSS underruns for now
+        for port in &mut state.ports {
+          port.xrun_timestamp = crate::utils::now_ns(&state.data_system);
+          #[cfg(debug_assertions)]
+          crate::warn!(state.log, "{}: clock change @ {}", port.dsp.path, port.xrun_timestamp);
+        }
       }
     }
-  }
+  });
 
   0
 }
@@ -370,42 +375,48 @@ unsafe extern "C" fn send_command(object: *mut c_void, command: *const spa_comma
   #[allow(non_upper_case_globals)]
   match (body.type_, body.id) {
     (SPA_TYPE_COMMAND_Node, SPA_NODE_COMMAND_Start) => {
+      let state: *mut State = state;
+      crate::utils::block_on_loop(&(*state).data_loop, state, |state| {
 
-      for port in &mut state.ports {
-        port.xrun_timestamp = 0;
-      }
+        for port in &mut state.ports {
+          port.xrun_timestamp = 0;
+        }
 
-      // sane clock delay/rate_diff until process() publishes measured values
-      if !state.clock.is_null() {
-        (*state.clock).delay     = 0;
-        (*state.clock).rate_diff = 1.0;
-      }
+        // sane clock delay/rate_diff until process() publishes measured values
+        if !state.clock.is_null() {
+          (*state.clock).delay     = 0;
+          (*state.clock).rate_diff = 1.0;
+        }
 
-      state.started   = true;
-      state.following = state.node_is_follower();
+        state.started   = true;
+        state.following = state.node_is_follower();
 
-      state.cur_timestamp = 0;
-      state.old_timestamp = 0;
+        state.cur_timestamp = 0;
+        state.old_timestamp = 0;
 
-      let user_data = state as *mut _ as *mut c_void;
-      let _ = state.data_loop.invoke(Some(set_timers), 0, std::ptr::null(), 0, true, user_data);
+        update_timers(state);
+      });
       0
     },
     (SPA_TYPE_COMMAND_Node, SPA_NODE_COMMAND_Pause) => {
-      state.started = false;
-      let user_data = state as *mut _ as *mut c_void;
-      let _ = state.data_loop.invoke(Some(set_timers), 0, std::ptr::null(), 0, true, user_data);
+      let state: *mut State = state;
+      crate::utils::block_on_loop(&(*state).data_loop, state, |state| {
+        state.started = false;
+        update_timers(state);
+      });
       0
     },
     (SPA_TYPE_COMMAND_Node, SPA_NODE_COMMAND_Suspend) => {
-      for port in &mut state.ports {
-        if !port.dsp.is_closed() {
-          port.dsp.close();
+      let state: *mut State = state;
+      crate::utils::block_on_loop(&(*state).data_loop, state, |state| {
+        for port in &mut state.ports {
+          if !port.dsp.is_closed() {
+            port.dsp.close();
+          }
         }
-      }
-      state.started = false;
-      let user_data = state as *mut _ as *mut c_void;
-      let _ = state.data_loop.invoke(Some(set_timers), 0, std::ptr::null(), 0, true, user_data);
+        state.started = false;
+        update_timers(state);
+      });
       0
     },
     (SPA_TYPE_COMMAND_Node, SPA_NODE_COMMAND_ParamBegin | SPA_NODE_COMMAND_ParamEnd) => 0, // we don't care
@@ -582,15 +593,7 @@ unsafe extern "C" fn port_set_param(object: *mut c_void, direction: spa_directio
 
             crate::debug!(state.log, "reconfiguring with {:?}", config);
 
-            let port = &mut state.ports[port_id as usize];
-
-            if !port.dsp.is_closed() {
-              port.dsp.close();
-            }
-
-            port.dsp.open().unwrap();
-
-            let format = match config.format {
+            let oss_format = match config.format {
               libspa::param::audio::AudioFormat::S32LE => crate::sound::AFMT_S32_LE,
               libspa::param::audio::AudioFormat::S32BE => crate::sound::AFMT_S32_BE,
               libspa::param::audio::AudioFormat::S16LE => crate::sound::AFMT_S16_LE,
@@ -598,11 +601,26 @@ unsafe extern "C" fn port_set_param(object: *mut c_void, direction: spa_directio
               _ => unreachable!()
             };
 
-            port.dsp.set_format(format);
-            port.dsp.set_channels(config.channels);
-            port.dsp.set_rate(config.rate);
+            // the host renegotiates on a live node; swap the device and
+            // config on the data loop
+            let port_idx = port_id as usize;
+            let state_ptr: *mut State = state;
+            crate::utils::block_on_loop(&(*state_ptr).data_loop, state_ptr, move |state| {
 
-            port.config = Some(config);
+              let port = &mut state.ports[port_idx];
+
+              if !port.dsp.is_closed() {
+                port.dsp.close();
+              }
+
+              port.dsp.open().unwrap();
+
+              port.dsp.set_format(oss_format);
+              port.dsp.set_channels(config.channels);
+              port.dsp.set_rate(config.rate);
+
+              port.config = Some(config);
+            });
           },
           Ok((t, st)) => {
             crate::warn!(state.log, "unknown media type combination: {:?}, {:?}", t, st);
@@ -615,13 +633,18 @@ unsafe extern "C" fn port_set_param(object: *mut c_void, direction: spa_directio
         };
       } else {
         // releasing the format: close the device and drop the buffers (the
-        // Suspend path may have closed the dsp already, hence the guard)
-        let port = &mut state.ports[port_id as usize];
-        if !port.dsp.is_closed() {
-          port.dsp.close();
-        }
-        port.buffers.clear();
-        port.config = None;
+        // Suspend path may have closed the dsp already, hence the guard); all
+        // three are read by process(), so do it from the data loop
+        let port_idx = port_id as usize;
+        let state_ptr: *mut State = state;
+        crate::utils::block_on_loop(&(*state_ptr).data_loop, state_ptr, move |state| {
+          let port = &mut state.ports[port_idx];
+          if !port.dsp.is_closed() {
+            port.dsp.close();
+          }
+          port.buffers.clear();
+          port.config = None;
+        });
       }
 
       // update the port rate and flip Format/Buffers flags to reflect whether a
@@ -651,7 +674,11 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
   let state = object.cast::<State>().as_mut()
     .expect("object is not supposed to be null");
 
-  assert!(state.started);
+  // a cycle that was already signaled when we paused can still land here; drop
+  // it instead of assert!()ing, which aborts the daemon across extern "C"
+  if !state.started {
+    return SPA_STATUS_OK as i32;
+  }
 
   state.old_timestamp = state.cur_timestamp;
   state.cur_timestamp = crate::utils::now_ns(&state.data_system);
@@ -913,12 +940,19 @@ unsafe extern "C" fn port_use_buffers(object: *mut c_void, direction: spa_direct
   assert!((port_id as usize) < MAX_PORTS);
   assert_eq!(flags, 0);
 
-  if !buffers.is_null() {
+  let new_buffers = if !buffers.is_null() {
     assert!(n_buffers > 0);
-    state.ports[port_id as usize].buffers = std::slice::from_raw_parts(buffers, n_buffers as usize).to_vec();
+    std::slice::from_raw_parts(buffers, n_buffers as usize).to_vec()
   } else {
-    state.ports[port_id as usize].buffers = vec![];
-  }
+    vec![]
+  };
+
+  // process() walks this vec on the data loop; swap it there
+  let port_idx = port_id as usize;
+  let state_ptr: *mut State = state;
+  crate::utils::block_on_loop(&(*state_ptr).data_loop, state_ptr, move |state| {
+    state.ports[port_idx].buffers = new_buffers;
+  });
 
   0
 }
