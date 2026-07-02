@@ -135,8 +135,9 @@ pub unsafe fn build_enum_format_info(b: &mut libspa::pod::builder::Builder, caps
     formats = all.iter().map(|(_, f)| *f).collect();
   }
 
-  // counts with a defined kernel interleave order, within the granted range
-  let mut counts = [1u32, 2, 4, 6, 8].iter().copied()
+  // counts with a defined kernel interleave order, within the granted range;
+  // stereo first: the host takes the first result as the default format
+  let mut counts = [2u32, 4, 6, 8, 1].iter().copied()
     .filter(|c| *c >= caps.min_channels && *c <= caps.max_channels)
     .collect::<Vec<_>>();
   if counts.is_empty() {
