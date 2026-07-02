@@ -54,7 +54,14 @@ impl SysctlReader {
       return Err(Errno::last());
     }
 
-    Ok(String::from_utf8_lossy(&self.scratch_buffer[0..len]).to_string())
+    // classic string sysctls (e.g. kern.ostype) count the terminating NUL
+    // in the returned length; device-tree ones don't - trim either way, or
+    // the NUL poisons map keys and C-string conversions downstream
+    let mut bytes = &self.scratch_buffer[0..len];
+    while let [head @ .., 0] = bytes {
+      bytes = head;
+    }
+    Ok(String::from_utf8_lossy(bytes).to_string())
   }
 
   pub fn read_u32<T: Into<SysctlName>>(&mut self, name: T) -> Result<u32, Errno> {
@@ -149,6 +156,11 @@ pub unsafe fn build_enum_format_info(b: &mut libspa::pod::builder::Builder, caps
   ];
   let mut formats = all.iter().filter(|(m, _)| caps.formats & m != 0).map(|(_, f)| *f).collect::<Vec<_>>();
   if formats.is_empty() {
+    if caps.convertless {
+      // bitperfect has no feeder: a format we can't produce natively can't
+      // be offered at all (a snap-and-mismatch would just fail negotiation)
+      return Ok(false);
+    }
     // the device only does formats we don't (e.g. S24); the kernel converts
     formats = all.iter().map(|(_, f)| *f).collect();
   }

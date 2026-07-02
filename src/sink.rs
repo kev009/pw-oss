@@ -76,6 +76,9 @@ impl PortConfig {
 }
 
 impl crate::node::ConfigOps for PortConfig {
+  fn oss_format(&self) -> u32 {
+    PortConfig::oss_format(self)
+  }
   fn rate(&self) -> u32        { self.rate }
   fn channels(&self) -> u32    { self.channels }
   fn stride(&self) -> u32      { PortConfig::stride(self) }
@@ -182,8 +185,10 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
   state.ext.old_timestamp = state.ext.cur_timestamp;
   state.ext.cur_timestamp = crate::utils::now_ns(&state.data_system);
 
-  // freewheeling: the graph runs faster than realtime, so consume the input
-  // without touching the device (ALSA discards the same way)
+  // Freewheeling: the graph runs faster than realtime, so consume the input
+  // without touching the device. The io NEED_DATA + return HAVE_DATA pair
+  // looks odd for a sink but matches alsa-pcm-sink.c:788-791; it is what
+  // keeps the freewheel pump running.
   if (*state.position).clock.flags & SPA_IO_CLOCK_FLAG_FREEWHEEL != 0 {
     for port in &mut state.ports {
       if !port.io.is_null() {

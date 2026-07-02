@@ -95,20 +95,22 @@ impl Mixer {
 
   // Capture: RECLEV (ADC-side on hdaa, survives RECSRC changes), else the
   // level control of the current RECSRC source, else IGAIN, else nothing.
-  pub fn input_control(&self) -> Option<c_uint> {
+  // the bool marks a recsrc-derived choice, which must be re-resolved when
+  // the recording source changes (RECSRC writes don't tick modify_counter)
+  pub fn input_control(&self) -> Option<(c_uint, bool)> {
     if self.has(SOUND_MIXER_RECLEV) {
-      return Some(SOUND_MIXER_RECLEV);
+      return Some((SOUND_MIXER_RECLEV, false));
     }
     if let Some(recsrc) = self.read_int(SOUND_MIXER_RECSRC) {
       let named = recsrc as u32 & self.recmask & self.devmask;
       for dev in 0..SOUND_MIXER_NRDEVICES {
         if named & (1 << dev) != 0 {
-          return Some(dev);
+          return Some((dev, true));
         }
       }
     }
     if self.has(SOUND_MIXER_IGAIN) {
-      return Some(SOUND_MIXER_IGAIN);
+      return Some((SOUND_MIXER_IGAIN, false));
     }
     None
   }

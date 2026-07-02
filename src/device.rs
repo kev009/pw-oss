@@ -12,6 +12,7 @@ struct RouteState {
   description: String,
   mixer:   usize,  // index into State::mixers
   control: c_uint, // mixer device selected by mixer::{output,input}_control
+  follows_recsrc: bool, // control derives from RECSRC; re-resolve on change
   levels:  (u32, u32), // shadow OSS levels, 0-100 each
   mute:    bool,
   save:    bool    // echoed back in the Route pod, never interpreted
@@ -356,6 +357,31 @@ unsafe fn announce_route_change(state: &mut State) {
 // levels and mute against the shadow and re-emit only on a real change. The
 // counter is only a hint (it misses RECSRC changes and writes-to-muted); the
 // value diff is what prevents spurious re-emissions either way.
+// re-resolve a recsrc-derived capture control (RECSRC changes never tick the
+// modify counter, and the write path must not adjust the OLD source)
+fn resolve_recsrc(state: &mut State, pos: usize) {
+  if !state.routes[pos].follows_recsrc {
+    return;
+  }
+  let mi = state.routes[pos].mixer;
+  if let Some((control, true)) = state.mixers[mi].mixer.input_control() {
+    state.routes[pos].control = control;
+  }
+}
+
+// pull the hardware state into a route's shadow (no emissions)
+fn refresh_route_shadow(state: &mut State, pos: usize) {
+  resolve_recsrc(state, pos);
+  let mi      = state.routes[pos].mixer;
+  let control = state.routes[pos].control;
+  if let Some(levels) = state.mixers[mi].mixer.level(control) {
+    state.routes[pos].levels = levels;
+  }
+  if let Some(mute) = state.mixers[mi].mixer.muted(control) {
+    state.routes[pos].mute = mute;
+  }
+}
+
 unsafe fn poll_mixers(state: &mut State) {
 
   if state.profile == 0 {
@@ -380,6 +406,7 @@ unsafe fn poll_mixers(state: &mut State) {
       if state.routes[pos].mixer != mi {
         continue;
       }
+      resolve_recsrc(state, pos);
       let control = state.routes[pos].control;
       let mut vol_changed  = false;
       let mut mute_changed = false;
@@ -540,6 +567,9 @@ unsafe fn apply_route_props(state: &mut State, pos: usize, props: libspa::pod::O
 
   use libspa::pod::{Value, ValueArray};
 
+  // the cached control may lag a recording-source change by up to a poll
+  // tick; a write must target the CURRENT source
+  resolve_recsrc(state, pos);
   let mi      = state.routes[pos].mixer;
   let control = state.routes[pos].control;
 
@@ -555,7 +585,8 @@ unsafe fn apply_route_props(state: &mut State, pos: usize, props: libspa::pod::O
       (SPA_PROP_channelVolumes, Value::ValueArray(ValueArray::Float(v))) if !v.is_empty() => {
         // any width is accepted: mixer channel i reads v[i % n], so a mono
         // request fans out and a wider-than-stereo one folds down
-        #[cfg(debug_assertions)]
+        // log what the session manager actually sent; misapplied volumes
+        // are hard to attribute after the fact (PIPEWIRE_DEBUG=spa.oss:4)
         crate::debug!(state.log, "route {} channelVolumes {:?}", state.routes[pos].name, v);
         let levels = (linear_to_oss(v[0]), linear_to_oss(v[1 % v.len()]));
         if levels != state.routes[pos].levels && state.mixers[mi].mixer.set_level(control, levels.0, levels.1) {
@@ -614,11 +645,21 @@ unsafe extern "C" fn set_param(object: *mut c_void, id: u32, _flags: u32, param:
         return -libc::EINVAL;
       };
 
+      let profile_save_changed = state.profile_save != save;
       state.profile_save = save;
 
       if state.profile != index {
         state.profile = index;
         crate::info!(state.log, "profile -> {}", if index == 0 { "off" } else { "default" });
+
+        // The poll idles while Off, so external mixer changes may have gone
+        // unseen; refresh every shadow BEFORE the bump re-announces Route
+        // pods, or consumers read stale volumes for up to a tick.
+        if index != 0 {
+          for pos in 0..state.routes.len() {
+            refresh_route_shadow(state, pos);
+          }
+        }
 
         // add or remove the nodes, then re-announce the params tied to the
         // active profile (Route pods appear/vanish with it)
@@ -634,7 +675,7 @@ unsafe extern "C" fn set_param(object: *mut c_void, id: u32, _flags: u32, param:
         state.dev_info.bump_param(SPA_PARAM_EnumRoute);
         state.dev_info.bump_param(SPA_PARAM_Route);
         emit_device_info(state);
-      } else {
+      } else if profile_save_changed {
         // the save flag is part of the Profile readback; keep it fresh
         let _ = state.dev_info.replace_change_mask(0);
         state.dev_info.bump_param(SPA_PARAM_Profile);
@@ -645,8 +686,8 @@ unsafe extern "C" fn set_param(object: *mut c_void, id: u32, _flags: u32, param:
     },
     SPA_PARAM_Route => {
 
-      if param.is_null() {
-        return -libc::EINVAL;
+      if param.is_null() || state.profile == 0 {
+        return -libc::EINVAL; // no routes exist under the Off profile
       }
 
       let object = match crate::utils::deserialize_pod(param) {
@@ -676,17 +717,18 @@ unsafe extern "C" fn set_param(object: *mut c_void, id: u32, _flags: u32, param:
         return -libc::EINVAL;
       };
 
-      // resolve by index, else by name (restores may come back either way)
-      let pos = index.filter(|i| *i < state.routes.len())
-        .or_else(|| name.as_deref().and_then(|n| state.routes.iter().position(|r| r.name == n)));
+      // Resolve with device consistency required: a stale in-range index
+      // (route set changed since the state was saved) must lose to the
+      // durable name instead of winning and then failing the device check.
+      let pos = index
+        .filter(|i| *i < state.routes.len() && state.routes[*i].node_id == device)
+        .or_else(|| name.as_deref().and_then(|n|
+          state.routes.iter().position(|r| r.name == n && r.node_id == device)));
       let Some(pos) = pos else {
         return -libc::EINVAL;
       };
 
-      if state.routes[pos].node_id != device {
-        return -libc::EINVAL;
-      }
-
+      let save_changed = state.routes[pos].save != save;
       state.routes[pos].save = save;
 
       // a port-switch message carries no props and must not touch the volume
@@ -703,7 +745,11 @@ unsafe extern "C" fn set_param(object: *mut c_void, id: u32, _flags: u32, param:
         state.mixers[mi].counter = counter;
       }
 
-      announce_route_change(state);
+      // bump only on an observable change: every spurious serial flip costs
+      // the session manager a full param re-enumeration
+      if vol_changed || mute_changed || save_changed {
+        announce_route_change(state);
+      }
 
       if vol_changed {
         emit_object_config(state, pos, true);
@@ -784,7 +830,8 @@ fn probe_routes(pcm_devices: &[crate::sound::PcmDevice]) -> (Vec<RouteState>, Ve
       if !enabled {
         continue;
       }
-      let Some(control) = (if rec { mixer.input_control() } else { mixer.output_control() }) else {
+      let picked = if rec { mixer.input_control() } else { mixer.output_control().map(|c| (c, false)) };
+      let Some((control, follows_recsrc)) = picked else {
         continue; // no usable control for this direction
       };
       let Some(levels) = mixer.level(control) else {
@@ -813,6 +860,7 @@ fn probe_routes(pcm_devices: &[crate::sound::PcmDevice]) -> (Vec<RouteState>, Ve
         description,
         mixer: mixer_index,
         control,
+        follows_recsrc,
         levels,
         mute,
         save: false

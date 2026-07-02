@@ -39,6 +39,7 @@ impl DeviceOps for crate::sound::DspWriter {
 // the negotiated format as the generic core needs it; the concrete PortConfig
 // types (whose Debug readback differs) stay per direction
 pub(crate) trait ConfigOps: std::fmt::Debug + Clone {
+  fn oss_format(&self) -> u32;
   fn rate(&self) -> u32;
   fn channels(&self) -> u32;
   fn stride(&self) -> u32;
@@ -823,6 +824,16 @@ unsafe extern "C" fn port_set_param<D: Direction>(object: *mut c_void, direction
               Err(err)   => return err
             };
 
+            // Validate against the advertised caps first: an out-of-caps
+            // request on an exclusive device would EBUSY-retire the WORKING
+            // fd and then fail configure, killing the stream for nothing.
+            // configure() stays as the backstop for stale caps (a rejection
+            // there re-probes and re-announces).
+            if !state.caps.admits(config.oss_format(), raw.channels, raw.rate) {
+              crate::warn!(state.log, "rejecting out-of-caps format: rate={} channels={}", raw.rate, raw.channels);
+              return -libc::EINVAL;
+            }
+
             res = install_device(state, port_id as usize, config);
             if res == -libc::EINVAL || res == -libc::ENOTSUP {
               // the device rejected caps-derived values: the snapshot may be
@@ -1026,8 +1037,12 @@ pub(crate) unsafe fn resetup_task<D: Direction>(state: &mut State<D>, port_idx: 
 unsafe fn check_loop_identity<D: Direction>(state: &mut State<D>) -> bool {
   use std::sync::atomic::Ordering;
   let tid = libc::pthread_self() as usize;
+  // The expected id is SEEDED from a closure run on the data loop at init,
+  // not claimed by whoever calls first: a pure follower never runs
+  // on_timeout, so a process() arriving on a divergent host loop would
+  // otherwise bless itself and undo the block_on_loop serialization.
   let seen = match state.loop_thread.compare_exchange(0, tid, Ordering::Relaxed, Ordering::Relaxed) {
-    Ok(_) => tid,
+    Ok(_) => tid, // seeding failed at init; degrade to first-caller-wins
     Err(seen) => seen
   };
   if seen == tid {
@@ -1372,6 +1387,14 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
     std::ptr::drop_in_place(state);
     return err;
   }
+
+  // learn the data loop's thread identity from the loop itself (see
+  // check_loop_identity); pw's data loops run before any node loads, so
+  // this executes on the loop thread, not inline
+  let state_ptr: *mut State<D> = state;
+  crate::utils::block_on_loop(&(*state_ptr).data_loop, state_ptr, |state| {
+    state.loop_thread.store(libc::pthread_self() as usize, std::sync::atomic::Ordering::Relaxed);
+  });
 
   0
 }

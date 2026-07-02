@@ -111,7 +111,8 @@ pub struct DspCaps {
   pub min_rate:       u32,
   pub max_rate:       u32,
   pub preferred_rate: Option<u32>, // the parent's vchan mix rate, when known
-  pub rates:          Vec<u32> // discrete native rates (exclusive devices); empty = the range
+  pub rates:          Vec<u32>, // discrete native rates (exclusive devices); empty = the range
+  pub convertless:    bool // bitperfect: no feeder, only native values negotiate
 }
 
 impl DspCaps {
@@ -125,8 +126,29 @@ impl DspCaps {
       min_rate:       8000,
       max_rate:       192000,
       preferred_rate: None,
-      rates:          vec![]
+      rates:          vec![],
+      convertless:    false
     }
+  }
+
+  // Lenient admission check for a host-requested format: rejects only clear
+  // violations of the advertised caps (staleness is handled by the caller's
+  // configure backstop). Rates within the feeder snap window pass.
+  pub fn admits(&self, oss_format: u32, channels: u32, rate: u32) -> bool {
+    // format only matters where no feeder converts (bitperfect): a
+    // non-native SETFMT there snaps and fails the strict grant check -
+    // after the EBUSY retire already killed the working fd
+    if self.convertless && self.formats & oss_format == 0 {
+      return false;
+    }
+    if channels < self.min_channels || channels > self.max_channels {
+      return false;
+    }
+    if !self.rates.is_empty() {
+      return self.rates.contains(&rate);
+    }
+    let slack = feeder_rate_round();
+    rate.saturating_add(slack) >= self.min_rate && rate <= self.max_rate.saturating_add(slack)
   }
 }
 
@@ -268,7 +290,8 @@ fn caps_from_sndstat(nv: &SndstatDspInfo, rates: Vec<u32>) -> DspCaps {
     min_rate:       nv.min_rate.max(1),
     max_rate:       nv.max_rate.max(nv.min_rate).max(1),
     preferred_rate: None, // the native values are the preference
-    rates
+    rates,
+    convertless:    nv.bitperfect
   }
 }
 
@@ -311,7 +334,15 @@ pub fn probe_caps(path: &str, play: bool) -> Option<DspCaps> {
   // build the caps from sndstat without opening at all.
   if let Some(nv) = &native {
     if nv.bitperfect || nv.exclusive == Some(true) {
-      return Some(caps_from_sndstat(nv, native_rates(path, play)));
+      let mut rates = native_rates(path, play);
+      // native_rates opens the device briefly; if that failed (busy) on a
+      // bitperfect device, fall back to the native EXTREMES - they are
+      // themselves native, while a dense min..max range would admit
+      // pitch-shifting non-native rates (playback echoes the request back)
+      if nv.bitperfect && rates.is_empty() && nv.min_rate != nv.max_rate {
+        rates = vec![nv.min_rate.max(1), nv.max_rate.max(nv.min_rate).max(1)];
+      }
+      return Some(caps_from_sndstat(nv, rates));
     }
   }
 
@@ -387,7 +418,8 @@ pub fn probe_caps(path: &str, play: bool) -> Option<DspCaps> {
     min_rate:       min_rate as u32,
     max_rate:       max_rate as u32,
     preferred_rate,
-    rates:          vec![] // the feeder converts; the range really is dense
+    rates:          vec![], // the feeder converts; the range really is dense
+    convertless:    false
   })
 }
 

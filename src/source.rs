@@ -47,6 +47,9 @@ impl PortConfig {
 }
 
 impl crate::node::ConfigOps for PortConfig {
+  fn oss_format(&self) -> u32 {
+    PortConfig::oss_format(self)
+  }
   fn rate(&self) -> u32        { self.rate }
   fn channels(&self) -> u32    { self.channels }
   fn stride(&self) -> u32      { self.stride }

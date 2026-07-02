@@ -110,14 +110,15 @@ pub enum DictionaryString {
 impl From<&str> for DictionaryString {
 
   fn from(str: &str) -> Self {
-    DictionaryString::CString(CString::new(str).unwrap())
+    // host/sysctl strings; a stray interior NUL must not abort the daemon
+    DictionaryString::CString(CString::new(str.replace('\0', " ")).expect("NULs replaced"))
   }
 }
 
 impl From<String> for DictionaryString {
 
   fn from(str: String) -> Self {
-    DictionaryString::CString(CString::new(str).unwrap())
+    DictionaryString::CString(CString::new(str.replace('\0', " ")).expect("NULs replaced"))
   }
 }
 
