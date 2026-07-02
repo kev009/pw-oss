@@ -28,6 +28,7 @@ struct State {
   latency:       [spa_latency_info; 2], // indexed by direction; written by the host, replayed on read
   process_latency: spa_process_latency_info,
   started:       bool,
+  clearing:      bool, // teardown in progress; queued tasks must no-op
   following:     bool,
   cur_timestamp: u64,  // method invocation timestamp for `process`
   old_timestamp: u64,
@@ -292,12 +293,23 @@ unsafe extern "C" fn set_param(object: *mut c_void, id: u32, _flags: u32, param:
     SPA_PARAM_Props => {
       if param.is_null() {
         // a NULL pod resets the props to their defaults and re-applies them
-        let state_ptr: *mut State = state;
-        crate::utils::block_on_loop(&(*state_ptr).data_loop, state_ptr, |state| {
-          state.oss_delay = state.oss_delay_default; // read by process()
-        });
-        for port_idx in 0..MAX_PORTS {
-          if !state.ports[port_idx].dsp.is_running() {
+        let mut running = [false; MAX_PORTS];
+        let applied = {
+          let running_ref = &mut running;
+          let state_ptr: *mut State = state;
+          crate::utils::block_on_loop(&(*state_ptr).data_loop, state_ptr, move |state| {
+            state.oss_delay = state.oss_delay_default; // read by process()
+            // dsp state is loop-owned; snapshot it here
+            for (i, port) in state.ports.iter().enumerate() {
+              running_ref[i] = port.dsp.is_running();
+            }
+          })
+        };
+        if !applied {
+          return -libc::EIO;
+        }
+        for (port_idx, &was_running) in running.iter().enumerate() {
+          if !was_running {
             continue;
           }
           if let Some(config) = state.ports[port_idx].config.clone() {
@@ -345,12 +357,23 @@ unsafe extern "C" fn set_param(object: *mut c_void, id: u32, _flags: u32, param:
                           // apply immediately: store on the loop (process()
                           // reads it), then rebuild the device from this
                           // (main) thread so the next cycle re-primes
-                          let state_ptr: *mut State = state;
-                          crate::utils::block_on_loop(&(*state_ptr).data_loop, state_ptr, move |state| {
-                            state.oss_delay = new_delay;
-                          });
-                          for port_idx in 0..MAX_PORTS {
-                            if !state.ports[port_idx].dsp.is_running() {
+                          let mut running = [false; MAX_PORTS];
+                          let applied = {
+                            let running_ref = &mut running;
+                            let state_ptr: *mut State = state;
+                            crate::utils::block_on_loop(&(*state_ptr).data_loop, state_ptr, move |state| {
+                              state.oss_delay = new_delay;
+                              // dsp state is loop-owned; snapshot it here
+                              for (i, port) in state.ports.iter().enumerate() {
+                                running_ref[i] = port.dsp.is_running();
+                              }
+                            })
+                          };
+                          if !applied {
+                            return -libc::EIO;
+                          }
+                          for (port_idx, &was_running) in running.iter().enumerate() {
+                            if !was_running {
                               continue; // not streaming; picked up at start
                             }
                             if let Some(config) = state.ports[port_idx].config.clone() {
@@ -674,17 +697,33 @@ unsafe extern "C" fn send_command(object: *mut c_void, command: *const spa_comma
       0
     },
     (SPA_TYPE_COMMAND_Node, SPA_NODE_COMMAND_Suspend) => {
-      let state: *mut State = state;
-      if !crate::utils::block_on_loop(&(*state).data_loop, state, |state| {
-        for port in &mut state.ports {
-          if !port.dsp.is_closed() {
-            port.dsp.close();
+      // swap the devices out on the loop and close them here: HALT+close can
+      // sleep (chn_abort), which would stall every node on the data loop
+      let mut retired: [Option<crate::sound::DspWriter>; MAX_PORTS] = std::default::Default::default();
+      let paths: [String; MAX_PORTS] = std::array::from_fn(|i| state.ports[i].dsp.path.clone());
+      {
+        let retired_ref = &mut retired;
+        let state: *mut State = state;
+        let paths_ref = &paths;
+        if !crate::utils::block_on_loop(&(*state).data_loop, state, move |state| {
+          for (i, port) in state.ports.iter_mut().enumerate() {
+            if !port.dsp.is_closed() {
+              let closed = crate::sound::DspWriter::new(&paths_ref[i]);
+              retired_ref[i] = Some(std::mem::replace(&mut port.dsp, closed));
+            }
+          }
+          state.started = false;
+          update_timers(state);
+        }) {
+          return -libc::EIO;
+        }
+      }
+      for old in retired.iter_mut() {
+        if let Some(dsp) = old.as_mut() {
+          if !dsp.is_closed() {
+            dsp.close(); // off the RT path
           }
         }
-        state.started = false;
-        update_timers(state);
-      }) {
-        return -libc::EIO;
       }
       0
     },
@@ -1000,6 +1039,9 @@ unsafe fn install_device(state: &mut State, port_idx: usize, config: PortConfig)
       let state_ptr: *mut State = state;
       if !crate::utils::block_on_loop(&(*state_ptr).data_loop, state_ptr, move |state| {
         *retired_ref = Some(std::mem::replace(&mut state.ports[port_idx].dsp, closed));
+        // a cycle landing in this window must skip, not queue a rebuild of
+        // the device we are about to install (cleared by the final swap)
+        state.ports[port_idx].resetup_pending = true;
       }) {
         return -libc::EIO;
       }
@@ -1020,6 +1062,7 @@ unsafe fn install_device(state: &mut State, port_idx: usize, config: PortConfig)
       port.config = if ok { Some(config) } else { None };
       port.xrun_timestamp  = 0;
       port.resetup_pending = false;
+      port.was_matching    = false; // force a relock when matching resumes
     })
   };
   drop(old_dsp); // ditto
@@ -1032,6 +1075,22 @@ unsafe fn install_device(state: &mut State, port_idx: usize, config: PortConfig)
 
 // runs on the main thread (queued from the data loop via invoke_on_loop)
 unsafe fn resetup_task(state: &mut State, port_idx: usize) {
+  if state.clearing {
+    return; // teardown is flushing us out; don't touch the device
+  }
+  // consume-or-bail: an intervening install_device (renegotiation) already
+  // cleared the flag, making this task stale
+  let mut still_pending = false;
+  {
+    let pending_ref = &mut still_pending;
+    let state_ptr: *mut State = state;
+    crate::utils::block_on_loop(&(*state_ptr).data_loop, state_ptr, move |state| {
+      *pending_ref = state.ports[port_idx].resetup_pending;
+    });
+  }
+  if !still_pending {
+    return;
+  }
   // config only mutates from main-thread calls, which are serialized with us
   match state.ports[port_idx].config.clone() {
     Some(config) => {
@@ -1180,6 +1239,7 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       port.resetup_pending = state.main_loop.as_ref().is_some_and(|main_loop|
         crate::utils::invoke_on_loop(main_loop, state_ptr, move |state| resetup_task(state, port_idx)));
       if port.resetup_pending {
+        port.was_matching = false; // the gap invalidates matching history
         (*port.io).status = SPA_STATUS_NEED_DATA as i32;
         result |= SPA_STATUS_NEED_DATA as i32;
         continue;
@@ -1484,6 +1544,14 @@ unsafe extern "C" fn clear(handle: *mut spa_handle) -> c_int {
   let state: *mut State = handle.cast();
   assert!(!state.is_null());
 
+  // A queued resetup_task holds this state pointer; a blocking self-invoke
+  // on the main loop flushes all pending queue items (in submission order)
+  // before we free anything, and `clearing` makes the flushed tasks no-op.
+  (*state).clearing = true;
+  if let Some(main_loop) = (*state).main_loop.as_ref() {
+    crate::utils::block_on_loop(main_loop, state, |_| {});
+  }
+
   // the data loop still holds the timer source; detach it there before the
   // state is freed, then close the timerfd
   if !crate::utils::block_on_loop(&(*state).data_loop, state, |state| {
@@ -1646,7 +1714,8 @@ unsafe extern "C" fn init(
 
     process_latency: crate::utils::process_latency_default(),
 
-    started:   false,
+    started:    false,
+    clearing:   false,
     following: false,
 
     cur_timestamp: 0,

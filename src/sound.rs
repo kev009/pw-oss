@@ -144,17 +144,21 @@ pub fn probe_caps(path: &str, play: bool) -> Option<DspCaps> {
   let formats_ok = unsafe { libc::ioctl(fd, SNDCTL_DSP_GETFMTS, &mut formats) } != -1;
 
   // ENGINEINFO with dev == -1 resolves the channel bound to THIS fd, so the
-  // limits are per-direction (AUDIOINFO blends play and rec across the device)
-  let (ai_min_ch, ai_max_ch, ai_min_rate, ai_max_rate) = unsafe {
+  // limits are per-direction (AUDIOINFO blends play and rec across the
+  // device). Note: kernels before the 15.x sound rewrite report a vchan's
+  // fixed rate here instead of the feeder range; harmless, since these
+  // values are only consulted when the empirical probe fails.
+  let (ai_min_ch, ai_max_ch, ai_min_rate, ai_max_rate, ai_caps) = unsafe {
     let mut ai = std::mem::MaybeUninit::<oss_audioinfo>::zeroed();
     (*ai.as_mut_ptr()).dev = -1; // this fd's channel
     if libc::ioctl(fd, SNDCTL_ENGINEINFO, ai.as_mut_ptr()) == -1 {
-      (0, 0, 0, 0)
+      (0, 0, 0, 0, 0)
     } else {
       let ai = ai.assume_init();
-      (ai.min_channels, ai.max_channels, ai.min_rate, ai.max_rate)
+      (ai.min_channels, ai.max_channels, ai.min_rate, ai.max_rate, ai.caps)
     }
   };
+  const PCM_CAP_VIRTUAL: c_int = 0x0004_0000;
 
   let probe = |req: c_ulong, val: c_int| -> c_int {
     let mut v = val;
@@ -164,12 +168,17 @@ pub fn probe_caps(path: &str, play: bool) -> Option<DspCaps> {
   // a failed probe (bitperfect device) defers to the audioinfo limits
   let pick = |probed: c_int, ai_val: c_int| if probed >= 1 { probed } else { ai_val };
 
-  // When the empirical probe succeeds the kernel feeder is converting, and
-  // SETCHANNELS clamps at SND_CHN_MAX - hardware wider than that is only
-  // usable in bitperfect mode, where the probe FAILS and the engine limits
-  // take over. So never advertise beyond what one of the two grants.
+  // On a vchan the feeder converts and SETCHANNELS clamps at SND_CHN_MAX, so
+  // advertising the engine's wider native count would only fail at configure
+  // time. On a DIRECT channel (bitperfect / vchans off) the grant snaps to a
+  // native format and wider counts are genuinely negotiable, so the engine
+  // width extends the probe there (e.g. 10-channel USB mixers).
+  let direct = ai_caps != 0 && ai_caps & PCM_CAP_VIRTUAL == 0;
   let min_channels = pick(probe(SNDCTL_DSP_CHANNELS, 1), ai_min_ch);
-  let max_channels = pick(probe(SNDCTL_DSP_CHANNELS, SND_CHN_MAX), ai_max_ch);
+  let max_channels = {
+    let probed = pick(probe(SNDCTL_DSP_CHANNELS, SND_CHN_MAX), ai_max_ch);
+    if direct { probed.max(ai_max_ch) } else { probed }
+  };
   let min_rate     = pick(probe(SNDCTL_DSP_SPEED, 8000), ai_min_rate);
   let max_rate     = pick(probe(SNDCTL_DSP_SPEED, 192000), ai_max_rate);
 

@@ -551,13 +551,20 @@ pub unsafe fn invoke_on_loop<T, F: FnOnce(&mut T)>(loop_: &crate::spa::Loop, tar
     let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
       (ctx.f)(target.as_mut().expect("target is not supposed to be null"));
     }));
-    if ok.is_err() { -libc::ECANCELED } else { 0 }
+    if ok.is_err() {
+      eprintln!("freebsd-oss: panic in a queued main-loop task (swallowed)");
+    }
+    // never return negative: when the loop flushes the item INLINE (same
+    // thread, or the loop not currently entered) the invoke returns this
+    // value, and a negative would make the caller free the ctx a second time
+    0
   }
 
   let ctx = Box::into_raw(Box::new(Ctx { target, f }));
   let err = loop_.invoke(Some(trampoline::<T, F>), 0, std::ptr::null(), 0, false,
     ctx as *mut std::os::raw::c_void);
   if err < 0 {
+    // a negative here uniquely means the item was never queued
     drop(Box::from_raw(ctx));
     return false;
   }

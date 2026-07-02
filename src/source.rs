@@ -4,6 +4,7 @@ use std::os::raw::{c_char, c_int, c_void};
 use libspa::sys::*;
 
 const MAX_PORTS: usize = 1;
+const EMPTY_CYCLE: isize = -1; // no data queued this cycle (scheduling jitter)
 
 #[repr(C)]
 struct State {
@@ -29,6 +30,7 @@ struct State {
   latency:        [spa_latency_info; 2], // indexed by direction; written by the host, replayed on read
   process_latency: spa_process_latency_info,
   started:        bool,
+  clearing:       bool, // teardown in progress; queued tasks must no-op
   following:      bool,
   active_buffers: usize
 }
@@ -559,17 +561,31 @@ unsafe extern "C" fn send_command(object: *mut c_void, command: *const spa_comma
       0
     },
     (SPA_TYPE_COMMAND_Node, SPA_NODE_COMMAND_Suspend) => {
-      let state: *mut State = state;
-      if !crate::utils::block_on_loop(&(*state).data_loop, state, |state| {
-        for port in &mut state.ports {
-          if !port.dsp.is_closed() {
-            port.dsp.close();
+      // swap the devices out on the loop and close them here: HALT+close can
+      // sleep (chn_abort), which would stall every node on the data loop
+      let mut retired: [Option<crate::sound::Dsp>; MAX_PORTS] = std::default::Default::default();
+      {
+        let retired_ref = &mut retired;
+        let state: *mut State = state;
+        if !crate::utils::block_on_loop(&(*state).data_loop, state, move |state| {
+          for (i, port) in state.ports.iter_mut().enumerate() {
+            if !port.dsp.is_closed() {
+              let closed = crate::sound::Dsp::new(&state.dsp_path);
+              retired_ref[i] = Some(std::mem::replace(&mut port.dsp, closed));
+            }
+          }
+          state.started = false;
+          update_timers(state);
+        }) {
+          return -libc::EIO;
+        }
+      }
+      for old in retired.iter_mut() {
+        if let Some(dsp) = old.as_mut() {
+          if !dsp.is_closed() {
+            dsp.close(); // off the RT path
           }
         }
-        state.started = false;
-        update_timers(state);
-      }) {
-        return -libc::EIO;
       }
       0
     },
@@ -882,6 +898,9 @@ unsafe fn install_device(state: &mut State, port_idx: usize, config: PortConfig)
       let state_ptr: *mut State = state;
       if !crate::utils::block_on_loop(&(*state_ptr).data_loop, state_ptr, move |state| {
         *retired_ref = Some(std::mem::replace(&mut state.ports[port_idx].dsp, closed));
+        // a cycle landing in this window must skip, not queue a rebuild of
+        // the device we are about to install (cleared by the final swap)
+        state.ports[port_idx].resetup_pending = true;
       }) {
         return -libc::EIO;
       }
@@ -903,6 +922,7 @@ unsafe fn install_device(state: &mut State, port_idx: usize, config: PortConfig)
       port.dll.init(); // fresh device, fresh servo
       port.primed          = false;
       port.resetup_pending = false;
+      port.was_matching    = false; // force a relock when matching resumes
       state.active_buffers = 0;
     })
   };
@@ -916,6 +936,22 @@ unsafe fn install_device(state: &mut State, port_idx: usize, config: PortConfig)
 
 // runs on the main thread (queued from the data loop via invoke_on_loop)
 unsafe fn resetup_task(state: &mut State, port_idx: usize) {
+  if state.clearing {
+    return; // teardown is flushing us out; don't touch the device
+  }
+  // consume-or-bail: an intervening install_device (renegotiation) already
+  // cleared the flag, making this task stale
+  let mut still_pending = false;
+  {
+    let pending_ref = &mut still_pending;
+    let state_ptr: *mut State = state;
+    crate::utils::block_on_loop(&(*state_ptr).data_loop, state_ptr, move |state| {
+      *pending_ref = state.ports[port_idx].resetup_pending;
+    });
+  }
+  if !still_pending {
+    return;
+  }
   // config only mutates from main-thread calls, which are serialized with us
   match state.ports[port_idx].config.clone() {
     Some(config) => {
@@ -948,6 +984,10 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       continue;
     }
 
+    if port.buffers.is_empty() || port.io.is_null() {
+      continue; // not (fully) negotiated yet
+    }
+
     if port.resetup_pending {
       continue; // the main thread is rebuilding the device
     }
@@ -958,10 +998,6 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       port.resetup_pending = state.main_loop.as_ref().is_some_and(|main_loop|
         crate::utils::invoke_on_loop(main_loop, state_ptr, move |state| resetup_task(state, port_idx)));
       continue;
-    }
-
-    if port.buffers.is_empty() || port.io.is_null() {
-      continue; // not (fully) negotiated yet
     }
 
     if (*port.io).status == SPA_STATUS_HAVE_DATA as i32 {
@@ -1064,8 +1100,14 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       let len = period_in_bytes.min(data_0.maxsize);
       std::ptr::write_bytes(data_0.data.cast::<u8>(), 0, len as usize);
       len as isize
-    } else if port.dsp.ready_for_reading(0) {
+    } else {
+      // Gate on the queued byte count, not poll: the kernel's poll trigger
+      // is one full fragment, which can exceed a small graph period - every
+      // read (and the servo error) would then be biased by a fragment. The
+      // priming pass already triggered the channel; GETISPACE doesn't need
+      // the trigger.
       let queued = port.dsp.ispace_in_bytes().max(0) as u32;
+      if queued == 0 { crate::source::EMPTY_CYCLE } else {
 
       // when driving, the servo runs in on_timeout where the clock is
       // published; here the DLL only serves rate matching as a follower on a
@@ -1093,8 +1135,7 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       #[cfg(debug_assertions)]
       crate::trace!(state.log, "ispace: {}", ispace);
       port.dsp.read(data_0.data, ispace as usize)
-    } else {
-      -1
+      }
     };
 
     // Rate-match only as a follower on a foreign clock: when driving, the
@@ -1102,7 +1143,8 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
     // from our clock so there is nothing to match (ALSA gates on the clock
     // name the same way).
     port.was_matching = matching;
-    if !state.rate_match.is_null() {
+    // an empty cycle didn't run the servo; keep the previous correction
+    if nbytes >= 0 && !state.rate_match.is_null() {
       if matching {
         (*state.rate_match).flags |= SPA_IO_RATE_MATCH_FLAG_ACTIVE;
         (*state.rate_match).rate   = (1.0 / corr).clamp(0.99, 1.01);
@@ -1263,6 +1305,14 @@ unsafe extern "C" fn clear(handle: *mut spa_handle) -> c_int {
   let state: *mut State = handle.cast();
   assert!(!state.is_null());
 
+  // A queued resetup_task holds this state pointer; a blocking self-invoke
+  // on the main loop flushes all pending queue items (in submission order)
+  // before we free anything, and `clearing` makes the flushed tasks no-op.
+  (*state).clearing = true;
+  if let Some(main_loop) = (*state).main_loop.as_ref() {
+    crate::utils::block_on_loop(main_loop, state, |_| {});
+  }
+
   // the data loop still holds the timer source; detach it there before the
   // state is freed, then close the timerfd
   if !crate::utils::block_on_loop(&(*state).data_loop, state, |state| {
@@ -1404,7 +1454,8 @@ unsafe extern "C" fn init(
 
     process_latency: crate::utils::process_latency_default(),
 
-    started:   false,
+    started:    false,
+    clearing:   false,
     following: false,
 
     active_buffers: 0
