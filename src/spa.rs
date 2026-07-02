@@ -41,6 +41,20 @@ pub unsafe fn dev_emit_result(hooks: &mut spa_hook_list, seq: c_int, res: c_int,
   });
 }
 
+// Run spa_pod_filter with the output going into `out` through its own builder.
+// The source pod must NOT live in `out`: the builder's overflow callback grows
+// the Vec by reallocating, which would move the source out from under the
+// filter mid-copy. Returns a pointer into `out`, valid until `out` changes.
+pub unsafe fn filter_pod(out: &mut Vec<u8>, src: *mut spa_pod, filter: *const spa_pod) -> Option<*mut spa_pod> {
+  let builder = libspa::pod::builder::Builder::new(out);
+  let mut param: *mut spa_pod = std::ptr::null_mut();
+  if spa_pod_filter(builder.as_raw_ptr(), &mut param, src, filter) >= 0 {
+    Some(param)
+  } else {
+    None
+  }
+}
+
 // sync() replies with an empty result carrying the sequence number
 pub unsafe fn node_emit_done(hooks: &mut spa_hook_list, seq: c_int) {
   for_each_hook(hooks, |entry| {

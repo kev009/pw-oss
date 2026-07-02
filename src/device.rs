@@ -154,7 +154,8 @@ unsafe extern "C" fn enum_params(object: *mut c_void, seq: c_int, id: u32, start
 
   assert_ne!(max, 0);
 
-  let mut buffer = vec![];
+  let mut buffer  = vec![];
+  let mut fbuffer = vec![]; // spa_pod_filter output; kept apart from the source pod (see spa::filter_pod)
 
   let mut index = start;
   let mut count = 0;
@@ -174,9 +175,12 @@ unsafe extern "C" fn enum_params(object: *mut c_void, seq: c_int, id: u32, start
       _ => return -libc::ENOENT
     };
 
+    drop(builder); // its borrow of `buffer` must end before we take the source pointer
+
     let mut result = spa_result_device_params { id, index, next: index + 1, param: std::ptr::null_mut() };
 
-    if spa_pod_filter(builder.as_raw_ptr(), &mut result.param, buffer.as_mut_ptr() as *mut spa_pod, filter) >= 0 {
+    if let Some(param) = crate::spa::filter_pod(&mut fbuffer, buffer.as_mut_ptr() as *mut spa_pod, filter) {
+      result.param = param;
       crate::spa::dev_emit_result(&mut state.hooks, seq, 0, SPA_RESULT_TYPE_DEVICE_PARAMS, &result);
       count += 1;
     }
