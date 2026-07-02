@@ -619,6 +619,9 @@ unsafe extern "C" fn send_command<D: Direction>(object: *mut c_void, command: *c
       }) {
         return -libc::EIO;
       }
+      // dsp is loop-owned, but the blocking started=false above quiesced the
+      // loop: no process/on_timeout touches it again before a later blocking
+      // invoke re-establishes ordering, so the main thread owns it here
       for port in &mut (*state).ports {
         if !port.dsp.is_closed() && !port.dsp.suspend() {
           port.dsp.close();
@@ -827,10 +830,15 @@ unsafe extern "C" fn port_set_param<D: Direction>(object: *mut c_void, direction
               // stale (vchans/bitperfect toggled at runtime); re-probe and
               // re-announce EnumFormat so the host renegotiates from reality
               if let Some(caps) = crate::sound::probe_caps(&state.dsp_path.clone(), D::PLAYBACK) {
-                crate::info!(state.log, "re-probed caps after rejection: {:?}", caps);
-                state.caps = caps;
                 state.caps_fallback = false;
-                state.port_info.bump_param(SPA_PARAM_EnumFormat);
+                // bump only on a real change: the serial flip re-triggers the
+                // adapter's negotiation, and an unchanged snapshot would loop
+                // it against the same rejection
+                if caps != state.caps {
+                  crate::info!(state.log, "re-probed caps after rejection: {:?}", caps);
+                  state.caps = caps;
+                  state.port_info.bump_param(SPA_PARAM_EnumFormat);
+                }
               }
             }
           },
@@ -845,7 +853,7 @@ unsafe extern "C" fn port_set_param<D: Direction>(object: *mut c_void, direction
         };
       } else {
         // releasing the format: close the device and drop the buffers (the
-        // Suspend path may have closed the dsp already, hence the guard); all
+        // refused trigger-suspend may have closed the dsp, hence the guard); all
         // three are read by process(), so do it from the data loop
         let port_idx = port_id as usize;
         let state_ptr: *mut State<D> = state;

@@ -7,6 +7,7 @@ mod device;
 mod monitor;
 #[allow(clippy::absurd_extreme_comparisons)]
 mod node;
+mod nv;
 #[allow(clippy::absurd_extreme_comparisons)]
 mod sink;
 #[allow(clippy::absurd_extreme_comparisons)]

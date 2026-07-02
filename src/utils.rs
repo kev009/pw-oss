@@ -191,7 +191,20 @@ pub unsafe fn build_enum_format_info(b: &mut libspa::pod::builder::Builder, caps
   }
 
   b.add_prop(SPA_FORMAT_AUDIO_rate, 0)?;
-  if caps.min_rate == caps.max_rate {
+  if caps.rates.len() > 1 {
+    // discrete native rates (exclusive devices); a range would admit
+    // in-between rates the hardware can't run (see sound::native_rates)
+    let target  = caps.preferred_rate.unwrap_or(48000);
+    let default = *caps.rates.iter().min_by_key(|r| r.abs_diff(target)).unwrap();
+    b.push_choice(&mut inner, SPA_CHOICE_Enum, 0)?;
+    b.add_int(default as i32)?;
+    for rate in &caps.rates {
+      b.add_int(*rate as i32)?;
+    }
+    b.pop(inner.assume_init_mut());
+  } else if let [rate] = caps.rates[..] {
+    b.add_int(rate as i32)?;
+  } else if caps.min_rate == caps.max_rate {
     b.add_int(caps.min_rate as i32)?;
   } else {
     b.push_choice(&mut inner, SPA_CHOICE_Range, 0)?;
