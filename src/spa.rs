@@ -268,7 +268,6 @@ impl NodeInfo {
     self.info.change_mask |= SPA_NODE_CHANGE_MASK_PROPS as u64;
   }
 
-  /* currently unused
   pub fn add_param(&mut self, id: u32, flags: u32) {
     assert!(self.info.n_params < MAX_PARAMS);
     self.params[self.info.n_params as usize] = spa_param_info {
@@ -276,7 +275,19 @@ impl NodeInfo {
     };
     self.info.change_mask |= SPA_NODE_CHANGE_MASK_PARAMS as u64;
     self.info.n_params += 1;
-  }*/
+  }
+
+  // flip a param's serial so consumers (the adapter compares flags, not user)
+  // re-read it even when the read/write flags didn't change
+  pub fn bump_param(&mut self, id: u32) {
+    for p in &mut self.params[0..self.info.n_params as usize] {
+      if p.id == id {
+        p.flags ^= SPA_PARAM_INFO_SERIAL;
+        self.info.change_mask |= SPA_NODE_CHANGE_MASK_PARAMS as u64;
+        return;
+      }
+    }
+  }
 
   pub fn replace_change_mask(&mut self, new_mask: u64) -> u64 {
     let old = self.info.change_mask;
@@ -355,11 +366,12 @@ impl PortInfo {
     }
   }
 
-  // bump a param's serial so the host re-reads it even when the flags didn't change
+  // flip a param's serial so consumers (the adapter compares flags, not user)
+  // re-read it even when the read/write flags didn't change
   pub fn bump_param(&mut self, id: u32) {
     for p in &mut self.params[0..self.info.n_params as usize] {
       if p.id == id {
-        p.user += 1;
+        p.flags ^= SPA_PARAM_INFO_SERIAL;
         self.info.change_mask |= SPA_PORT_CHANGE_MASK_PARAMS as u64;
         return;
       }

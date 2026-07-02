@@ -344,6 +344,109 @@ pub unsafe fn build_latency_info(b: &mut libspa::pod::builder::Builder, info: &l
   Ok(())
 }
 
+pub fn process_latency_default() -> libspa::sys::spa_process_latency_info {
+  libspa::sys::spa_process_latency_info { quantum: 0.0, rate: 0, ns: 0 }
+}
+
+// spa_process_latency_parse is static inline C, so reimplemented here
+pub unsafe fn parse_process_latency_info(param: *const libspa::sys::spa_pod) -> Option<libspa::sys::spa_process_latency_info> {
+
+  use libspa::sys::*;
+  use libspa::pod::{Value, Object, Pod};
+  use libspa::pod::deserialize::PodDeserializer;
+
+  match PodDeserializer::deserialize_any_from(Pod::from_raw(param).as_bytes()) {
+    Ok((_, Value::Object(Object { type_, properties, .. }))) if type_ == SPA_TYPE_OBJECT_ParamProcessLatency => {
+      let mut info = process_latency_default();
+      for p in properties {
+        #[allow(non_upper_case_globals)]
+        match (p.key, p.value) {
+          (SPA_PARAM_PROCESS_LATENCY_quantum, Value::Float(v)) => info.quantum = v,
+          (SPA_PARAM_PROCESS_LATENCY_rate,    Value::Int(v))   => info.rate    = v,
+          (SPA_PARAM_PROCESS_LATENCY_ns,      Value::Long(v))  => info.ns      = v,
+          _ => ()
+        }
+      }
+      Some(info)
+    },
+    _ => None
+  }
+}
+
+// spa_process_latency_build is static inline C, so reimplemented here
+pub unsafe fn build_process_latency_info(b: &mut libspa::pod::builder::Builder, info: &libspa::sys::spa_process_latency_info) -> Result<(), rustix::io::Errno> {
+
+  use libspa::sys::*;
+
+  let mut frame = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
+
+  b.push_object(&mut frame, SPA_TYPE_OBJECT_ParamProcessLatency, SPA_PARAM_ProcessLatency)?;
+
+  b.add_prop(SPA_PARAM_PROCESS_LATENCY_quantum, 0)?;
+  b.add_float(info.quantum)?;
+  b.add_prop(SPA_PARAM_PROCESS_LATENCY_rate, 0)?;
+  b.add_int(info.rate)?;
+  b.add_prop(SPA_PARAM_PROCESS_LATENCY_ns, 0)?;
+  b.add_long(info.ns)?;
+
+  b.pop(frame.assume_init_mut());
+
+  Ok(())
+}
+
+// spa_process_latency_info_add is static inline C, so reimplemented here
+pub fn process_latency_info_add(process: &libspa::sys::spa_process_latency_info, info: &mut libspa::sys::spa_latency_info) {
+  info.min_quantum += process.quantum;
+  info.max_quantum += process.quantum;
+  info.min_rate    += process.rate;
+  info.max_rate    += process.rate;
+  info.min_ns      += process.ns;
+  info.max_ns      += process.ns;
+}
+
+pub unsafe fn build_latency_offset_prop_info(b: &mut libspa::pod::builder::Builder) -> Result<(), rustix::io::Errno> {
+
+  use libspa::sys::*;
+
+  let mut outer = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
+  let mut inner = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
+
+  b.push_object(&mut outer, SPA_TYPE_OBJECT_PropInfo, SPA_PARAM_PropInfo)?;
+
+  b.add_prop(SPA_PROP_INFO_id, 0)?;
+  b.add_id(libspa::utils::Id(SPA_PROP_latencyOffsetNsec))?;
+
+  b.add_prop(SPA_PROP_INFO_description, 0)?;
+  b.add_string("Latency offset (ns)")?;
+
+  b.add_prop(SPA_PROP_INFO_type, 0)?;
+  b.push_choice(&mut inner, SPA_CHOICE_Range, 0)?;
+  b.add_long(0)?;
+  b.add_long(0)?;
+  b.add_long(2 * SPA_NSEC_PER_SEC as i64)?;
+  b.pop(inner.assume_init_mut());
+
+  b.pop(outer.assume_init_mut());
+
+  Ok(())
+}
+
+pub unsafe fn build_latency_offset_props(b: &mut libspa::pod::builder::Builder, ns: i64) -> Result<(), rustix::io::Errno> {
+
+  use libspa::sys::*;
+
+  let mut frame = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
+
+  b.push_object(&mut frame, SPA_TYPE_OBJECT_Props, SPA_PARAM_Props)?;
+
+  b.add_prop(SPA_PROP_latencyOffsetNsec, 0)?;
+  b.add_long(ns)?;
+
+  b.pop(frame.assume_init_mut());
+
+  Ok(())
+}
+
 pub fn now_ns(system: &crate::spa::System) -> u64 {
   let mut now = libspa::sys::timespec { tv_sec: 0, tv_nsec: 0 };
   let err = unsafe { system.clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };

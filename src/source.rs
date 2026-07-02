@@ -24,6 +24,7 @@ struct State {
   ports:          [Port; MAX_PORTS],
   caps:           crate::sound::DspCaps,
   latency:        [spa_latency_info; 2], // indexed by direction; written by the host, replayed on read
+  process_latency: spa_process_latency_info,
   started:        bool,
   following:      bool,
   active_buffers: usize
@@ -89,6 +90,46 @@ unsafe extern "C" fn add_listener(object: *mut c_void, listener: *mut spa_hook, 
   0
 }
 
+// re-emit node_info to every listener (carrying whatever change_mask the caller
+// set, e.g. PARAMS), then clear the mask
+unsafe fn emit_node_info(state: &mut State) {
+  crate::spa::for_each_hook(&mut state.hooks, |entry| {
+    let f = entry.cb.funcs.cast::<spa_node_events>().as_ref()
+      .expect("hook should be initialized");
+    if f.version >= SPA_VERSION_NODE_EVENTS {
+      if let Some(node_info_fun) = f.info {
+        node_info_fun(entry.cb.data, state.node_info.raw());
+      }
+    }
+  });
+  let _ = state.node_info.replace_change_mask(0);
+}
+
+// the process latency (user-set latency offset) shifts the node's reported
+// latency, so a change re-emits the Props/ProcessLatency node params and the
+// port Latency param
+unsafe fn handle_process_latency(state: &mut State, info: spa_process_latency_info) {
+
+  let ns_changed = state.process_latency.ns != info.ns;
+  if state.process_latency.quantum == info.quantum &&
+     state.process_latency.rate    == info.rate && !ns_changed {
+    return;
+  }
+
+  state.process_latency = info;
+
+  let _ = state.node_info.replace_change_mask(0);
+  if ns_changed {
+    state.node_info.bump_param(SPA_PARAM_Props);
+  }
+  state.node_info.bump_param(SPA_PARAM_ProcessLatency);
+  emit_node_info(state);
+
+  let _ = state.port_info.replace_change_mask(0);
+  state.port_info.bump_param(SPA_PARAM_Latency);
+  emit_port_info(state);
+}
+
 // re-emit port_info to every listener (carrying whatever change_mask the caller
 // set, e.g. PARAMS), then clear the mask
 unsafe fn emit_port_info(state: &mut State) {
@@ -117,7 +158,7 @@ unsafe extern "C" fn sync(object: *mut c_void, seq: c_int) -> c_int {
   unimplemented!()
 }
 
-/*unsafe extern "C" fn enum_params(object: *mut c_void, seq: c_int, id: u32, start: u32, max: u32, filter: *const spa_pod) -> c_int {
+unsafe extern "C" fn enum_params(object: *mut c_void, seq: c_int, id: u32, start: u32, max: u32, filter: *const spa_pod) -> c_int {
 
   let state = object.cast::<State>().as_mut()
     .expect("object is not supposed to be null");
@@ -132,14 +173,18 @@ unsafe extern "C" fn sync(object: *mut c_void, seq: c_int) -> c_int {
   while count < max {
 
     use libspa::pod::builder::Builder;
-    use libspa::pod::builder::builder_add;
 
     let mut builder = Builder::new(&mut buffer);
 
     #[allow(non_upper_case_globals)]
     match (id, index) {
-      //TODO: ?
-      _ => unimplemented!()
+      (SPA_PARAM_PropInfo, 0)       => crate::utils::build_latency_offset_prop_info(&mut builder).unwrap(),
+      (SPA_PARAM_PropInfo, _)       => return 0,
+      (SPA_PARAM_Props, 0)          => crate::utils::build_latency_offset_props(&mut builder, state.process_latency.ns).unwrap(),
+      (SPA_PARAM_Props, _)          => return 0,
+      (SPA_PARAM_ProcessLatency, 0) => crate::utils::build_process_latency_info(&mut builder, &state.process_latency).unwrap(),
+      (SPA_PARAM_ProcessLatency, _) => return 0,
+      _ => return -libc::EINVAL
     };
 
     let mut result = spa_result_node_params { id, index, next: index + 1, param: std::ptr::null_mut() };
@@ -153,9 +198,12 @@ unsafe extern "C" fn sync(object: *mut c_void, seq: c_int) -> c_int {
   }
 
   0
-}*/
+}
 
-unsafe extern "C" fn set_param(_object: *mut c_void, id: u32, _flags: u32, param: *const spa_pod) -> c_int {
+unsafe extern "C" fn set_param(object: *mut c_void, id: u32, _flags: u32, param: *const spa_pod) -> c_int {
+
+  let state = object.cast::<State>().as_mut()
+    .expect("object is not supposed to be null");
 
   use libspa::pod::{Value, Object, Pod};
   use libspa::pod::deserialize::PodDeserializer;
@@ -178,6 +226,13 @@ unsafe extern "C" fn set_param(_object: *mut c_void, id: u32, _flags: u32, param
               SPA_PROP_monitorVolumes => (), // ditto
               SPA_PROP_softMute       => (), // ditto
               SPA_PROP_softVolumes    => (), // ditto
+              SPA_PROP_latencyOffsetNsec => {
+                if let Value::Long(ns) = property.value {
+                  let mut info = state.process_latency;
+                  info.ns = ns;
+                  handle_process_latency(state, info);
+                }
+              },
               SPA_PROP_params         => (), // ditto
               _ => unimplemented!()
             }
@@ -186,6 +241,16 @@ unsafe extern "C" fn set_param(_object: *mut c_void, id: u32, _flags: u32, param
         _ => return -libc::EINVAL
       }
       0
+    },
+    SPA_PARAM_ProcessLatency => {
+      if param.is_null() {
+        handle_process_latency(state, crate::utils::process_latency_default());
+        return 0;
+      }
+      match crate::utils::parse_process_latency_info(param) {
+        Some(info) => { handle_process_latency(state, info); 0 },
+        None       => -libc::EINVAL
+      }
     },
     _ => unimplemented!()
   }
@@ -467,7 +532,14 @@ unsafe extern "C" fn port_enum_params(
         }
       },
       (SPA_PARAM_Buffers, _)    => return -libc::ENOENT,
-      (SPA_PARAM_Latency, 0 | 1) => crate::utils::build_latency_info(&mut builder, &state.latency[index as usize]).unwrap(),
+      (SPA_PARAM_Latency, 0 | 1) => {
+        let mut info = state.latency[index as usize];
+        // the process latency shifts what we report downstream
+        if info.direction == SPA_DIRECTION_OUTPUT {
+          crate::utils::process_latency_info_add(&state.process_latency, &mut info);
+        }
+        crate::utils::build_latency_info(&mut builder, &info).unwrap()
+      },
       (SPA_PARAM_Latency, _)     => return 0,
       _ => return -libc::EINVAL
     };
@@ -866,7 +938,7 @@ const NODE_IMPL: spa_node_methods = spa_node_methods {
   add_listener:      Some(add_listener),
   set_callbacks:     Some(set_callbacks),
   sync:              Some(sync),
-  enum_params:       None, // Some(enum_params),
+  enum_params:       Some(enum_params),
   set_param:         Some(set_param),
   set_io:            Some(set_io),
   send_command:      Some(send_command),
@@ -1023,6 +1095,8 @@ unsafe extern "C" fn init(
       crate::utils::latency_info_default(SPA_DIRECTION_OUTPUT)
     ],
 
+    process_latency: crate::utils::process_latency_default(),
+
     started:   false,
     following: false,
 
@@ -1041,8 +1115,9 @@ unsafe extern "C" fn init(
   //state.node_info.add_param(SPA_PARAM_EnumFormat,     SPA_PARAM_INFO_READ);
   //state.node_info.add_param(SPA_PARAM_EnumPortConfig, SPA_PARAM_INFO_READ);
   //state.node_info.add_param(SPA_PARAM_PortConfig,     SPA_PARAM_INFO_READ);
-  //state.node_info.add_param(SPA_PARAM_Props,          SPA_PARAM_INFO_READWRITE);
-  //state.node_info.add_param(SPA_PARAM_PropInfo,       SPA_PARAM_INFO_READ);
+  state.node_info.add_param(SPA_PARAM_PropInfo,       SPA_PARAM_INFO_READ);
+  state.node_info.add_param(SPA_PARAM_Props,          SPA_PARAM_INFO_READWRITE);
+  state.node_info.add_param(SPA_PARAM_ProcessLatency, SPA_PARAM_INFO_READWRITE);
 
   state.port_info.fix_pointers();
 
