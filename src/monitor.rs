@@ -12,6 +12,7 @@ struct State {
   dev_info:    spa_device_info,
   hooks:       spa_hook_list,
   pcm_indexes: BTreeMap<String, Vec<u32>>,
+  main_loop:   crate::spa::Loop,
   devd_socket: crate::utils::DevdSocket,
   devd_source: spa_source,
   log:         crate::spa::Log
@@ -103,6 +104,9 @@ unsafe extern "C" fn get_interface(handle: *mut spa_handle, type_: *const c_char
 unsafe extern "C" fn clear(handle: *mut spa_handle) -> c_int {
   let state = handle.cast::<State>().as_mut()
     .expect("handle is not supposed to be null");
+  // clear runs on the main loop's thread, so detach the devd source directly;
+  // the socket fd itself is closed by the DevdSocket drop below
+  state.main_loop.remove_source(&mut state.devd_source);
   std::ptr::drop_in_place(state);
   0
 }
@@ -236,6 +240,7 @@ unsafe extern "C" fn init(
 
     pcm_indexes,
 
+    main_loop,
     devd_socket,
     devd_source,
 
@@ -244,7 +249,7 @@ unsafe extern "C" fn init(
 
   spa_hook_list_init(&mut state.hooks);
 
-  let err = main_loop.add_source(&mut state.devd_source);
+  let err = state.main_loop.add_source(&mut state.devd_source);
   assert!(err >= 0);
 
   0

@@ -725,8 +725,16 @@ unsafe extern "C" fn get_interface(handle: *mut spa_handle, type_: *const c_char
 }
 
 unsafe extern "C" fn clear(handle: *mut spa_handle) -> c_int {
-  let state = handle.cast::<State>().as_mut()
-    .expect("handle is not supposed to be null");
+  let state: *mut State = handle.cast();
+  assert!(!state.is_null());
+
+  // the data loop still holds the timer source; detach it there before the
+  // state is freed, then close the timerfd
+  crate::utils::block_on_loop(&(*state).data_loop, state, |state| {
+    state.data_loop.remove_source(&mut state.timer_source);
+  });
+  (*state).data_system.close((*state).timer_source.fd);
+
   std::ptr::drop_in_place(state);
   0
 }

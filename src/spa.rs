@@ -383,6 +383,12 @@ impl Loop {
     spa_loop_add_source(self.loop_.iface.cb.data, source)
   }
 
+  // must be called from the loop thread (or through an invoke)
+  pub unsafe extern "C" fn remove_source(&self, source: *mut spa_source) -> c_int {
+    let spa_loop_remove_source = self.methods.remove_source.expect("remove_source should be initialized");
+    spa_loop_remove_source(self.loop_.iface.cb.data, source)
+  }
+
   pub unsafe extern "C" fn invoke(&self,
     func: spa_invoke_func_t, seq: u32, data: *const c_void, size: usize, block: bool, user_data: *mut c_void) -> c_int
   {
@@ -405,6 +411,11 @@ impl System {
       .expect("system methods should be initialized");
     assert!(methods.version >= SPA_VERSION_SYSTEM_METHODS);
     Self { system, methods }
+  }
+
+  pub unsafe extern "C" fn close(&self, fd: c_int) -> c_int {
+    let spa_system_close = self.methods.close.expect("close should be initialized");
+    spa_system_close(self.system.iface.cb.data, fd)
   }
 
   pub unsafe extern "C" fn clock_gettime(&self, clock_id: c_int, value: *mut timespec) -> c_int {
