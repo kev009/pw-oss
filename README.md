@@ -8,7 +8,50 @@ No other operating systems are supported.
 
 1. The plugin is only sufficiently complete to be used with the
 `node.features.audio.no-dsp=false` Wireplumber setting (which is the default).
-1. No bitperfect audio (for now).
+
+## Bitperfect / exclusive devices
+
+Devices in bitperfect mode (`sysctl dev.pcm.X.bitperfect=1`, usually together
+with `dev.pcm.X.play.vchans=0` or `hw.snd.vchans_enable=0`) are fully
+supported: the plugin probes and advertises the device's native formats,
+rates and channel widths (including >8-channel interfaces), and handles the
+single exclusive channel across renegotiation. Note that the kernel is only
+half of the story - for the samples to remain untouched end to end, the
+PipeWire graph must also run at the device's native rate and avoid volume
+scaling. Pin the graph rate in `pipewire.conf.d`:
+
+```
+context.properties = {
+    default.clock.rate        = 96000       # the device's native rate
+    default.clock.allowed-rates = [ 96000 ]
+}
+```
+
+and keep the stream/device volume at 100% (or use hardware volume once
+available). Exclusive devices allow one open per direction: a second client
+gets EBUSY and stays silent by design.
+
+## Tunables
+
+Per-device properties can be set from WirePlumber rules
+(`wireplumber.conf.d`), matched against the monitor's device objects:
+
+```
+monitor.oss.rules = [
+  {
+    matches = [ { device.name = "~oss_card.*" } ]
+    actions = { update-props = { oss.delay = 16 } }
+  }
+]
+```
+
+`oss.delay` sets the sink's fill target in eighths of a graph period
+(default 10 = 1.25 periods; higher absorbs more scheduling jitter at the
+cost of latency). It can also be changed live on a node via
+`pw-cli set-param <node> Props '{ params: [ "oss.delay", 16 ] }'`.
+
+Log verbosity follows the `spa.oss` topic, e.g.
+`PIPEWIRE_DEBUG='spa.oss:3' pipewire`.
 
 ## Usage
 
