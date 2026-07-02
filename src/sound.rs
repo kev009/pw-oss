@@ -204,7 +204,10 @@ impl Dsp {
   pub fn open(&mut self) -> Result<(), Errno> {
     assert_eq!(self.state, DspState::Closed);
 
-    let fd = unsafe { libc::open(self.path.as_ptr(), libc::O_RDWR) };
+    // O_RDONLY, not O_RDWR: on devices with asymmetric play/rec channel
+    // counts (e.g. RODECaster) the kernel won't take per-direction counts on
+    // one fd (shkhln/pw-oss#3)
+    let fd = unsafe { libc::open(self.path.as_ptr(), libc::O_RDONLY) };
     if fd == -1 {
       return Err(Errno::last());
     }

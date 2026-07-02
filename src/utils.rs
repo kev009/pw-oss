@@ -141,8 +141,10 @@ pub unsafe fn build_enum_format_info(b: &mut libspa::pod::builder::Builder, caps
   let mut counts = [2u32, 4, 6, 8, 1].iter().copied()
     .filter(|c| *c >= caps.min_channels && *c <= caps.max_channels)
     .collect::<Vec<_>>();
-  if counts.is_empty() {
-    counts.push(caps.max_channels); // no standard count fits; goes unpositioned
+  // always offer the full native width too (e.g. 10-channel USB mixers);
+  // non-standard counts go out as AUX channels
+  if !counts.contains(&caps.max_channels) {
+    counts.push(caps.max_channels);
   }
 
   let Some(&channels) = counts.get(index as usize) else {
@@ -185,11 +187,18 @@ pub unsafe fn build_enum_format_info(b: &mut libspa::pod::builder::Builder, caps
   b.add_prop(SPA_FORMAT_AUDIO_channels, 0)?;
   b.add_int(channels as i32)?;
 
-  if let Some(positions) = channel_positions(channels) {
-    b.add_prop(SPA_FORMAT_AUDIO_position, 0)?;
-    b.add_array(std::mem::size_of::<u32>() as u32, SPA_TYPE_Id,
-      positions.len() as u32, positions.as_ptr().cast())?;
-  }
+  let aux_positions;
+  let positions: &[u32] = match channel_positions(channels) {
+    Some(positions) => positions,
+    None => {
+      aux_positions = (0..channels).map(|i| SPA_AUDIO_CHANNEL_AUX0 + i).collect::<Vec<u32>>();
+      &aux_positions
+    }
+  };
+
+  b.add_prop(SPA_FORMAT_AUDIO_position, 0)?;
+  b.add_array(std::mem::size_of::<u32>() as u32, SPA_TYPE_Id,
+    positions.len() as u32, positions.as_ptr().cast())?;
 
   b.pop(outer.assume_init_mut());
 
