@@ -268,6 +268,10 @@ impl Dsp {
     self.state == DspState::Closed
   }
 
+  pub fn is_running(&self) -> bool {
+    self.state == DspState::Running
+  }
+
   pub fn open(&mut self) -> Result<(), Errno> {
     assert_eq!(self.state, DspState::Closed);
 

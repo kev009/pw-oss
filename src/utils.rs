@@ -467,6 +467,38 @@ pub unsafe fn build_latency_offset_props(b: &mut libspa::pod::builder::Builder, 
   Ok(())
 }
 
+// identify our device clock (spa_io_clock.name) so consumers can tell whether
+// two nodes tick from the same hardware
+pub unsafe fn set_clock_name(clock: *mut libspa::sys::spa_io_clock, name: &std::ffi::CStr) {
+  if clock.is_null() {
+    return;
+  }
+  let bytes = name.to_bytes_with_nul();
+  let n = bytes.len().min(63);
+  std::ptr::copy_nonoverlapping(bytes.as_ptr().cast(), (*clock).name.as_mut_ptr(), n);
+  (*clock).name[63] = 0;
+}
+
+// does the driver's clock in `position` carry our clock name? (then we tick
+// from the same device and rate matching is pointless - ALSA does the same
+// clock-name comparison)
+pub unsafe fn same_clock(position: *const libspa::sys::spa_io_position, name: &std::ffi::CStr) -> bool {
+  if position.is_null() {
+    return false;
+  }
+  let theirs = &(*position).clock.name;
+  let ours   = name.to_bytes();
+  if ours.is_empty() || ours.len() >= theirs.len() || theirs[0] == 0 {
+    return false;
+  }
+  for (i, &b) in ours.iter().enumerate() {
+    if theirs[i] as u8 != b {
+      return false;
+    }
+  }
+  theirs[ours.len()] == 0
+}
+
 pub fn now_ns(system: &crate::spa::System) -> u64 {
   let mut now = libspa::sys::timespec { tv_sec: 0, tv_nsec: 0 };
   let err = unsafe { system.clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };

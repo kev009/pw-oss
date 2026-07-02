@@ -17,6 +17,7 @@ struct State {
   clock:          *mut spa_io_clock,
   position:       *mut spa_io_position,
   rate_match:     *mut spa_io_rate_match,
+  clock_name:     std::ffi::CString, // stamped into spa_io_clock.name
   timer_source:   spa_source,
   next_time:      u64,
   hooks:          spa_hook_list,
@@ -38,12 +39,14 @@ impl State {
 }
 
 struct Port {
-  config:  Option<PortConfig>,
-  buffers: Vec<*mut spa_buffer>,
-  io:      *mut spa_io_buffers,
-  dsp:     crate::sound::Dsp,
-  dll:     crate::dll::SpaDLL,
-  primed:  bool
+  config:        Option<PortConfig>,
+  buffers:       Vec<*mut spa_buffer>,
+  io:            *mut spa_io_buffers,
+  dsp:           crate::sound::Dsp,
+  dll:           crate::dll::SpaDLL,
+  primed:        bool,
+  setup_period:  u32, // device bytes per graph cycle the servo was tuned for
+  bw_fast_until: u64  // while nonzero, the DLL runs at BW_MAX for a fast lock
 }
 
 #[derive(Debug)]
@@ -273,6 +276,17 @@ unsafe extern "C" fn set_param(object: *mut c_void, id: u32, _flags: u32, param:
   }
 }
 
+// two-stage DLL bandwidth (see sink.rs: a simplification of ALSA's
+// variance-driven adaptation): fast lock after (re)start, then steady state
+const DLL_FAST_NSEC: u64 = 3 * SPA_NSEC_PER_SEC as u64;
+
+fn maybe_relax_dll(port: &mut Port, device_rate: u32, stride: u32, now: u64) {
+  if port.bw_fast_until != 0 && now >= port.bw_fast_until {
+    port.bw_fast_until = 0;
+    port.dll.set_bw(crate::dll::SPA_DLL_BW_MIN, port.setup_period, device_rate * stride);
+  }
+}
+
 unsafe extern "C" fn on_timeout(source: *mut spa_source) {
 
   let state = (*source).data.cast::<State>().as_mut()
@@ -293,25 +307,77 @@ unsafe extern "C" fn on_timeout(source: *mut spa_source) {
     return;
   }
 
-  let nsec = state.next_time;
-
   if state.position.is_null() || state.clock.is_null() {
     return; // ios cleared while the timer was armed; skip the cycle
   }
 
+  let now = crate::utils::now_ns(&state.data_system);
+
+  // resync after a long stall instead of replaying a burst of stale cycles
+  // (ALSA snaps when more than a second behind)
+  if now.saturating_sub(state.next_time) > SPA_NSEC_PER_SEC as u64 {
+    crate::warn!(state.log, "timer stalled ({} ns behind); resyncing", now - state.next_time);
+    state.next_time = now;
+  }
+
+  let nsec = state.next_time;
+
   let duration = (*state.position).clock.target_duration;
   let rate     = (*state.position).clock.target_rate.denom;
+  if duration == 0 || rate == 0 {
+    set_timeout(state, nsec + SPA_NSEC_PER_SEC as u64 / 100); // malformed position; idle-tick
+    return;
+  }
 
-  crate::trace!(state.log, "duration = {}, rate = {}", duration, rate);
+  // Run the servo before the clock is published so every field below belongs
+  // to this cycle (the shape of ALSA's update_time). The pre-read fill level
+  // here and process()'s post-drain accounting see the same signal: we drain
+  // the ring every cycle, so what's queued is one period's accumulation.
+  let mut corr:  f64 = 1.0;
+  let mut delay: i64 = 0;
+  for port in &mut state.ports {
+    let Some(cfg) = port.config.as_ref() else { continue };
+    let stride      = cfg.stride.max(1);
+    let device_rate = cfg.rate.max(1);
+    if !port.dsp.is_running() || !port.primed || port.setup_period == 0 {
+      continue;
+    }
 
-  state.next_time = nsec + duration * SPA_NSEC_PER_SEC as u64 / rate as u64;
+    let queued = port.dsp.ispace_in_bytes().max(0) as u32;
+    // device frames scaled to the graph rate
+    delay = (queued / stride) as i64 * rate as i64 / device_rate as i64;
+
+    maybe_relax_dll(port, device_rate, stride, nsec);
+
+    // capture error is inverted vs the sink: a slow device queues less than a
+    // period; clamp so wakeup jitter can't wind up the integrator
+    let max_err = (port.setup_period as f64 / 2.0).max(256.0 * stride as f64);
+    let err = (port.setup_period as f64 - queued as f64).clamp(-max_err, max_err);
+    corr = port.dll.update(err);
+
+    // a diverged servo must not wedge the graph clock
+    if !(0.5..=2.0).contains(&corr) {
+      crate::warn!(state.log, "capture DLL diverged (corr {}); relocking", corr);
+      port.dll.init();
+      port.dll.set_bw(crate::dll::SPA_DLL_BW_MAX, port.setup_period, device_rate * stride);
+      port.bw_fast_until = nsec + DLL_FAST_NSEC;
+      corr = 1.0;
+    }
+
+    #[cfg(debug_assertions)]
+    eprintln!("capture: corr = {}, queued = {}", corr, queued);
+  }
+
+  // steer the timer by the correction so the published clock genuinely follows
+  // the device (ALSA warps next_time the same way)
+  state.next_time = nsec + (duration as f64 * SPA_NSEC_PER_SEC as f64 / (rate as f64 * corr)) as u64;
 
   (*state.clock).nsec      = nsec;
   (*state.clock).rate      = (*state.clock).target_rate;
   (*state.clock).position += (*state.clock).duration;
   (*state.clock).duration  = duration;
-  // .delay and .rate_diff are published from process(), where the queued input
-  // and the DLL correction are known; keep last cycle's values here (set at Start).
+  (*state.clock).delay     = delay;
+  (*state.clock).rate_diff = corr;
   (*state.clock).next_nsec = state.next_time;
 
   let Some(node_callbacks) = state.callbacks.funcs.cast::<spa_node_callbacks>().as_ref() else {
@@ -389,8 +455,12 @@ unsafe extern "C" fn set_io(object: *mut c_void, id: u32, data: *mut c_void, siz
 
     #[allow(non_upper_case_globals)]
     match id {
-      SPA_IO_Clock    => state.clock    = data.cast(), // null clears
-      SPA_IO_Position => state.position = data.cast(), // ditto
+      SPA_IO_Clock    => {
+        state.clock = data.cast(); // null clears
+        // identify our clock so same-device followers can skip rate matching
+        crate::utils::set_clock_name(state.clock, &state.clock_name);
+      },
+      SPA_IO_Position => state.position = data.cast(), // null clears
       _ => () // filtered above
     };
 
@@ -823,8 +893,7 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
     let stride = port.config.as_ref().unwrap().stride.max(1);
     let rate   = port.config.as_ref().unwrap().rate;
 
-    let mut corr: f64 = 1.0; // DLL rate correction, published below
-    let mut queued_frames: i64 = 0;
+    let mut corr: f64 = 1.0; // DLL rate correction for the follower rate match
 
     // one period in device bytes (0 while position is absent)
     let mut period_in_bytes = 0u32;
@@ -852,26 +921,25 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
           backlog -= n as u32;
         }
       }
-      port.primed = true;
-      port.dll.init(); // servo starts fresh on the next cycle
+      port.primed        = true;
+      port.setup_period  = period_in_bytes;
+      port.bw_fast_until = crate::utils::now_ns(&state.data_system) + DLL_FAST_NSEC;
+      port.dll.init();
+      port.dll.set_bw(crate::dll::SPA_DLL_BW_MAX, period_in_bytes, rate * stride);
 
       let len = period_in_bytes.min(data_0.maxsize);
       std::ptr::write_bytes(data_0.data.cast::<u8>(), 0, len as usize);
       len as isize
     } else if port.dsp.ready_for_reading(1) {
       let queued = port.dsp.ispace_in_bytes().max(0) as u32;
-      queued_frames = (queued / stride) as i64;
 
-      // We drain the ring every cycle, so the pre-read level is what the
-      // device captured in one period; its deviation from one period is the
-      // clock error. Note the sign: a slow device queues less than a period
-      // and must push corr below 1.0, the inverse of the sink's error.
-      if period_in_bytes > 0 {
-        if port.dll.bw() == 0.0 {
-          port.dll.init();
-          port.dll.set_bw(crate::dll::SPA_DLL_BW_MIN, period_in_bytes, rate * stride);
-        }
-        let err = (period_in_bytes as i64 - queued as i64) as f64;
+      // when driving, the servo runs in on_timeout where the clock is
+      // published; here the DLL only serves rate matching as a follower
+      if state.following && period_in_bytes > 0 && port.setup_period != 0 {
+        maybe_relax_dll(port, rate, stride, crate::utils::now_ns(&state.data_system));
+        let max_err = (port.setup_period as f64 / 2.0).max(256.0 * stride as f64);
+        // capture error is inverted vs the sink: a slow device queues less
+        let err = (period_in_bytes as f64 - queued as f64).clamp(-max_err, max_err);
         corr = port.dll.update(err);
 
         #[cfg(debug_assertions)]
@@ -887,15 +955,19 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       -1
     };
 
-    // publish device latency (queued frames) and the rate correction when
-    // driving; hand the correction to the resampler when following. Capture
-    // uses the inverse rate (matching ALSA's update_time).
-    if !state.following && !state.clock.is_null() {
-      (*state.clock).delay     = queued_frames;
-      (*state.clock).rate_diff = corr;
-    }
+    // Rate-match only as a follower on a foreign clock: when driving, the
+    // timer steering applies the correction, and a same-device follower ticks
+    // from our clock so there is nothing to match (ALSA gates on the clock
+    // name the same way).
     if !state.rate_match.is_null() {
-      (*state.rate_match).rate = (1.0 / corr).clamp(0.99, 1.01);
+      let matching = state.following && !crate::utils::same_clock(state.position, &state.clock_name);
+      if matching {
+        (*state.rate_match).flags |= SPA_IO_RATE_MATCH_FLAG_ACTIVE;
+        (*state.rate_match).rate   = (1.0 / corr).clamp(0.99, 1.01);
+      } else {
+        (*state.rate_match).flags &= !SPA_IO_RATE_MATCH_FLAG_ACTIVE;
+        (*state.rate_match).rate   = 1.0;
+      }
     }
 
     // the dsp is running after ready_for_reading; report overruns to the host
@@ -983,12 +1055,8 @@ unsafe extern "C" fn port_set_io(object: *mut c_void, direction: spa_direction, 
       0
     },
     SPA_IO_RateMatch => {
-      let rate_match = data as *mut spa_io_rate_match;
-      if !rate_match.is_null() {
-        assert_eq!(MAX_PORTS, 1); // the code assumes a single port
-        (*rate_match).flags |= SPA_IO_RATE_MATCH_FLAG_ACTIVE;
-      }
-      state.rate_match = rate_match;
+      // ACTIVE is managed per cycle in process(): only set while matching
+      state.rate_match = data as *mut spa_io_rate_match;
       0
     },
     _ => -libc::ENOENT
@@ -1130,6 +1198,7 @@ unsafe extern "C" fn init(
     clock:      std::ptr::null_mut(),
     position:   std::ptr::null_mut(),
     rate_match: std::ptr::null_mut(),
+    clock_name: std::ffi::CString::new(format!("freebsd-oss.{}", dsp_path.trim_start_matches("/dev/"))).unwrap_or_default(),
 
     timer_source: spa_source {
       loop_: std::ptr::null_mut(),
@@ -1155,7 +1224,7 @@ unsafe extern "C" fn init(
       data:  std::ptr::null_mut()
     },
 
-    ports: [Port { config: None, buffers: vec![], io: std::ptr::null_mut(), dsp: crate::sound::Dsp::new(&dsp_path), dll: std::default::Default::default(), primed: false }; MAX_PORTS],
+    ports: [Port { config: None, buffers: vec![], io: std::ptr::null_mut(), dsp: crate::sound::Dsp::new(&dsp_path), dll: std::default::Default::default(), primed: false, setup_period: 0, bw_fast_until: 0 }; MAX_PORTS],
 
     caps,
 

@@ -4,7 +4,7 @@
 /* SPDX-FileCopyrightText: Copyright © 2019 Wim Taymans */
 /* SPDX-License-Identifier: MIT */
 
-// pub const SPA_DLL_BW_MAX: f64 = 0.128; // currently unused
+pub const SPA_DLL_BW_MAX: f64 = 0.128;
 pub const SPA_DLL_BW_MIN: f64 = 0.016;
 
 #[derive(Default)]
@@ -35,11 +35,6 @@ impl SpaDLL {
     self.w1 = w * 1.5 / period as f64;
     self.w2 = w / 1.5;
     self.bw = bw;
-  }
-
-  #[inline(always)]
-  pub fn bw(&self) -> f64 {
-    self.bw
   }
 
   #[inline(always)]
