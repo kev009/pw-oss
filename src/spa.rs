@@ -26,8 +26,12 @@ pub const SPA_PORT_CHANGE_MASK_ALL: u32 =
 pub unsafe fn for_each_hook(head: *mut spa_hook_list, mut apply: impl FnMut(&spa_hook)) {
   let mut entry = (*head).list.next as *mut spa_hook;
   while (*entry).link != (*head).list {
+    // grab next first: a listener may remove (and free) its own hook from
+    // inside the callback, which SPA allows. (Removing a *different* hook is
+    // still unsafe here; the C helpers use a shared cursor for that.)
+    let next = (*entry).link.next as *mut spa_hook;
     apply(entry.as_ref().expect("broken spa_hook_list"));
-    entry = (*entry).link.next as *mut spa_hook;
+    entry = next;
   }
 }
 
@@ -541,7 +545,13 @@ impl Log {
   pub fn log_level(&self) -> spa_log_level {
     let topic = std::ptr::addr_of!(LOG_TOPIC);
     unsafe {
-      if (*topic).has_custom_level { (*topic).level } else { self.logger.level }
+      // volatile: the host logger rewrites the registered topic's level on
+      // runtime log-level changes (inherent to the C API; same as C plugins)
+      if std::ptr::read_volatile(std::ptr::addr_of!((*topic).has_custom_level)) {
+        std::ptr::read_volatile(std::ptr::addr_of!((*topic).level))
+      } else {
+        self.logger.level
+      }
     }
   }
 

@@ -247,10 +247,12 @@ pub unsafe fn build_buffers_info(b: &mut libspa::pod::builder::Builder, stride: 
   Ok(())
 }
 
-// run `f` on the data loop and wait for it; serializes main-thread
+// Run `f` on the data loop and wait for it; serializes main-thread
 // reconfiguration against process()/on_timeout() (runs inline when already on
-// the loop thread)
-pub unsafe fn block_on_loop<T, F: FnOnce(&mut T)>(loop_: &crate::spa::Loop, target: *mut T, f: F) {
+// the loop thread). The closure and target cross a thread boundary; callers
+// only capture raw pointers and plain data. Returns false when the invoke
+// failed or the closure panicked - the closure then may not have run.
+pub unsafe fn block_on_loop<T, F: FnOnce(&mut T)>(loop_: &crate::spa::Loop, target: *mut T, f: F) -> bool {
 
   struct Ctx<T, F> {
     target: *mut T,
@@ -270,15 +272,19 @@ pub unsafe fn block_on_loop<T, F: FnOnce(&mut T)>(loop_: &crate::spa::Loop, targ
       .expect("user_data is not supposed to be null");
     let f = ctx.f.take()
       .expect("the invoked function only runs once");
-    f(ctx.target.as_mut().expect("target is not supposed to be null"));
-    0
+    let target = ctx.target;
+    // a panic must not unwind into the C loop (that aborts the daemon)
+    let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      f(target.as_mut().expect("target is not supposed to be null"));
+    }));
+    if ok.is_err() { -libc::ECANCELED } else { 0 }
   }
 
   // blocking, so `ctx` outlives the call
   let mut ctx = Ctx { target, f: Some(f) };
   let err = loop_.invoke(Some(trampoline::<T, F>), 0, std::ptr::null(), 0, true,
     &mut ctx as *mut _ as *mut std::os::raw::c_void);
-  assert!(err >= 0);
+  err >= 0
 }
 
 pub fn latency_info_default(direction: libspa::sys::spa_direction) -> libspa::sys::spa_latency_info {

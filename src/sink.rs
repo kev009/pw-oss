@@ -180,10 +180,13 @@ unsafe fn emit_port_info(state: &mut State) {
 }
 
 unsafe extern "C" fn set_callbacks(object: *mut c_void, callbacks: *const spa_node_callbacks, data: *mut c_void) -> c_int {
-  let state = object.cast::<State>().as_mut()
-    .expect("object is not supposed to be null");
-  state.callbacks.funcs = callbacks as *const c_void;
-  state.callbacks.data  = data;
+  let state: *mut State = object.cast();
+  assert!(!state.is_null());
+  // read by on_timeout/process on the data loop
+  crate::utils::block_on_loop(&(*state).data_loop, state, |state| {
+    state.callbacks.funcs = callbacks as *const c_void;
+    state.callbacks.data  = data;
+  });
   0
 }
 
@@ -252,7 +255,7 @@ unsafe extern "C" fn enum_params(object: *mut c_void, seq: c_int, id: u32, start
       (SPA_PARAM_Props, _)          => return 0,
       (SPA_PARAM_ProcessLatency, 0) => crate::utils::build_process_latency_info(&mut builder, &state.process_latency).unwrap(),
       (SPA_PARAM_ProcessLatency, _) => return 0,
-      _ => return -libc::EINVAL
+      _ => return -libc::ENOENT // unknown param id (ALSA convention)
     };
 
     drop(builder); // its borrow of `buffer` must end before we take the source pointer
@@ -284,7 +287,10 @@ unsafe extern "C" fn set_param(object: *mut c_void, id: u32, _flags: u32, param:
     SPA_PARAM_Props => {
       if param.is_null() {
         // a NULL pod resets the props to their defaults
-        state.oss_delay = state.oss_delay_default;
+        let state_ptr: *mut State = state;
+        crate::utils::block_on_loop(&(*state_ptr).data_loop, state_ptr, |state| {
+          state.oss_delay = state.oss_delay_default; // read by process()
+        });
         handle_process_latency(state, crate::utils::process_latency_default());
         return 0;
       }
@@ -317,17 +323,18 @@ unsafe extern "C" fn set_param(object: *mut c_void, id: u32, _flags: u32, param:
                         // pw-cli set-param <object-id> Props '{ "params": ["oss.delay", 8]}'
                         (Value::String(s), Value::Int(x)) if s == crate::keys::OSS_DELAY && *x >= 0 => {
                           // cap it: period/8 * oss_delay runs in the RT path and must not overflow
-                          state.oss_delay = (*x as u32).min(1024);
+                          let new_delay = (*x as u32).min(1024);
                           // announce the new value so Props readback stays fresh
                           let _ = state.node_info.replace_change_mask(0);
                           state.node_info.bump_param(SPA_PARAM_Props);
                           emit_node_info(state);
 
-                          // apply immediately: reopen the device so the next
-                          // cycle re-sizes the buffer and re-primes with the
-                          // new target (a brief gap, like a format change)
+                          // apply immediately: store on the loop (process()
+                          // reads it) and reopen the device so the next cycle
+                          // re-sizes and re-primes with the new target
                           let state_ptr: *mut State = state;
-                          crate::utils::block_on_loop(&(*state_ptr).data_loop, state_ptr, |state| {
+                          crate::utils::block_on_loop(&(*state_ptr).data_loop, state_ptr, move |state| {
+                            state.oss_delay = new_delay;
                             for port in &mut state.ports {
                               let Some(cfg) = port.config.as_ref() else { continue };
                               if !port.dsp.is_running() {
@@ -781,7 +788,7 @@ unsafe extern "C" fn port_enum_params(
         crate::utils::build_latency_info(&mut builder, &info).unwrap()
       },
       (SPA_PARAM_Latency, _)     => return 0,
-      _ => return -libc::EINVAL
+      _ => return -libc::ENOENT // unknown param id (ALSA convention)
     };
 
     drop(builder); // its borrow of `buffer` must end before we take the source pointer
@@ -1311,18 +1318,24 @@ unsafe extern "C" fn port_set_io(object: *mut c_void, direction: spa_direction, 
 
   #[allow(non_upper_case_globals)]
   match id {
-    SPA_IO_Buffers => {
-      state.ports[port_id as usize].io = data.cast();
-      0
-    },
-    // you'd think that would be a node parameter instead
-    SPA_IO_RateMatch => {
-      // ACTIVE is managed per cycle in process(): only set while matching
-      state.rate_match = data as *mut spa_io_rate_match;
-      0
-    },
-    _ => -libc::ENOENT
+    SPA_IO_Buffers | SPA_IO_RateMatch => (),
+    _ => return -libc::ENOENT
   }
+
+  // these pointers are dereferenced by process() on the data loop
+  let state: *mut State = state;
+  crate::utils::block_on_loop(&(*state).data_loop, state, |state| {
+    #[allow(non_upper_case_globals)]
+    match id {
+      SPA_IO_Buffers   => state.ports[port_id as usize].io = data.cast(), // null clears
+      // you'd think RateMatch would be a node parameter instead; ACTIVE is
+      // managed per cycle in process(), only set while matching
+      SPA_IO_RateMatch => state.rate_match = data as *mut spa_io_rate_match,
+      _ => ()
+    }
+  });
+
+  0
 }
 
 unsafe extern "C" fn port_reuse_buffer(_object: *mut c_void, _port_id: u32, _buffer_id: u32) -> c_int {

@@ -245,7 +245,7 @@ unsafe extern "C" fn set_param(object: *mut c_void, id: u32, _flags: u32, param:
       0
     },
     // Route lands together with mixer/hardware volume support
-    _ => -libc::ENOTSUP
+    _ => -libc::ENOENT // unknown param id (ALSA convention)
   }
 }
 
