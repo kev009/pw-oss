@@ -557,9 +557,14 @@ unsafe extern "C" fn port_set_param(object: *mut c_void, direction: spa_directio
                 return;
               }
 
-              port.dsp.set_format(oss_format);
-              port.dsp.set_channels(config.channels);
-              port.dsp.set_rate(config.rate);
+              // ditto for a device that won't take the format exactly
+              if let Err(err) = port.dsp.configure(oss_format, config.channels, config.rate) {
+                crate::warn!(state.log, "device rejected {:?}: {}", config, err);
+                port.dsp.close();
+                port.config = None;
+                *res_ref = -(err as c_int);
+                return;
+              }
 
               port.config = Some(config);
               state.active_buffers = 0;

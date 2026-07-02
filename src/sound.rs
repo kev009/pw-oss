@@ -123,25 +123,17 @@ pub fn probe_caps(path: &str, play: bool) -> Option<DspCaps> {
   })
 }
 
-fn set_format(fd: c_int, format: u32) {
-  let mut f = format as c_int;
-  let err = unsafe { libc::ioctl(fd, SNDCTL_DSP_SETFMT, &mut f) };
-  assert_ne!(err, -1);
-  assert_eq!(f, format as c_int);
-}
-
-fn set_channels(fd: c_int, channels: u32) {
-  let mut n = channels as c_int;
-  let err = unsafe { libc::ioctl(fd, SNDCTL_DSP_CHANNELS, &mut n) };
-  assert_ne!(err, -1);
-  assert_eq!(n, channels as c_int);
-}
-
-fn set_rate(fd: c_int, rate: u32) {
-  let mut n = rate as c_int;
-  let err = unsafe { libc::ioctl(fd, SNDCTL_DSP_SPEED, &mut n) };
-  assert_ne!(err, -1);
-  assert_eq!(n, rate as c_int);
+// OSS grants the nearest supported value instead of failing, so a grant that
+// differs from the request is a rejection here
+fn set_value(fd: c_int, req: c_ulong, value: u32) -> Result<(), Errno> {
+  let mut v = value as c_int;
+  if unsafe { libc::ioctl(fd, req, &mut v) } == -1 {
+    return Err(Errno::last());
+  }
+  if v != value as c_int {
+    return Err(Errno::EINVAL);
+  }
+  Ok(())
 }
 
 fn ospace_in_bytes(fd: c_int) -> c_int {
@@ -230,19 +222,11 @@ impl Dsp {
     self.state = DspState::Closed;
   }
 
-  pub fn set_format(&mut self, format: u32) {
+  pub fn configure(&mut self, format: u32, channels: u32, rate: u32) -> Result<(), Errno> {
     assert_eq!(self.state, DspState::Setup);
-    set_format(self.fd, format);
-  }
-
-  pub fn set_channels(&mut self, channels: u32) {
-    assert_eq!(self.state, DspState::Setup);
-    set_channels(self.fd, channels);
-  }
-
-  pub fn set_rate(&mut self, rate: u32) {
-    assert_eq!(self.state, DspState::Setup);
-    set_rate(self.fd, rate);
+    set_value(self.fd, SNDCTL_DSP_SETFMT,   format)?;
+    set_value(self.fd, SNDCTL_DSP_CHANNELS, channels)?;
+    set_value(self.fd, SNDCTL_DSP_SPEED,    rate)
   }
 
   pub unsafe fn read(&mut self, buf: *mut c_void, count: size_t) -> ssize_t {
@@ -343,19 +327,11 @@ impl DspWriter {
     self.state = DspState::Closed;
   }
 
-  pub fn set_format(&mut self, format: u32) {
+  pub fn configure(&mut self, format: u32, channels: u32, rate: u32) -> Result<(), Errno> {
     assert_eq!(self.state, DspState::Setup);
-    set_format(self.fd, format);
-  }
-
-  pub fn set_channels(&mut self, channels: u32) {
-    assert_eq!(self.state, DspState::Setup);
-    set_channels(self.fd, channels);
-  }
-
-  pub fn set_rate(&mut self, rate: u32) {
-    assert_eq!(self.state, DspState::Setup);
-    set_rate(self.fd, rate);
+    set_value(self.fd, SNDCTL_DSP_SETFMT,   format)?;
+    set_value(self.fd, SNDCTL_DSP_CHANNELS, channels)?;
+    set_value(self.fd, SNDCTL_DSP_SPEED,    rate)
   }
 
   /// Request a `len`-byte output buffer and return the size the device granted.
