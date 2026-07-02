@@ -45,6 +45,9 @@ struct State {
   system:      Option<crate::spa::System>, // ditto
   timer_source: spa_source,
   timer_added: bool,
+  devd_socket: Option<crate::utils::DevdSocket>, // jack/default-unit nudges; None = poll only
+  devd_source: spa_source,
+  devd_added:  bool,
   log:         crate::spa::Log
 }
 
@@ -232,6 +235,12 @@ unsafe fn build_route_info(b: &mut libspa::pod::builder::Builder, id: u32,
   b.add_string(&route.description)?;
   b.add_prop(SPA_PARAM_ROUTE_priority, 0)?;
   b.add_int(route.priority)?;
+  // Constant yes: FreeBSD exposes no per-jack state userland can read (the
+  // SND CONN devctl names a preferred device, not a jack - see
+  // on_devd_event), and "no" would make WirePlumber's find-best-routes skip
+  // the route and state-routes refuse to save its volume. acp would say
+  // "unknown" where detection is absent, but flipping v1's "yes" carries no
+  // information and only churns session-manager behavior.
   b.add_prop(SPA_PARAM_ROUTE_available, 0)?;
   b.add_id(libspa::utils::Id(SPA_PARAM_AVAILABILITY_yes))?;
 
@@ -540,6 +549,62 @@ unsafe extern "C" fn on_mixer_timeout(source: *mut spa_source) {
   }
 
   poll_mixers(state);
+}
+
+// devd "SND CONN" watcher. What the kernel actually emits (verified against
+// 14.4+ /usr/src) is "!system=SND subsystem=CONN type={IN,OUT} cdev=dspN"
+// (type=NODEV without a cdev when the last device goes):
+//  - sound.c:81-97 (pcm_hotswap) fires it when hw.snd.default_unit moves -
+//    not jack state at all;
+//  - hdaa.c:566-592 (hdaa_presence_handler) fires it on a pin-sense change,
+//    but only when the codec owns the default unit, never for headphone
+//    redirect associations (hdaa.c:572 returns first - the common laptop
+//    jack), and cdev names the device the kernel now PREFERS: the plugged
+//    association on connect, the first enabled same-direction association
+//    on disconnect. Connect and disconnect messages are indistinguishable.
+// No other sound driver emits it. The payload therefore identifies a pcm
+// unit but carries no jack state, so per-route available yes/no cannot be
+// derived and availability stays a constant "yes" (see build_route_info).
+// What a jack event DOES change kernel-side is the recording source
+// (hdaa_autorecsrc_handler, hdaa.c:562) and pin mutes, so the one sound
+// reaction is nudging the mixer poll instead of waiting out the 1 Hz tick.
+unsafe extern "C" fn on_devd_event(source: *mut spa_source) {
+
+  let state = (*source).data.cast::<State>().as_mut()
+    .expect("(*source).data is not supposed to be null");
+
+  let Some(devd_socket) = state.devd_socket.as_mut() else {
+    return; // the source is only registered when the socket exists
+  };
+
+  let pcm_devices = &state.pcm_devices;
+  let mut nudged  = false;
+  let alive = devd_socket.read_event(|line| {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(||
+      regex::Regex::new(r"^!system=SND subsystem=CONN type=(?:IN|OUT) cdev=dsp([0-9]+)").unwrap());
+    if let Some(groups) = re.captures(line) {
+      if let Ok(unit) = groups[1].parse::<u32>() {
+        nudged |= pcm_devices.iter().any(|d| d.index == unit);
+      }
+    }
+  });
+
+  if nudged {
+    crate::debug!(state.log, "SND CONN event; re-polling the mixers");
+    poll_mixers(state);
+  }
+
+  if !alive {
+    // devd restarted or dropped us; deregister or the level-triggered fd
+    // spins the main loop forever. The 1 Hz poll still covers the changes.
+    crate::warn!(state.log, "devd connection lost; falling back to the mixer poll alone");
+    if let Some(main_loop) = &state.main_loop {
+      main_loop.remove_source(&mut state.devd_source);
+    }
+    state.devd_socket = None;
+    state.devd_added  = false;
+  }
 }
 
 unsafe extern "C" fn add_listener(object: *mut c_void, listener: *mut spa_hook, events: *const spa_device_events, data: *mut c_void) -> c_int {
@@ -951,6 +1016,13 @@ unsafe extern "C" fn clear(handle: *mut spa_handle) -> c_int {
     state.timer_source.fd = -1;
     state.timer_added = false;
   }
+  // ditto for the devd watch; the socket fd closes with the DevdSocket drop
+  if state.devd_added {
+    if let Some(main_loop) = &state.main_loop {
+      main_loop.remove_source(&mut state.devd_source);
+    }
+    state.devd_added = false;
+  }
   std::ptr::drop_in_place(state);
   0
 }
@@ -1227,6 +1299,18 @@ unsafe extern "C" fn init(
     },
     timer_added: false,
 
+    devd_socket: None,
+    devd_source: spa_source {
+      loop_: std::ptr::null_mut(),
+      func:  Some(on_devd_event),
+      data:  state as *mut _ as *mut c_void,
+      fd:    -1,
+      mask:  SPA_IO_IN,
+      rmask: 0,
+      priv_: std::ptr::null_mut()
+    },
+    devd_added: false,
+
     log
   });
 
@@ -1266,6 +1350,28 @@ unsafe extern "C" fn init(
           crate::warn!(state.log, "can't watch the mixer; external volume changes won't be noticed");
           system.close(fd);
           state.timer_source.fd = -1;
+        }
+      }
+    }
+
+    // devd's SND CONN notifications (jack sense, default-unit moves) nudge
+    // the same poll so kernel-side recording-source flips show up right
+    // away; losing devd only costs that immediacy (jails, minimal systems)
+    if let Some(main_loop) = &state.main_loop {
+      match crate::utils::DevdSocket::open() {
+        Ok(socket) => {
+          state.devd_source.fd = socket.fd();
+          state.devd_socket    = Some(socket);
+          if main_loop.add_source(&mut state.devd_source) >= 0 {
+            state.devd_added = true;
+          } else {
+            crate::warn!(state.log, "can't watch devd; jack events will wait for the mixer poll");
+            state.devd_socket    = None;
+            state.devd_source.fd = -1;
+          }
+        },
+        Err(err) => {
+          crate::info!(state.log, "no devd connection ({}); jack events will wait for the mixer poll", err);
         }
       }
     }
