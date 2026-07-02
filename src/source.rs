@@ -838,6 +838,7 @@ fn try_open_configure(dsp: &mut crate::sound::Dsp, config: &PortConfig, log: &cr
     dsp.close();
     return -(err as c_int);
   }
+  dsp.set_small_fragments();
   0
 }
 
@@ -1017,7 +1018,7 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       // discard any backlog so the fill level starts out known, and hand the
       // graph one period of silence while the ring fills. Don't wait for real
       // data: an empty first cycle reads as a missed deadline to the graph.
-      if port.dsp.ready_for_reading(1) {
+      if port.dsp.ready_for_reading(0) {
         let mut backlog = port.dsp.ispace_in_bytes().max(0) as u32;
         while backlog > 0 {
           let chunk = backlog.min(data_0.maxsize);
@@ -1037,7 +1038,7 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       let len = period_in_bytes.min(data_0.maxsize);
       std::ptr::write_bytes(data_0.data.cast::<u8>(), 0, len as usize);
       len as isize
-    } else if port.dsp.ready_for_reading(1) {
+    } else if port.dsp.ready_for_reading(0) {
       let queued = port.dsp.ispace_in_bytes().max(0) as u32;
 
       // when driving, the servo runs in on_timeout where the clock is

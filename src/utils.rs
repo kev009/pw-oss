@@ -56,6 +56,16 @@ impl SysctlReader {
 
     Ok(String::from_utf8_lossy(&self.scratch_buffer[0..len]).to_string())
   }
+
+  pub fn read_u32<T: Into<SysctlName>>(&mut self, name: T) -> Result<u32, Errno> {
+    let SysctlName::CString(name) = name.into();
+    let mut value: u32 = 0;
+    let mut len = std::mem::size_of::<u32>();
+    if unsafe { sysctlbyname(name.as_ptr(), (&mut value as *mut u32).cast(), &mut len, std::ptr::null(), 0) } == -1 {
+      return Err(Errno::last());
+    }
+    Ok(value)
+  }
 }
 
 use std::os::fd::AsRawFd;

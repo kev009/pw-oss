@@ -152,7 +152,9 @@ unsafe extern "C" fn enum_params(object: *mut c_void, seq: c_int, id: u32, start
   let state = object.cast::<State>().as_mut()
     .expect("object is not supposed to be null");
 
-  assert_ne!(max, 0);
+  if max == 0 {
+    return 0;
+  }
 
   let mut buffer  = vec![];
   let mut fbuffer = vec![]; // spa_pod_filter output; kept apart from the source pod (see spa::filter_pod)

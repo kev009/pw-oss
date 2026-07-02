@@ -22,7 +22,7 @@ const SNDCTL_DSP_GETISPACE:   c_ulong = nix::request_code_read!     (b'P', 13, s
 const SNDCTL_DSP_GETODELAY:   c_ulong = nix::request_code_read!     (b'P', 23, std::mem::size_of::<c_int>());
 const SNDCTL_DSP_GETERROR:    c_ulong = nix::request_code_read!     (b'P', 25, std::mem::size_of::<audio_errinfo>());
 const SNDCTL_DSP_HALT:        c_ulong = nix::request_code_none!     (b'P',  0); // aka SNDCTL_DSP_RESET
-const SNDCTL_AUDIOINFO:       c_ulong = nix::request_code_readwrite!(b'X',  7, std::mem::size_of::<oss_audioinfo>());
+const SNDCTL_ENGINEINFO:      c_ulong = nix::request_code_readwrite!(b'X', 12, std::mem::size_of::<oss_audioinfo>());
 
 // sys/soundcard.h; the ioctl encodes the size, so a layout mismatch fails
 // cleanly instead of corrupting memory
@@ -143,10 +143,12 @@ pub fn probe_caps(path: &str, play: bool) -> Option<DspCaps> {
   let mut formats: c_int = 0;
   let formats_ok = unsafe { libc::ioctl(fd, SNDCTL_DSP_GETFMTS, &mut formats) } != -1;
 
+  // ENGINEINFO with dev == -1 resolves the channel bound to THIS fd, so the
+  // limits are per-direction (AUDIOINFO blends play and rec across the device)
   let (ai_min_ch, ai_max_ch, ai_min_rate, ai_max_rate) = unsafe {
     let mut ai = std::mem::MaybeUninit::<oss_audioinfo>::zeroed();
-    (*ai.as_mut_ptr()).dev = -1; // this fd's device
-    if libc::ioctl(fd, SNDCTL_AUDIOINFO, ai.as_mut_ptr()) == -1 {
+    (*ai.as_mut_ptr()).dev = -1; // this fd's channel
+    if libc::ioctl(fd, SNDCTL_ENGINEINFO, ai.as_mut_ptr()) == -1 {
       (0, 0, 0, 0)
     } else {
       let ai = ai.assume_init();
@@ -162,9 +164,12 @@ pub fn probe_caps(path: &str, play: bool) -> Option<DspCaps> {
   // a failed probe (bitperfect device) defers to the audioinfo limits
   let pick = |probed: c_int, ai_val: c_int| if probed >= 1 { probed } else { ai_val };
 
+  // When the empirical probe succeeds the kernel feeder is converting, and
+  // SETCHANNELS clamps at SND_CHN_MAX - hardware wider than that is only
+  // usable in bitperfect mode, where the probe FAILS and the engine limits
+  // take over. So never advertise beyond what one of the two grants.
   let min_channels = pick(probe(SNDCTL_DSP_CHANNELS, 1), ai_min_ch);
-  let max_channels = pick(probe(SNDCTL_DSP_CHANNELS, SND_CHN_MAX), ai_max_ch)
-    .max(ai_max_ch); // hardware wider than SND_CHN_MAX only shows here
+  let max_channels = pick(probe(SNDCTL_DSP_CHANNELS, SND_CHN_MAX), ai_max_ch);
   let min_rate     = pick(probe(SNDCTL_DSP_SPEED, 8000), ai_min_rate);
   let max_rate     = pick(probe(SNDCTL_DSP_SPEED, 192000), ai_max_rate);
 
@@ -184,8 +189,16 @@ pub fn probe_caps(path: &str, play: bool) -> Option<DspCaps> {
 }
 
 // hw.snd.feeder_rate_round: the kernel snaps a requested rate within this of
-// the hardware clock to the exact hardware rate (channel.c chn_setparam)
-const FEEDER_RATE_ROUND: u32 = 25;
+// the hardware clock to the exact hardware rate (channel.c chn_setparam);
+// it's a runtime sysctl (0..500), so read it, falling back to the default
+const FEEDER_RATE_ROUND_DEFAULT: u32 = 25;
+
+fn feeder_rate_round() -> u32 {
+  crate::utils::SysctlReader::new()
+    .read_u32("hw.snd.feeder_rate_round")
+    .unwrap_or(FEEDER_RATE_ROUND_DEFAULT)
+    .min(500)
+}
 
 // OSS grants the nearest supported value instead of failing, so a grant that
 // differs from the request beyond `tolerance` is a rejection here
@@ -300,7 +313,15 @@ impl Dsp {
     assert_eq!(self.state, DspState::Setup);
     set_value(self.fd, SNDCTL_DSP_SETFMT,   format,   0)?;
     set_value(self.fd, SNDCTL_DSP_CHANNELS, channels, 0)?;
-    set_value(self.fd, SNDCTL_DSP_SPEED,    rate,     FEEDER_RATE_ROUND)
+    set_value(self.fd, SNDCTL_DSP_SPEED,    rate,     feeder_rate_round())
+  }
+
+  // Size the capture ring into small fragments: the kernel's poll trigger is
+  // one fragment (chn_polltrigger, lw = blksz), and the hw.snd.latency default
+  // can exceed a small graph period, which would make every poll come up empty.
+  pub fn set_small_fragments(&mut self) {
+    assert_eq!(self.state, DspState::Setup);
+    set_fragment(self.fd, 64, 10); // 64 x 1 KiB
   }
 
   pub unsafe fn read(&mut self, buf: *mut c_void, count: size_t) -> ssize_t {
@@ -408,7 +429,7 @@ impl DspWriter {
     assert_eq!(self.state, DspState::Setup);
     set_value(self.fd, SNDCTL_DSP_SETFMT,   format,   0)?;
     set_value(self.fd, SNDCTL_DSP_CHANNELS, channels, 0)?;
-    set_value(self.fd, SNDCTL_DSP_SPEED,    rate,     FEEDER_RATE_ROUND)
+    set_value(self.fd, SNDCTL_DSP_SPEED,    rate,     feeder_rate_round())
   }
 
   /// Request a `len`-byte output buffer and return the size the device granted.
