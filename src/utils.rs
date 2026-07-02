@@ -521,7 +521,10 @@ pub fn device_period_bytes(target_duration: u64, device_rate: u32, graph_rate: u
   if graph_rate == 0 {
     return 0;
   }
-  (target_duration * device_rate as u64 / graph_rate as u64) as u32 * stride
+  // saturate: a corrupt duration must not wrap (or panic in debug builds)
+  (target_duration.saturating_mul(device_rate as u64) / graph_rate as u64)
+    .saturating_mul(stride as u64)
+    .min(u32::MAX as u64) as u32
 }
 
 // Fire-and-forget: queue `f` to run once on the given loop (from any thread;

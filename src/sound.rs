@@ -207,7 +207,7 @@ fn set_value(fd: c_int, req: c_ulong, value: u32, tolerance: u32) -> Result<(), 
   if unsafe { libc::ioctl(fd, req, &mut v) } == -1 {
     return Err(Errno::last());
   }
-  if (v - value as c_int).unsigned_abs() > tolerance {
+  if (v as i64 - value as i64).unsigned_abs() > tolerance as u64 {
     return Err(Errno::EINVAL);
   }
   Ok(())

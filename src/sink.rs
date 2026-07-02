@@ -53,6 +53,7 @@ struct Port {
   setup_period:   u32, // device bytes per graph cycle the stream was set up for
   bw_fast_until:  u64, // while nonzero, the DLL runs at BW_MAX for a fast lock
   resetup_pending: bool, // a main-thread device rebuild is queued; skip cycles
+  was_matching:   bool, // rate matching active last cycle (relock on transition)
   warn_limit:     crate::utils::RateLimit
 }
 
@@ -185,10 +186,12 @@ unsafe extern "C" fn set_callbacks(object: *mut c_void, callbacks: *const spa_no
   let state: *mut State = object.cast();
   assert!(!state.is_null());
   // read by on_timeout/process on the data loop
-  crate::utils::block_on_loop(&(*state).data_loop, state, |state| {
+  if !crate::utils::block_on_loop(&(*state).data_loop, state, |state| {
     state.callbacks.funcs = callbacks as *const c_void;
     state.callbacks.data  = data;
-  });
+  }) {
+    return -libc::EIO;
+  }
   0
 }
 
@@ -442,7 +445,10 @@ unsafe extern "C" fn on_timeout(source: *mut spa_source) {
   let duration = (*state.position).clock.target_duration;
   let rate     = (*state.position).clock.target_rate.denom;
   if duration == 0 || rate == 0 {
-    set_timeout(state, nsec + SPA_NSEC_PER_SEC as u64 / 100); // malformed position; idle-tick
+    // malformed position: idle-tick, and advance next_time so the deadline
+    // isn't stale when the position recovers
+    state.next_time = nsec + SPA_NSEC_PER_SEC as u64 / 100;
+    set_timeout(state, state.next_time);
     return;
   }
 
@@ -463,9 +469,10 @@ unsafe extern "C" fn on_timeout(source: *mut spa_source) {
     }
 
     let odelay = port.dsp.odelay();
-    // device frames scaled to the graph rate, plus the resampler's queue
+    // device frames scale to the graph rate; the resampler queue is already
+    // graph-side (audioconvert reports it unscaled, like ALSA adds it)
     let resamp = if state.rate_match.is_null() { 0 } else { (*state.rate_match).delay as i64 };
-    delay = (odelay as i64 / stride as i64 + resamp) * rate as i64 / device_rate as i64;
+    delay = (odelay as i64 / stride as i64) * rate as i64 / device_rate as i64 + resamp;
 
     if port.xrun_timestamp != 0 {
       continue; // recovering; process() is discarding buffers, hold the servo
@@ -571,7 +578,9 @@ unsafe extern "C" fn set_io(object: *mut c_void, id: u32, data: *mut c_void, siz
   }
 
   // clock/position are read on the data loop; apply the change there
-  crate::utils::block_on_loop(&(*state).data_loop, state, |state| {
+  let applied = crate::utils::block_on_loop(&(*state).data_loop, state, |state| {
+
+    let was_armed = !state.clock.is_null() && !state.position.is_null();
 
     #[allow(non_upper_case_globals)]
     match id {
@@ -585,10 +594,11 @@ unsafe extern "C" fn set_io(object: *mut c_void, id: u32, data: *mut c_void, siz
     };
 
     if state.started {
+      let armed     = !state.clock.is_null() && !state.position.is_null();
       let following = state.node_is_follower();
-      if state.following != following {
+      let flipped   = state.following != following;
+      if flipped {
         state.following = following;
-        update_timers(state);
 
         // there are some weird PipeWire xruns on clock changes that are messing up our OSS buffer delay,
         // we'll just preemptively treat them as OSS underruns for now
@@ -598,8 +608,16 @@ unsafe extern "C" fn set_io(object: *mut c_void, id: u32, data: *mut c_void, siz
           crate::warn!(state.log, "{}: clock change @ {}", port.dsp.path, port.xrun_timestamp);
         }
       }
+      // rearm/park only on a real transition (io presence or role); resetting
+      // the timer phase on every re-point causes cycle bunching
+      if flipped || was_armed != armed {
+        update_timers(state);
+      }
     }
   });
+  if !applied {
+    return -libc::EIO;
+  }
 
   0
 }
@@ -621,7 +639,7 @@ unsafe extern "C" fn send_command(object: *mut c_void, command: *const spa_comma
         return -libc::EIO; // not negotiated yet (ALSA rejects this too)
       }
       let state: *mut State = state;
-      crate::utils::block_on_loop(&(*state).data_loop, state, |state| {
+      if !crate::utils::block_on_loop(&(*state).data_loop, state, |state| {
 
         for port in &mut state.ports {
           port.xrun_timestamp = 0;
@@ -640,20 +658,24 @@ unsafe extern "C" fn send_command(object: *mut c_void, command: *const spa_comma
         state.old_timestamp = 0;
 
         update_timers(state);
-      });
+      }) {
+        return -libc::EIO;
+      }
       0
     },
     (SPA_TYPE_COMMAND_Node, SPA_NODE_COMMAND_Pause) => {
       let state: *mut State = state;
-      crate::utils::block_on_loop(&(*state).data_loop, state, |state| {
+      if !crate::utils::block_on_loop(&(*state).data_loop, state, |state| {
         state.started = false;
         update_timers(state);
-      });
+      }) {
+        return -libc::EIO;
+      }
       0
     },
     (SPA_TYPE_COMMAND_Node, SPA_NODE_COMMAND_Suspend) => {
       let state: *mut State = state;
-      crate::utils::block_on_loop(&(*state).data_loop, state, |state| {
+      if !crate::utils::block_on_loop(&(*state).data_loop, state, |state| {
         for port in &mut state.ports {
           if !port.dsp.is_closed() {
             port.dsp.close();
@@ -661,7 +683,9 @@ unsafe extern "C" fn send_command(object: *mut c_void, command: *const spa_comma
         }
         state.started = false;
         update_timers(state);
-      });
+      }) {
+        return -libc::EIO;
+      }
       0
     },
     (SPA_TYPE_COMMAND_Node, SPA_NODE_COMMAND_ParamBegin | SPA_NODE_COMMAND_ParamEnd) => 0, // we don't care
@@ -1131,6 +1155,7 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
     }
 
     let driver_clock = (*state.position).clock;
+    let matching = state.following && !crate::utils::same_clock(state.position, &state.clock_name);
 
     // the resampler can legitimately hand us a few frames over a quantum; warn
     // rather than debug_assert!, which would abort the process (panic across the
@@ -1303,9 +1328,17 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       }
     } else {
       // when driving, the servo runs in on_timeout where the clock is
-      // published; here the DLL only serves rate matching as a follower
-      if state.following && port.setup_period != 0 {
+      // published; here the DLL only serves rate matching as a follower on a
+      // foreign clock - a same-device follower has nothing to correct, and
+      // updating anyway would wind the integrator (ALSA gates the same way)
+      if matching && port.setup_period != 0 {
         let stride = port_config.stride().max(1);
+        if !port.was_matching {
+          // matching just engaged; relock rather than apply stale state
+          port.dll.init();
+          port.dll.set_bw(crate::dll::SPA_DLL_BW_MAX, port.setup_period, port_config.rate * stride);
+          port.bw_fast_until = state.cur_timestamp + DLL_FAST_NSEC;
+        }
         maybe_relax_dll(port, port_config.rate, stride, state.cur_timestamp);
         let max_err = (port.setup_period as f64 / 2.0).max(256.0 * stride as f64);
         let err = (port.dsp.odelay() as f64 - port.target_delay as f64).clamp(-max_err, max_err);
@@ -1322,8 +1355,8 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
     // timer steering applies the correction, and a same-device follower ticks
     // from our clock so there is nothing to match (ALSA gates on the clock
     // name the same way).
+    port.was_matching = matching;
     if !state.rate_match.is_null() {
-      let matching = state.following && !crate::utils::same_clock(state.position, &state.clock_name);
       if matching {
         (*state.rate_match).flags |= SPA_IO_RATE_MATCH_FLAG_ACTIVE;
         (*state.rate_match).rate   = corr.clamp(0.99, 1.01);
@@ -1369,9 +1402,11 @@ unsafe extern "C" fn port_use_buffers(object: *mut c_void, direction: spa_direct
   // process() walks this vec on the data loop; swap it there
   let port_idx = port_id as usize;
   let state_ptr: *mut State = state;
-  crate::utils::block_on_loop(&(*state_ptr).data_loop, state_ptr, move |state| {
+  if !crate::utils::block_on_loop(&(*state_ptr).data_loop, state_ptr, move |state| {
     state.ports[port_idx].buffers = new_buffers;
-  });
+  }) {
+    return -libc::EIO; // keeping stale host buffer pointers would be a UAF
+  }
 
   0
 }
@@ -1393,7 +1428,7 @@ unsafe extern "C" fn port_set_io(object: *mut c_void, direction: spa_direction, 
 
   // these pointers are dereferenced by process() on the data loop
   let state: *mut State = state;
-  crate::utils::block_on_loop(&(*state).data_loop, state, |state| {
+  let applied = crate::utils::block_on_loop(&(*state).data_loop, state, |state| {
     #[allow(non_upper_case_globals)]
     match id {
       SPA_IO_Buffers   => state.ports[port_id as usize].io = data.cast(), // null clears
@@ -1403,6 +1438,9 @@ unsafe extern "C" fn port_set_io(object: *mut c_void, direction: spa_direction, 
       _ => ()
     }
   });
+  if !applied {
+    return -libc::EIO;
+  }
 
   0
 }
@@ -1448,9 +1486,14 @@ unsafe extern "C" fn clear(handle: *mut spa_handle) -> c_int {
 
   // the data loop still holds the timer source; detach it there before the
   // state is freed, then close the timerfd
-  crate::utils::block_on_loop(&(*state).data_loop, state, |state| {
+  if !crate::utils::block_on_loop(&(*state).data_loop, state, |state| {
     state.data_loop.remove_source(&mut state.timer_source);
-  });
+  }) {
+    // freeing the state now would leave the loop a dangling source; a clean
+    // abort beats a use-after-free on the next timer tick
+    eprintln!("freebsd-oss: can't detach the timer source; aborting");
+    std::process::abort();
+  }
   (*state).data_system.close((*state).timer_source.fd);
 
   std::ptr::drop_in_place(state);
@@ -1588,6 +1631,7 @@ unsafe extern "C" fn init(
         setup_period:   0,
         bw_fast_until:  0,
         resetup_pending: false,
+        was_matching:   false,
         warn_limit:     crate::utils::RateLimit::new()
       };
       MAX_PORTS
