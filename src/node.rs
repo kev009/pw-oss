@@ -18,22 +18,25 @@ pub(crate) const MAX_PORTS: usize = 1;
 pub(crate) trait DeviceOps {
   fn new(path: &str) -> Self;
   fn is_closed(&self) -> bool;
+  fn is_running(&self) -> bool;
   fn close(&mut self);
   fn suspend(&mut self) -> bool;
 }
 
 impl DeviceOps for crate::sound::Dsp {
-  fn new(path: &str) -> Self    { crate::sound::Dsp::new(path) }
-  fn is_closed(&self) -> bool   { crate::sound::Dsp::is_closed(self) }
-  fn close(&mut self)           { crate::sound::Dsp::close(self) }
-  fn suspend(&mut self) -> bool { crate::sound::Dsp::suspend(self) }
+  fn new(path: &str) -> Self     { crate::sound::Dsp::new(path) }
+  fn is_closed(&self) -> bool    { crate::sound::Dsp::is_closed(self) }
+  fn is_running(&self) -> bool   { crate::sound::Dsp::is_running(self) }
+  fn close(&mut self)            { crate::sound::Dsp::close(self) }
+  fn suspend(&mut self) -> bool  { crate::sound::Dsp::suspend(self) }
 }
 
 impl DeviceOps for crate::sound::DspWriter {
-  fn new(path: &str) -> Self    { crate::sound::DspWriter::new(path) }
-  fn is_closed(&self) -> bool   { crate::sound::DspWriter::is_closed(self) }
-  fn close(&mut self)           { crate::sound::DspWriter::close(self) }
-  fn suspend(&mut self) -> bool { crate::sound::DspWriter::suspend(self) }
+  fn new(path: &str) -> Self     { crate::sound::DspWriter::new(path) }
+  fn is_closed(&self) -> bool    { crate::sound::DspWriter::is_closed(self) }
+  fn is_running(&self) -> bool   { crate::sound::DspWriter::is_running(self) }
+  fn close(&mut self)            { crate::sound::DspWriter::close(self) }
+  fn suspend(&mut self) -> bool  { crate::sound::DspWriter::suspend(self) }
 }
 
 // the negotiated format as the generic core needs it; the concrete PortConfig
@@ -87,8 +90,11 @@ pub(crate) trait Direction: Sized + 'static {
 
   // port_set_param(Format): validate the format and build the config
   unsafe fn parse_config(state: &mut State<Self>, raw: &spa_audio_info_raw) -> Result<Self::Config, c_int>;
-  // used from the main thread only; returns 0 or -errno with the device closed
-  fn try_open_configure(dsp: &mut Self::Device, config: &Self::Config, log: &crate::spa::Log) -> c_int;
+  // used from the main thread only; returns 0 or -errno with the device
+  // closed. `fragment` is the normalized oss.fragment (0 = automatic); the
+  // source applies it at open time, the sink at prime time (the period is
+  // only known then)
+  fn try_open_configure(dsp: &mut Self::Device, config: &Self::Config, fragment: u32, log: &crate::spa::Log) -> c_int;
   // install_device: direction-specific resets inside the loop-side swap
   unsafe fn on_device_swapped(state: &mut State<Self>, port_idx: usize);
   // port_use_buffers: direction-specific resets inside the loop-side swap
@@ -152,6 +158,8 @@ pub(crate) struct State<D: Direction> {
   pub ports:         [Port<D>; MAX_PORTS],
   pub caps:          crate::sound::DspCaps,
   pub caps_fallback: bool, // init-time probe failed (busy device); re-probe lazily
+  pub oss_fragment:  u32, // normalized fragment size in bytes (0 = automatic); read by the prime paths
+  pub oss_fragment_default: u32, // init-dict value, restored by a NULL Props reset
   pub loop_thread:   std::sync::atomic::AtomicUsize, // thread process()/on_timeout run on (0 = unseen)
   pub latency:       [spa_latency_info; 2], // indexed by direction; written by the host, replayed on read
   pub process_latency: spa_process_latency_info,
@@ -925,6 +933,57 @@ unsafe extern "C" fn port_set_param<D: Direction>(object: *mut c_void, direction
   }
 }
 
+// oss.fragment: 0 = automatic; otherwise round DOWN to a power of two and
+// clamp to [64, 16384] bytes. The kernel would take 16..65536 (dsp.c:1251
+// RANGE(fragln, 4, 16)); staying well inside keeps the request grantable
+// verbatim and the buffer budget sane (CHN_2NDBUFMAXSIZE, channel.h:442).
+pub(crate) fn normalize_fragment(v: u32) -> u32 {
+  if v == 0 { 0 } else { (1u32 << (31 - v.leading_zeros())).clamp(64, 16384) }
+}
+
+// The oss.* tunable live re-apply path: store the new loop-owned value on the
+// data loop (the prime paths read it there), then rebuild any running port
+// from this (main) thread so the next cycle re-primes with the new layout.
+pub(crate) unsafe fn store_and_rebuild<D: Direction>(state: &mut State<D>, store: impl FnOnce(&mut State<D>)) -> c_int {
+  let mut running = [false; MAX_PORTS];
+  let applied = {
+    let running_ref = &mut running;
+    let state_ptr: *mut State<D> = state;
+    crate::utils::block_on_loop(&(*state_ptr).data_loop, state_ptr, move |state| {
+      store(state);
+      // dsp state is loop-owned; snapshot it here
+      for (i, port) in state.ports.iter().enumerate() {
+        running_ref[i] = port.dsp.is_running();
+      }
+    })
+  };
+  if !applied {
+    return -libc::EIO;
+  }
+  for (port_idx, &was_running) in running.iter().enumerate() {
+    if !was_running {
+      continue; // not streaming; picked up at the next start/prime
+    }
+    if let Some(config) = state.ports[port_idx].config.clone() {
+      if install_device(state, port_idx, config) != 0 {
+        // the host didn't initiate this rebuild; without a re-announce it
+        // keeps believing a format is set on a dead port
+        emit_format_lost(state);
+      }
+    }
+  }
+  0
+}
+
+// announce a Props change (so readback stays fresh), then apply it through
+// store_and_rebuild; shared by the sink's and source's set_props_params
+pub(crate) unsafe fn apply_props_param<D: Direction>(state: &mut State<D>, store: impl FnOnce(&mut State<D>)) -> c_int {
+  let _ = state.node_info.replace_change_mask(0);
+  state.node_info.bump_param(SPA_PARAM_Props);
+  emit_node_info(state);
+  store_and_rebuild(state, store)
+}
+
 // Open and configure on the calling (main) thread - device opens can sleep for
 // tens of ms and must stay off the shared data loop - then swap only the
 // pointers there and close the old device back here. Exclusive devices
@@ -934,7 +993,8 @@ unsafe extern "C" fn port_set_param<D: Direction>(object: *mut c_void, direction
 pub(crate) unsafe fn install_device<D: Direction>(state: &mut State<D>, port_idx: usize, config: D::Config) -> c_int {
 
   let mut new_dsp = D::Device::new(&state.dsp_path);
-  let mut res = D::try_open_configure(&mut new_dsp, &config, &state.log);
+  // oss_fragment only mutates from main-thread calls, serialized with us
+  let mut res = D::try_open_configure(&mut new_dsp, &config, state.oss_fragment, &state.log);
 
   if res == -libc::EBUSY {
     let mut retired = None;
@@ -952,7 +1012,7 @@ pub(crate) unsafe fn install_device<D: Direction>(state: &mut State<D>, port_idx
       }
     }
     drop(retired); // closes the old fd here, off the RT path
-    res = D::try_open_configure(&mut new_dsp, &config, &state.log);
+    res = D::try_open_configure(&mut new_dsp, &config, state.oss_fragment, &state.log);
   }
 
   let ok = res == 0;
@@ -1211,8 +1271,9 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
     return timer_fd; // fd exhaustion fails node creation, not the daemon
   }
 
-  let mut dsp_path = None;
-  let mut ext      = D::Ext::default();
+  let mut dsp_path     = None;
+  let mut oss_fragment = 0u32; // automatic (today's layout) unless the dict says otherwise
+  let mut ext          = D::Ext::default();
 
   if let Some(info) = info.as_ref() {
     #[cfg(debug_assertions)]
@@ -1222,6 +1283,12 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
     crate::spa::for_each_dict_item(info, |key, value| {
       if key == crate::keys::OSS_DSP_PATH {
         dsp_path = Some(value.to_string());
+      } else if key == crate::keys::OSS_FRAGMENT {
+        // direction-shared per-device default, e.g. from a wireplumber node
+        // rule; stored normalized so readback reports the effective value
+        if let Ok(v) = value.parse::<u32>() {
+          oss_fragment = normalize_fragment(v);
+        }
       } else {
         D::info_item(&mut ext, key, value);
       }
@@ -1325,6 +1392,8 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
 
     caps,
     caps_fallback,
+    oss_fragment,
+    oss_fragment_default: oss_fragment,
     loop_thread: std::sync::atomic::AtomicUsize::new(0),
 
     latency: [

@@ -102,7 +102,7 @@ unsafe fn timeout_servo(state: &mut State<SourceDir>, nsec: u64, rate: u32) -> (
 }
 
 // used from the main thread only; returns 0 or -errno with the device closed
-fn try_open_configure(dsp: &mut crate::sound::Dsp, config: &PortConfig, log: &crate::spa::Log) -> c_int {
+fn try_open_configure(dsp: &mut crate::sound::Dsp, config: &PortConfig, fragment: u32, log: &crate::spa::Log) -> c_int {
   // a busy or vanished device must fail negotiation, not abort
   if let Err(err) = dsp.open() {
     crate::warn!(log, "dsp open: {}", err);
@@ -114,7 +114,7 @@ fn try_open_configure(dsp: &mut crate::sound::Dsp, config: &PortConfig, log: &cr
     dsp.close();
     return -(err as c_int);
   }
-  dsp.set_small_fragments();
+  dsp.set_small_fragments(fragment, 65536); // normalized oss.fragment (0 = 1 KiB default)
   0
 }
 
@@ -224,6 +224,19 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
       // discard any backlog so the fill level starts out known, and hand the
       // graph one period of silence while the ring fills. Don't wait for real
       // data: an empty first cycle reads as a missed deadline to the graph.
+      // Re-apply the fragment layout while the channel is in setup (legal
+      // after a trigger suspend too, so live oss.fragment changes reach a
+      // suspended source). The capture fragment is capped at the period:
+      // queued readings move in fragment steps, and a fragment far above
+      // the period makes the servo target unreachable - the error pegs at
+      // the clamp and the integrator ramps. The ring scales with the
+      // period so large quanta keep some overrun slack.
+      if !port.dsp.is_running() {
+        let m    = period_in_bytes.max(1024);
+        let cap  = 1u32 << (31 - m.leading_zeros());
+        let frag = if state.oss_fragment == 0 { 1024 } else { state.oss_fragment.min(cap) };
+        port.dsp.set_small_fragments(frag, period_in_bytes.saturating_mul(4));
+      }
       if port.dsp.ready_for_reading(0) {
         let mut backlog = port.dsp.ispace_in_bytes().max(0) as u32;
         while backlog > 0 {
@@ -396,8 +409,11 @@ impl Direction for SourceDir {
     #[allow(non_upper_case_globals)]
     match (id, index) {
       (SPA_PARAM_PropInfo, 0)       => crate::utils::build_latency_offset_prop_info(b).unwrap(),
+      (SPA_PARAM_PropInfo, 1)       => crate::utils::build_params_prop_info(b, crate::keys::OSS_FRAGMENT,
+        "OSS fragment size (bytes, power of two, 0 = automatic)", state.oss_fragment, 16384).unwrap(),
       (SPA_PARAM_PropInfo, _)       => return ParamBuild::Exhausted,
-      (SPA_PARAM_Props, 0)          => crate::utils::build_latency_offset_props(b, state.process_latency.ns, None).unwrap(),
+      (SPA_PARAM_Props, 0)          => crate::utils::build_latency_offset_props(b, state.process_latency.ns,
+        &[(crate::keys::OSS_FRAGMENT, state.oss_fragment)]).unwrap(),
       (SPA_PARAM_Props, _)          => return ParamBuild::Exhausted,
       (SPA_PARAM_ProcessLatency, 0) => crate::utils::build_process_latency_info(b, &state.process_latency).unwrap(),
       (SPA_PARAM_ProcessLatency, _) => return ParamBuild::Exhausted,
@@ -406,14 +422,44 @@ impl Direction for SourceDir {
     ParamBuild::Built
   }
 
-  // a NULL Props pod resets the props to their defaults
+  // a NULL Props pod resets the props to their defaults and re-applies them
   unsafe fn reset_props(state: &mut State<SourceDir>) -> c_int {
+    let res = crate::node::store_and_rebuild(state, |state| {
+      state.oss_fragment = state.oss_fragment_default;
+    });
+    if res != 0 {
+      return res;
+    }
     crate::node::handle_process_latency(state, crate::utils::process_latency_default());
     0
   }
 
-  unsafe fn set_props_params(_state: &mut State<SourceDir>, _value: &libspa::pod::Value) -> c_int {
-    0 // ditto (nothing settable through params here)
+  unsafe fn set_props_params(state: &mut State<SourceDir>, value: &libspa::pod::Value) -> c_int {
+    use libspa::pod::Value;
+    match value {
+      Value::Struct(values) if values.len() % 2 == 0 => {
+        for kv in values.chunks(2) {
+          match (&kv[0], &kv[1]) {
+            // pw-cli set-param <object-id> Props '{ "params": ["oss.fragment", 4096]}'
+            (Value::String(s), Value::Int(x)) if s == crate::keys::OSS_FRAGMENT && *x >= 0 => {
+              // stored normalized, so the Props readback reports the
+              // effective (rounded/clamped) value, not the raw request
+              let new_fragment = crate::node::normalize_fragment(*x as u32);
+              if new_fragment != state.oss_fragment {
+                // unchanged echoes must not rebuild a running device
+                let res = crate::node::apply_props_param(state, move |state| state.oss_fragment = new_fragment);
+                if res != 0 {
+                  return res;
+                }
+              }
+            },
+            _ => ()
+          }
+        }
+      }
+      _ => ()
+    }
+    0
   }
 
   unsafe fn parse_config(state: &mut State<SourceDir>, raw: &spa_audio_info_raw) -> Result<PortConfig, c_int> {
@@ -446,8 +492,8 @@ impl Direction for SourceDir {
     Ok(config)
   }
 
-  fn try_open_configure(dsp: &mut crate::sound::Dsp, config: &PortConfig, log: &crate::spa::Log) -> c_int {
-    try_open_configure(dsp, config, log)
+  fn try_open_configure(dsp: &mut crate::sound::Dsp, config: &PortConfig, fragment: u32, log: &crate::spa::Log) -> c_int {
+    try_open_configure(dsp, config, fragment, log)
   }
 
   unsafe fn on_device_swapped(state: &mut State<SourceDir>, port_idx: usize) {

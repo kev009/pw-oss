@@ -10,3 +10,7 @@ pub const OSS_DSP_PATH:       &str = "api.freebsd-oss.dsp-path";
 /// Sink buffer fill target in 1/8ths of a period; settable per device through
 /// wireplumber node rules, or at runtime through the Props params struct
 pub const OSS_DELAY:          &str = "oss.delay";
+
+/// Device fragment size in bytes (power of two, clamped to 64..16384;
+/// 0 = automatic), shared by both directions; settable like oss.delay
+pub const OSS_FRAGMENT:       &str = "oss.fragment";

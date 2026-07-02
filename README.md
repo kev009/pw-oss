@@ -57,6 +57,17 @@ monitor.oss.rules = [
 cost of latency). It can also be changed live on a node via
 `pw-cli set-param <node> Props '{ params: [ "oss.delay", 16 ] }'`.
 
+`oss.fragment` sets the device fragment size in bytes for both playback and
+capture (default 0 = automatic, which sizes 1 KiB fragments). Values are
+rounded down to a power of two and clamped to 64..16384; the Props readback
+reports the effective value. Smaller fragments help latency-critical small
+quanta (finer DMA delivery granularity at the price of more interrupts);
+larger fragments mean fewer interrupts when latency doesn't matter. The
+device may still grant a different size (some drivers force a fixed period);
+the plugin reads the granted size back, and the rate servo's measurement
+granularity - and thus its noise model - follows it automatically. Live:
+`pw-cli set-param <node> Props '{ params: [ "oss.fragment", 4096 ] }'`.
+
 ### Routes / hardware volume
 
 Each pcm device with a usable mixer control (`vol`, else `pcm` for playback;

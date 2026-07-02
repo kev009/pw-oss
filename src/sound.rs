@@ -556,11 +556,25 @@ impl Dsp {
   // quantization); the hw.snd.latency default can exceed a small graph
   // period. The low-water mark then decouples the poll trigger from the
   // GRANTED fragment size (chn_polltrigger fires at lw, which SETFRAGMENT
-  // resets to blksz - so the order here matters, and the mark survives a
-  // trigger suspend since chn_resetbuf doesn't touch it).
-  pub fn set_small_fragments(&mut self) {
-    assert_eq!(self.state, DspState::Setup);
-    set_fragment(self.fd, 64, 10); // 64 x 1 KiB
+  // resets to blksz (channel.c:1980) - so the order here matters, and the
+  // mark survives a trigger suspend since chn_resetbuf doesn't touch it).
+  // `fragment` is the normalized oss.fragment override (0 = the 1 KiB
+  // default); either way the ring keeps a 64 KiB byte budget.
+  pub fn set_small_fragments(&mut self, fragment: u32, ring: u32) {
+    if self.state != DspState::Setup {
+      return; // triggered channels can't retune; the next re-prime will
+    }
+    let ring = ring.clamp(65536, CHN_2NDBUFMAXSIZE as u32);
+    if fragment == 0 {
+      set_fragment(self.fd, (ring >> 10).min(u16::MAX as u32) as u16, 10); // 1 KiB fragments
+    } else {
+      // fragment is a power of two in [64, 16384] (node.rs
+      // normalize_fragment), so the selector stays inside the kernel's
+      // RANGE(fragln, 4, 16) (dsp.c:1251) and the count never drops under
+      // the kernel minimum of 2 (dsp.c:1256)
+      let count = (ring >> fragment.trailing_zeros()).max(2u32);
+      set_fragment(self.fd, count.min(u16::MAX as u32) as u16, fragment.trailing_zeros() as u16);
+    }
     let mut lw: c_int = 1;
     // best-effort: without it, poll readiness is merely fragment-coarse
     let _ = unsafe { libc::ioctl(self.fd, SNDCTL_DSP_LOW_WATER, &mut lw) };
@@ -739,11 +753,21 @@ impl DspWriter {
   /// Request a `len`-byte output buffer and return the size the device granted.
   /// FreeBSD clamps the fragment count, so the grant can be much smaller than
   /// requested; size the target delay to the return value, not `len`.
-  pub fn set_buffer_size(&mut self, len: u32) -> u32 {
+  /// `fragment` is the normalized oss.fragment override (0 = 1 KiB default).
+  pub fn set_buffer_size(&mut self, len: u32, fragment: u32) -> u32 {
     assert_eq!(self.state, DspState::Setup);
-    // the fragment count field is 16 bits; an extreme oss.delay x quantum
-    // request must clamp, not truncate
-    set_fragment(self.fd, len.div_ceil(1024).min(u16::MAX as u32) as u16, 10);
+    if fragment == 0 {
+      // the fragment count field is 16 bits; an extreme oss.delay x quantum
+      // request must clamp, not truncate
+      set_fragment(self.fd, len.div_ceil(1024).min(u16::MAX as u32) as u16, 10);
+    } else {
+      // fragment is a power of two in [64, 16384] (node.rs
+      // normalize_fragment), keeping the selector inside the kernel's
+      // RANGE(fragln, 4, 16) (dsp.c:1251); the count clamp mirrors the
+      // kernel's own bounds (min 2, total <= CHN_2NDBUFMAXSIZE, dsp.c:1256-1259)
+      let count = len.div_ceil(fragment).clamp(2, CHN_2NDBUFMAXSIZE as u32 / fragment);
+      set_fragment(self.fd, count as u16, fragment.trailing_zeros() as u16);
+    }
     // nothing's written yet, so GETOSPACE reports the granted buffer size
     let granted = ospace_in_bytes(self.fd);
     if granted > 0 { granted as u32 } else { len }

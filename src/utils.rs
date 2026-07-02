@@ -487,7 +487,7 @@ pub unsafe fn build_latency_offset_prop_info(b: &mut libspa::pod::builder::Build
   Ok(())
 }
 
-pub unsafe fn build_latency_offset_props(b: &mut libspa::pod::builder::Builder, ns: i64, oss_delay: Option<u32>) -> Result<(), rustix::io::Errno> {
+pub unsafe fn build_latency_offset_props(b: &mut libspa::pod::builder::Builder, ns: i64, params: &[(&str, u32)]) -> Result<(), rustix::io::Errno> {
 
   use libspa::sys::*;
 
@@ -498,17 +498,51 @@ pub unsafe fn build_latency_offset_props(b: &mut libspa::pod::builder::Builder, 
   b.add_prop(SPA_PROP_latencyOffsetNsec, 0)?;
   b.add_long(ns)?;
 
-  // custom key/value props ride in the params struct
-  if let Some(delay) = oss_delay {
+  // custom key/value props (oss.delay, oss.fragment) ride in the params struct
+  if !params.is_empty() {
     let mut inner = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
     b.add_prop(SPA_PROP_params, 0)?;
     b.push_struct(&mut inner)?;
-    b.add_string("oss.delay")?;
-    b.add_int(delay as i32)?;
+    for (key, value) in params {
+      b.add_string(key)?;
+      b.add_int(*value as i32)?;
+    }
     b.pop(inner.assume_init_mut());
   }
 
   b.pop(frame.assume_init_mut());
+
+  Ok(())
+}
+
+// PropInfo for a custom u32 tunable carried in the Props params struct; the
+// advertised default is the CURRENT (effective) value, like the ALSA plugin
+pub unsafe fn build_params_prop_info(b: &mut libspa::pod::builder::Builder, name: &str, description: &str, current: u32, max: u32) -> Result<(), rustix::io::Errno> {
+
+  use libspa::sys::*;
+
+  let mut outer = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
+  let mut inner = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
+
+  b.push_object(&mut outer, SPA_TYPE_OBJECT_PropInfo, SPA_PARAM_PropInfo)?;
+
+  b.add_prop(SPA_PROP_INFO_name, 0)?;
+  b.add_string(name)?;
+
+  b.add_prop(SPA_PROP_INFO_description, 0)?;
+  b.add_string(description)?;
+
+  b.add_prop(SPA_PROP_INFO_type, 0)?;
+  b.push_choice(&mut inner, SPA_CHOICE_Range, 0)?;
+  b.add_int(current as i32)?;
+  b.add_int(0)?;
+  b.add_int(max as i32)?;
+  b.pop(inner.assume_init_mut());
+
+  b.add_prop(SPA_PROP_INFO_params, 0)?;
+  b.add_bool(true)?; // settable through the Props params struct
+
+  b.pop(outer.assume_init_mut());
 
   Ok(())
 }

@@ -87,34 +87,6 @@ impl crate::node::ConfigOps for PortConfig {
   fn positions(&self) -> &[u32] { &self.positions }
 }
 
-unsafe fn build_oss_delay_prop_info(b: &mut libspa::pod::builder::Builder, current: u32) -> Result<(), rustix::io::Errno> {
-
-  let mut outer = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
-  let mut inner = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
-
-  b.push_object(&mut outer, SPA_TYPE_OBJECT_PropInfo, SPA_PARAM_PropInfo)?;
-
-  b.add_prop(SPA_PROP_INFO_name, 0)?;
-  b.add_string("oss.delay")?;
-
-  b.add_prop(SPA_PROP_INFO_description, 0)?;
-  b.add_string("OSS buffer fill target (1/8ths of a period)")?;
-
-  b.add_prop(SPA_PROP_INFO_type, 0)?;
-  b.push_choice(&mut inner, SPA_CHOICE_Range, 0)?;
-  b.add_int(current as i32)?;
-  b.add_int(0)?;
-  b.add_int(1024)?;
-  b.pop(inner.assume_init_mut());
-
-  b.add_prop(SPA_PROP_INFO_params, 0)?;
-  b.add_bool(true)?; // settable through the Props params struct
-
-  b.pop(outer.assume_init_mut());
-
-  Ok(())
-}
-
 // Run the servo before the clock is published so every field below belongs
 // to this cycle (the shape of ALSA's update_time). One FreeBSD difference:
 // GETODELAY reports the soft buffer only - the kernel pre-fills the hardware
@@ -369,12 +341,17 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
       // half-full. "Near-full" still leaves headroom for a write that runs a few
       // frames over a quantum (the resampler's output size varies), or the OSS
       // write short-writes and drops those frames every cycle.
-      let granted   = port.dsp.set_buffer_size(period_in_bytes.saturating_mul(2).saturating_add(desired_delay));
+      // oss_fragment (0 = automatic 1 KiB) only mutates on this loop, so the
+      // read is race-free; no ioctls beyond what the prime always issued
+      let granted   = port.dsp.set_buffer_size(period_in_bytes.saturating_mul(2).saturating_add(desired_delay), state.oss_fragment);
       let blocksize = port.dsp.blocksize();
       // saturating arithmetic: blocksize/rate_match.size are device-provided and
       // an overflow here would abort the data loop.
       port.ext.target_delay = if granted >= period_in_bytes.saturating_mul(2) {
-        if blocksize > 0 && blocksize.saturating_mul(4) < period_in_bytes {
+        if blocksize > 0 && blocksize.saturating_mul(4) < period_in_bytes && state.oss_fragment == 0 {
+          // (driver-forced small fragments only: a USER-chosen small
+          // fragment must keep the calibrated oss.delay target, or setting
+          // it would silently raise latency toward near-full)
           // near-full, leaving headroom for the largest expected write (a quantum,
           // or the resampler's size if larger) plus one fragment. A chunk over
           // even that drops the excess: on a buffer this small no target both
@@ -592,9 +569,13 @@ impl Direction for SinkDir {
     #[allow(non_upper_case_globals)]
     match (id, index) {
       (SPA_PARAM_PropInfo, 0)       => crate::utils::build_latency_offset_prop_info(b).unwrap(),
-      (SPA_PARAM_PropInfo, 1)       => build_oss_delay_prop_info(b, state.ext.oss_delay).unwrap(),
+      (SPA_PARAM_PropInfo, 1)       => crate::utils::build_params_prop_info(b, crate::keys::OSS_DELAY,
+        "OSS buffer fill target (1/8ths of a period)", state.ext.oss_delay, 1024).unwrap(),
+      (SPA_PARAM_PropInfo, 2)       => crate::utils::build_params_prop_info(b, crate::keys::OSS_FRAGMENT,
+        "OSS fragment size (bytes, power of two, 0 = automatic)", state.oss_fragment, 16384).unwrap(),
       (SPA_PARAM_PropInfo, _)       => return ParamBuild::Exhausted,
-      (SPA_PARAM_Props, 0)          => crate::utils::build_latency_offset_props(b, state.process_latency.ns, Some(state.ext.oss_delay)).unwrap(),
+      (SPA_PARAM_Props, 0)          => crate::utils::build_latency_offset_props(b, state.process_latency.ns,
+        &[(crate::keys::OSS_DELAY, state.ext.oss_delay), (crate::keys::OSS_FRAGMENT, state.oss_fragment)]).unwrap(),
       (SPA_PARAM_Props, _)          => return ParamBuild::Exhausted,
       (SPA_PARAM_ProcessLatency, 0) => crate::utils::build_process_latency_info(b, &state.process_latency).unwrap(),
       (SPA_PARAM_ProcessLatency, _) => return ParamBuild::Exhausted,
@@ -605,28 +586,12 @@ impl Direction for SinkDir {
 
   // a NULL Props pod resets the props to their defaults and re-applies them
   unsafe fn reset_props(state: &mut State<SinkDir>) -> c_int {
-    let mut running = [false; MAX_PORTS];
-    let applied = {
-      let running_ref = &mut running;
-      let state_ptr: *mut State<SinkDir> = state;
-      crate::utils::block_on_loop(&(*state_ptr).data_loop, state_ptr, move |state| {
-        state.ext.oss_delay = state.ext.oss_delay_default; // read by process()
-        // dsp state is loop-owned; snapshot it here
-        for (i, port) in state.ports.iter().enumerate() {
-          running_ref[i] = port.dsp.is_running();
-        }
-      })
-    };
-    if !applied {
-      return -libc::EIO;
-    }
-    for (port_idx, &was_running) in running.iter().enumerate() {
-      if !was_running {
-        continue;
-      }
-      if let Some(config) = state.ports[port_idx].config.clone() {
-        let _ = crate::node::install_device(state, port_idx, config);
-      }
+    let res = crate::node::store_and_rebuild(state, |state| {
+      state.ext.oss_delay = state.ext.oss_delay_default; // read by process()
+      state.oss_fragment  = state.oss_fragment_default;  // ditto (the prime path)
+    });
+    if res != 0 {
+      return res;
     }
     crate::node::handle_process_latency(state, crate::utils::process_latency_default());
     0
@@ -642,35 +607,22 @@ impl Direction for SinkDir {
             (Value::String(s), Value::Int(x)) if s == crate::keys::OSS_DELAY && *x >= 0 => {
               // cap it: period/8 * oss_delay runs in the RT path and must not overflow
               let new_delay = (*x as u32).min(1024);
-              // announce the new value so Props readback stays fresh
-              let _ = state.node_info.replace_change_mask(0);
-              state.node_info.bump_param(SPA_PARAM_Props);
-              crate::node::emit_node_info(state);
-
-              // apply immediately: store on the loop (process()
-              // reads it), then rebuild the device from this
-              // (main) thread so the next cycle re-primes
-              let mut running = [false; MAX_PORTS];
-              let applied = {
-                let running_ref = &mut running;
-                let state_ptr: *mut State<SinkDir> = state;
-                crate::utils::block_on_loop(&(*state_ptr).data_loop, state_ptr, move |state| {
-                  state.ext.oss_delay = new_delay;
-                  // dsp state is loop-owned; snapshot it here
-                  for (i, port) in state.ports.iter().enumerate() {
-                    running_ref[i] = port.dsp.is_running();
-                  }
-                })
-              };
-              if !applied {
-                return -libc::EIO;
-              }
-              for (port_idx, &was_running) in running.iter().enumerate() {
-                if !was_running {
-                  continue; // not streaming; picked up at start
+              if new_delay != state.ext.oss_delay {
+                // unchanged echoes must not rebuild a running device
+                let res = crate::node::apply_props_param(state, move |state| state.ext.oss_delay = new_delay);
+                if res != 0 {
+                  return res;
                 }
-                if let Some(config) = state.ports[port_idx].config.clone() {
-                  let _ = crate::node::install_device(state, port_idx, config);
+              }
+            },
+            (Value::String(s), Value::Int(x)) if s == crate::keys::OSS_FRAGMENT && *x >= 0 => {
+              // stored normalized, so the Props readback reports the
+              // effective (rounded/clamped) value, not the raw request
+              let new_fragment = crate::node::normalize_fragment(*x as u32);
+              if new_fragment != state.oss_fragment {
+                let res = crate::node::apply_props_param(state, move |state| state.oss_fragment = new_fragment);
+                if res != 0 {
+                  return res;
                 }
               }
             },
@@ -712,7 +664,9 @@ impl Direction for SinkDir {
     Ok(config)
   }
 
-  fn try_open_configure(dsp: &mut crate::sound::DspWriter, config: &PortConfig, log: &crate::spa::Log) -> c_int {
+  fn try_open_configure(dsp: &mut crate::sound::DspWriter, config: &PortConfig, _fragment: u32, log: &crate::spa::Log) -> c_int {
+    // the sink's SETFRAGMENT happens at prime time (process_ports), where
+    // the graph period the layout depends on is known
     try_open_configure(dsp, config, log)
   }
 
