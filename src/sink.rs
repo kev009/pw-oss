@@ -612,7 +612,7 @@ unsafe fn build_port_format_info(builder: &mut libspa::pod::builder::Builder, co
     *slot = p;
   }
 
-  let mut raw = spa_audio_info_raw {
+  let raw = spa_audio_info_raw {
     format:   config.format.0,
     flags:    config.flags,
     rate:     config.rate,
@@ -620,7 +620,7 @@ unsafe fn build_port_format_info(builder: &mut libspa::pod::builder::Builder, co
     position
   };
 
-  spa_format_audio_raw_build(builder.as_raw_ptr(), id, &mut raw);
+  spa_format_audio_raw_build(builder.as_raw_ptr(), id, &raw);
 }
 
 unsafe extern "C" fn port_enum_params(
