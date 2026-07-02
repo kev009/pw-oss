@@ -439,9 +439,6 @@ unsafe extern "C" fn on_timeout(source: *mut spa_source) {
   let state = (*source).data.cast::<State>().as_mut()
     .expect("(*source).data is not supposed to be null");
 
-  if !check_loop_identity(state) {
-    return; // poisoned: leave the timer disarmed
-  }
 
   #[cfg(debug_assertions)]
   crate::trace!(state.log, "on_timeout");
@@ -449,6 +446,13 @@ unsafe extern "C" fn on_timeout(source: *mut spa_source) {
   let mut expirations = 0;
   if state.data_system.timerfd_read(state.timer_source.fd, &mut expirations) < 0 {
     // disarmed (Pause/Suspend) in this same wakeup; nothing to read
+    return;
+  }
+
+  // after the drain: the source is level-triggered, so bailing with the fd
+  // readable would busy-spin the loop; the one-shot timer is only re-armed
+  // by set_timeout below, so returning here really does park it
+  if !check_loop_identity(state) {
     return;
   }
 
@@ -1124,6 +1128,11 @@ unsafe fn emit_format_lost(state: &mut State) {
   let _ = state.port_info.replace_change_mask(0);
   state.port_info.set_param_flags(SPA_PARAM_Format,  SPA_PARAM_INFO_WRITE);
   state.port_info.set_param_flags(SPA_PARAM_Buffers, 0);
+  // the EnumFormat serial flip is what audioadapter actually reacts to: only
+  // an EnumFormat flags change sets its recheck_format (audioadapter.c
+  // follower_port_info), so without it the adapter keeps have_format=true
+  // and never re-issues set_param(Format)
+  state.port_info.bump_param(SPA_PARAM_EnumFormat);
   emit_port_info(state);
 }
 
@@ -1178,7 +1187,8 @@ unsafe fn check_loop_identity(state: &mut State) -> bool {
     return true;
   }
   if seen != usize::MAX && state.loop_thread.swap(usize::MAX, Ordering::Relaxed) != usize::MAX {
-    crate::warn!(state.log, "process() and our data loop run on different threads       (multi-data-loop config?); pin node.loop.name for this node. Disabling processing.");
+    crate::warn!(state.log, "process() and our data loop run on different threads \
+      (multi-data-loop config?); pin node.loop.name for this node. Disabling processing.");
   }
   false
 }
@@ -1387,7 +1397,7 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       let blocksize = port.dsp.blocksize();
       // saturating arithmetic: blocksize/rate_match.size are device-provided and
       // an overflow here would abort the data loop.
-      port.target_delay = if granted >= 2 * period_in_bytes {
+      port.target_delay = if granted >= period_in_bytes.saturating_mul(2) {
         if blocksize > 0 && blocksize.saturating_mul(4) < period_in_bytes {
           // near-full, leaving headroom for the largest expected write (a quantum,
           // or the resampler's size if larger) plus one fragment. A chunk over
@@ -1397,8 +1407,12 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
           let write_max = period_in_bytes.max(rate_match_bytes);
           granted.saturating_sub(write_max.saturating_add(blocksize))
         } else {
-          // calibrated: period/8 per oss.delay step, floored at one period
-          desired_delay.clamp(period_in_bytes, granted - period_in_bytes)
+          // Calibrated: period/8 per oss.delay step. The floor keeps a
+          // jitter margin - a quarter period, or one device fragment when
+          // the fragment dwarfs the quantum - so a small oss.delay (or a
+          // tiny quantum) can't starve the wakeup fill.
+          let floor = period_in_bytes.saturating_add((period_in_bytes / 4).max(blocksize));
+          desired_delay.max(floor).clamp(period_in_bytes, granted - period_in_bytes)
         }
       } else {
         granted / 2 // buffer too small for two quanta; best-effort, will drop (warned below)
@@ -1411,11 +1425,11 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
 
       crate::warn!(state.log, "{}: granted {}, blocksize {}, period {}, target delay {}",
         port.dsp.path, granted, blocksize, period_in_bytes, port.target_delay);
-      if granted < period_in_bytes.saturating_mul(2).saturating_add(desired_delay) && granted >= 2 * period_in_bytes {
+      if granted < period_in_bytes.saturating_mul(2).saturating_add(desired_delay) && granted >= period_in_bytes.saturating_mul(2) {
         crate::info!(state.log, "{}: granted {} < requested {}; the oss.delay target is truncated",
           port.dsp.path, granted, period_in_bytes.saturating_mul(2).saturating_add(desired_delay));
       }
-      if granted < 2 * period_in_bytes {
+      if granted < period_in_bytes.saturating_mul(2) {
         crate::warn!(state.log, "{}: granted OSS buffer ({}) is smaller than two quanta ({}); \
           audio will glitch. Lower the PipeWire quantum; we set the fragment size \
           explicitly, so hw.snd.latency has no effect",
@@ -1431,7 +1445,11 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
             port.dsp.path, underrun_count, state.cur_timestamp, suppressed);
         }
         if port.xrun_timestamp == 0 {
-          port.xrun_timestamp = state.cur_timestamp;
+          // snapshot the DRIVER clock, not wall time: the recovery condition
+          // compares against driver_clock.nsec (idealized cycle start, which
+          // lags wall time by any lateness); a wall snapshot deferred
+          // recovery by the lateness, discarding a buffer per late cycle
+          port.xrun_timestamp = driver_clock.nsec.max(1);
 
           // report the EVENT to the host (pw-top's xrun counter) once, not
           // per held cycle; the length isn't known at detection, so 0 delay
@@ -1480,7 +1498,7 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       // foreign clock - a same-device follower has nothing to correct, and
       // updating anyway would wind the integrator (ALSA gates the same way)
       let mut skip_write = false;
-      if matching && port.setup_period != 0 {
+      if matching && port.setup_period != 0 && port.period_mismatch == 0 {
         let stride   = port_config.stride().max(1);
         let cfg_rate = port_config.rate;
         if !port.was_matching {
@@ -1512,6 +1530,18 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
 
         #[cfg(debug_assertions)]
         eprintln!("{}: corr = {}, err = {}", port.dsp.path, corr, err_raw);
+      }
+
+      if state.following && !matching && port.setup_period != 0 && port.period_mismatch == 0 {
+        // same-device follower: no rate to match, but the level can still
+        // drift on missed cycles; correct it directly
+        let odelay  = port.dsp.odelay();
+        let err_raw = odelay as f64 - port.target_delay as f64;
+        if err_raw < -(port.setup_period as f64) {
+          port.dsp.write_zeroes(port.target_delay.saturating_sub(odelay));
+        } else if err_raw > port.setup_period as f64 {
+          skip_write = true;
+        }
       }
 
       if skip_write {
@@ -1881,6 +1911,8 @@ unsafe extern "C" fn init(
   let err = state.data_loop.add_source(&mut state.timer_source);
   if err < 0 {
     state.data_system.close(state.timer_source.fd);
+    // the host won't call clear() after a failed init; free what we built
+    std::ptr::drop_in_place(state);
     return err;
   }
 

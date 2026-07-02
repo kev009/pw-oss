@@ -138,16 +138,20 @@ unsafe extern "C" fn on_devd_event(source: *mut spa_source) {
   // different hardware - resync the whole map and diff it instead of
   // trusting the event's subject alone.
   let mut resync = false;
+  let mut detached: Vec<String> = Vec::new();
   let alive = devd_socket.read_event(|line| {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let re = RE.get_or_init(|| regex::Regex::new(r"^[\+-](pcm|uaudio)\d+").unwrap());
-    if re.is_match(line) {
+    let re = RE.get_or_init(|| regex::Regex::new(r"^([\+-])((?:pcm|uaudio)\d+)").unwrap());
+    if let Some(groups) = re.captures(line) {
       resync = true;
+      if groups.get(1).unwrap().as_str() == "-" {
+        detached.push(groups.get(2).unwrap().as_str().to_string());
+      }
     }
   });
 
   if resync {
-    resync_devices(state);
+    resync_devices(state, &detached);
   }
 
   if !alive {
@@ -162,7 +166,33 @@ unsafe extern "C" fn on_devd_event(source: *mut spa_source) {
 // re-read sndstat, diff the parent->indexes map, and retract/emit whatever
 // changed; a parent whose index set changed is retracted and re-emitted so a
 // reused unit number never leaves a node bound to the wrong hardware
-unsafe fn resync_devices(state: &mut State) {
+unsafe fn resync_devices(state: &mut State, detached: &[String]) {
+
+  // Force-retract every group a detach event names BEFORE diffing: a fast
+  // replug can land the '-' event after the replacement re-attached with the
+  // same nameunit and index set, leaving the maps identical while the
+  // underlying hardware changed; the diff below then re-emits them fresh.
+  for subject in detached {
+    let key = if let Some(unit) = subject.strip_prefix("pcm").and_then(|u| u.parse::<u32>().ok()) {
+      state.pcm_indexes.iter().find(|(_, v)| v.contains(&unit)).map(|(k, _)| k.clone())
+    } else if state.pcm_indexes.contains_key(subject) {
+      Some(subject.clone())
+    } else {
+      None
+    };
+    if let Some(key) = key {
+      if let Some(indexes) = state.pcm_indexes.remove(&key) {
+        crate::info!(state.log, "removing {} ({:?}) on detach", key, indexes);
+        crate::spa::for_each_hook(&mut state.hooks, |entry| {
+          let f = entry.cb.funcs.cast::<spa_device_events>().as_ref()
+            .expect("callback should be initialized");
+          assert!(f.version >= SPA_VERSION_DEVICE_EVENTS);
+          remove_dev_node(entry, f, &indexes);
+        });
+      }
+    }
+  }
+
   let indexes = match crate::sound::read_sndstat() {
     Ok(indexes) => indexes,
     Err(err)    => {

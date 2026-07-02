@@ -103,7 +103,7 @@ impl DevdSocket {
         apply(&String::from_utf8_lossy(&self.buffer[..len]));
         true
       },
-      Err(err) => err.kind() == std::io::ErrorKind::WouldBlock
+      Err(err) => matches!(err.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted)
     }
   }
 }

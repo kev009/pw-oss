@@ -322,9 +322,6 @@ unsafe extern "C" fn on_timeout(source: *mut spa_source) {
   let state = (*source).data.cast::<State>().as_mut()
     .expect("(*source).data is not supposed to be null");
 
-  if !check_loop_identity(state) {
-    return; // poisoned: leave the timer disarmed
-  }
 
   #[cfg(debug_assertions)]
   crate::trace!(state.log, "on_timeout");
@@ -332,6 +329,13 @@ unsafe extern "C" fn on_timeout(source: *mut spa_source) {
   let mut expirations = 0;
   if state.data_system.timerfd_read(state.timer_source.fd, &mut expirations) < 0 {
     // disarmed (Pause/Suspend) in this same wakeup; nothing to read
+    return;
+  }
+
+  // after the drain: the source is level-triggered, so bailing with the fd
+  // readable would busy-spin the loop; the one-shot timer is only re-armed
+  // by set_timeout below, so returning here really does park it
+  if !check_loop_identity(state) {
     return;
   }
 
@@ -985,6 +989,11 @@ unsafe fn emit_format_lost(state: &mut State) {
   let _ = state.port_info.replace_change_mask(0);
   state.port_info.set_param_flags(SPA_PARAM_Format,  SPA_PARAM_INFO_WRITE);
   state.port_info.set_param_flags(SPA_PARAM_Buffers, 0);
+  // the EnumFormat serial flip is what audioadapter actually reacts to: only
+  // an EnumFormat flags change sets its recheck_format (audioadapter.c
+  // follower_port_info), so without it the adapter keeps have_format=true
+  // and never re-issues set_param(Format)
+  state.port_info.bump_param(SPA_PARAM_EnumFormat);
   emit_port_info(state);
 }
 
@@ -1229,7 +1238,11 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       // chunk holds io.status HAVE_DATA, we skip the device next cycle, it
       // queues 2 periods, repeat) and pollutes the servo error.
       let want = if port.setup_period != 0 {
-        port.setup_period.saturating_add(queued.saturating_sub(port.setup_period.saturating_mul(2)))
+        // catch-up beyond 1.5 periods; the servo handles the rest without a
+        // pegged error (a 2-period threshold stranded a full period that
+        // only the 1% actuator could drain)
+        port.setup_period.saturating_add(
+          queued.saturating_sub(port.setup_period.saturating_mul(3) / 2))
       } else {
         queued
       };
@@ -1604,6 +1617,8 @@ unsafe extern "C" fn init(
   let err = state.data_loop.add_source(&mut state.timer_source);
   if err < 0 {
     state.data_system.close(state.timer_source.fd);
+    // the host won't call clear() after a failed init; free what we built
+    std::ptr::drop_in_place(state);
     return err;
   }
 
