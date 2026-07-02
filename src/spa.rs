@@ -23,6 +23,9 @@ pub const SPA_PORT_CHANGE_MASK_ALL: u32 =
   SPA_PORT_CHANGE_MASK_PROPS  |
   SPA_PORT_CHANGE_MASK_RATE;
 
+// spa/node/node.h:241; the libspa-sys bindings don't carry the set_param flags
+pub const SPA_NODE_PARAM_FLAG_NEAREST: u32 = 1 << 2;
+
 pub unsafe fn for_each_hook(head: *mut spa_hook_list, mut apply: impl FnMut(&spa_hook)) {
   let mut entry = (*head).list.next as *mut spa_hook;
   while (*entry).link != (*head).list {

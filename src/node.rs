@@ -653,32 +653,18 @@ unsafe extern "C" fn remove_port(_object: *mut c_void, _direction: spa_direction
   -libc::ENOTSUP // the ports are static
 }
 
-//TODO: SPA_PARAM_PORT_CONFIG_MODE_none vs SPA_PARAM_PORT_CONFIG_MODE_passthrough vs SPA_PARAM_PORT_CONFIG_MODE_convert
-/*unsafe fn build_port_config_info(builder: &mut libspa::pod::builder::Builder, config: &PortConfig, id: u32) -> Result<(), Errno> {
-
-  let mut frame = MaybeUninit::<spa_pod_frame>::uninit();
-
-  builder.push_object(&mut frame, SPA_TYPE_OBJECT_ParamPortConfig, SPA_PARAM_PortConfig)?;
-
-  builder.add_prop(SPA_PARAM_PORT_CONFIG_direction, 0)?;
-  builder.add_id(libspa::utils::Id(D::DIRECTION))?;
-
-  builder.add_prop(SPA_PARAM_PORT_CONFIG_mode, 0)?;
-  builder.add_id(libspa::utils::Id(SPA_PARAM_PORT_CONFIG_MODE_none))?;
-
-  builder.add_prop(SPA_PARAM_PORT_CONFIG_monitor, 0)?;
-  builder.add_bool(false)?;
-
-  builder.add_prop(SPA_PARAM_PORT_CONFIG_control, 0)?;
-  builder.add_bool(false)?;
-
-  builder.add_prop(SPA_PARAM_PORT_CONFIG_format, 0)?;
-  build_port_format_info(builder, config, id);
-
-  builder.pop(frame.assume_init_mut());
-
-  Ok(())
-}*/
+// No EnumPortConfig/PortConfig params here, on purpose: a follower's
+// PortConfig surface is dead code under the adapter. audioadapter answers
+// both params itself in passthrough and from its convert node otherwise
+// (audioadapter.c:221) and only mirrors PropInfo/Props/ProcessLatency from
+// the follower's node info (follower_info, audioadapter.c:1312); WirePlumber
+// never reads them either - it probes EnumFormat and writes PortConfig on
+// the adapter (module-si-audio-adapter.c si_audio_adapter_find_format /
+// set_ports_format). Passthrough mode is carried entirely by the port
+// params below: reconfigure_mode sets our Format with the NEAREST flag
+// (audioadapter.c:758) and the graph link then negotiates buffers against
+// the port directly (negotiate_buffers/negotiate_format short-circuit when
+// follower == target, audioadapter.c:445, :995).
 
 // replays the negotiated format exactly, for port_enum_params(Format)
 unsafe fn build_port_format_info<C: ConfigOps>(builder: &mut libspa::pod::builder::Builder, config: &C, id: u32) {
@@ -791,7 +777,7 @@ unsafe extern "C" fn port_enum_params<D: Direction>(
   0
 }
 
-unsafe extern "C" fn port_set_param<D: Direction>(object: *mut c_void, direction: spa_direction, port_id: u32, id: u32, _flags: u32, param: *const spa_pod) -> c_int {
+unsafe extern "C" fn port_set_param<D: Direction>(object: *mut c_void, direction: spa_direction, port_id: u32, id: u32, flags: u32, param: *const spa_pod) -> c_int {
 
   let state = object.cast::<State<D>>().as_mut()
     .expect("object is not supposed to be null");
@@ -816,15 +802,29 @@ unsafe extern "C" fn port_set_param<D: Direction>(object: *mut c_void, direction
               return -libc::EINVAL;
             }
 
-            let raw = raw.assume_init();
-
-            //TODO: check whether format is supported by OSS
+            let mut raw = raw.assume_init();
 
             // reject bad values rather than assert (an FFI panic aborts pipewire);
-            // flags are stored but unused, OSS writes interleaved frames
+            // format flags are stored but unused, OSS writes interleaved frames
             if raw.rate == 0 || raw.channels == 0 || raw.channels > SPA_AUDIO_MAX_CHANNELS {
               crate::warn!(state.log, "rejecting format: rate={} channels={}", raw.rate, raw.channels);
               return -libc::EINVAL;
+            }
+
+            // audioadapter always sets the follower format with NEAREST
+            // (audioadapter.c:758, :1059); snap only what the exact path
+            // below would reject, so in-caps requests stay untouched
+            let admitted = |caps: &crate::sound::DspCaps, raw: &spa_audio_info_raw| {
+              crate::utils::FORMAT_MAP.iter().find(|(_, f)| *f == raw.format)
+                .is_some_and(|(m, _)| caps.admits(*m, raw.channels, raw.rate))
+            };
+            let mut snapped = false;
+            if flags & crate::spa::SPA_NODE_PARAM_FLAG_NEAREST != 0 && !admitted(&state.caps, &raw) {
+              snapped = crate::utils::snap_raw_to_caps(&state.caps, &mut raw);
+              if snapped {
+                crate::info!(state.log, "snapped requested format to caps: format={} rate={} channels={}",
+                  raw.format, raw.rate, raw.channels);
+              }
             }
 
             let config = match D::parse_config(state, &raw) {
@@ -843,6 +843,12 @@ unsafe extern "C" fn port_set_param<D: Direction>(object: *mut c_void, direction
             }
 
             res = install_device(state, port_id as usize, config);
+            if res == 0 && snapped {
+              // we deviated from the request: return 1 (alsa-pcm.c:2548) so
+              // configure_format re-reads our Format param for the actual
+              // values (audioadapter.c:596)
+              res = 1;
+            }
             if res == -libc::EINVAL || res == -libc::ENOTSUP {
               // the device rejected caps-derived values: the snapshot may be
               // stale (vchans/bitperfect toggled at runtime); re-probe and
@@ -1422,10 +1428,10 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
   state.node_info.add_prop(SPA_KEY_MEDIA_CLASS.as_ptr(), D::MEDIA_CLASS);
   state.node_info.add_prop(SPA_KEY_NODE_DRIVER.as_ptr(), "true");
 
+  // no EnumPortConfig/PortConfig: dead surface on a follower, see the note
+  // above build_port_format_info
   //state.node_info.add_param(SPA_PARAM_IO,             SPA_PARAM_INFO_READ);
   //state.node_info.add_param(SPA_PARAM_EnumFormat,     SPA_PARAM_INFO_READ);
-  //state.node_info.add_param(SPA_PARAM_EnumPortConfig, SPA_PARAM_INFO_READ);
-  //state.node_info.add_param(SPA_PARAM_PortConfig,     SPA_PARAM_INFO_READ);
   state.node_info.add_param(SPA_PARAM_PropInfo,       SPA_PARAM_INFO_READ);
   state.node_info.add_param(SPA_PARAM_Props,          SPA_PARAM_INFO_READWRITE);
   state.node_info.add_param(SPA_PARAM_ProcessLatency, SPA_PARAM_INFO_READWRITE);
@@ -1443,7 +1449,6 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
   state.port_info.add_param(SPA_PARAM_Buffers,    0);
   state.port_info.add_param(SPA_PARAM_Latency,    SPA_PARAM_INFO_READWRITE);
 
-  //state.port_info.add_param(SPA_PARAM_PortConfig, SPA_PARAM_INFO_READWRITE);
   //state.port_info.add_param(SPA_PARAM_IO,         SPA_PARAM_INFO_READ);
   //state.port_info.add_param(SPA_PARAM_Buffers,    SPA_PARAM_INFO_WRITE); // ?
 

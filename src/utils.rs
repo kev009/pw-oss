@@ -140,6 +140,80 @@ pub fn channel_positions(channels: u32) -> Option<&'static [u32]> {
   }
 }
 
+// (OSS AFMT, SPA audio format) pairs we can produce, best first; keep in
+// sync with the per-direction parse_config/oss_format matches
+pub const FORMAT_MAP: [(u32, u32); 4] = [
+  (crate::sound::AFMT_S32_LE, libspa::sys::SPA_AUDIO_FORMAT_S32_LE),
+  (crate::sound::AFMT_S32_BE, libspa::sys::SPA_AUDIO_FORMAT_S32_BE),
+  (crate::sound::AFMT_S16_LE, libspa::sys::SPA_AUDIO_FORMAT_S16_LE),
+  (crate::sound::AFMT_S16_BE, libspa::sys::SPA_AUDIO_FORMAT_S16_BE)
+];
+
+// the formats a device gets offered: native ones when any exist, all of ours
+// otherwise (the kernel feeder converts), nothing on a convertless device
+// without a native match (bitperfect has no feeder; a snap-and-mismatch
+// would just fail negotiation)
+fn offered_formats(caps: &crate::sound::DspCaps) -> Vec<u32> {
+  let native = FORMAT_MAP.iter().filter(|(m, _)| caps.formats & m != 0).map(|(_, f)| *f).collect::<Vec<_>>();
+  if !native.is_empty() {
+    native
+  } else if caps.convertless {
+    vec![]
+  } else {
+    FORMAT_MAP.iter().map(|(_, f)| *f).collect()
+  }
+}
+
+// Snap a requested raw format onto the advertised caps for callers that pass
+// SPA_NODE_PARAM_FLAG_NEAREST - audioadapter always negotiates the follower
+// that way (audioadapter.c:758, :1059) - mirroring alsa's set_*_near handling
+// (alsa-pcm.c:2364, :2388). Returns true when anything was adjusted; the
+// caller then returns 1 (alsa-pcm.c:2548) so the adapter re-reads our Format
+// param for the actual values (audioadapter.c:596).
+pub fn snap_raw_to_caps(caps: &crate::sound::DspCaps, raw: &mut libspa::sys::spa_audio_info_raw) -> bool {
+
+  let mut changed = false;
+
+  let offered = offered_formats(caps);
+  if !offered.contains(&raw.format) {
+    if let Some(&best) = offered.first() {
+      raw.format = best;
+      changed = true;
+    } // else: convertless with no native format; the exact path rejects it
+  }
+
+  // the position array is 64 wide; garbage caps must not push past it
+  let channels = raw.channels.clamp(caps.min_channels, caps.max_channels)
+    .min(libspa::sys::SPA_AUDIO_MAX_CHANNELS);
+  if channels != raw.channels {
+    raw.channels = channels;
+    // the requested layout no longer applies; hand out the kernel interleave
+    // order (or AUX slots), same as EnumFormat
+    match channel_positions(channels) {
+      Some(positions) => for (slot, &p) in raw.position.iter_mut().zip(positions.iter()) {
+        *slot = p;
+      },
+      None => for (i, slot) in raw.position.iter_mut().take(channels as usize).enumerate() {
+        *slot = libspa::sys::SPA_AUDIO_CHANNEL_AUX0 + i as u32;
+      }
+    }
+    changed = true;
+  }
+
+  let rate = if !caps.rates.is_empty() {
+    // discrete native rates (exclusive devices): nearest wins
+    *caps.rates.iter().min_by_key(|r| r.abs_diff(raw.rate)).unwrap()
+  } else {
+    raw.rate.clamp(caps.min_rate, caps.max_rate)
+  };
+  if rate != raw.rate {
+    raw.rate = rate;
+    changed = true;
+  }
+
+  changed
+}
+
 // One EnumFormat result per channel count the device grants, with the kernel's
 // interleave order as the position array. Returns false when `index` is past
 // the last result.
@@ -148,21 +222,9 @@ pub unsafe fn build_enum_format_info(b: &mut libspa::pod::builder::Builder, caps
   use libspa::sys::*;
 
   // formats supported by both us and the device, best first
-  let all = [
-    (crate::sound::AFMT_S32_LE, SPA_AUDIO_FORMAT_S32_LE),
-    (crate::sound::AFMT_S32_BE, SPA_AUDIO_FORMAT_S32_BE),
-    (crate::sound::AFMT_S16_LE, SPA_AUDIO_FORMAT_S16_LE),
-    (crate::sound::AFMT_S16_BE, SPA_AUDIO_FORMAT_S16_BE)
-  ];
-  let mut formats = all.iter().filter(|(m, _)| caps.formats & m != 0).map(|(_, f)| *f).collect::<Vec<_>>();
+  let formats = offered_formats(caps);
   if formats.is_empty() {
-    if caps.convertless {
-      // bitperfect has no feeder: a format we can't produce natively can't
-      // be offered at all (a snap-and-mismatch would just fail negotiation)
-      return Ok(false);
-    }
-    // the device only does formats we don't (e.g. S24); the kernel converts
-    formats = all.iter().map(|(_, f)| *f).collect();
+    return Ok(false);
   }
 
   // counts with a defined kernel interleave order, within the granted range;
