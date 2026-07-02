@@ -4,6 +4,10 @@ use std::os::raw::{c_char, c_int, c_void};
 use libspa::sys::*;
 
 const MAX_PORTS: usize = 1;
+// several State fields are per-port in disguise (rate_match, the single
+// PortInfo, on_timeout's last-port-wins clock delay); fix those before
+// raising this
+const _: () = assert!(MAX_PORTS == 1);
 
 #[repr(C)]
 struct State {
@@ -25,6 +29,8 @@ struct State {
   callbacks:     spa_callbacks,
   ports:         [Port; MAX_PORTS],
   caps:          crate::sound::DspCaps,
+  caps_fallback: bool, // init-time probe failed (busy device); re-probe lazily
+  loop_thread:   std::sync::atomic::AtomicUsize, // thread process()/on_timeout run on (0 = unseen)
   latency:       [spa_latency_info; 2], // indexed by direction; written by the host, replayed on read
   process_latency: spa_process_latency_info,
   started:       bool,
@@ -53,6 +59,7 @@ struct Port {
   target_delay:   u32, // OSS buffer fill target in bytes, clamped to the granted buffer
   setup_period:   u32, // device bytes per graph cycle the stream was set up for
   bw_fast_until:  u64, // while nonzero, the DLL runs at BW_MAX for a fast lock
+  period_mismatch: u32, // consecutive cycles at a different period (debounce)
   resetup_pending: bool, // a main-thread device rebuild is queued; skip cycles
   was_matching:   bool, // rate matching active last cycle (relock on transition)
   warn_limit:     crate::utils::RateLimit
@@ -432,6 +439,10 @@ unsafe extern "C" fn on_timeout(source: *mut spa_source) {
   let state = (*source).data.cast::<State>().as_mut()
     .expect("(*source).data is not supposed to be null");
 
+  if !check_loop_identity(state) {
+    return; // poisoned: leave the timer disarmed
+  }
+
   #[cfg(debug_assertions)]
   crate::trace!(state.log, "on_timeout");
 
@@ -707,15 +718,18 @@ unsafe extern "C" fn send_command(object: *mut c_void, command: *const spa_comma
       // swap the devices out on the loop and close them here: HALT+close can
       // sleep (chn_abort), which would stall every node on the data loop
       let mut retired: [Option<crate::sound::DspWriter>; MAX_PORTS] = std::default::Default::default();
-      let paths: [String; MAX_PORTS] = std::array::from_fn(|i| state.ports[i].dsp.path.clone());
+      // pre-built here: constructing them in the closure would allocate on
+      // the RT loop
+      let mut replacements: [Option<crate::sound::DspWriter>; MAX_PORTS] =
+        std::array::from_fn(|i| Some(crate::sound::DspWriter::new(&state.ports[i].dsp.path)));
       {
         let retired_ref = &mut retired;
+        let replacements_ref = &mut replacements;
         let state: *mut State = state;
-        let paths_ref = &paths;
         if !crate::utils::block_on_loop(&(*state).data_loop, state, move |state| {
           for (i, port) in state.ports.iter_mut().enumerate() {
             if !port.dsp.is_closed() {
-              let closed = crate::sound::DspWriter::new(&paths_ref[i]);
+              let closed = replacements_ref[i].take().expect("replacement is pre-built");
               retired_ref[i] = Some(std::mem::replace(&mut port.dsp, closed));
             }
           }
@@ -832,6 +846,15 @@ unsafe extern "C" fn port_enum_params(
     #[allow(non_upper_case_globals)]
     match (id, index) {
       (SPA_PARAM_EnumFormat, i) => {
+        if state.caps_fallback {
+          // the init-time probe hit a busy device and baked in fallback
+          // caps; retry now (main thread, transient open)
+          if let Some(caps) = crate::sound::probe_caps(&state.ports[0].dsp.path.clone(), true) {
+            crate::info!(state.log, "re-probed caps: {:?}", caps);
+            state.caps = caps;
+            state.caps_fallback = false;
+          }
+        }
         if !crate::utils::build_enum_format_info(&mut builder, &state.caps, i).unwrap() {
           return 0;
         }
@@ -940,6 +963,17 @@ unsafe extern "C" fn port_set_param(object: *mut c_void, direction: spa_directio
 
             let _ = oss_format;
             res = install_device(state, port_id as usize, config);
+            if res == -libc::EINVAL || res == -libc::ENOTSUP {
+              // the device rejected caps-derived values: the snapshot may be
+              // stale (vchans/bitperfect toggled at runtime); re-probe and
+              // re-announce EnumFormat so the host renegotiates from reality
+              if let Some(caps) = crate::sound::probe_caps(&state.ports[0].dsp.path.clone(), true) {
+                crate::info!(state.log, "re-probed caps after rejection: {:?}", caps);
+                state.caps = caps;
+                state.caps_fallback = false;
+                state.port_info.bump_param(SPA_PARAM_EnumFormat);
+              }
+            }
           },
           Ok((t, st)) => {
             crate::warn!(state.log, "unknown media type combination: {:?}, {:?}", t, st);
@@ -956,14 +990,16 @@ unsafe extern "C" fn port_set_param(object: *mut c_void, direction: spa_directio
         // three are read by process(), so do it from the data loop
         let port_idx = port_id as usize;
         let state_ptr: *mut State = state;
-        crate::utils::block_on_loop(&(*state_ptr).data_loop, state_ptr, move |state| {
+        if !crate::utils::block_on_loop(&(*state_ptr).data_loop, state_ptr, move |state| {
           let port = &mut state.ports[port_idx];
           if !port.dsp.is_closed() {
             port.dsp.close();
           }
           port.buffers.clear();
           port.config = None;
-        });
+        }) {
+          return -libc::EIO; // the loop still holds the buffers; freeing them would dangle
+        }
       }
 
       // update the port rate and flip Format/Buffers flags to reflect whether a
@@ -1080,6 +1116,17 @@ unsafe fn install_device(state: &mut State, port_idx: usize, config: PortConfig)
   res
 }
 
+// A device rebuild the HOST didn't initiate just failed and cleared the
+// config: flip the param flags and re-emit port info so the session manager
+// renegotiates, instead of stranding a silently dead node (port_set_param
+// does the same for host-initiated failures).
+unsafe fn emit_format_lost(state: &mut State) {
+  let _ = state.port_info.replace_change_mask(0);
+  state.port_info.set_param_flags(SPA_PARAM_Format,  SPA_PARAM_INFO_WRITE);
+  state.port_info.set_param_flags(SPA_PARAM_Buffers, 0);
+  emit_port_info(state);
+}
+
 // runs on the main thread (queued from the data loop via invoke_on_loop)
 unsafe fn resetup_task(state: &mut State, port_idx: usize) {
   if state.clearing {
@@ -1101,7 +1148,9 @@ unsafe fn resetup_task(state: &mut State, port_idx: usize) {
   // config only mutates from main-thread calls, which are serialized with us
   match state.ports[port_idx].config.clone() {
     Some(config) => {
-      let _ = install_device(state, port_idx, config);
+      if install_device(state, port_idx, config) != 0 {
+        emit_format_lost(state);
+      }
     },
     None => {
       let state_ptr: *mut State = state;
@@ -1112,6 +1161,28 @@ unsafe fn resetup_task(state: &mut State, port_idx: usize) {
   }
 }
 
+// PipeWire doesn't contract that the DataLoop in spa_support (where our timer
+// lives and every marshaled mutation runs) is the loop process() is driven
+// from; under multi-data-loop configs (context.num-data-loops > 1) the two
+// are independent acquires and can diverge, breaking every serialization
+// invariant here. Detect it and refuse to process rather than corrupt; the
+// remedy is pinning node.loop.name for this node.
+unsafe fn check_loop_identity(state: &mut State) -> bool {
+  use std::sync::atomic::Ordering;
+  let tid = libc::pthread_self() as usize;
+  let seen = match state.loop_thread.compare_exchange(0, tid, Ordering::Relaxed, Ordering::Relaxed) {
+    Ok(_) => tid,
+    Err(seen) => seen
+  };
+  if seen == tid {
+    return true;
+  }
+  if seen != usize::MAX && state.loop_thread.swap(usize::MAX, Ordering::Relaxed) != usize::MAX {
+    crate::warn!(state.log, "process() and our data loop run on different threads       (multi-data-loop config?); pin node.loop.name for this node. Disabling processing.");
+  }
+  false
+}
+
 unsafe extern "C" fn process(object: *mut c_void) -> c_int {
 
   let state = object.cast::<State>().as_mut()
@@ -1120,6 +1191,10 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
   // a cycle that was already signaled when we paused can still land here; drop
   // it instead of assert!()ing, which aborts the daemon across extern "C"
   if !state.started || state.position.is_null() {
+    return SPA_STATUS_OK as i32;
+  }
+
+  if !check_loop_identity(state) {
     return SPA_STATUS_OK as i32;
   }
 
@@ -1242,17 +1317,25 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
     // rebuild happens on the main thread - device opens and closes can sleep,
     // which must stay off the shared data loop - while cycles are dropped.
     if port.dsp.is_running() && port.setup_period != 0 && period_in_bytes != 0 && period_in_bytes != port.setup_period {
-      crate::info!(state.log, "{}: period {} -> {} bytes; re-setting up", port.dsp.path, port.setup_period, period_in_bytes);
-      port.resetup_pending = state.main_loop.as_ref().is_some_and(|main_loop|
-        crate::utils::invoke_on_loop(main_loop, state_ptr, move |state| resetup_task(state, port_idx)));
-      if port.resetup_pending {
-        port.was_matching = false; // the gap invalidates matching history
-        (*port.io).status = SPA_STATUS_NEED_DATA as i32;
-        result |= SPA_STATUS_NEED_DATA as i32;
-        continue;
+      // debounce: a single-cycle flip usually means a renegotiation is in
+      // flight (which re-primes anyway); rebuilding on it costs an audible
+      // gap per storm event. Write at the old size for one cycle instead.
+      port.period_mismatch += 1;
+      if port.period_mismatch >= 2 {
+        crate::info!(state.log, "{}: period {} -> {} bytes; re-setting up", port.dsp.path, port.setup_period, period_in_bytes);
+        port.resetup_pending = state.main_loop.as_ref().is_some_and(|main_loop|
+          crate::utils::invoke_on_loop(main_loop, state_ptr, move |state| resetup_task(state, port_idx)));
+        if port.resetup_pending {
+          port.was_matching = false; // the gap invalidates matching history
+          (*port.io).status = SPA_STATUS_NEED_DATA as i32;
+          result |= SPA_STATUS_NEED_DATA as i32;
+          continue;
+        }
+        // no main loop (unusual host): keep running at the stale size; the
+        // write path drops or underruns but nothing stalls or aborts
       }
-      // no main loop (unusual host): keep running at the stale size; the
-      // write path drops or underruns but nothing stalls or aborts
+    } else {
+      port.period_mismatch = 0;
     }
 
     if !port.dsp.is_running() {
@@ -1647,12 +1730,15 @@ unsafe extern "C" fn init(
   }
 
   let Some(dsp_path) = dsp_path else {
+    data_system.close(timer_fd);
     crate::error!(log, "{} missing from the node properties", crate::keys::OSS_DSP_PATH);
     return -libc::EINVAL;
   };
 
+  let mut caps_fallback = false;
   let caps = crate::sound::probe_caps(&dsp_path, true).unwrap_or_else(|| {
     crate::warn!(log, "{}: can't probe device caps; using fallback", dsp_path);
+    caps_fallback = true;
     crate::sound::DspCaps::fallback()
   });
   crate::debug!(log, "{}: {:?}", dsp_path, caps);
@@ -1727,6 +1813,7 @@ unsafe extern "C" fn init(
         target_delay:   0,
         setup_period:   0,
         bw_fast_until:  0,
+        period_mismatch: 0,
         resetup_pending: false,
         was_matching:   false,
         warn_limit:     crate::utils::RateLimit::new()
@@ -1735,6 +1822,8 @@ unsafe extern "C" fn init(
     ],
 
     caps,
+    caps_fallback,
+    loop_thread: std::sync::atomic::AtomicUsize::new(0),
 
     latency: [
       crate::utils::latency_info_default(SPA_DIRECTION_INPUT),

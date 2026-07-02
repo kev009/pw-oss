@@ -132,48 +132,23 @@ unsafe extern "C" fn on_devd_event(source: *mut spa_source) {
     return; // the source is only registered when the socket exists
   };
 
+  // Any pcm (or its uaudio parent) attach/detach can change the device set,
+  // whatever the driver: kldload/kldunload snd_*, USB, HDMI codecs. Unit
+  // numbers are reused, so a missed detach could point a stale node at
+  // different hardware - resync the whole map and diff it instead of
+  // trusting the event's subject alone.
+  let mut resync = false;
   let alive = devd_socket.read_event(|line| {
-
-    if !(line.starts_with("+uaudio") || line.starts_with("-uaudio")) {
-      return;
-    }
-
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let re = RE.get_or_init(|| regex::Regex::new(r"^([\+-])(uaudio\d+)").unwrap());
-    if let Some(groups) = re.captures(line) {
-
-      let change = groups.get(1).unwrap();
-      let driver = groups.get(2).unwrap();
-
-      if change.as_str() == "+" {
-        let indexes = match crate::sound::read_sndstat() {
-          Ok(indexes) => indexes,
-          Err(err)    => {
-            crate::warn!(state.log, "can't re-read sndstat: {}", err);
-            return;
-          }
-        };
-        state.pcm_indexes = crate::sound::group_pcm_devices_by_parent(&indexes);
-        if let Some(indexes) = state.pcm_indexes.get(driver.as_str()) {
-          crate::info!(state.log, "registering {} ({:?})", driver.as_str(), indexes);
-          crate::spa::for_each_hook(&mut state.hooks, |entry| {
-            let f = entry.cb.funcs.cast::<spa_device_events>().as_ref()
-              .expect("callback should be initialized");
-            assert!(f.version >= SPA_VERSION_DEVICE_EVENTS);
-            emit_dev_node(entry, f, driver.as_str(), indexes);
-          });
-        }
-      } else if let Some(indexes) = state.pcm_indexes.remove(driver.as_str()) {
-        crate::info!(state.log, "removing {} ({:?})", driver.as_str(), indexes);
-        crate::spa::for_each_hook(&mut state.hooks, |entry| {
-          let f = entry.cb.funcs.cast::<spa_device_events>().as_ref()
-            .expect("callback should be initialized");
-          assert!(f.version >= SPA_VERSION_DEVICE_EVENTS);
-          remove_dev_node(entry, f, &indexes);
-        });
-      }
+    let re = RE.get_or_init(|| regex::Regex::new(r"^[\+-](pcm|uaudio)\d+").unwrap());
+    if re.is_match(line) {
+      resync = true;
     }
   });
+
+  if resync {
+    resync_devices(state);
+  }
 
   if !alive {
     // devd restarted or dropped us; deregister or the level-triggered fd
@@ -181,6 +156,44 @@ unsafe extern "C" fn on_devd_event(source: *mut spa_source) {
     crate::warn!(state.log, "devd connection lost; hotplug disabled");
     state.main_loop.remove_source(&mut state.devd_source);
     state.devd_socket = None;
+  }
+}
+
+// re-read sndstat, diff the parent->indexes map, and retract/emit whatever
+// changed; a parent whose index set changed is retracted and re-emitted so a
+// reused unit number never leaves a node bound to the wrong hardware
+unsafe fn resync_devices(state: &mut State) {
+  let indexes = match crate::sound::read_sndstat() {
+    Ok(indexes) => indexes,
+    Err(err)    => {
+      crate::warn!(state.log, "can't re-read sndstat: {}", err);
+      return;
+    }
+  };
+  let new_map = crate::sound::group_pcm_devices_by_parent(&indexes);
+  let old_map = std::mem::replace(&mut state.pcm_indexes, new_map);
+
+  for (driver, old_indexes) in &old_map {
+    if state.pcm_indexes.get(driver) != Some(old_indexes) {
+      crate::info!(state.log, "removing {} ({:?})", driver, old_indexes);
+      crate::spa::for_each_hook(&mut state.hooks, |entry| {
+        let f = entry.cb.funcs.cast::<spa_device_events>().as_ref()
+          .expect("callback should be initialized");
+        assert!(f.version >= SPA_VERSION_DEVICE_EVENTS);
+        remove_dev_node(entry, f, old_indexes);
+      });
+    }
+  }
+  for (driver, new_indexes) in &state.pcm_indexes {
+    if old_map.get(driver) != Some(new_indexes) {
+      crate::info!(state.log, "registering {} ({:?})", driver, new_indexes);
+      crate::spa::for_each_hook(&mut state.hooks, |entry| {
+        let f = entry.cb.funcs.cast::<spa_device_events>().as_ref()
+          .expect("callback should be initialized");
+        assert!(f.version >= SPA_VERSION_DEVICE_EVENTS);
+        emit_dev_node(entry, f, driver, new_indexes);
+      });
+    }
   }
 }
 

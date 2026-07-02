@@ -202,15 +202,14 @@ unsafe extern "C" fn set_param(object: *mut c_void, id: u32, _flags: u32, param:
   match id {
     SPA_PARAM_Profile => {
 
-      if param.is_null() {
-        return -libc::EINVAL;
-      }
-
       use libspa::pod::{Value, Object, Pod};
       use libspa::pod::deserialize::PodDeserializer;
 
       let mut index = None;
-      match PodDeserializer::deserialize_any_from(Pod::from_raw(param).as_bytes()) {
+      if param.is_null() {
+        index = Some(1); // a NULL pod resets to the boot default (on)
+      } else {
+        match PodDeserializer::deserialize_any_from(Pod::from_raw(param).as_bytes()) {
         Ok((_, Value::Object(Object { type_, properties, .. }))) if type_ == SPA_TYPE_OBJECT_ParamProfile => {
           for p in properties {
             #[allow(non_upper_case_globals)]
@@ -221,6 +220,7 @@ unsafe extern "C" fn set_param(object: *mut c_void, id: u32, _flags: u32, param:
           }
         },
         _ => return -libc::EINVAL
+        }
       }
 
       let Some(index) = index else {

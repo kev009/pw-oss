@@ -195,7 +195,7 @@ pub unsafe fn build_enum_format_info(b: &mut libspa::pod::builder::Builder, caps
     b.add_int(caps.min_rate as i32)?;
   } else {
     b.push_choice(&mut inner, SPA_CHOICE_Range, 0)?;
-    b.add_int(48000.clamp(caps.min_rate as i32, caps.max_rate as i32))?;
+    b.add_int(caps.preferred_rate.unwrap_or(48000).clamp(caps.min_rate, caps.max_rate) as i32)?;
     b.add_int(caps.min_rate as i32)?;
     b.add_int(caps.max_rate as i32)?;
     b.pop(inner.assume_init_mut());

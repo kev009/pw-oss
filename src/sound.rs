@@ -103,11 +103,12 @@ enum DspState {
 
 #[derive(Debug, Clone, Copy)]
 pub struct DspCaps {
-  pub formats:      u32, // AFMT_* mask
-  pub min_channels: u32,
-  pub max_channels: u32,
-  pub min_rate:     u32,
-  pub max_rate:     u32
+  pub formats:        u32, // AFMT_* mask
+  pub min_channels:   u32,
+  pub max_channels:   u32,
+  pub min_rate:       u32,
+  pub max_rate:       u32,
+  pub preferred_rate: Option<u32> // the parent's vchan mix rate, when known
 }
 
 impl DspCaps {
@@ -118,8 +119,9 @@ impl DspCaps {
       formats:      AFMT_S16_LE | AFMT_S16_BE | AFMT_S32_LE | AFMT_S32_BE,
       min_channels: 1,
       max_channels: 2,
-      min_rate:     8000,
-      max_rate:     192000
+      min_rate:       8000,
+      max_rate:       192000,
+      preferred_rate: None
     }
   }
 }
@@ -188,12 +190,24 @@ pub fn probe_caps(path: &str, play: bool) -> Option<DspCaps> {
     return None;
   }
 
+  // On a vchan the parent hardware mixes at dev.pcm.N.{play,rec}.vchanrate;
+  // preferring it avoids a second in-kernel resample on non-48k parents.
+  // ENODEV/EINVAL (direct channel, vchans off) just means no preference.
+  let preferred_rate = path.trim_start_matches("/dev/dsp").parse::<u32>().ok()
+    .and_then(|unit| {
+      let dir = if play { "play" } else { "rec" };
+      crate::utils::SysctlReader::new()
+        .read_u32(format!("dev.pcm.{}.{}.vchanrate", unit, dir)).ok()
+    })
+    .filter(|r| (min_rate as u32..=max_rate as u32).contains(r));
+
   Some(DspCaps {
-    formats:      formats as u32,
-    min_channels: min_channels as u32,
-    max_channels: max_channels as u32,
-    min_rate:     min_rate as u32,
-    max_rate:     max_rate as u32
+    formats:        formats as u32,
+    min_channels:   min_channels as u32,
+    max_channels:   max_channels as u32,
+    min_rate:       min_rate as u32,
+    max_rate:       max_rate as u32,
+    preferred_rate
   })
 }
 
@@ -616,8 +630,17 @@ pub fn list_pcm_devices(indexes: &[u32]) -> Vec<PcmDevice> {
   for index in indexes {
     if let Some(desc) = read_pcm_device_description(&mut sysctl, *index) {
       if let Ok(location) = sysctl.read_string(format!("dev.pcm.{}.%location", index), 1024) {
-        let play = sysctl.read_string(format!("dev.pcm.{}.play.vchanformat", index), 1024).is_ok();
-        let rec  = sysctl.read_string(format!("dev.pcm.{}.rec.vchanformat",  index), 1024).is_ok();
+        // dev.pcm.N.mode reports direction support from the channel counts
+        // (1 = mixer, 2 = play, 4 = rec); the vchanformat sysctls previously
+        // used here return ENODEV with vchans disabled - i.e. bitperfect
+        // devices vanished. Fall back to vchanformat for pre-13.1 kernels.
+        let (play, rec) = match sysctl.read_u32(format!("dev.pcm.{}.mode", index)) {
+          Ok(mode) => (mode & 2 != 0, mode & 4 != 0),
+          Err(_) => (
+            sysctl.read_string(format!("dev.pcm.{}.play.vchanformat", index), 1024).is_ok(),
+            sysctl.read_string(format!("dev.pcm.{}.rec.vchanformat",  index), 1024).is_ok()
+          )
+        };
         result.push(PcmDevice { index: *index, desc, location, play, rec });
       }
     }
