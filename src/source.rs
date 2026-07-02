@@ -42,6 +42,7 @@ struct Port {
 
 #[derive(Debug)]
 pub struct PortConfig {
+  #[allow(dead_code)] // only read by Debug until the Format readback lands
   pub format:    libspa::param::audio::AudioFormat,
   pub rate:      u32,
   pub channels:  u32,
@@ -482,36 +483,36 @@ unsafe extern "C" fn port_set_param(object: *mut c_void, direction: spa_directio
             let raw = raw.assume_init();
 
             //TODO: check whether format is supported by OSS
-            //TODO: what should we do with flags?
 
-            assert!(raw.rate > 0);
-            assert!(raw.channels > 0 && raw.channels <= SPA_AUDIO_MAX_CHANNELS);
-            assert_eq!(raw.flags, 0);
+            // reject bad values rather than assert (an FFI panic aborts pipewire);
+            // flags are accepted but ignored
+            if raw.rate == 0 || raw.channels == 0 || raw.channels > SPA_AUDIO_MAX_CHANNELS {
+              crate::warn!(state.log, "rejecting format: rate={} channels={}", raw.rate, raw.channels);
+              return -libc::EINVAL;
+            }
 
-            let format    = libspa::param::audio::AudioFormat(raw.format);
+            let format = libspa::param::audio::AudioFormat(raw.format);
+
+            // only formats from our EnumFormat are expected; reject the rest
+            let (oss_format, bytes_per_sample) = match format {
+              libspa::param::audio::AudioFormat::S32LE => (crate::sound::AFMT_S32_LE, 4),
+              libspa::param::audio::AudioFormat::S32BE => (crate::sound::AFMT_S32_BE, 4),
+              libspa::param::audio::AudioFormat::S16LE => (crate::sound::AFMT_S16_LE, 2),
+              libspa::param::audio::AudioFormat::S16BE => (crate::sound::AFMT_S16_BE, 2),
+              _ => {
+                crate::warn!(state.log, "rejecting unsupported format {:?}", format);
+                return -libc::ENOTSUP;
+              }
+            };
 
             let config = PortConfig {
               format,
               rate:     raw.rate,
               channels: raw.channels,
-              stride: match format {
-                libspa::param::audio::AudioFormat::S32LE => 4,
-                libspa::param::audio::AudioFormat::S32BE => 4,
-                libspa::param::audio::AudioFormat::S16LE => 2,
-                libspa::param::audio::AudioFormat::S16BE => 2,
-                _ => unreachable!()
-              }
+              stride:   bytes_per_sample // mono; per-sample == per-frame
             };
 
             crate::debug!(state.log, "reconfiguring with {:?}", config);
-
-            let oss_format = match config.format {
-              libspa::param::audio::AudioFormat::S32LE => crate::sound::AFMT_S32_LE,
-              libspa::param::audio::AudioFormat::S32BE => crate::sound::AFMT_S32_BE,
-              libspa::param::audio::AudioFormat::S16LE => crate::sound::AFMT_S16_LE,
-              libspa::param::audio::AudioFormat::S16BE => crate::sound::AFMT_S16_BE,
-              _ => unreachable!()
-            };
 
             // the host renegotiates on a live node; swap the device and
             // config on the data loop
@@ -595,6 +596,7 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
     }
 
     let buffer_id = if (*port.io).buffer_id == -1i32 as u32 {
+      // hand out the next never-used buffer; the host returns ids after that
       let idx = state.active_buffers;
       state.active_buffers += 1;
       idx as u32
@@ -602,19 +604,31 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       (*port.io).buffer_id
     };
 
-    let buffer = port.buffers.get(buffer_id as usize).unwrap().as_ref().unwrap();
+    // buffer_id (or our fallback index) and n_datas come from outside. Validate
+    // them instead of asserting; a panic here aborts the process across extern "C".
+    let buffer = match port.buffers.get(buffer_id as usize).copied().and_then(|b| b.as_ref()) {
+      Some(b) if b.n_datas == 1 => b, // we fill the block directly, so need exactly one
+      _ => {
+        crate::warn!(state.log, "unusable buffer (id {}); skipping", buffer_id);
+        continue;
+      }
+    };
 
-    // no, I'm not the person that decided to pluralize "data" that way; it's completely savage
-    assert_eq!(buffer.n_datas, 1);
-
-    let data_0 = buffer.datas.offset(0).as_ref().unwrap();
-    assert_eq!(data_0.type_, SPA_DATA_MemPtr);
+    // we read straight into the block, so require a MemPtr with data, chunk and
+    // maxsize all valid. as_ref() (not offset(0)) handles a null datas pointer.
+    let data_0 = match buffer.datas.as_ref() {
+      Some(d) if d.type_ == SPA_DATA_MemPtr && !d.data.is_null() && !d.chunk.is_null() && d.maxsize > 0 => d,
+      _ => {
+        crate::warn!(state.log, "buffer data is not a usable MemPtr block; skipping");
+        continue;
+      }
+    };
 
     let nbytes = if port.dsp.ready_for_reading(1) {
-      let ispace = port.dsp.ispace_in_bytes();
+      // the device can report more queued input than the buffer holds; cap it
+      let ispace = (port.dsp.ispace_in_bytes().max(0) as u32).min(data_0.maxsize);
       #[cfg(debug_assertions)]
       crate::trace!(state.log, "ispace: {}", ispace);
-      assert!(ispace as u32 <= data_0.maxsize);
       port.dsp.read(data_0.data, ispace as usize)
     } else {
       -1

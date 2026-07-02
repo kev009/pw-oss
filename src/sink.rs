@@ -594,12 +594,16 @@ unsafe extern "C" fn port_set_param(object: *mut c_void, direction: spa_directio
 
             crate::debug!(state.log, "reconfiguring with {:?}", config);
 
+            // only formats from our EnumFormat are expected; reject the rest
             let oss_format = match config.format {
               libspa::param::audio::AudioFormat::S32LE => crate::sound::AFMT_S32_LE,
               libspa::param::audio::AudioFormat::S32BE => crate::sound::AFMT_S32_BE,
               libspa::param::audio::AudioFormat::S16LE => crate::sound::AFMT_S16_LE,
               libspa::param::audio::AudioFormat::S16BE => crate::sound::AFMT_S16_BE,
-              _ => unreachable!()
+              _ => {
+                crate::warn!(state.log, "rejecting unsupported format {:?}", config.format);
+                return -libc::ENOTSUP;
+              }
             };
 
             // the host renegotiates on a live node; swap the device and
