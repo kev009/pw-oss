@@ -499,6 +499,15 @@ pub unsafe fn same_clock(position: *const libspa::sys::spa_io_position, name: &s
   theirs[ours.len()] == 0
 }
 
+// one graph cycle expressed in device bytes; the device rate can differ from
+// the graph rate (the adapter's resampler makes up the difference)
+pub fn device_period_bytes(target_duration: u64, device_rate: u32, graph_rate: u32, stride: u32) -> u32 {
+  if graph_rate == 0 {
+    return 0;
+  }
+  (target_duration * device_rate as u64 / graph_rate as u64) as u32 * stride
+}
+
 pub fn now_ns(system: &crate::spa::System) -> u64 {
   let mut now = libspa::sys::timespec { tv_sec: 0, tv_nsec: 0 };
   let err = unsafe { system.clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };

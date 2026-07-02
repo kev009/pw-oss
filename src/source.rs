@@ -905,6 +905,16 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       }
     }
 
+    // a period change re-tunes the servo; capture needs no reopen (its ring
+    // isn't SETFRAGMENT-sized), but the DLL gain and target change - ALSA
+    // compensates the error by the threshold delta, we relock fast instead
+    if port.primed && port.setup_period != 0 && period_in_bytes != 0 && period_in_bytes != port.setup_period {
+      port.setup_period  = period_in_bytes;
+      port.bw_fast_until = crate::utils::now_ns(&state.data_system) + DLL_FAST_NSEC;
+      port.dll.init();
+      port.dll.set_bw(crate::dll::SPA_DLL_BW_MAX, period_in_bytes, rate * stride);
+    }
+
     let nbytes = if !port.primed && period_in_bytes > 0 {
       // Capture analogue of the sink's zero priming: trigger the device,
       // discard any backlog so the fill level starts out known, and hand the
@@ -980,6 +990,14 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       if let Some(xrun_fun) = node_callbacks.and_then(|c| c.xrun) {
         xrun_fun(state.callbacks.data, now / 1000, 0, std::ptr::null_mut());
       }
+
+      // recover like the sink's underrun path: re-enter priming next cycle,
+      // which drains the backlog and relocks the DLL - otherwise the
+      // un-drained backlog becomes permanent capture latency while the
+      // integrator winds up against an error the reads can't remove
+      port.primed        = false;
+      port.bw_fast_until = 0;
+      port.dll.init();
     }
 
     if nbytes != -1 {

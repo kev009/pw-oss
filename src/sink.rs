@@ -1052,6 +1052,29 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
         port.dsp.path, size, driver_clock.target_duration as u32 * port_config.stride());
     }
 
+    // one graph cycle in device bytes (see utils::device_period_bytes)
+    let period_in_bytes = crate::utils::device_period_bytes(
+      driver_clock.target_duration, port_config.rate, driver_clock.target_rate.denom, port_config.stride());
+
+    // A quantum or graph-rate change needs a different buffer layout, and a
+    // triggered OSS channel can't be retuned (SETFRAGMENT and the params
+    // return EINVAL once running, unlike ALSA's in-place rethreshold): reopen
+    // and fall into the sizing/priming below against the new period.
+    if port.dsp.is_running() && port.setup_period != 0 && period_in_bytes != 0 && period_in_bytes != port.setup_period {
+      crate::info!(state.log, "{}: period {} -> {} bytes; re-setting up", port.dsp.path, port.setup_period, period_in_bytes);
+      port.dsp.close();
+      if port.dsp.open().is_err() ||
+         port.dsp.configure(port_config.oss_format(), port_config.channels, port_config.rate).is_err() {
+        crate::warn!(state.log, "{}: re-setup failed; dropping the stream", port.dsp.path);
+        if !port.dsp.is_closed() {
+          port.dsp.close();
+        }
+        port.config = None;
+        continue;
+      }
+      port.xrun_timestamp = 0;
+    }
+
     if !port.dsp.is_running() {
 
       #[cfg(debug_assertions)]
@@ -1088,8 +1111,7 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
         }
       }
 
-      let period_in_bytes = driver_clock.target_duration as u32 * port_config.stride();
-      let desired_delay   = period_in_bytes / 8 * state.oss_delay;
+      let desired_delay = period_in_bytes / 8 * state.oss_delay;
 
       // Size the fill to the granted buffer and the device's real fragment. We
       // write about one quantum per cycle, so if the forced fragment is much
@@ -1121,7 +1143,7 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       port.setup_period  = period_in_bytes;
       port.bw_fast_until = state.cur_timestamp + DLL_FAST_NSEC;
       port.dll.init();
-      port.dll.set_bw(crate::dll::SPA_DLL_BW_MAX, period_in_bytes, driver_clock.target_rate.denom * port_config.stride());
+      port.dll.set_bw(crate::dll::SPA_DLL_BW_MAX, period_in_bytes, port_config.rate * port_config.stride());
 
       crate::warn!(state.log, "{}: granted {}, blocksize {}, period {}, target delay {}",
         port.dsp.path, granted, blocksize, period_in_bytes, port.target_delay);
@@ -1167,11 +1189,9 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       {
         port.xrun_timestamp = 0;
 
-        let period_in_bytes = driver_clock.target_duration as u32 * port_config.stride();
-
         port.bw_fast_until = state.cur_timestamp + DLL_FAST_NSEC;
         port.dll.init();
-        port.dll.set_bw(crate::dll::SPA_DLL_BW_MAX, period_in_bytes, driver_clock.target_rate.denom * port_config.stride());
+        port.dll.set_bw(crate::dll::SPA_DLL_BW_MAX, period_in_bytes, port_config.rate * port_config.stride());
 
         // buffer's already sized; re-prime only up to target, accounting for what's
         // still queued (a full target_delay would push odelay past the buffer)
