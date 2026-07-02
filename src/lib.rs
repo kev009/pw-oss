@@ -18,6 +18,7 @@ mod spa;
 mod dll;
 
 mod keys;
+mod mixer;
 mod sound;
 mod utils;
 

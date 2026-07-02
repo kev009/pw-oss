@@ -27,9 +27,16 @@ context.properties = {
 }
 ```
 
-and keep the stream/device volume at 100% (or use hardware volume once
-available). Exclusive devices allow one open per direction: a second client
-gets EBUSY and stays silent by design.
+and keep the *software* volumes (streams and the node) at 100%; the route
+(hardware) volume is free - it applies after the bit-exact sample path, so
+adjusting it loses nothing. On bitperfect devices it is in fact the only
+volume that does anything: the kernel's bitperfect feeder chain carries no
+volume feeder, so software attenuation via the `pcm` control is silently
+inert there. A bitperfect device without a usable mixer control exposes no
+route volume at all; the session manager's node softvol is then the
+(un-bitperfect) fallback, and purists simply pin it at 100%. Exclusive
+devices allow one open per direction: a second client gets EBUSY and stays
+silent by design.
 
 ## Tunables
 
@@ -49,6 +56,19 @@ monitor.oss.rules = [
 (default 10 = 1.25 periods; higher absorbs more scheduling jitter at the
 cost of latency). It can also be changed live on a node via
 `pw-cli set-param <node> Props '{ params: [ "oss.delay", 16 ] }'`.
+
+### Routes / hardware volume
+
+Each pcm device with a usable mixer control (`vol`, else `pcm` for playback;
+`rec`, else the current recording source, else `igain` for capture) exposes a
+PipeWire route, so desktop volume keys, `wpctl` and `pactl` drive the OSS
+mixer on `/dev/mixerN` directly instead of attenuating in software; the node's
+software volume stays at 100%. Volumes map through the same cubic curve ALSA
+devices without a dB scale use, quantized to the mixer's 0-100 steps. Changes
+made outside PipeWire (e.g. `mixer(8)`) are picked up by a ~1 Hz poll.
+Devices without a usable control get no route and keep the WirePlumber node
+softvol. WirePlumber persists route volumes under the route name and restores
+them on login (`device.restore-routes`, default true).
 
 Log verbosity follows the `spa.oss` topic, e.g.
 `PIPEWIRE_DEBUG='spa.oss:3' pipewire`.
