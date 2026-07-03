@@ -355,7 +355,13 @@ unsafe extern "C" fn set_param<D: Direction>(object: *mut c_void, id: u32, _flag
     SPA_PARAM_Props => {
       if param.is_null() {
         // a NULL pod resets the props to their defaults
-        return D::reset_props(state);
+        let res = D::reset_props(state);
+        if res == 0 {
+          let _ = state.node_info.replace_change_mask(0);
+          state.node_info.bump_param(SPA_PARAM_Props);
+          emit_node_info(state);
+        }
+        return res;
       }
       match crate::utils::deserialize_pod(param) {
         Some((_, Value::Object(Object { type_, properties, .. }))) if type_ == SPA_TYPE_OBJECT_Props => {
@@ -1064,6 +1070,19 @@ unsafe fn emit_format_lost<D: Direction>(state: &mut State<D>) {
 pub(crate) unsafe fn resetup_task<D: Direction>(state: &mut State<D>, port_idx: usize) {
   if state.clearing {
     return; // teardown is flushing us out; don't touch the device
+  }
+  // a Suspend that landed after this task was queued must win: reopening
+  // here would leave a suspended node holding an exclusive device
+  // (started only mutates through blocking loop invokes, so this
+  // main-thread read is serialized against them)
+  if !state.started {
+    let state_ptr: *mut State<D> = state;
+    crate::utils::block_on_loop(&(*state_ptr).data_loop, state_ptr, move |state| {
+      for port in &mut state.ports {
+        port.resetup_pending = false;
+      }
+    });
+    return;
   }
   // consume-or-bail: an intervening install_device (renegotiation) already
   // cleared the flag, making this task stale
