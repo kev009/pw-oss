@@ -334,39 +334,36 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
 
       let desired_delay = (period_in_bytes / 8).saturating_mul(state.ext.oss_delay);
 
-      // Size the fill to the granted buffer and the device's real fragment. We
-      // write about one quantum per cycle, so if the forced fragment is much
-      // smaller than the quantum (snd_hdspe forces 256 frames) the ring drains
-      // between writes and underruns; keep it near-full then, otherwise
-      // half-full. "Near-full" still leaves headroom for a write that runs a few
-      // frames over a quantum (the resampler's output size varies), or the OSS
-      // write short-writes and drops those frames every cycle.
+      // Size the fill to the granted buffer and the device's real fragment.
       // oss_fragment (0 = automatic 1 KiB) only mutates on this loop, so the
       // read is race-free; no ioctls beyond what the prime always issued
       let granted   = port.dsp.set_buffer_size(period_in_bytes.saturating_mul(2).saturating_add(desired_delay), state.oss_fragment);
       let blocksize = port.dsp.blocksize();
       // saturating arithmetic: blocksize/rate_match.size are device-provided and
       // an overflow here would abort the data loop.
+      let mut delay_capped = false;
       port.ext.target_delay = if granted >= period_in_bytes.saturating_mul(2) {
-        if blocksize > 0 && blocksize.saturating_mul(4) < period_in_bytes && state.oss_fragment == 0 {
-          // (driver-forced small fragments only: a USER-chosen small
-          // fragment must keep the calibrated oss.delay target, or setting
-          // it would silently raise latency toward near-full)
-          // near-full, leaving headroom for the largest expected write (a quantum,
-          // or the resampler's size if larger) plus one fragment. A chunk over
-          // even that drops the excess: on a buffer this small no target both
-          // avoids underruns and fits an arbitrary write.
-          let rate_match_bytes = if state.rate_match.is_null() { 0 } else { (*state.rate_match).size.saturating_mul(port_config.stride()) };
-          let write_max = period_in_bytes.max(rate_match_bytes);
-          granted.saturating_sub(write_max.saturating_add(blocksize))
-        } else {
-          // Calibrated: period/8 per oss.delay step. The floor keeps a
-          // jitter margin - a quarter period, or one device fragment when
-          // the fragment dwarfs the quantum - so a small oss.delay (or a
-          // tiny quantum) can't starve the wakeup fill.
-          let floor = period_in_bytes.saturating_add((period_in_bytes / 4).max(blocksize));
-          desired_delay.max(floor).clamp(period_in_bytes, granted - period_in_bytes)
-        }
+        // Calibrated: period/8 per oss.delay step. The floor keeps a jitter
+        // margin - a quarter period, or one device fragment when the
+        // fragment dwarfs the quantum - so a small oss.delay (or a tiny
+        // quantum) can't starve the wakeup fill. The ceiling always leaves
+        // room above target for the largest expected write (a quantum, or
+        // the resampler's size if larger) plus one fragment of servo
+        // wander: the OSS write is non-blocking, so a write that doesn't
+        // fit short-writes and DROPS the tail. A driver that grants many
+        // small fragments in a large buffer (uaudio: 1 ms packets) must
+        // not be fill-targeted near-full - that both adds 100+ ms of
+        // latency and leaves one fragment of headroom, dropping a chunk on
+        // every normal servo excursion. On a genuinely small grant
+        // (snd_hdspe forces both the fragment and the total) the ceiling
+        // lands just under near-full, which is the best a two-quanta
+        // buffer can do.
+        let rate_match_bytes = if state.rate_match.is_null() { 0 } else { (*state.rate_match).size.saturating_mul(port_config.stride()) };
+        let write_max = period_in_bytes.max(rate_match_bytes);
+        let floor = period_in_bytes.saturating_add((period_in_bytes / 4).max(blocksize));
+        let ceil  = granted.saturating_sub(write_max.saturating_add(blocksize)).max(period_in_bytes);
+        delay_capped = desired_delay.max(floor) > ceil;
+        desired_delay.max(floor).min(ceil).max(period_in_bytes)
       } else {
         granted / 2 // buffer too small for two quanta; best-effort, will drop (warned below)
       };
@@ -378,9 +375,9 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
 
       crate::warn!(state.log, "{}: granted {}, blocksize {}, period {}, target delay {}",
         port.dsp.path, granted, blocksize, period_in_bytes, port.ext.target_delay);
-      if granted < period_in_bytes.saturating_mul(2).saturating_add(desired_delay) && granted >= period_in_bytes.saturating_mul(2) {
-        crate::info!(state.log, "{}: granted {} < requested {}; the oss.delay target is truncated",
-          port.dsp.path, granted, period_in_bytes.saturating_mul(2).saturating_add(desired_delay));
+      if delay_capped {
+        crate::info!(state.log, "{}: the oss.delay target is capped by the granted buffer ({})",
+          port.dsp.path, granted);
       }
       if granted < period_in_bytes.saturating_mul(2) {
         crate::warn!(state.log, "{}: granted OSS buffer ({}) is smaller than two quanta ({}); \
