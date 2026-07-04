@@ -20,7 +20,8 @@ pub(crate) struct SourceExt {
 // direction-specific Port fields (Port.ext)
 #[derive(Default)]
 pub(crate) struct SourcePortExt {
-  pub primed: bool
+  pub primed: bool,
+  pub target_fill: u32 // servo fill target; a period, floored by the drain quantum
 }
 
 #[derive(Debug, Clone)]
@@ -82,7 +83,7 @@ unsafe fn timeout_servo(state: &mut State<SourceDir>, nsec: u64, rate: u32) -> (
     // capture error is inverted vs the sink: a slow device queues less than a
     // period; clamp so wakeup jitter can't wind up the integrator
     let max_err = (port.setup_period as f64 / 2.0).max(256.0 * stride as f64);
-    let err = (port.setup_period as f64 - queued as f64).clamp(-max_err, max_err);
+    let err = (port.ext.target_fill as f64 - queued as f64).clamp(-max_err, max_err);
     corr = port.dll.update(err);
     port.bw_adapt.update(&mut port.dll, err, stride, port.setup_blocksize,
       nsec, port.setup_period, device_rate * stride);
@@ -114,6 +115,9 @@ fn try_open_configure(dsp: &mut crate::sound::Dsp, config: &PortConfig, fragment
     dsp.close();
     return -(err as c_int);
   }
+  // on direct opens the hardware blocksize is per-session state; re-read it
+  // now that THIS configuration is in effect (vchan/uaudio values are stable)
+  dsp.refresh_hw_quantum();
   dsp.set_small_fragments(fragment, 65536); // normalized oss.fragment (0 = 1 KiB default)
   0
 }
@@ -205,6 +209,14 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
     // compensates the error by the threshold delta, we relock fast instead
     if port.ext.primed && port.setup_period != 0 && period_in_bytes != 0 && period_in_bytes != port.setup_period {
       port.setup_period = period_in_bytes;
+      // the fill target derives from the period; a stale one steers the
+      // servo to the OLD quantum's latency forever (capture re-tunes in
+      // place, so prime never recomputes it)
+      port.ext.target_fill = if port.setup_blocksize > period_in_bytes {
+        period_in_bytes.saturating_add(port.setup_blocksize / 2)
+      } else {
+        period_in_bytes
+      };
       port.dll.init();
       port.bw_adapt.reset();
     }
@@ -250,7 +262,23 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
       }
       port.ext.primed      = true;
       port.setup_period    = period_in_bytes;
-      port.setup_blocksize = port.dsp.blocksize();
+      // the measurement/arrival quantum is the granted fragment or the
+      // hardware cadence sndstat reports, whichever is coarser (see the
+      // sink); data arrives in these lumps regardless of the soft fragment
+      let chunk = (port.dsp.hw_quantum_ns as u128)
+        .saturating_mul(rate as u128)
+        .saturating_mul(stride as u128) / 1_000_000_000;
+      port.setup_blocksize = port.dsp.blocksize().max(chunk.min(u32::MAX as u128) as u32);
+      // A quantum coarser than the period makes a one-period fill target
+      // unreachable - queued readings move in whole arrivals, the error
+      // pegs at the clamp and the integrator ramps. Floor the target at
+      // half an arrival above the period; the added latency is physics
+      // (data that arrives every N ms can't be delivered sooner).
+      port.ext.target_fill = if port.setup_blocksize > period_in_bytes {
+        period_in_bytes.saturating_add(port.setup_blocksize / 2)
+      } else {
+        period_in_bytes
+      };
       port.dll.init();
       port.bw_adapt.reset(); // cold-starts at the granularity cap next servo cycle
 
@@ -281,8 +309,11 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
           port.bw_adapt.reset();
         }
         // capture error is inverted vs the sink: a slow device queues less
-        let err_raw = period_in_bytes as f64 - queued as f64;
-        if err_raw.abs() > port.setup_period as f64 {
+        let err_raw = port.ext.target_fill as f64 - queued as f64;
+        // the healthy swing is half an arrival either side of target; a
+        // snap threshold below that resets the DLL on every arrival
+        let snap = port.setup_period.max(port.setup_blocksize / 2 + port.setup_period / 2);
+        if err_raw.abs() > snap as f64 {
           // fill snap (see the sink): a level error past one period would
           // wind the integrator against the +/-1% clamp; the bounded read
           // above drains genuine backlog, so just relock here
@@ -306,11 +337,14 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
       // chunk holds io.status HAVE_DATA, we skip the device next cycle, it
       // queues 2 periods, repeat) and pollutes the servo error.
       let want = if port.setup_period != 0 {
-        // catch-up beyond 1.5 periods; the servo handles the rest without a
-        // pegged error (a 2-period threshold stranded a full period that
-        // only the 1% actuator could drain)
-        port.setup_period.saturating_add(
-          queued.saturating_sub(port.setup_period.saturating_mul(3) / 2))
+        // catch-up beyond the healthy peak (target + half an arrival, plus
+        // half a period of slack); the servo handles the rest without a
+        // pegged error, and a threshold under the arrival peak would drag
+        // the fill below target on every arrival
+        let peak = port.ext.target_fill
+          .saturating_add(port.setup_blocksize / 2)
+          .saturating_add(port.setup_period / 2);
+        port.setup_period.saturating_add(queued.saturating_sub(peak))
       } else {
         queued
       };
