@@ -391,26 +391,57 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
       let underrun_count = port.dsp.underruns();
       // The vchan mixer counts a momentarily-short child as an xrun and pads
       // it with silence (feeder_mixer.c); with the fill still healthy that's
-      // accounting noise, not a dropout - only a genuinely low fill (under a
-      // period at wakeup) is a real underrun worth recovery and reporting.
-      if underrun_count > 0 && port.dsp.odelay() < period_in_bytes.max(port.dsp.blocksize()) {
-        if let Some(suppressed) = port.warn_limit.check(state.ext.cur_timestamp) {
-          crate::warn!(state.log, "{}: OSS reported {:3} underruns @ {} (+{} warnings suppressed)",
-            port.dsp.path, underrun_count, state.ext.cur_timestamp, suppressed);
-        }
-        if port.ext.xrun_timestamp == 0 {
-          // snapshot the DRIVER clock, not wall time: the recovery condition
-          // compares against driver_clock.nsec (idealized cycle start, which
-          // lags wall time by any lateness); a wall snapshot deferred
-          // recovery by the lateness, discarding a buffer per late cycle
-          port.ext.xrun_timestamp = driver_clock.nsec.max(1);
-
-          // report the EVENT to the host (pw-top's xrun counter) once, not
-          // per held cycle; the length isn't known at detection, so 0 delay
-          let node_callbacks = state.callbacks.funcs.cast::<spa_node_callbacks>().as_ref();
-          if let Some(xrun_fun) = node_callbacks.and_then(|c| c.xrun) {
-            xrun_fun(state.callbacks.data, state.ext.cur_timestamp / 1000, 0, std::ptr::null_mut());
+      // accounting noise, not a dropout - only a genuinely low fill at
+      // wakeup is a real underrun worth recovery and reporting. "Low" is a
+      // period, capped by the healthy sawtooth floor (target minus one
+      // fragment): with a fragment wider than the period the fill routinely
+      // dips under one fragment while perfectly locked, and gating on the
+      // fragment size would fire recovery on every accounting tick there.
+      if underrun_count > 0 {
+        // (cached blocksize: the channel can't be retuned while triggered,
+        // and the gate must not cost ioctls on healthy cycles)
+        let low = period_in_bytes
+          .min(port.ext.target_delay.saturating_sub(port.setup_blocksize))
+          .max(period_in_bytes / 4);
+        // A late cycle finds a legitimately lower fill (the device kept
+        // draining), so the threshold tracks the expected healthy fill at
+        // THIS moment; the floor keeps a true empty ring (a real underrun
+        // reads 0 until we write) detectable at any lateness.
+        let elapsed = state.ext.cur_timestamp.saturating_sub(driver_clock.nsec);
+        let drained = ((elapsed as u128)
+          .saturating_mul(port_config.rate as u128)
+          .saturating_mul(port_config.stride().max(1) as u128) / 1_000_000_000) as u32;
+        let wander = (period_in_bytes / 4).max(port.setup_blocksize);
+        let low = low
+          .min(port.ext.target_delay.saturating_sub(drained).saturating_sub(wander))
+          .max(period_in_bytes / 16);
+        let odelay_now = port.dsp.odelay();
+        if odelay_now < low {
+          if let Some(suppressed) = port.warn_limit.check(state.ext.cur_timestamp) {
+            crate::warn!(state.log, "{}: OSS reported {:3} underruns @ {} (+{} warnings suppressed)",
+              port.dsp.path, underrun_count, state.ext.cur_timestamp, suppressed);
           }
+          if port.ext.xrun_timestamp == 0 {
+            // snapshot the DRIVER clock, not wall time: the recovery
+            // condition compares against driver_clock.nsec (idealized cycle
+            // start, which lags wall time by any lateness); a wall snapshot
+            // deferred recovery by the lateness, discarding a buffer per
+            // late cycle
+            port.ext.xrun_timestamp = driver_clock.nsec.max(1);
+
+            // report the EVENT to the host (pw-top's xrun counter) once,
+            // not per held cycle; the length isn't known at detection, so
+            // 0 delay
+            let node_callbacks = state.callbacks.funcs.cast::<spa_node_callbacks>().as_ref();
+            if let Some(xrun_fun) = node_callbacks.and_then(|c| c.xrun) {
+              xrun_fun(state.callbacks.data, state.ext.cur_timestamp / 1000, 0, std::ptr::null_mut());
+            }
+          }
+        } else {
+          // suppressed counts stay diagnosable: a marginal system that
+          // ticks the counter while self-healing shows up at debug level
+          crate::debug!(state.log, "{}: {} underrun counts ignored (fill {} >= {})",
+            port.dsp.path, underrun_count, odelay_now, low);
         }
       }
     }
