@@ -64,8 +64,10 @@ reports the effective value. Smaller fragments help latency-critical small
 quanta (finer DMA delivery granularity at the price of more interrupts);
 larger fragments mean fewer interrupts when latency doesn't matter. The
 device may still grant a different size (some drivers force a fixed period);
-the plugin reads the granted size back, and the rate servo's measurement
-granularity - and thus its noise model - follows it automatically. Live:
+the plugin reads the granted size back - and the device's real hardware
+cadence from sndstat(4), which can be coarser than any fragment (USB
+transfer chunks, vchan parents) - and the rate servo's measurement
+granularity and noise model follow the real quantum automatically. Live:
 `pw-cli set-param <node> Props '{ params: [ "oss.fragment", 4096 ] }'`.
 
 ### Routes / hardware volume

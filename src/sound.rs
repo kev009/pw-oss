@@ -500,6 +500,7 @@ fn get_error(fd: c_int) -> audio_errinfo {
 
 pub struct Dsp {
   path:  CString,
+  pub hw_quantum_ns: u64, // the hardware drain quantum (sndstat); 0 = fragment-accurate
   fd:    c_int,
   state: DspState,
   needs_trigger: bool // trigger-suspended: NOTRIGGER must be cleared on restart
@@ -508,11 +509,25 @@ pub struct Dsp {
 impl Dsp {
 
   pub fn new(path: &str) -> Self {
-    Self { path: CString::new(path).unwrap(), fd: -1, state: DspState::Closed, needs_trigger: false }
+    Self {
+      path: CString::new(path).unwrap(),
+      hw_quantum_ns: drain_quantum_ns(path, false),
+      fd: -1,
+      state: DspState::Closed,
+      needs_trigger: false
+    }
   }
 
   pub fn is_closed(&self) -> bool {
     self.state == DspState::Closed
+  }
+
+  // on direct opens the hardware blocksize is per-session state; call after
+  // configure so the snapshot reflects THIS session (see drain_quantum_ns)
+  pub fn refresh_hw_quantum(&mut self) {
+    if let Ok(path) = self.path.to_str() {
+      self.hw_quantum_ns = drain_quantum_ns(path, false);
+    }
   }
 
   pub fn is_running(&self) -> bool {
@@ -662,8 +677,62 @@ impl Drop for Dsp {
   }
 }
 
+// frame bytes for a sound4 AFMT value (width by encoding bit, channels from
+// the AFMT_CHANNEL field, sound.h:344); approximate widths are fine - the
+// quantum this feeds is a floor, and overstating errs toward more margin
+fn afmt_frame_bytes(format: u32) -> u32 {
+  let width: u32 = if format & (AFMT_S32_LE | AFMT_S32_BE | 0x0000c000 | 0x30000000) != 0 {
+    4 // S32/U32/F32
+  } else if format & 0x000f0000 != 0 { // AFMT_S24/U24
+    3
+  } else if format & (AFMT_S16_LE | AFMT_S16_BE | 0x00000180) != 0 {
+    2
+  } else {
+    1
+  };
+  let channels = ((format & 0x07f00000) >> 20).max(1); // AFMT_CHANNEL (sound.h:344)
+  width * channels
+}
+
+// The device's real drain quantum, as TIME: the hardware buffer blocksize of
+// the primary (non-virtual) channel for the direction, from the sndstat
+// channel info. The soft fragsize GETOSPACE reports can understate it badly
+// on drivers that ignore SETFRAGMENT and pull fixed transfers (uaudio:
+// buffer_ms of audio per completion) - and for vchan children the parent's
+// hardware cadence governs the mix pull the same way. Time-domain so a later
+// rate renegotiation converts cleanly; drivers with rate-proportional blocks
+// (fixed frame counts) read slightly large or small across rates, which only
+// shifts a floor. 0 = unknown, use the soft fragsize alone.
+pub fn drain_quantum_ns(devnode: &str, play: bool) -> u64 {
+  let devnode = devnode.trim_start_matches("/dev/"); // sndstat devnodes are bare
+  let want_dir = if play { 0x00020000u64 } else { 0x00010000 }; // PCM_CAP_OUTPUT/INPUT
+  let mut quantum: u64 = 0;
+  let Some(nvl) = sndstat_snapshot() else { return 0 };
+  for dev in nvl.root().nvlist_array(c"dsps") {
+    if dev.boolean(c"from_user").unwrap_or(false) || dev.string(c"devnode") != Some(devnode) {
+      continue;
+    }
+    let Some(p) = dev.nvlist(c"provider_info") else { return 0 };
+    for chan in p.nvlist_array(c"channel_info") {
+      let caps = chan.number(c"caps").unwrap_or(0);
+      if caps & 0x00040000 != 0 || caps & want_dir == 0 { // PCM_CAP_VIRTUAL
+        continue;
+      }
+      let blksz  = chan.number(c"hwbuf_blksz").unwrap_or(0);
+      let rate   = chan.number(c"hwbuf_rate").unwrap_or(0);
+      let stride = afmt_frame_bytes(chan.number(c"hwbuf_format").unwrap_or(0) as u32) as u64;
+      if blksz > 0 && rate > 0 {
+        quantum = quantum.max(blksz.saturating_mul(1_000_000_000) / (rate * stride));
+      }
+    }
+    break;
+  }
+  quantum
+}
+
 pub struct DspWriter {
   pub path: String,
+  pub hw_quantum_ns: u64, // the hardware drain quantum (sndstat); 0 = fragment-accurate
   fd:      c_int,
   state:   DspState,
   needs_trigger: bool, // trigger-suspended: writes buffer until armed
@@ -678,6 +747,7 @@ impl DspWriter {
   pub fn new(path: &str) -> Self {
     Self {
       path:    path.to_string(),
+      hw_quantum_ns: drain_quantum_ns(path, true), // main thread; nodes are built there
       fd:      -1,
       state:   DspState::Closed,
       needs_trigger: false,
@@ -938,4 +1008,16 @@ pub fn list_pcm_devices(indexes: &[u32]) -> Vec<PcmDevice> {
   }
 
   result
+}
+
+#[cfg(test)]
+mod tests {
+  #[test]
+  fn drain_quantum_probe() {
+    for unit in [0u32, 1, 6] {
+      let node = format!("/dev/dsp{}", unit); // the production string shape
+      println!("{}: play {} ns, rec {} ns", node,
+        super::drain_quantum_ns(&node, true), super::drain_quantum_ns(&node, false));
+    }
+  }
 }

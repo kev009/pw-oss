@@ -149,6 +149,9 @@ fn try_open_configure(dsp: &mut crate::sound::DspWriter, config: &PortConfig, lo
     dsp.close();
     return -(err as c_int);
   }
+  // on direct opens the hardware blocksize is per-session state; re-read it
+  // now that THIS configuration is in effect (vchan/uaudio values are stable)
+  dsp.hw_quantum_ns = crate::sound::drain_quantum_ns(&dsp.path, true);
   0
 }
 
@@ -337,8 +340,26 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
       // Size the fill to the granted buffer and the device's real fragment.
       // oss_fragment (0 = automatic 1 KiB) only mutates on this loop, so the
       // read is race-free; no ioctls beyond what the prime always issued
-      let granted   = port.dsp.set_buffer_size(period_in_bytes.saturating_mul(2).saturating_add(desired_delay), state.oss_fragment);
-      let blocksize = port.dsp.blocksize();
+      // The measurement/drain quantum is the granted fragment - unless the
+      // device's hardware cadence is coarser (drivers that ignore
+      // SETFRAGMENT and pull fixed transfers; vchan parents), which the
+      // soft fragsize can't see and sndstat can. Floor, headroom and the
+      // servo noise model key on the larger - and the buffer REQUEST must
+      // include it, or a device that honors the request grants no room for
+      // the ceiling above the floor.
+      let chunk = ((port.dsp.hw_quantum_ns as u128)
+        .saturating_mul(port_config.rate as u128)
+        .saturating_mul(port_config.stride() as u128) / 1_000_000_000)
+        .min(u32::MAX as u128) as u32;
+      let frag_est = if state.oss_fragment == 0 { 1024 } else { state.oss_fragment };
+      let request = period_in_bytes.saturating_mul(2).saturating_add(desired_delay)
+        .max(period_in_bytes
+          .saturating_add((period_in_bytes / 4).max(frag_est.max(chunk)))
+          .saturating_add(period_in_bytes) // write_max at rate_match.size <= period
+          .saturating_add(frag_est.max(chunk)));
+      let granted   = port.dsp.set_buffer_size(request, state.oss_fragment);
+      let blocksize = port.dsp.blocksize().max(chunk);
+
       // saturating arithmetic: blocksize/rate_match.size are device-provided and
       // an overflow here would abort the data loop.
       let mut delay_capped = false;
@@ -351,10 +372,11 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
         // the resampler's size if larger) plus one fragment of servo
         // wander: the OSS write is non-blocking, so a write that doesn't
         // fit short-writes and DROPS the tail. A driver that grants many
-        // small fragments in a large buffer (uaudio: 1 ms packets) must
+        // small fragments in a large buffer (uaudio) must
         // not be fill-targeted near-full - that both adds 100+ ms of
         // latency and leaves one fragment of headroom, dropping a chunk on
-        // every normal servo excursion. On a genuinely small grant
+        // every normal servo excursion. (uaudio drains buffer_ms-sized
+        // transfers, folded into blocksize above.) On a genuinely small grant
         // (snd_hdspe forces both the fragment and the total) the ceiling
         // lands just under near-full, which is the best a two-quanta
         // buffer can do.
@@ -369,7 +391,7 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
       };
 
       port.setup_period    = period_in_bytes;
-      port.setup_blocksize = blocksize;
+      port.setup_blocksize = blocksize; // the effective quantum, incl. hw chunk
       port.dll.init();
       port.bw_adapt.reset(); // cold-starts at the granularity cap next servo cycle
 
