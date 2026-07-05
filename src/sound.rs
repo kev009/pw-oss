@@ -605,6 +605,19 @@ impl Dsp {
     unsafe { info.assume_init().fragsize.max(0) as u32 }
   }
 
+  // the total granted capture ring (fragstotal * fragsize): GETISPACE's
+  // `bytes` field is the current fill, not the capacity. The kernel clamps
+  // requests at CHN_2NDBUFMAXSIZE silently, so the grant must be read back,
+  // never assumed. 0 = unknown (ioctl failed, e.g. device unplugged).
+  pub fn ring_in_bytes(&self) -> u32 {
+    let mut info = std::mem::MaybeUninit::<audio_buf_info>::uninit();
+    if unsafe { libc::ioctl(self.fd, SNDCTL_DSP_GETISPACE, info.as_mut_ptr()) } == -1 {
+      return 0;
+    }
+    let info = unsafe { info.assume_init() };
+    (info.fragstotal.max(0) as u32).saturating_mul(info.fragsize.max(0) as u32)
+  }
+
   // Stop the channel but keep the fd: SETTRIGGER(0) aborts, resets the ring
   // and clears TRIGGERED, so the next prime retunes and poll() force-starts
   // the channel again (chn_poll ignores NOTRIGGER). false = driver refused;

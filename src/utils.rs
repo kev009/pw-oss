@@ -314,10 +314,20 @@ pub unsafe fn build_buffers_info(b: &mut libspa::pod::builder::Builder, stride: 
   use libspa::sys::*;
 
   // The point here is dataType = MemPtr: process() maps the buffer memory
-  // directly, so a MemFd/DmaBuf block would be unusable. Sizes are permissive;
-  // the graph's quantum drives the real per-buffer size.
-  let default = 1024 * stride;
-  let max     = 16384 * stride;
+  // directly, so a MemFd/DmaBuf block would be unusable.
+  //
+  // Capacity floors at two graph periods (2048 frames at the 1024-frame
+  // reference quantum). The capture catch-up read (source.rs) drains a device
+  // ring excursion by handing the graph MORE than one period in a cycle; a
+  // one-period buffer clamps that read back to a period, so the ring stays
+  // pinned at its ceiling and the kernel overruns every late cycle. Two
+  // periods of *capacity* cost no latency - we still deliver one period per
+  // cycle - it only widens the container so the drain can happen. The adapter
+  // sizes the buffer to the graph quantum and clamps up to this floor, so the
+  // headroom is present at the common quanta (a quantum coarser than the floor
+  // needs the ring-quantum cap in node.rs to stay glitch-free anyway).
+  let floor = 2048 * stride;
+  let max   = 16384 * stride;
 
   let mut obj    = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
   let mut choice = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
@@ -334,7 +344,7 @@ pub unsafe fn build_buffers_info(b: &mut libspa::pod::builder::Builder, stride: 
 
   b.add_prop(SPA_PARAM_BUFFERS_size, 0)?;
   b.push_choice(&mut choice, SPA_CHOICE_Range, 0)?;
-  b.add_int(default as i32)?;  b.add_int(stride as i32)?;  b.add_int(max as i32)?;
+  b.add_int(floor as i32)?;  b.add_int(floor as i32)?;  b.add_int(max as i32)?;  // default, min, max
   b.pop(choice.assume_init_mut());
 
   b.add_prop(SPA_PARAM_BUFFERS_stride, 0)?;
