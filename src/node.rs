@@ -166,6 +166,7 @@ pub(crate) struct State<D: Direction> {
   pub started:       bool,
   pub clearing:      bool, // teardown in progress; queued tasks must no-op
   pub following:     bool,
+  pub ring_cap_published: bool, // node.max-latency emitted (props dict is append-only)
   pub ext:           D::Ext // direction-specific fields (see sink.rs/source.rs)
 }
 
@@ -1047,7 +1048,36 @@ pub(crate) unsafe fn install_device<D: Direction>(state: &mut State<D>, port_idx
   if !swapped {
     return -libc::EIO; // the swap never ran; the port keeps its old state
   }
+  if res == 0 {
+    publish_ring_quantum_cap(state, port_idx); // stride is known now
+  }
   res
+}
+
+// FreeBSD caps every soft ring at CHN_2NDBUFMAXSIZE (131 KiB); at fat strides
+// (a 20-channel S32 interface is 80 bytes/frame) the ring holds only ~1.6
+// periods at quantum 1024 and both directions glitch structurally - the
+// capture side has no room for arrival jitter, the playback side can't hold
+// two quanta plus the delay target. Publish node.max-latency once the stride
+// is known so the graph never negotiates a quantum the kernel ring can't hold
+// four of (pw_impl_node parses the fraction into max_latency, which caps the
+// driver quantum). Emitted only when the cap bites below the common 2048
+// default; published once - the props dict is append-only, and a stride
+// change without a node rebuild is not worth a duplicate entry.
+unsafe fn publish_ring_quantum_cap<D: Direction>(state: &mut State<D>, port_idx: usize) {
+  let Some(config) = state.ports[port_idx].config.as_ref() else { return };
+  let stride = config.stride().max(1);
+  let rate   = config.rate();
+  let frames = crate::sound::CHN_2NDBUFMAXSIZE as u32 / stride / 4;
+  if frames >= 2048 || rate == 0 || state.ring_cap_published {
+    return;
+  }
+  state.ring_cap_published = true;
+  crate::info!(state.log, "kernel ring ({} bytes) at stride {} holds 4 periods only up to \
+    quantum {}; publishing node.max-latency", crate::sound::CHN_2NDBUFMAXSIZE, stride, frames);
+  let _ = state.node_info.replace_change_mask(0);
+  state.node_info.add_prop("node.max-latency", format!("{}/{}", frames, rate));
+  emit_node_info(state);
 }
 
 // A device rebuild the HOST didn't initiate just failed and cleared the
@@ -1431,6 +1461,7 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
     started:   false,
     clearing:  false,
     following: false,
+    ring_cap_published: false,
 
     ext
   });

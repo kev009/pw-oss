@@ -71,7 +71,7 @@ const PCM_ENABLE_INPUT:  c_int = 0x00000001;
 const PCM_ENABLE_OUTPUT: c_int = 0x00000002;
 
 // sys/dev/sound/pcm/channel.h
-const CHN_2NDBUFMAXSIZE: usize = 131072;
+pub const CHN_2NDBUFMAXSIZE: usize = 131072;
 
 #[repr(C)]
 struct audio_buf_info {
