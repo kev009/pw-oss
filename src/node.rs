@@ -95,6 +95,9 @@ pub(crate) trait Direction: Sized + 'static {
     type Ext: Default; // direction-specific State fields
     type PortExt: Default; // direction-specific Port fields
 
+    // init: the module's registered log topic (see the lib.rs section entries)
+    fn log_topic() -> &'static spa_log_topic;
+
     // init: direction-specific node property keys (e.g. the sink's oss.delay)
     fn info_item(ext: &mut Self::Ext, key: &str, value: &str);
     // init: after the info dict is parsed (e.g. latching the oss.delay default)
@@ -1720,7 +1723,7 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
 ) -> c_int {
     let log = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Log.as_ptr().cast())
         as *mut spa_log;
-    let log = crate::spa::Log::wrap(log);
+    let log = crate::spa::Log::wrap(log, Some(D::log_topic()));
 
     let data_loop = spa_support_find(
         support,

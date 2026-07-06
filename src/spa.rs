@@ -646,21 +646,13 @@ impl System {
 pub struct Log {
     logger: &'static spa_log, // not really 'static, but it should outlive our plugin anyway
     methods: &'static spa_log_methods, // ditto
+    // the module's registered topic (see the lib.rs section entries); the
+    // host enumerates and initializes the topics at plugin load
+    topic: Option<&'static spa_log_topic>,
 }
 
-// registered once with the host logger so PIPEWIRE_DEBUG topic patterns
-// (e.g. PIPEWIRE_DEBUG=spa.oss:4) apply; the logger writes the level back
-static mut LOG_TOPIC: spa_log_topic = spa_log_topic {
-    version: 0,
-    topic: c"spa.oss".as_ptr(),
-    level: SPA_LOG_LEVEL_NONE,
-    has_custom_level: false,
-};
-
-static LOG_TOPIC_INIT: std::sync::Once = std::sync::Once::new();
-
 impl Log {
-    pub unsafe fn wrap(log: *mut spa_log) -> Self {
+    pub unsafe fn wrap(log: *mut spa_log, topic: Option<&'static spa_log_topic>) -> Self {
         let logger = log
             .cast::<spa_log>()
             .as_ref()
@@ -673,26 +665,22 @@ impl Log {
             .as_ref()
             .expect("log methods should be initialized");
         assert!(methods.version >= SPA_VERSION_LOG_METHODS);
-
-        LOG_TOPIC_INIT.call_once(|| {
-            if let Some(topic_init) = methods.topic_init {
-                topic_init(logger.iface.cb.data, std::ptr::addr_of_mut!(LOG_TOPIC));
-            }
-        });
-
-        Self { logger, methods }
+        Self {
+            logger,
+            methods,
+            topic,
+        }
     }
 
     pub fn log_level(&self) -> spa_log_level {
-        let topic = std::ptr::addr_of!(LOG_TOPIC);
-        unsafe {
-            // volatile: the host logger rewrites the registered topic's level on
-            // runtime log-level changes (inherent to the C API; same as C plugins)
-            if std::ptr::read_volatile(std::ptr::addr_of!((*topic).has_custom_level)) {
-                std::ptr::read_volatile(std::ptr::addr_of!((*topic).level))
+        if let Some(topic) = self.topic {
+            if topic.has_custom_level {
+                topic.level
             } else {
                 self.logger.level
             }
+        } else {
+            self.logger.level
         }
     }
 
@@ -701,12 +689,15 @@ impl Log {
         let func = CString::new(func).unwrap(); // ditto
                                                 // the message can carry host-derived strings; don't abort on an interior NUL
         let msg = CString::new(msg).unwrap_or_else(|_| c"<message contained NUL>".to_owned());
+        let topic = self
+            .topic
+            .map_or(std::ptr::null(), |topic| &raw const *topic);
         unsafe {
             if let Some(logt) = self.methods.logt {
                 logt(
                     self.logger.iface.cb.data,
                     level,
-                    std::ptr::addr_of!(LOG_TOPIC),
+                    topic,
                     file.as_ptr(),
                     line,
                     func.as_ptr(),

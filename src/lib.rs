@@ -57,3 +57,58 @@ pub unsafe extern "C" fn spa_handle_factory_enum(
         _ => 0,
     }
 }
+
+// The static log-topic registration the host's plugin loader enumerates:
+// one pointer per topic in a dedicated "spa_log_topic" ELF section plus a
+// `spa_log_topic_enum` symbol spanning it (SPA_LOG_TOPIC_REGISTER /
+// SPA_LOG_TOPIC_ENUM_DEFINE_REGISTERED in spa/support/log.h).
+
+use libspa::sys::{SPA_VERSION_LOG_TOPIC_ENUM, spa_log_topic};
+
+#[allow(dead_code)]
+#[cfg(target_pointer_width = "64")]
+#[repr(align(8))]
+struct AlignedTopicPointer(*mut spa_log_topic);
+
+#[unsafe(link_section = "spa_log_topic")]
+#[unsafe(no_mangle)]
+#[used]
+#[allow(non_upper_case_globals)]
+static mut spa_log_topic_export_oss_device: AlignedTopicPointer =
+    AlignedTopicPointer(&raw mut device::OSS_DEVICE_TOPIC);
+
+#[unsafe(link_section = "spa_log_topic")]
+#[unsafe(no_mangle)]
+#[used]
+#[allow(non_upper_case_globals)]
+static mut spa_log_topic_export_oss_sink: AlignedTopicPointer =
+    AlignedTopicPointer(&raw mut sink::OSS_SINK_TOPIC);
+
+#[unsafe(link_section = "spa_log_topic")]
+#[unsafe(no_mangle)]
+#[used]
+#[allow(non_upper_case_globals)]
+static mut spa_log_topic_export_oss_source: AlignedTopicPointer =
+    AlignedTopicPointer(&raw mut source::OSS_SOURCE_TOPIC);
+
+#[unsafe(link_section = "spa_log_topic")]
+#[unsafe(no_mangle)]
+#[used]
+#[allow(non_upper_case_globals)]
+static mut spa_log_topic_export_oss_monitor: AlignedTopicPointer =
+    AlignedTopicPointer(&raw mut monitor::OSS_MONITOR_TOPIC);
+
+// the linker generates these for the section
+unsafe extern "C" {
+    static __start_spa_log_topic: *mut spa_log_topic;
+    static __stop_spa_log_topic: *mut spa_log_topic;
+}
+
+#[unsafe(no_mangle)]
+#[used]
+#[allow(non_upper_case_globals)]
+static mut spa_log_topic_enum: libspa::sys::spa_log_topic_enum = libspa::sys::spa_log_topic_enum {
+    version: SPA_VERSION_LOG_TOPIC_ENUM,
+    topics: &raw const __start_spa_log_topic,
+    topics_end: &raw const __stop_spa_log_topic,
+};

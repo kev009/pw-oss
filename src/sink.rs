@@ -1058,6 +1058,13 @@ impl Direction for SinkDir {
     type Ext = SinkExt;
     type PortExt = SinkPortExt;
 
+    fn log_topic() -> &'static spa_log_topic {
+        #[allow(static_mut_refs)]
+        unsafe {
+            &OSS_SINK_TOPIC
+        }
+    }
+
     fn info_item(ext: &mut SinkExt, key: &str, value: &str) {
         if key == crate::keys::OSS_DELAY {
             // per-device default, e.g. from a wireplumber node rule
@@ -1298,6 +1305,14 @@ pub const OSS_SINK_FACTORY: spa_handle_factory = spa_handle_factory {
     get_size: Some(crate::node::get_size::<SinkDir>),
     init: Some(crate::node::init::<SinkDir>),
     enum_interface_info: Some(crate::node::enum_interface_info),
+};
+
+// mut: the host logger writes level/has_custom_level back after registration
+pub(crate) static mut OSS_SINK_TOPIC: spa_log_topic = spa_log_topic {
+    version: SPA_VERSION_LOG_TOPIC,
+    topic: c"oss.sink".as_ptr(),
+    level: SPA_LOG_LEVEL_NONE,
+    has_custom_level: false,
 };
 
 #[cfg(test)]
