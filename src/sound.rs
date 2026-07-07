@@ -629,12 +629,14 @@ impl Dsp {
   // resets to blksz (channel.c:1980) - so the order here matters, and the
   // mark survives a trigger suspend since chn_resetbuf doesn't touch it).
   // `fragment` is the normalized oss.fragment override (0 = the 1 KiB
-  // default); either way the ring keeps a 64 KiB byte budget.
+  // default); either way the ring keeps the MIN_RING_BYTES budget.
   pub fn set_small_fragments(&mut self, fragment: u32, ring: u32) {
     if self.state != DspState::Setup {
       return; // triggered channels can't retune; the next re-prime will
     }
-    let ring = ring.clamp(65536, CHN_2NDBUFMAXSIZE as u32);
+    // max-then-min, not clamp: the kernel cap must win over the floor (and
+    // clamp panics if a future rate-dependent cap undercuts MIN_RING_BYTES)
+    let ring = ring.max(MIN_RING_BYTES).min(CHN_2NDBUFMAXSIZE as u32);
     if fragment == 0 {
       set_fragment(self.fd, (ring >> 10).min(u16::MAX as u32) as u16, 10); // 1 KiB fragments
     } else {
@@ -650,28 +652,6 @@ impl Dsp {
     let _ = unsafe { libc::ioctl(self.fd, SNDCTL_DSP_LOW_WATER, &mut lw) };
   }
 
-  // GETOSPACE requires a write channel, so the shared helper reads 0 on a
-  // capture fd; GETISPACE's fragsize is the capture-side equivalent
-  pub fn blocksize(&self) -> u32 {
-    let mut info = std::mem::MaybeUninit::<audio_buf_info>::uninit();
-    if unsafe { libc::ioctl(self.fd, SNDCTL_DSP_GETISPACE, info.as_mut_ptr()) } == -1 {
-      return 0;
-    }
-    unsafe { info.assume_init().fragsize.max(0) as u32 }
-  }
-
-  // the total granted capture ring (fragstotal * fragsize): GETISPACE's
-  // `bytes` field is the current fill, not the capacity. The kernel clamps
-  // requests at CHN_2NDBUFMAXSIZE silently, so the grant must be read back,
-  // never assumed. 0 = unknown (ioctl failed, e.g. device unplugged).
-  pub fn ring_in_bytes(&self) -> u32 {
-    let mut info = std::mem::MaybeUninit::<audio_buf_info>::uninit();
-    if unsafe { libc::ioctl(self.fd, SNDCTL_DSP_GETISPACE, info.as_mut_ptr()) } == -1 {
-      return 0;
-    }
-    let info = unsafe { info.assume_init() };
-    (info.fragstotal.max(0) as u32).saturating_mul(info.fragsize.max(0) as u32)
-  }
 
   // Stop the channel but keep the fd: SETTRIGGER(0) aborts, resets the ring
   // and clears TRIGGERED, so the next prime retunes and poll() force-starts
@@ -728,6 +708,22 @@ impl Dsp {
     } else {
       0
     }
+  }
+
+  // fill, granted fragment and total ring from ONE GETISPACE: the prime path
+  // needs all three and they come from the same struct (fragsize/fragstotal
+  // are layout constants after SETFRAGMENT; only `bytes` moves). (0, 0, 0) =
+  // ioctl failed (e.g. device unplugged mid-stream).
+  pub fn ispace_layout(&mut self) -> (u32, u32, u32) {
+    assert_eq!(self.state, DspState::Running);
+    let mut info = std::mem::MaybeUninit::<audio_buf_info>::uninit();
+    if unsafe { libc::ioctl(self.fd, SNDCTL_DSP_GETISPACE, info.as_mut_ptr()) } == -1 {
+      return (0, 0, 0);
+    }
+    let info = unsafe { info.assume_init() };
+    (info.bytes.max(0) as u32,
+     info.fragsize.max(0) as u32,
+     (info.fragstotal.max(0) as u32).saturating_mul(info.fragsize.max(0) as u32))
   }
 
   pub fn overruns(&self) -> u32 {
