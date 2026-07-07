@@ -253,10 +253,8 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
       // re-tunes in place, so prime never recomputes them). Refresh the
       // arrival quantum too: the prime-time snapshot may predate this
       // channel state, and re-tunes are rare so the ioctl is cheap.
-      let chunk = (port.dsp.hw_quantum_ns as u128)
-        .saturating_mul(rate as u128)
-        .saturating_mul(stride as u128) / 1_000_000_000;
-      port.setup_blocksize = port.dsp.blocksize().max(chunk.min(u32::MAX as u128) as u32);
+      let chunk = crate::utils::ns_to_bytes(port.dsp.hw_quantum_ns, rate, stride);
+      port.setup_blocksize = port.dsp.blocksize().max(chunk);
       let (target, peak) = fill_targets(period_in_bytes, port.setup_blocksize, port.ext.ring_size);
       port.ext.target_fill = target;
       port.ext.read_peak   = peak;
@@ -322,10 +320,8 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
       // the measurement/arrival quantum is the granted fragment or the
       // hardware cadence sndstat reports, whichever is coarser (see the
       // sink); data arrives in these lumps regardless of the soft fragment
-      let chunk = (port.dsp.hw_quantum_ns as u128)
-        .saturating_mul(rate as u128)
-        .saturating_mul(stride as u128) / 1_000_000_000;
-      port.setup_blocksize = port.dsp.blocksize().max(chunk.min(u32::MAX as u128) as u32);
+      let chunk = crate::utils::ns_to_bytes(port.dsp.hw_quantum_ns, rate, stride);
+      port.setup_blocksize = port.dsp.blocksize().max(chunk);
       // the ACTUAL grant, not the request: the kernel clamps the ring at
       // CHN_2NDBUFMAXSIZE silently, and the fill geometry must fit reality
       port.ext.ring_size = port.dsp.ring_in_bytes();

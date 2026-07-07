@@ -663,6 +663,16 @@ pub fn device_period_bytes(target_duration: u64, device_rate: u32, graph_rate: u
     .min(u32::MAX as u64) as u32
 }
 
+// a nanosecond interval (hardware drain quantum, elapsed time) expressed in
+// device bytes; saturating and clamped - the inputs are device- or
+// clock-provided and an overflow here would abort the data loop
+pub fn ns_to_bytes(ns: u64, rate: u32, stride: u32) -> u32 {
+  ((ns as u128)
+    .saturating_mul(rate as u128)
+    .saturating_mul(stride as u128) / 1_000_000_000)
+    .min(u32::MAX as u128) as u32
+}
+
 // Deserialize a host-supplied pod without trusting it: libspa's
 // deserializer divides by a pod-declared child size (Choice pods) and
 // pre-allocates from declared lengths, so a hostile pod can panic it -

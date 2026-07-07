@@ -1061,20 +1061,25 @@ pub(crate) unsafe fn install_device<D: Direction>(state: &mut State<D>, port_idx
 // two quanta plus the delay target. Publish node.max-latency once the stride
 // is known so the graph never negotiates a quantum the kernel ring can't hold
 // four of (pw_impl_node parses the fraction into max_latency, which caps the
-// driver quantum). Emitted only when the cap bites below the common 2048
-// default; published once - the props dict is append-only, and a stride
-// change without a node rebuild is not worth a duplicate entry.
+// driver quantum). Emitted only when the cap bites below the common
+// 2048-frame default in TIME, at a conservative 44.1 kHz reference -
+// clock.rate is unknown here and an over-published cap is inert (sound.rs
+// advertised_quantum_cap_frames); published once -
+// the props dict is append-only, and a stride change without a node rebuild
+// is not worth a duplicate entry.
 unsafe fn publish_ring_quantum_cap<D: Direction>(state: &mut State<D>, port_idx: usize) {
   let Some(config) = state.ports[port_idx].config.as_ref() else { return };
   let stride = config.stride().max(1);
   let rate   = config.rate();
-  let frames = crate::sound::CHN_2NDBUFMAXSIZE as u32 / stride / 4;
-  if frames >= 2048 || rate == 0 || state.ring_cap_published {
+  // the shared ring policy (sound.rs); the published fraction is time-based
+  // (frames/device rate), so it needs no graph-rate scaling
+  let Some(frames) = crate::sound::advertised_quantum_cap_frames(stride, rate) else { return };
+  if state.ring_cap_published {
     return;
   }
   state.ring_cap_published = true;
   crate::info!(state.log, "kernel ring ({} bytes) at stride {} holds 4 periods only up to \
-    quantum {}; publishing node.max-latency", crate::sound::CHN_2NDBUFMAXSIZE, stride, frames);
+    quantum {}; publishing node.max-latency", crate::sound::ring_byte_cap(stride, rate), stride, frames);
   let _ = state.node_info.replace_change_mask(0);
   state.node_info.add_prop("node.max-latency", format!("{}/{}", frames, rate));
   emit_node_info(state);

@@ -73,6 +73,61 @@ const PCM_ENABLE_OUTPUT: c_int = 0x00000002;
 // sys/dev/sound/pcm/channel.h
 pub const CHN_2NDBUFMAXSIZE: usize = 131072;
 
+// every ring request keeps at least this byte budget, both directions
+pub const MIN_RING_BYTES: u32 = 65536;
+
+// The kernel's per-channel soft-ring byte budget. Today the fixed
+// CHN_2NDBUFMAXSIZE; the pending hw.snd.secondary_buffer_max kernel change
+// makes it rate-dependent (stride x rate x 200ms, clamped to the sysctl).
+// Adapt HERE and every ring request, retune gate and advertised quantum cap
+// follows. Note the cap always wins over MIN_RING_BYTES at the use sites (a
+// future cap can undercut the floor).
+pub fn ring_byte_cap(_stride: u32, _rate: u32) -> u32 {
+  CHN_2NDBUFMAXSIZE as u32
+}
+
+// One graph cycle of the LARGEST quantum the graph commonly drives (the
+// 2048-frame default), in DEVICE bytes - a device running above the graph
+// rate needs proportionally more device frames per cycle - clamped so four
+// such periods still fit the ring cap. This is the shared policy behind the
+// sink's stable ring floor, the capture ring request and the advertised
+// node.max-latency (node.rs publish_ring_quantum_cap): ring requests floor
+// on it so quantum changes retune in place instead of resizing the device.
+// graph_rate 0 (no position mapped yet) falls back to device frames.
+pub fn max_ring_period_bytes(stride: u32, device_rate: u32, graph_rate: u32) -> u32 {
+  let stride = stride.max(1);
+  let default_max = if graph_rate == 0 {
+    2048u32.saturating_mul(stride)
+  } else {
+    crate::utils::device_period_bytes(2048, device_rate, graph_rate, stride)
+  };
+  let cap_frames = ring_byte_cap(stride, device_rate) / stride / 4;
+  default_max.min(cap_frames.saturating_mul(stride))
+}
+
+// The ring-derived quantum cap worth ADVERTISING as node.max-latency:
+// ring/4 in device frames, published only when that is shorter in TIME than
+// the common 2048-frame default max quantum. Raw device frames would
+// suppress the cap on high-rate devices whose ring is short in time
+// (192 kHz stereo: 4096 device frames is only 1024 graph frames at 48 kHz).
+// PipeWire scales its quantum limits with the graph rate (context.c,
+// SPA_SCALE32(max_quantum, rate, clock.rate)), so the default is a fixed
+// 2048/clock.rate of TIME - but clock.rate is host config we can't see from
+// here, so compare against the lowest common one (44100): max-latency only
+// ever LOWERS the quantum, so an over-published cap is inert, while an
+// under-published one leaves a structurally glitching ring unprotected. The
+// published fraction itself is time-based (frames / device rate) and thus
+// correct at whatever rate the graph actually runs. None = the cap can't
+// bite below the default, nothing worth publishing.
+pub fn advertised_quantum_cap_frames(stride: u32, rate: u32) -> Option<u32> {
+  let stride = stride.max(1);
+  let frames = ring_byte_cap(stride, rate) / stride / 4;
+  if rate == 0 || frames as u64 * 44100 >= 2048 * rate as u64 {
+    return None;
+  }
+  Some(frames)
+}
+
 #[repr(C)]
 struct audio_buf_info {
   fragments:  c_int,
@@ -800,10 +855,11 @@ impl DspWriter {
   }
 
   // Stop the channel but keep the fd: SETTRIGGER(0) aborts, resets the ring
-  // and sets NOTRIGGER (writes only buffer until armed), and clears
-  // TRIGGERED so the next prime's SETFRAGMENT is legal again; write() and
-  // write_zeroes() arm the channel once the prefill is buffered. false =
-  // driver refused; the caller falls back to closing.
+  // (discarding queued audio, exactly like close's HALT) and sets NOTRIGGER
+  // (writes only buffer until armed), and clears TRIGGERED so the next
+  // prime's SETFRAGMENT is legal again; write() arms the channel once real
+  // data is buffered (write_zeroes only buffers, it never arms). false =
+  // driver refused; the caller falls back to rebuilding.
   pub fn suspend(&mut self) -> bool {
     if self.state != DspState::Running {
       return true; // nothing runs; already primable
@@ -837,6 +893,10 @@ impl DspWriter {
   /// FreeBSD clamps the fragment count, so the grant can be much smaller than
   /// requested; size the target delay to the return value, not `len`.
   /// `fragment` is the normalized oss.fragment override (0 = 1 KiB default).
+  /// Returns 0 when the grant can't be read back (the device vanished): the
+  /// caller caches this value across period changes, and a fictitious
+  /// capacity would gate quantum changes onto the in-place retune path
+  /// forever with a fill target the real ring can't hold.
   pub fn set_buffer_size(&mut self, len: u32, fragment: u32) -> u32 {
     assert_eq!(self.state, DspState::Setup);
     if fragment == 0 {
@@ -852,8 +912,7 @@ impl DspWriter {
       set_fragment(self.fd, count as u16, fragment.trailing_zeros() as u16);
     }
     // nothing's written yet, so GETOSPACE reports the granted buffer size
-    let granted = ospace_in_bytes(self.fd);
-    if granted > 0 { granted as u32 } else { len }
+    ospace_in_bytes(self.fd).max(0) as u32
   }
 
   pub unsafe fn write(&mut self, buf: *const c_void, count: u32) -> ssize_t {
@@ -1025,6 +1084,33 @@ pub fn list_pcm_devices(indexes: &[u32]) -> Vec<PcmDevice> {
 
 #[cfg(test)]
 mod tests {
+  #[test]
+  fn max_ring_period_policy() {
+    // stereo S32, device rate == graph rate: the 2048-frame default
+    assert_eq!(super::max_ring_period_bytes(8, 48000, 48000), 16384);
+    // a 96k device under a 48k graph needs twice the device frames per cycle
+    assert_eq!(super::max_ring_period_bytes(8, 96000, 48000), 32768);
+    // fat stride: the kernel ring cap binds (ring/4, frame-aligned)
+    assert_eq!(super::max_ring_period_bytes(40, 48000, 48000), 819 * 40);
+    // unknown graph rate falls back to device frames
+    assert_eq!(super::max_ring_period_bytes(8, 48000, 0), 16384);
+  }
+
+  #[test]
+  fn advertised_quantum_cap() {
+    // stride 8 @48k: ring/4 = 4096 device frames >= the 2048 default - no cap
+    assert_eq!(super::advertised_quantum_cap_frames(8, 48000), None);
+    // 192k device: 4096 device frames is only 1024 frames at a 48k graph
+    assert_eq!(super::advertised_quantum_cap_frames(8, 192000), Some(4096));
+    // 96k device: on the 42.7ms boundary - published for a 44.1k clock.rate
+    // (inert at the 48k default, where the cap equals the max quantum)
+    assert_eq!(super::advertised_quantum_cap_frames(8, 96000), Some(4096));
+    // fat stride @48k: 819 device frames < 2048 - the original case
+    assert_eq!(super::advertised_quantum_cap_frames(40, 48000), Some(819));
+    // 44.1k stereo: 4096 device frames is ~4458 graph frames - no cap
+    assert_eq!(super::advertised_quantum_cap_frames(8, 44100), None);
+  }
+
   #[test]
   fn drain_quantum_probe() {
     for unit in [0u32, 1, 6] {
