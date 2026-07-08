@@ -1,6 +1,6 @@
 [package]
 name        = "spa-freebsd-oss-ng"
-version     = "0.9.4"
+version     = "0.9.5"
 edition     = "2021"
 description = "FreeBSD OSS sound input/output plugin for PipeWire"
 authors     = ["Alex S <shkhln@users.noreply.github.com>", "Kevin Bowling <kevin.bowling@kev009.com>"]
