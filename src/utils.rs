@@ -214,9 +214,12 @@ pub fn snap_raw_to_caps(caps: &crate::sound::DspCaps, raw: &mut libspa::sys::spa
   changed
 }
 
-// One EnumFormat result per channel count the device grants, with the kernel's
-// interleave order as the position array. Returns false when `index` is past
-// the last result.
+// One EnumFormat pod per offered channel width, positions from the kernel
+// interleave. When 2ch is in range it is listed first (host default) and last
+// (pulse-server falls back to the last EnumFormat map when Format is gone;
+// HW routes always report 2ch volume, so a last width of 1/max would thrash
+// cvolume.channels). That can mean two entries for stereo. Returns false when
+// `index` is past the last result.
 pub unsafe fn build_enum_format_info(b: &mut libspa::pod::builder::Builder, caps: &crate::sound::DspCaps, index: u32) -> Result<bool, rustix::io::Errno> {
 
   use libspa::sys::*;
@@ -227,15 +230,20 @@ pub unsafe fn build_enum_format_info(b: &mut libspa::pod::builder::Builder, caps
     return Ok(false);
   }
 
-  // counts with a defined kernel interleave order, within the granted range;
-  // stereo first: the host takes the first result as the default format
+  // standard widths in range, then native max if missing (AUX for non-std)
   let mut counts = [2u32, 4, 6, 8, 1].iter().copied()
     .filter(|c| *c >= caps.min_channels && *c <= caps.max_channels)
     .collect::<Vec<_>>();
-  // always offer the full native width too (e.g. 10-channel USB mixers);
-  // non-standard counts go out as AUX channels
   if !counts.contains(&caps.max_channels) {
     counts.push(caps.max_channels);
+  }
+  // pin 2 first and last (see fn doc); no-op when already only [2]
+  if caps.min_channels <= 2 && caps.max_channels >= 2 {
+    counts.retain(|c| *c != 2);
+    counts.insert(0, 2);
+    if counts.last() != Some(&2) {
+      counts.push(2);
+    }
   }
 
   let Some(&channels) = counts.get(index as usize) else {
