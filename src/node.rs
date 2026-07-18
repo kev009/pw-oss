@@ -823,6 +823,55 @@ pub(crate) unsafe fn set_timeout<D: Direction>(state: &mut State<D>, next_time: 
     }
 }
 
+// the io areas set_io accepts, with the geometry a full deref needs
+const NODE_IO_AREAS: [(u32, usize, usize); 2] = [
+    (
+        SPA_IO_Clock,
+        std::mem::size_of::<spa_io_clock>(),
+        std::mem::align_of::<spa_io_clock>(),
+    ),
+    (
+        SPA_IO_Position,
+        std::mem::size_of::<spa_io_position>(),
+        std::mem::align_of::<spa_io_position>(),
+    ),
+];
+
+// ditto for port_set_io
+const PORT_IO_AREAS: [(u32, usize, usize); 2] = [
+    (
+        SPA_IO_Buffers,
+        std::mem::size_of::<spa_io_buffers>(),
+        std::mem::align_of::<spa_io_buffers>(),
+    ),
+    (
+        SPA_IO_RateMatch,
+        std::mem::size_of::<spa_io_rate_match>(),
+        std::mem::align_of::<spa_io_rate_match>(),
+    ),
+];
+
+// The io-area admission shared by set_io and port_set_io: an id outside the
+// caller's table is -ENOENT; NULL/0 clears the area; a non-empty area must
+// admit a full deref of the struct. A short one is -ENOSPC - the installed
+// header specifies it for both entry points ("-ENOSPC when \a size is too
+// small", spa/node/node.h set_io and port_set_io) - while a misaligned one
+// stays the generic invalid-argument -EINVAL (no closer errno is specified).
+fn io_area_ok(table: &[(u32, usize, usize)], id: u32, data: *const c_void, size: usize) -> c_int {
+    let Some(&(_, min_size, align)) = table.iter().find(|(t, _, _)| *t == id) else {
+        return -libc::ENOENT;
+    };
+    if !data.is_null() {
+        if size < min_size {
+            return -libc::ENOSPC;
+        }
+        if data as usize % align != 0 {
+            return -libc::EINVAL;
+        }
+    }
+    0
+}
+
 unsafe extern "C" fn set_io<D: Direction>(
     object: *mut c_void,
     id: u32,
@@ -832,24 +881,9 @@ unsafe extern "C" fn set_io<D: Direction>(
     let state: *mut State<D> = object.cast();
     assert!(!state.is_null());
 
-    #[allow(non_upper_case_globals)]
-    let (min_size, align) = match id {
-        SPA_IO_Clock => (
-            std::mem::size_of::<spa_io_clock>(),
-            std::mem::align_of::<spa_io_clock>(),
-        ),
-        SPA_IO_Position => (
-            std::mem::size_of::<spa_io_position>(),
-            std::mem::align_of::<spa_io_position>(),
-        ),
-        _ => return -libc::ENOENT,
-    };
-    // NULL/0 clears the area; only a non-empty-but-short (or misaligned) one
-    // is an error. -EINVAL, not -ENOSPC: the installed SPA/pipewire headers
-    // use ENOSPC for map/array exhaustion only and show no undersized-io-area
-    // convention, so stay with the generic invalid-argument errno.
-    if !data.is_null() && (size < min_size || data as usize % align != 0) {
-        return -libc::EINVAL;
+    let res = io_area_ok(&NODE_IO_AREAS, id, data, size);
+    if res != 0 {
+        return res;
     }
 
     // clock/position are read on the data loop; apply the change there.
@@ -1818,23 +1852,9 @@ unsafe extern "C" fn port_set_io<D: Direction>(
         return -libc::EINVAL;
     }
 
-    #[allow(non_upper_case_globals)]
-    let (min_size, align) = match id {
-        SPA_IO_Buffers => (
-            std::mem::size_of::<spa_io_buffers>(),
-            std::mem::align_of::<spa_io_buffers>(),
-        ),
-        SPA_IO_RateMatch => (
-            std::mem::size_of::<spa_io_rate_match>(),
-            std::mem::align_of::<spa_io_rate_match>(),
-        ),
-        _ => return -libc::ENOENT,
-    };
-    // NULL/0 clears the area; only a non-empty-but-short (or misaligned) one
-    // is an error (process derefs the full struct, as set_io guards for
-    // clock/position; see set_io for the -EINVAL-over--ENOSPC note)
-    if !data.is_null() && (size < min_size || data as usize % align != 0) {
-        return -libc::EINVAL;
+    let res = io_area_ok(&PORT_IO_AREAS, id, data, size);
+    if res != 0 {
+        return res;
     }
 
     let state =
@@ -2257,5 +2277,189 @@ pub(crate) unsafe extern "C" fn enum_interface_info(
             }
             _ => 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sink::SinkDir;
+
+    // the oss.fragment normalization contract: 0 stays automatic, everything
+    // else rounds DOWN to a power of two and clamps into [64, 16384]
+    #[test]
+    fn normalize_fragment_rounds_down_and_clamps() {
+        assert_eq!(normalize_fragment(0), 0); // automatic
+        assert_eq!(normalize_fragment(1), 64); // clamps up to the floor
+        assert_eq!(normalize_fragment(63), 64); // rounds to 32, clamps to 64
+        assert_eq!(normalize_fragment(64), 64);
+        assert_eq!(normalize_fragment(65), 64); // round-down, then in range
+        assert_eq!(normalize_fragment(1000), 512); // non-pow2 rounds down
+        assert_eq!(normalize_fragment(4096), 4096); // pow2 passes through
+        assert_eq!(normalize_fragment(16384), 16384);
+        assert_eq!(normalize_fragment(30000), 16384); // clamps to the ceiling
+        assert_eq!(normalize_fragment(1 << 31), 16384);
+        assert_eq!(normalize_fragment(u32::MAX), 16384);
+    }
+
+    // an aligned backing store for the admission tests (every io struct's
+    // alignment divides 16)
+    #[repr(align(16))]
+    struct Aligned([u8; 4096]);
+
+    #[test]
+    fn io_area_admission_null_short_exact_misaligned() {
+        let mut area = Aligned([0; 4096]);
+        let p = area.0.as_mut_ptr().cast::<c_void>();
+        let full = std::mem::size_of::<spa_io_clock>();
+
+        // NULL/0 clears whatever the size says
+        assert_eq!(
+            io_area_ok(&NODE_IO_AREAS, SPA_IO_Clock, std::ptr::null(), 0),
+            0
+        );
+        // exact and oversized areas are admitted
+        assert_eq!(io_area_ok(&NODE_IO_AREAS, SPA_IO_Clock, p, full), 0);
+        assert_eq!(io_area_ok(&NODE_IO_AREAS, SPA_IO_Clock, p, full + 8), 0);
+        // a non-empty-but-short area is -ENOSPC (the header's "size is too
+        // small" errno for set_io/port_set_io)
+        assert_eq!(
+            io_area_ok(&NODE_IO_AREAS, SPA_IO_Clock, p, full - 1),
+            -libc::ENOSPC
+        );
+        // a misaligned one is the generic -EINVAL
+        let off = unsafe { p.cast::<u8>().add(1) }.cast::<c_void>();
+        assert_eq!(
+            io_area_ok(&NODE_IO_AREAS, SPA_IO_Clock, off, full),
+            -libc::EINVAL
+        );
+        // ids outside the caller's table are -ENOENT (set_io does not take
+        // the port areas and vice versa)
+        assert_eq!(
+            io_area_ok(&NODE_IO_AREAS, SPA_IO_Buffers, p, full),
+            -libc::ENOENT
+        );
+        assert_eq!(
+            io_area_ok(&PORT_IO_AREAS, SPA_IO_Clock, p, full),
+            -libc::ENOENT
+        );
+        // the port table's own areas admit the same policy
+        let bsize = std::mem::size_of::<spa_io_buffers>();
+        assert_eq!(io_area_ok(&PORT_IO_AREAS, SPA_IO_Buffers, p, bsize), 0);
+        assert_eq!(
+            io_area_ok(&PORT_IO_AREAS, SPA_IO_Buffers, p, bsize - 1),
+            -libc::ENOSPC
+        );
+        // a short AND misaligned area reports the size problem first: the
+        // host's remedy (grow the area) subsumes re-placing it
+        let off = unsafe { p.cast::<u8>().add(1) }.cast::<c_void>();
+        assert_eq!(
+            io_area_ok(&PORT_IO_AREAS, SPA_IO_Buffers, off, bsize - 1),
+            -libc::ENOSPC
+        );
+        assert_eq!(
+            io_area_ok(&PORT_IO_AREAS, SPA_IO_RateMatch, std::ptr::null(), 0),
+            0
+        );
+    }
+
+    fn test_port(fd: std::os::raw::c_int) -> Port<SinkDir> {
+        Port {
+            config: None,
+            buffers: vec![],
+            io: crate::spa::IoArea::null(),
+            rate_match: crate::spa::IoArea::null(),
+            dsp: crate::sound::DspWriter::test_on_fd(fd, 8),
+            dll: Default::default(),
+            setup_period: 0,
+            bw_adapt: Default::default(),
+            setup_blocksize: 0,
+            resetup_pending: false,
+            was_matching: false,
+            warn_limit: crate::utils::RateLimit::new(),
+            ext: Default::default(),
+        }
+    }
+
+    // a stack fixture: one spa_buffer with one MemPtr data block; the tests
+    // then break one field at a time
+    fn fixture(payload: &mut [u8], chunk: *mut spa_chunk) -> (spa_buffer, Box<spa_data>) {
+        let mut data: spa_data = unsafe { std::mem::zeroed() };
+        data.type_ = SPA_DATA_MemPtr;
+        data.maxsize = payload.len() as u32;
+        data.data = payload.as_mut_ptr().cast();
+        data.chunk = chunk;
+        let mut data = Box::new(data);
+        let mut buffer: spa_buffer = unsafe { std::mem::zeroed() };
+        buffer.n_datas = 1;
+        buffer.datas = &mut *data;
+        (buffer, data)
+    }
+
+    // the per-cycle buffer gate: exactly one MemPtr block with data, chunk
+    // and maxsize all valid is admitted; everything else skips (None), never
+    // faults - buffer_id and the block layout come from the peer
+    #[test]
+    fn valid_data_block_admits_only_a_usable_memptr_block() {
+        let (r, w) = crate::sound::test_util::pipe_pair(true, true);
+        let mut port = test_port(w);
+        let log = crate::spa::Log::test_null();
+        let mut payload = [0u8; 64];
+        let mut chunk: spa_chunk = unsafe { std::mem::zeroed() };
+
+        // happy path: the descriptor carries the validated pointers by value
+        let (mut buffer, _data) = fixture(&mut payload, &mut chunk);
+        port.buffers = vec![&mut buffer];
+        let block = unsafe { valid_data_block(&port, 0, &log) };
+        assert!(block.is_some_and(|d| {
+            std::ptr::eq(d.data.as_ptr(), payload.as_ptr().cast())
+                && std::ptr::eq(d.chunk.as_ptr(), &raw const chunk)
+                && d.maxsize == payload.len() as u32
+        }));
+
+        // out-of-range buffer_id
+        assert!(unsafe { valid_data_block(&port, 1, &log) }.is_none());
+
+        // a null host buffer pointer
+        port.buffers = vec![std::ptr::null_mut()];
+        assert!(unsafe { valid_data_block(&port, 0, &log) }.is_none());
+
+        // n_datas != 1
+        let (mut buffer, _data) = fixture(&mut payload, &mut chunk);
+        buffer.n_datas = 2;
+        port.buffers = vec![&mut buffer];
+        assert!(unsafe { valid_data_block(&port, 0, &log) }.is_none());
+
+        // null datas array
+        let (mut buffer, _data) = fixture(&mut payload, &mut chunk);
+        buffer.datas = std::ptr::null_mut();
+        port.buffers = vec![&mut buffer];
+        assert!(unsafe { valid_data_block(&port, 0, &log) }.is_none());
+
+        // null data pointer
+        let (mut buffer, mut data) = fixture(&mut payload, &mut chunk);
+        data.data = std::ptr::null_mut();
+        port.buffers = vec![&mut buffer];
+        assert!(unsafe { valid_data_block(&port, 0, &log) }.is_none());
+
+        // null chunk
+        let (mut buffer, mut data) = fixture(&mut payload, &mut chunk);
+        data.chunk = std::ptr::null_mut();
+        port.buffers = vec![&mut buffer];
+        assert!(unsafe { valid_data_block(&port, 0, &log) }.is_none());
+
+        // zero maxsize
+        let (mut buffer, mut data) = fixture(&mut payload, &mut chunk);
+        data.maxsize = 0;
+        port.buffers = vec![&mut buffer];
+        assert!(unsafe { valid_data_block(&port, 0, &log) }.is_none());
+
+        // a non-MemPtr block
+        let (mut buffer, mut data) = fixture(&mut payload, &mut chunk);
+        data.type_ = SPA_DATA_MemFd;
+        port.buffers = vec![&mut buffer];
+        assert!(unsafe { valid_data_block(&port, 0, &log) }.is_none());
+
+        unsafe { libc::close(r) };
     }
 }
