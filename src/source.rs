@@ -408,7 +408,7 @@ unsafe fn bounded_read(
 // `overrun_count` is the counter the caller read this cycle (nonzero, or
 // this isn't called) and `now` the caller's timestamp; measured outside so
 // tests can drive the pin gate.
-unsafe fn recover_overrun(
+fn recover_overrun(
     port: &mut crate::node::Port<SourceDir>,
     overrun_count: u32,
     pre_read_fill: Option<u32>,
@@ -437,7 +437,8 @@ unsafe fn recover_overrun(
         overrun_count, now, suppressed);
         }
         // only for real recovery, not per ignored tick
-        crate::node::emit_xrun(callbacks, now / 1000);
+        // the host callback table outlives the node (set_callbacks contract)
+        unsafe { crate::node::emit_xrun(callbacks, now / 1000) };
 
         // recover like the sink's underrun path: re-enter priming next cycle,
         // which drains the backlog and relocks the DLL - otherwise the
@@ -842,18 +843,18 @@ impl Direction for SourceDir {
         try_open_configure(dsp, config, fragment, log)
     }
 
-    unsafe fn on_device_swapped(state: &mut State<SourceDir>, port_idx: usize) {
+    fn on_device_swapped(state: &mut State<SourceDir>, port_idx: usize) {
         let port = &mut state.ports[port_idx];
         port.dll.init(); // fresh device, fresh servo
         port.ext.primed = false;
         port.ext.active_buffers = 0;
     }
 
-    unsafe fn on_buffers_swapped(state: &mut State<SourceDir>, port_idx: usize) {
+    fn on_buffers_swapped(state: &mut State<SourceDir>, port_idx: usize) {
         state.ports[port_idx].ext.active_buffers = 0;
     }
 
-    unsafe fn on_start_loop(state: &mut State<SourceDir>) {
+    fn on_start_loop(state: &mut State<SourceDir>) {
         // the device kept capturing across a Pause; re-prime so the first
         // cycles deliver fresh audio at a known fill, not the paused backlog
         for port in &mut state.ports {
@@ -863,13 +864,13 @@ impl Direction for SourceDir {
         }
     }
 
-    unsafe fn on_suspend_loop(state: &mut State<SourceDir>) {
+    fn on_suspend_loop(state: &mut State<SourceDir>) {
         for port in &mut state.ports {
             port.ext.primed = false; // resume re-primes for a known fill
         }
     }
 
-    unsafe fn on_role_flip(_state: &mut State<SourceDir>) {}
+    fn on_role_flip(_state: &mut State<SourceDir>) {}
 
     // data loop only
     unsafe fn update_timers(state: &mut State<SourceDir>) {
@@ -900,18 +901,18 @@ impl Direction for SourceDir {
 
     unsafe fn debug_cycle(_state: &State<SourceDir>, _now: u64, _nsec: u64) {}
 
-    unsafe fn servo_ready(port: &crate::node::Port<SourceDir>) -> bool {
+    fn servo_ready(port: &crate::node::Port<SourceDir>) -> bool {
         port.ext.primed
     }
 
     // the pre-read fill here and process()'s post-drain accounting see the
     // same signal: we drain the ring every cycle, so what's queued is one
     // period's accumulation
-    unsafe fn servo_fill(port: &mut crate::node::Port<SourceDir>) -> u32 {
+    fn servo_fill(port: &mut crate::node::Port<SourceDir>) -> u32 {
         port.dsp.ispace_in_bytes().max(0) as u32
     }
 
-    unsafe fn servo_hold(_port: &crate::node::Port<SourceDir>) -> bool {
+    fn servo_hold(_port: &crate::node::Port<SourceDir>) -> bool {
         false // the primed gate already covers recovery
     }
 
@@ -1107,19 +1108,19 @@ mod tests {
         let log = crate::spa::Log::test_null();
 
         // two pinned cycles: counted, no recovery yet
-        unsafe { recover_overrun(&mut port, 4, Some(8000), 0, &callbacks, &log) };
-        unsafe { recover_overrun(&mut port, 4, Some(8000), 0, &callbacks, &log) };
+        recover_overrun(&mut port, 4, Some(8000), 0, &callbacks, &log);
+        recover_overrun(&mut port, 4, Some(8000), 0, &callbacks, &log);
         assert_eq!(port.ext.pinned_cycles, 2);
         assert!(port.ext.primed);
 
         // a drainable fill resets the pin streak (kernel disposed upstream)
-        unsafe { recover_overrun(&mut port, 4, Some(100), 0, &callbacks, &log) };
+        recover_overrun(&mut port, 4, Some(100), 0, &callbacks, &log);
         assert_eq!(port.ext.pinned_cycles, 0);
         assert!(port.ext.primed);
 
         // three consecutive pinned cycles: recovery re-primes
         for _ in 0..3 {
-            unsafe { recover_overrun(&mut port, 4, Some(8000), 0, &callbacks, &log) };
+            recover_overrun(&mut port, 4, Some(8000), 0, &callbacks, &log);
         }
         assert_eq!(port.ext.pinned_cycles, 0);
         assert!(!port.ext.primed);

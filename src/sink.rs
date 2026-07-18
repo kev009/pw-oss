@@ -237,7 +237,7 @@ fn log_delay_capped(log: &crate::spa::Log, path: &str, granted: u32) {
 // A grant too small re-primes in place via a trigger suspend (SETFRAGMENT
 // becomes legal again). Returns true when the driver refused the trigger stop
 // (dying fd) and only a main-thread rebuild remains.
-unsafe fn retune_period(
+fn retune_period(
     port: &mut crate::node::Port<SinkDir>,
     period_in_bytes: u32,
     stride: u32,
@@ -265,7 +265,7 @@ unsafe fn retune_period(
     // prime) cannot have changed; reusing it avoids an ioctl here
     let blocksize = port.setup_blocksize;
     let desired = desired_delay(period_in_bytes, oss_delay);
-    let write_max = period_in_bytes.max(rate_match_bytes(port.rate_match, stride));
+    let write_max = period_in_bytes.max(unsafe { rate_match_bytes(port.rate_match, stride) });
     if port.ext.buffer_size >= buffer_required(period_in_bytes, desired, blocksize, write_max) {
         let old_period = port.setup_period;
         let delay_capped = commit_geometry(
@@ -342,7 +342,7 @@ unsafe fn retune_period(
 // debug-build diagnostics: the scheduling class/priority the data loop
 // actually runs at (RT setup problems show up here first)
 #[cfg(debug_assertions)]
-unsafe fn debug_log_priorities(log: &crate::spa::Log) {
+fn debug_log_priorities(log: &crate::spa::Log) {
     fn prio_type(type_: libc::c_ushort) -> &'static str {
         match type_ {
             libc::RTP_PRIO_REALTIME => "realtime",
@@ -364,8 +364,8 @@ unsafe fn debug_log_priorities(log: &crate::spa::Log) {
 
     let mut rtp = libc::rtprio { type_: 0, prio: 0 };
 
-    let pid = libc::getpid();
-    if libc::rtprio(libc::RTP_LOOKUP, pid, &mut rtp) != -1 {
+    let pid = unsafe { libc::getpid() };
+    if unsafe { libc::rtprio(libc::RTP_LOOKUP, pid, &mut rtp) } != -1 {
         crate::warn!(
             log,
             "process priority ({:5}): type = {}, prio = {}",
@@ -376,7 +376,7 @@ unsafe fn debug_log_priorities(log: &crate::spa::Log) {
     }
 
     let tid = gettid();
-    if libc::rtprio_thread(libc::RTP_LOOKUP, tid, &mut rtp) != -1 {
+    if unsafe { libc::rtprio_thread(libc::RTP_LOOKUP, tid, &mut rtp) } != -1 {
         crate::warn!(
             log,
             "thread priority ({:6}): type = {}, prio = {}",
@@ -391,7 +391,7 @@ unsafe fn debug_log_priorities(log: &crate::spa::Log) {
 // suspend from the retune/resize path), so the ring layout can be applied.
 // Size the ring, commit the fill geometry and pre-fill to target; the
 // cycle's real write then arms the channel.
-unsafe fn prime_playback(
+fn prime_playback(
     port: &mut crate::node::Port<SinkDir>,
     period_in_bytes: u32,
     graph_rate: u32,
@@ -418,7 +418,7 @@ unsafe fn prime_playback(
     // the ceiling above the floor.
     let desired = desired_delay(period_in_bytes, oss_delay);
     let chunk = crate::utils::ns_to_frame_bytes(port.dsp.hw_quantum_ns, cfg_rate, stride);
-    let write_max = period_in_bytes.max(rate_match_bytes(port.rate_match, stride));
+    let write_max = period_in_bytes.max(unsafe { rate_match_bytes(port.rate_match, stride) });
     let max_period = crate::sound::max_ring_period_bytes(stride, cfg_rate, graph_rate);
     let request = buffer_request(
         period_in_bytes,
@@ -483,7 +483,7 @@ unsafe fn prime_playback(
 // the host once, not per held cycle.
 // `underrun_count` is the counter the caller read this cycle (nonzero, or
 // this isn't called); measured outside so tests can drive the gate.
-unsafe fn detect_underrun(
+fn detect_underrun(
     port: &mut crate::node::Port<SinkDir>,
     period_in_bytes: u32,
     underrun_count: u32,
@@ -536,7 +536,8 @@ unsafe fn detect_underrun(
             port.ext.xrun_timestamp = clock_nsec.max(1);
 
             // once per event, not per held cycle
-            crate::node::emit_xrun(callbacks, cur_timestamp / 1000);
+            // the host callback table outlives the node (set_callbacks contract)
+            unsafe { crate::node::emit_xrun(callbacks, cur_timestamp / 1000) };
         }
     } else {
         // suppressed counts stay diagnosable: a marginal system that
@@ -1086,13 +1087,13 @@ impl Direction for SinkDir {
         try_open_configure(dsp, config, log)
     }
 
-    unsafe fn on_device_swapped(state: &mut State<SinkDir>, port_idx: usize) {
+    fn on_device_swapped(state: &mut State<SinkDir>, port_idx: usize) {
         state.ports[port_idx].ext.xrun_timestamp = 0;
     }
 
-    unsafe fn on_buffers_swapped(_state: &mut State<SinkDir>, _port_idx: usize) {}
+    fn on_buffers_swapped(_state: &mut State<SinkDir>, _port_idx: usize) {}
 
-    unsafe fn on_start_loop(state: &mut State<SinkDir>) {
+    fn on_start_loop(state: &mut State<SinkDir>) {
         for port in &mut state.ports {
             port.ext.xrun_timestamp = 0;
         }
@@ -1100,9 +1101,9 @@ impl Direction for SinkDir {
         state.ext.old_timestamp = 0;
     }
 
-    unsafe fn on_suspend_loop(_state: &mut State<SinkDir>) {}
+    fn on_suspend_loop(_state: &mut State<SinkDir>) {}
 
-    unsafe fn on_role_flip(state: &mut State<SinkDir>) {
+    fn on_role_flip(state: &mut State<SinkDir>) {
         // a role flip shifts the servo's measurement phase, not the fill:
         // relock the DLL instead of holding playback like an underrun (the
         // fill snap in the write path corrects any real level error)
@@ -1140,7 +1141,7 @@ impl Direction for SinkDir {
         );
     }
 
-    unsafe fn servo_ready(_port: &crate::node::Port<SinkDir>) -> bool {
+    fn servo_ready(_port: &crate::node::Port<SinkDir>) -> bool {
         true
     }
 
@@ -1148,11 +1149,11 @@ impl Direction for SinkDir {
     // pre-fills the hardware buffer at trigger and never counts it - so the
     // absolute delay is understated by bufhard; the servo only needs
     // cycle-to-cycle consistency and is unaffected.
-    unsafe fn servo_fill(port: &mut crate::node::Port<SinkDir>) -> u32 {
+    fn servo_fill(port: &mut crate::node::Port<SinkDir>) -> u32 {
         port.dsp.odelay()
     }
 
-    unsafe fn servo_hold(port: &crate::node::Port<SinkDir>) -> bool {
+    fn servo_hold(port: &crate::node::Port<SinkDir>) -> bool {
         port.ext.xrun_timestamp != 0
     }
 
@@ -1381,11 +1382,11 @@ mod tests {
         };
         let log = crate::spa::Log::test_null();
 
-        unsafe { detect_underrun(&mut port, 2048, 3, 1_000_000, 500_000, &callbacks, &log) };
+        detect_underrun(&mut port, 2048, 3, 1_000_000, 500_000, &callbacks, &log);
         assert_eq!(port.ext.xrun_timestamp, 500_000);
 
         // a later cycle's count must not move the armed snapshot
-        unsafe { detect_underrun(&mut port, 2048, 5, 2_000_000, 700_000, &callbacks, &log) };
+        detect_underrun(&mut port, 2048, 5, 2_000_000, 700_000, &callbacks, &log);
         assert_eq!(port.ext.xrun_timestamp, 500_000);
         unsafe { libc::close(r) };
     }
@@ -1466,13 +1467,13 @@ mod tests {
         let log = crate::spa::Log::test_null();
 
         // one flip is debounced: write at the old geometry for a cycle
-        assert!(!unsafe { retune_period(&mut port, 4096, 8, 0, &log) });
+        assert!(!retune_period(&mut port, 4096, 8, 0, &log));
         assert_eq!(port.setup_period, 2048);
         assert!(drain(r).is_empty());
 
         // sustained: retune in place and fill to the new target (odelay
         // reads 0 on a pipe, so the snap writes the whole target)
-        assert!(!unsafe { retune_period(&mut port, 4096, 8, 0, &log) });
+        assert!(!retune_period(&mut port, 4096, 8, 0, &log));
         assert_eq!(port.setup_period, 4096);
         assert_eq!(port.ext.target_delay, 5120); // fill_floor(4096, 1024) binds
         assert_eq!(port.ext.period_mismatch, 0);
@@ -1492,8 +1493,8 @@ mod tests {
         port.dsp.write_zeroes(0);
         let log = crate::spa::Log::test_null();
 
-        assert!(!unsafe { retune_period(&mut port, 4096, 8, 0, &log) });
-        assert!(unsafe { retune_period(&mut port, 4096, 8, 0, &log) });
+        assert!(!retune_period(&mut port, 4096, 8, 0, &log));
+        assert!(retune_period(&mut port, 4096, 8, 0, &log));
         assert_eq!(port.setup_period, 2048); // untouched; the rebuild replaces the device
         assert!(port.ext.period_mismatch >= 2);
         assert!(drain(r).is_empty());

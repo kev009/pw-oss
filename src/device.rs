@@ -29,6 +29,8 @@ struct MixerHandle {
     recsrc: u32,    // RECSRC shadow; polled by value (the counter never ticks for it)
 }
 
+// repr(C): the host casts spa_handle* to State*, so `handle` must stay
+// the first field at offset 0
 #[repr(C)]
 struct State {
     handle: spa_handle,
@@ -894,7 +896,7 @@ unsafe extern "C" fn enum_params(
 
 // apply a Route props object to the hardware and the shadow; unknown props
 // are ignored (WirePlumber sends softVolumes and friends along)
-unsafe fn apply_route_props(
+fn apply_route_props(
     state: &mut State,
     pos: usize,
     props: libspa::pod::Object,

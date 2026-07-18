@@ -5,6 +5,8 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::string::String;
 use std::vec::Vec;
 
+// repr(C): the host casts spa_handle* to State*, so `handle` must stay
+// the first field at offset 0
 #[repr(C)]
 struct State {
     handle: spa_handle,

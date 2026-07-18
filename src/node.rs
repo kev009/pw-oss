@@ -139,16 +139,16 @@ pub(crate) trait Direction: Sized + 'static {
         log: &crate::spa::Log,
     ) -> c_int;
     // install_device: direction-specific resets inside the loop-side swap
-    unsafe fn on_device_swapped(state: &mut State<Self>, port_idx: usize);
+    fn on_device_swapped(state: &mut State<Self>, port_idx: usize);
     // port_use_buffers: direction-specific resets inside the loop-side swap
-    unsafe fn on_buffers_swapped(state: &mut State<Self>, port_idx: usize);
+    fn on_buffers_swapped(state: &mut State<Self>, port_idx: usize);
 
     // send_command(Start): direction-specific resets, on the data loop
-    unsafe fn on_start_loop(state: &mut State<Self>);
+    fn on_start_loop(state: &mut State<Self>);
     // send_command(Suspend): direction-specific resets, on the data loop
-    unsafe fn on_suspend_loop(state: &mut State<Self>);
+    fn on_suspend_loop(state: &mut State<Self>);
     // set_io: the driver/follower role flipped on a live node
-    unsafe fn on_role_flip(state: &mut State<Self>);
+    fn on_role_flip(state: &mut State<Self>);
 
     unsafe fn update_timers(state: &mut State<Self>);
     // on_timeout: debug-build cycle tracing (the sink prints one line)
@@ -156,9 +156,9 @@ pub(crate) trait Direction: Sized + 'static {
     // on_timeout servo hooks (see node::timeout_servo): the extra readiness
     // gate (the source's primed flag), the fill measurement, the recovery
     // hold (the sink's xrun window) and the signed servo error for a fill
-    unsafe fn servo_ready(port: &Port<Self>) -> bool;
-    unsafe fn servo_fill(port: &mut Port<Self>) -> u32;
-    unsafe fn servo_hold(port: &Port<Self>) -> bool;
+    fn servo_ready(port: &Port<Self>) -> bool;
+    fn servo_fill(port: &mut Port<Self>) -> u32;
+    fn servo_hold(port: &Port<Self>) -> bool;
     fn servo_err(port: &Port<Self>, fill: u32) -> f64;
 
     // process(): the direction-specific data path over the ports
@@ -184,6 +184,8 @@ pub(crate) trait Direction: Sized + 'static {
     };
 }
 
+// repr(C): the host casts spa_handle* to State*, so `handle` must stay
+// the first field at offset 0
 #[repr(C)]
 pub(crate) struct State<D: Direction> {
     pub handle: spa_handle,
@@ -639,7 +641,8 @@ unsafe fn timeout_servo<D: Direction>(state: &mut State<D>, nsec: u64, rate: u32
         let resamp = if port.rate_match.is_null() {
             0
         } else {
-            (*port.rate_match).delay as i64
+            // the host keeps the io area valid while it is set (port_set_io)
+            unsafe { (*port.rate_match).delay as i64 }
         };
         delay = (fill as i64 / stride as i64) * rate as i64 / device_rate as i64 + resamp;
 
@@ -1625,11 +1628,12 @@ pub(crate) unsafe fn resetup_task<D: Direction>(state: &mut State<D>, port_idx: 
 // remedy is pinning node.loop.name for this node.
 unsafe fn check_loop_identity<D: Direction>(state: &mut State<D>) -> bool {
     use std::sync::atomic::Ordering;
-    let tid = libc::pthread_self() as usize;
+    let tid = unsafe { libc::pthread_self() } as usize;
     // The expected id is SEEDED from a closure run on the data loop at init,
     // not claimed by whoever calls first: a pure follower never runs
     // on_timeout, so a process() arriving on a divergent host loop would
-    // otherwise bless itself and undo the block_on_loop serialization.
+    // otherwise install itself as the expected thread and undo the
+    // block_on_loop serialization.
     let seen =
         match state
             .loop_thread
