@@ -175,6 +175,330 @@ fn log_delay_capped(log: &crate::spa::Log, path: &str, granted: u32) {
   crate::info!(log, "{}: the oss.delay target is capped by the granted buffer ({})", path, granted);
 }
 
+// The retune phase. A quantum or graph-rate change needs new servo geometry.
+// If the current OSS ring is already large enough, retune that geometry in
+// place: the triggered channel can't accept SETFRAGMENT, but it does not need
+// to when the existing grant still has the headroom the new period requires.
+// A grant too small re-primes in place via a trigger suspend (SETFRAGMENT
+// becomes legal again). Returns true when the driver refused the trigger stop
+// (dying fd) and only a main-thread rebuild remains.
+unsafe fn retune_period(port: &mut crate::node::Port<SinkDir>, period_in_bytes: u32, stride: u32,
+                        oss_delay: u32, rate_match: *const spa_io_rate_match, log: &crate::spa::Log) -> bool {
+  if !port.dsp.is_running() || port.setup_period == 0 || period_in_bytes == 0 || period_in_bytes == port.setup_period {
+    port.ext.period_mismatch = 0;
+    return false;
+  }
+  // debounce BOTH paths: a single-cycle flip usually means a renegotiation is
+  // in flight (which re-primes anyway); a rebuild on it costs an audible gap,
+  // and even the in-place retune relocks the servo and snaps the fill. Write
+  // at the old size for one cycle instead.
+  port.ext.period_mismatch += 1;
+  if port.ext.period_mismatch < 2 {
+    return false;
+  }
+  // cached blocksize: the triggered channel refuses SETFRAGMENT, so the
+  // granted fragment (and the session-fixed hw cadence folded in at
+  // prime) cannot have changed; reusing it avoids an ioctl here
+  let blocksize = port.setup_blocksize;
+  let desired   = desired_delay(period_in_bytes, oss_delay);
+  let write_max = period_in_bytes.max(rate_match_bytes(rate_match, stride));
+  if port.ext.buffer_size >= buffer_required(period_in_bytes, desired, blocksize, write_max) {
+    let old_period = port.setup_period;
+    let delay_capped =
+      commit_geometry(port, port.ext.buffer_size, period_in_bytes, blocksize, write_max, desired);
+    port.ext.period_mismatch = 0;
+    port.was_matching = false;
+
+    // Level snap (ALSA's resync does the same): a sustained quantum
+    // change is a re-prime in place. When driving, nothing else
+    // corrects the level - the timer servo only rate-steers with a
+    // clamped error - so an under-filled ring after a quantum growth
+    // would sit one late wakeup away from an underrun for the seconds
+    // the skew needs; fill to target like the prime and xrun-recovery
+    // paths do. Overfill after a shrink is latency only and drains via
+    // the servo (or the follower fill snap below).
+    let odelay = port.dsp.odelay();
+    port.dsp.write_zeroes(port.ext.target_delay.saturating_sub(odelay));
+
+    crate::info!(log, "{}: period {} -> {} bytes; retuned in place (granted {}, target delay {})",
+      port.dsp.path, old_period, period_in_bytes, port.ext.buffer_size, port.ext.target_delay);
+    if delay_capped {
+      log_delay_capped(log, &port.dsp.path, port.ext.buffer_size);
+    }
+    false
+  } else if port.dsp.suspend() {
+    // Too small for the new period: stop the channel in place.
+    // SETTRIGGER(0) discards the queued audio exactly like the
+    // rebuild's HALT and clears TRIGGERED, so the prime phase
+    // re-runs SETFRAGMENT at the new layout IN THIS CYCLE and this
+    // cycle's real write re-arms - one prime-sized gap instead of the
+    // multi-cycle main-thread close/reopen, and no main-loop
+    // dependency (the source resizes the same way).
+    crate::info!(log, "{}: period {} -> {} bytes exceeds the ring ({}); re-priming",
+      port.dsp.path, port.setup_period, period_in_bytes, port.ext.buffer_size);
+    port.ext.period_mismatch = 0;
+    port.ext.xrun_timestamp  = 0; // a stale recovery hold must not defer the re-arm
+    port.was_matching = false;
+    false
+  } else {
+    crate::info!(log, "{}: period {} -> {} bytes; re-setting up", port.dsp.path, port.setup_period, period_in_bytes);
+    true
+  }
+}
+
+// debug-build diagnostics: the scheduling class/priority the data loop
+// actually runs at (RT setup problems show up here first)
+#[cfg(debug_assertions)]
+unsafe fn debug_log_priorities(log: &crate::spa::Log) {
+  fn prio_type(type_: libc::c_ushort) -> &'static str {
+    match type_ {
+      libc::RTP_PRIO_REALTIME => "realtime",
+      libc::RTP_PRIO_NORMAL   => "normal",
+      libc::RTP_PRIO_IDLE     => "idle",
+      _ => unreachable!()
+    }
+  }
+
+  fn gettid() -> i32 {
+    let mut tid = 0;
+    if unsafe { libc::thr_self(&mut tid) } != -1 {
+      assert!(tid <= i32::MAX as i64);
+      tid as i32
+    } else {
+      0
+    }
+  }
+
+  let mut rtp = libc::rtprio { type_: 0, prio:  0 };
+
+  let pid = libc::getpid();
+  if libc::rtprio(libc::RTP_LOOKUP, pid, &mut rtp) != -1 {
+    crate::warn!(log, "process priority ({:5}): type = {}, prio = {}", pid, prio_type(rtp.type_), rtp.prio);
+  }
+
+  let tid = gettid();
+  if libc::rtprio_thread(libc::RTP_LOOKUP, tid, &mut rtp) != -1 {
+    crate::warn!(log, "thread priority ({:6}): type = {}, prio = {}", tid, prio_type(rtp.type_), rtp.prio);
+  }
+}
+
+// The prime phase: the channel is in setup (first cycle, or a trigger
+// suspend from the retune/resize path), so the ring layout can be applied.
+// Size the ring, commit the fill geometry and pre-fill to target; the
+// cycle's real write then arms the channel.
+unsafe fn prime_playback(port: &mut crate::node::Port<SinkDir>, period_in_bytes: u32, graph_rate: u32,
+                         oss_delay: u32, oss_fragment: u32,
+                         rate_match: *const spa_io_rate_match, log: &crate::spa::Log) {
+  #[cfg(debug_assertions)]
+  debug_log_priorities(log);
+
+  // copies, not a borrow (the geometry commit below needs &mut port); the
+  // gate in process_ports guarantees a negotiated config here
+  let (stride, cfg_rate) = {
+    let config = port.config.as_ref().unwrap();
+    (config.stride().max(1), config.rate)
+  };
+
+  // Size the fill to the granted buffer and the device's real fragment.
+  // oss_fragment (0 = automatic 1 KiB) only mutates on this loop, so the
+  // read is race-free; no ioctls beyond what the prime always issued
+  // The measurement/drain quantum is the granted fragment - unless the
+  // device's hardware cadence is coarser (drivers that ignore
+  // SETFRAGMENT and pull fixed transfers; vchan parents), which the
+  // soft fragsize can't see and sndstat can. Floor, headroom and the
+  // servo noise model key on the larger - and the buffer REQUEST must
+  // include it, or a device that honors the request grants no room for
+  // the ceiling above the floor.
+  let desired    = desired_delay(period_in_bytes, oss_delay);
+  let chunk      = crate::utils::ns_to_frame_bytes(port.dsp.hw_quantum_ns, cfg_rate, stride);
+  let write_max  = period_in_bytes.max(rate_match_bytes(rate_match, stride));
+  let max_period = crate::sound::max_ring_period_bytes(stride, cfg_rate, graph_rate);
+  let request    = buffer_request(period_in_bytes, max_period, crate::sound::ring_byte_cap(stride, cfg_rate),
+    oss_fragment, chunk, write_max, oss_delay);
+  let granted   = port.dsp.set_buffer_size(request, oss_fragment);
+  let blocksize = port.dsp.blocksize().max(chunk);
+
+  // saturating arithmetic: blocksize/rate_match.size are device-provided and
+  // an overflow here would abort the data loop.
+  let delay_capped = commit_geometry(port, granted, period_in_bytes, blocksize, write_max, desired);
+  port.ext.buffer_size = granted;
+
+  crate::warn!(log, "{}: granted {}, blocksize {}, period {}, target delay {}",
+    port.dsp.path, granted, blocksize, period_in_bytes, port.ext.target_delay);
+  if delay_capped {
+    log_delay_capped(log, &port.dsp.path, granted);
+  }
+  if granted < period_in_bytes.saturating_mul(2) {
+    crate::warn!(log, "{}: granted OSS buffer ({}) is smaller than two quanta ({}); \
+      audio will glitch. Lower the PipeWire quantum; we set the fragment size \
+      explicitly, so hw.snd.latency has no effect",
+      port.dsp.path, granted, period_in_bytes * 2);
+  }
+
+  port.dsp.write_zeroes(port.ext.target_delay);
+}
+
+// The xrun-detection phase, on a running channel. The vchan mixer counts a
+// momentarily-short child as an xrun and pads it with silence
+// (feeder_mixer.c); with the fill still healthy that's accounting noise, not
+// a dropout - only a genuinely low fill at wakeup is a real underrun worth
+// recovery and reporting. "Low" is a period, capped by the healthy sawtooth
+// floor (target minus one fragment): with a fragment wider than the period
+// the fill routinely dips under one fragment while perfectly locked, and
+// gating on the fragment size would fire recovery on every accounting tick
+// there. Arms the recovery hold (xrun_timestamp) and reports the EVENT to
+// the host once, not per held cycle.
+unsafe fn detect_underrun(port: &mut crate::node::Port<SinkDir>, period_in_bytes: u32,
+                          cur_timestamp: u64, clock_nsec: u64,
+                          callbacks: &spa_callbacks, log: &crate::spa::Log) {
+  let underrun_count = port.dsp.underruns();
+  if underrun_count == 0 {
+    return;
+  }
+  // copies, not a borrow (warn_limit/ext below need &mut port); the gate in
+  // process_ports guarantees a negotiated config here
+  let (stride, cfg_rate) = {
+    let config = port.config.as_ref().unwrap();
+    (config.stride().max(1), config.rate)
+  };
+  // (cached blocksize: the channel can't be retuned while triggered,
+  // and the gate must not cost ioctls on healthy cycles)
+  let low = period_in_bytes
+    .min(port.ext.target_delay.saturating_sub(port.setup_blocksize))
+    .max(period_in_bytes / 4);
+  // A late cycle finds a legitimately lower fill (the device kept
+  // draining), so the threshold tracks the expected healthy fill at
+  // THIS moment; the floor keeps a true empty ring (a real underrun
+  // reads 0 until we write) detectable at any lateness.
+  let elapsed = cur_timestamp.saturating_sub(clock_nsec);
+  let drained = crate::utils::ns_to_bytes(elapsed, cfg_rate, stride);
+  let wander = (period_in_bytes / 4).max(port.setup_blocksize);
+  let low = low
+    .min(port.ext.target_delay.saturating_sub(drained).saturating_sub(wander))
+    .max(period_in_bytes / 16);
+  let odelay_now = port.dsp.odelay();
+  if odelay_now < low {
+    if let Some(suppressed) = port.warn_limit.check(cur_timestamp) {
+      crate::warn!(log, "{}: OSS reported {:3} underruns @ {} (+{} warnings suppressed)",
+        port.dsp.path, underrun_count, cur_timestamp, suppressed);
+    }
+    if port.ext.xrun_timestamp == 0 {
+      // snapshot the DRIVER clock, not wall time: the recovery
+      // condition compares against driver_clock.nsec (idealized cycle
+      // start, which lags wall time by any lateness); a wall snapshot
+      // deferred recovery by the lateness, discarding a buffer per
+      // late cycle
+      port.ext.xrun_timestamp = clock_nsec.max(1);
+
+      // report the EVENT to the host (pw-top's xrun counter) once,
+      // not per held cycle; the length isn't known at detection, so
+      // 0 delay
+      let node_callbacks = callbacks.funcs.cast::<spa_node_callbacks>().as_ref();
+      if let Some(xrun_fun) = node_callbacks.and_then(|c| c.xrun) {
+        xrun_fun(callbacks.data, cur_timestamp / 1000, 0, std::ptr::null_mut());
+      }
+    }
+  } else {
+    // suppressed counts stay diagnosable: a marginal system that
+    // ticks the counter while self-healing shows up at debug level
+    crate::debug!(log, "{}: {} underrun counts ignored (fill {} >= {})",
+      port.dsp.path, underrun_count, odelay_now, low);
+  }
+}
+
+// The recovery phase, entered while an underrun hold is pending
+// (xrun_timestamp != 0). Recover on the first data cycle past the event
+// (ALSA does the same: snap the fill, resume immediately): relock the servo,
+// re-prime the fill to target and write this cycle's data in the SAME cycle.
+// Waiting for a particular process cadence discards real buffers per failed
+// attempt, and a follower under a corr-steered driver may never hit a fixed
+// window at all. Until the recovery cycle arrives the buffer is consumed
+// unwritten (the skip-buffer hold). Returns the cycle's write result
+// (`size` when held).
+unsafe fn recover_or_hold(port: &mut crate::node::Port<SinkDir>, clock_nsec: u64, clock_flags: u32,
+                          data: *const std::os::raw::c_void, size: u32, log: &crate::spa::Log) -> isize {
+  if clock_nsec > port.ext.xrun_timestamp && clock_flags & SPA_IO_CLOCK_FLAG_XRUN_RECOVER == 0 {
+    port.ext.xrun_timestamp = 0;
+
+    port.dll.init();
+    port.bw_adapt.reset();
+
+    // buffer's already sized; re-prime only up to target, accounting for what's
+    // still queued (a full target_delay would push odelay past the buffer)
+    let odelay = port.dsp.odelay();
+    let refill = port.ext.target_delay.saturating_sub(odelay);
+
+    #[cfg(debug_assertions)]
+    crate::warn!(log, "{}: re-priming with {} zeroes (odelay {})", port.dsp.path, refill, odelay);
+    #[cfg(not(debug_assertions))]
+    let _ = log;
+
+    port.dsp.write_zeroes(refill);
+    // write `size`, not the period: only `size` bytes at the offset are owned
+    port.dsp.write(data, size)
+  } else {
+    #[cfg(debug_assertions)]
+    crate::warn!(log, "{}: skipping buffer @ {}", port.dsp.path, clock_nsec);
+
+    size as isize
+  }
+}
+
+// The follower-servo phase, matching a foreign clock: the DLL serves rate
+// matching only (when driving, the servo runs in on_timeout where the clock
+// is published, and a same-device follower has nothing to correct - updating
+// anyway would wind the integrator; ALSA gates the same way). `odelay` is
+// the fill the caller measured this cycle. Returns the rate correction and
+// whether this cycle's buffer must be skipped (overfill drain).
+fn matching_servo(port: &mut crate::node::Port<SinkDir>, odelay: u32, stride: u32,
+                  cfg_rate: u32, nsec: u64) -> (f64, bool) {
+  let mut corr: f64 = 1.0;
+  let mut skip_write = false;
+  if !port.was_matching {
+    // matching just engaged; relock rather than apply stale state
+    port.dll.init();
+    port.bw_adapt.reset();
+  }
+  let err_raw = odelay as f64 - port.ext.target_delay as f64;
+  if err_raw.abs() > port.setup_period as f64 {
+    // Fill snap (ALSA's max_resync): a level error past one period is
+    // beyond what the +/-1% actuator removes promptly and would wind the
+    // integrator against the clamp. Correct the level directly -
+    // refill on underfill, drain a cycle on overfill - and relock.
+    port.dll.init();
+    port.bw_adapt.reset();
+    if err_raw < 0.0 {
+      port.dsp.write_zeroes(port.ext.target_delay.saturating_sub(odelay));
+    } else {
+      skip_write = true;
+    }
+  } else {
+    let max_err = (port.setup_period as f64 / 2.0).max(256.0 * stride as f64);
+    let err = err_raw.clamp(-max_err, max_err);
+    corr = port.dll.update(err);
+    port.bw_adapt.update(&mut port.dll, err, stride, port.setup_blocksize,
+      nsec, port.setup_period, cfg_rate * stride);
+  }
+
+  #[cfg(debug_assertions)]
+  eprintln!("{}: corr = {}, err = {}", port.dsp.path, corr, err_raw);
+
+  (corr, skip_write)
+}
+
+// same-device follower: no rate to match, but the level can still drift on
+// missed cycles; correct it directly. Returns whether this cycle's buffer
+// must be skipped (overfill drain).
+fn level_correct(port: &mut crate::node::Port<SinkDir>, odelay: u32) -> bool {
+  let err_raw = odelay as f64 - port.ext.target_delay as f64;
+  if err_raw < -(port.setup_period as f64) {
+    port.dsp.write_zeroes(port.ext.target_delay.saturating_sub(odelay));
+  } else if err_raw > port.setup_period as f64 {
+    return true;
+  }
+  false
+}
+
 // Run the servo before the clock is published so every field below belongs
 // to this cycle (the shape of ALSA's update_time). One FreeBSD difference:
 // GETODELAY reports the soft buffer only - the kernel pre-fills the hardware
@@ -366,289 +690,40 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
     let period_in_bytes = crate::utils::device_period_bytes(
       driver_clock.target_duration, cfg_rate, driver_clock.target_rate.denom, stride);
 
-    // A quantum or graph-rate change needs new servo geometry. If the current
-    // OSS ring is already large enough, retune that geometry in place: the
-    // triggered channel can't accept SETFRAGMENT, but it does not need to when
-    // the existing grant still has the headroom the new period requires. A
-    // grant too small re-primes in place via a trigger suspend (SETFRAGMENT
-    // becomes legal again); the main-thread rebuild remains only for a
-    // refused suspend (dying fd).
-    if port.dsp.is_running() && port.setup_period != 0 && period_in_bytes != 0 && period_in_bytes != port.setup_period {
-      // debounce BOTH paths: a single-cycle flip usually means a
-      // renegotiation is in flight (which re-primes anyway); a rebuild on it
-      // costs an audible gap, and even the in-place retune relocks the servo
-      // and snaps the fill. Write at the old size for one cycle instead.
-      port.ext.period_mismatch += 1;
-      if port.ext.period_mismatch >= 2 {
-        // cached blocksize: the triggered channel refuses SETFRAGMENT, so the
-        // granted fragment (and the session-fixed hw cadence folded in at
-        // prime) cannot have changed; reusing it avoids an ioctl here
-        let blocksize = port.setup_blocksize;
-        let desired   = desired_delay(period_in_bytes, state.ext.oss_delay);
-        let write_max = period_in_bytes.max(rate_match_bytes(state.rate_match, stride));
-        if port.ext.buffer_size >= buffer_required(period_in_bytes, desired, blocksize, write_max) {
-          let old_period = port.setup_period;
-          let delay_capped =
-            commit_geometry(port, port.ext.buffer_size, period_in_bytes, blocksize, write_max, desired);
-          port.ext.period_mismatch = 0;
-          port.was_matching = false;
-
-          // Level snap (ALSA's resync does the same): a sustained quantum
-          // change is a re-prime in place. When driving, nothing else
-          // corrects the level - the timer servo only rate-steers with a
-          // clamped error - so an under-filled ring after a quantum growth
-          // would sit one late wakeup away from an underrun for the seconds
-          // the skew needs; fill to target like the prime and xrun-recovery
-          // paths do. Overfill after a shrink is latency only and drains via
-          // the servo (or the follower fill snap below).
-          let odelay = port.dsp.odelay();
-          port.dsp.write_zeroes(port.ext.target_delay.saturating_sub(odelay));
-
-          crate::info!(state.log, "{}: period {} -> {} bytes; retuned in place (granted {}, target delay {})",
-            port.dsp.path, old_period, period_in_bytes, port.ext.buffer_size, port.ext.target_delay);
-          if delay_capped {
-            log_delay_capped(&state.log, &port.dsp.path, port.ext.buffer_size);
-          }
-        } else if port.dsp.suspend() {
-          // Too small for the new period: stop the channel in place.
-          // SETTRIGGER(0) discards the queued audio exactly like the
-          // rebuild's HALT and clears TRIGGERED, so the prime branch below
-          // re-runs SETFRAGMENT at the new layout IN THIS CYCLE and this
-          // cycle's real write re-arms - one prime-sized gap instead of the
-          // multi-cycle main-thread close/reopen, and no main-loop
-          // dependency (the source resizes the same way).
-          crate::info!(state.log, "{}: period {} -> {} bytes exceeds the ring ({}); re-priming",
-            port.dsp.path, port.setup_period, period_in_bytes, port.ext.buffer_size);
-          port.ext.period_mismatch = 0;
-          port.ext.xrun_timestamp  = 0; // a stale recovery hold must not defer the re-arm
-          port.was_matching = false;
-        } else {
-          // the driver refused the trigger stop (dying fd): rebuild off-loop
-          crate::info!(state.log, "{}: period {} -> {} bytes; re-setting up", port.dsp.path, port.setup_period, period_in_bytes);
-          port.resetup_pending = state.main_loop.as_ref().is_some_and(|main_loop|
-            crate::utils::invoke_on_loop(main_loop, state_ptr, move |state| crate::node::resetup_task(state, port_idx)));
-          if port.resetup_pending {
-            port.was_matching = false; // the gap invalidates matching history
-            (*port.io).status = SPA_STATUS_NEED_DATA as i32;
-            result |= SPA_STATUS_NEED_DATA as i32;
-            continue;
-          }
-          // no main loop (unusual host): keep running at the stale size; the
-          // write path drops or underruns but nothing stalls or aborts
-        }
+    if retune_period(port, period_in_bytes, stride, state.ext.oss_delay, state.rate_match, &state.log) {
+      // the driver refused the trigger stop (dying fd): rebuild off-loop
+      port.resetup_pending = state.main_loop.as_ref().is_some_and(|main_loop|
+        crate::utils::invoke_on_loop(main_loop, state_ptr, move |state| crate::node::resetup_task(state, port_idx)));
+      if port.resetup_pending {
+        port.was_matching = false; // the gap invalidates matching history
+        (*port.io).status = SPA_STATUS_NEED_DATA as i32;
+        result |= SPA_STATUS_NEED_DATA as i32;
+        continue;
       }
-    } else {
-      port.ext.period_mismatch = 0;
+      // no main loop (unusual host): keep running at the stale size; the
+      // write path drops or underruns but nothing stalls or aborts
     }
 
     if !port.dsp.is_running() {
-
-      #[cfg(debug_assertions)]
-      {
-        fn prio_type(type_: libc::c_ushort) -> &'static str {
-          match type_ {
-            libc::RTP_PRIO_REALTIME => "realtime",
-            libc::RTP_PRIO_NORMAL   => "normal",
-            libc::RTP_PRIO_IDLE     => "idle",
-            _ => unreachable!()
-          }
-        }
-
-        fn gettid() -> i32 {
-          let mut tid = 0;
-          if unsafe { libc::thr_self(&mut tid) } != -1 {
-            assert!(tid <= i32::MAX as i64);
-            tid as i32
-          } else {
-            0
-          }
-        }
-
-        let mut rtp = libc::rtprio { type_: 0, prio:  0 };
-
-        let pid = libc::getpid();
-        if libc::rtprio(libc::RTP_LOOKUP, pid, &mut rtp) != -1 {
-          crate::warn!(state.log, "process priority ({:5}): type = {}, prio = {}", pid, prio_type(rtp.type_), rtp.prio);
-        }
-
-        let tid = gettid();
-        if libc::rtprio_thread(libc::RTP_LOOKUP, tid, &mut rtp) != -1 {
-          crate::warn!(state.log, "thread priority ({:6}): type = {}, prio = {}", tid, prio_type(rtp.type_), rtp.prio);
-        }
-      }
-
-      // Size the fill to the granted buffer and the device's real fragment.
-      // oss_fragment (0 = automatic 1 KiB) only mutates on this loop, so the
-      // read is race-free; no ioctls beyond what the prime always issued
-      // The measurement/drain quantum is the granted fragment - unless the
-      // device's hardware cadence is coarser (drivers that ignore
-      // SETFRAGMENT and pull fixed transfers; vchan parents), which the
-      // soft fragsize can't see and sndstat can. Floor, headroom and the
-      // servo noise model key on the larger - and the buffer REQUEST must
-      // include it, or a device that honors the request grants no room for
-      // the ceiling above the floor.
-      let desired    = desired_delay(period_in_bytes, state.ext.oss_delay);
-      let chunk      = crate::utils::ns_to_frame_bytes(port.dsp.hw_quantum_ns, cfg_rate, stride);
-      let write_max  = period_in_bytes.max(rate_match_bytes(state.rate_match, stride));
-      let max_period = crate::sound::max_ring_period_bytes(stride, cfg_rate, driver_clock.target_rate.denom);
-      let request    = buffer_request(period_in_bytes, max_period, crate::sound::ring_byte_cap(stride, cfg_rate),
-        state.oss_fragment, chunk, write_max, state.ext.oss_delay);
-      let granted   = port.dsp.set_buffer_size(request, state.oss_fragment);
-      let blocksize = port.dsp.blocksize().max(chunk);
-
-      // saturating arithmetic: blocksize/rate_match.size are device-provided and
-      // an overflow here would abort the data loop.
-      let delay_capped = commit_geometry(port, granted, period_in_bytes, blocksize, write_max, desired);
-      port.ext.buffer_size = granted;
-
-      crate::warn!(state.log, "{}: granted {}, blocksize {}, period {}, target delay {}",
-        port.dsp.path, granted, blocksize, period_in_bytes, port.ext.target_delay);
-      if delay_capped {
-        log_delay_capped(&state.log, &port.dsp.path, granted);
-      }
-      if granted < period_in_bytes.saturating_mul(2) {
-        crate::warn!(state.log, "{}: granted OSS buffer ({}) is smaller than two quanta ({}); \
-          audio will glitch. Lower the PipeWire quantum; we set the fragment size \
-          explicitly, so hw.snd.latency has no effect",
-          port.dsp.path, granted, period_in_bytes * 2);
-      }
-
-      port.dsp.write_zeroes(port.ext.target_delay);
+      prime_playback(port, period_in_bytes, driver_clock.target_rate.denom,
+        state.ext.oss_delay, state.oss_fragment, state.rate_match, &state.log);
     } else {
-      let underrun_count = port.dsp.underruns();
-      // The vchan mixer counts a momentarily-short child as an xrun and pads
-      // it with silence (feeder_mixer.c); with the fill still healthy that's
-      // accounting noise, not a dropout - only a genuinely low fill at
-      // wakeup is a real underrun worth recovery and reporting. "Low" is a
-      // period, capped by the healthy sawtooth floor (target minus one
-      // fragment): with a fragment wider than the period the fill routinely
-      // dips under one fragment while perfectly locked, and gating on the
-      // fragment size would fire recovery on every accounting tick there.
-      if underrun_count > 0 {
-        // (cached blocksize: the channel can't be retuned while triggered,
-        // and the gate must not cost ioctls on healthy cycles)
-        let low = period_in_bytes
-          .min(port.ext.target_delay.saturating_sub(port.setup_blocksize))
-          .max(period_in_bytes / 4);
-        // A late cycle finds a legitimately lower fill (the device kept
-        // draining), so the threshold tracks the expected healthy fill at
-        // THIS moment; the floor keeps a true empty ring (a real underrun
-        // reads 0 until we write) detectable at any lateness.
-        let elapsed = state.ext.cur_timestamp.saturating_sub(driver_clock.nsec);
-        let drained = crate::utils::ns_to_bytes(elapsed, cfg_rate, stride);
-        let wander = (period_in_bytes / 4).max(port.setup_blocksize);
-        let low = low
-          .min(port.ext.target_delay.saturating_sub(drained).saturating_sub(wander))
-          .max(period_in_bytes / 16);
-        let odelay_now = port.dsp.odelay();
-        if odelay_now < low {
-          if let Some(suppressed) = port.warn_limit.check(state.ext.cur_timestamp) {
-            crate::warn!(state.log, "{}: OSS reported {:3} underruns @ {} (+{} warnings suppressed)",
-              port.dsp.path, underrun_count, state.ext.cur_timestamp, suppressed);
-          }
-          if port.ext.xrun_timestamp == 0 {
-            // snapshot the DRIVER clock, not wall time: the recovery
-            // condition compares against driver_clock.nsec (idealized cycle
-            // start, which lags wall time by any lateness); a wall snapshot
-            // deferred recovery by the lateness, discarding a buffer per
-            // late cycle
-            port.ext.xrun_timestamp = driver_clock.nsec.max(1);
-
-            // report the EVENT to the host (pw-top's xrun counter) once,
-            // not per held cycle; the length isn't known at detection, so
-            // 0 delay
-            let node_callbacks = state.callbacks.funcs.cast::<spa_node_callbacks>().as_ref();
-            if let Some(xrun_fun) = node_callbacks.and_then(|c| c.xrun) {
-              xrun_fun(state.callbacks.data, state.ext.cur_timestamp / 1000, 0, std::ptr::null_mut());
-            }
-          }
-        } else {
-          // suppressed counts stay diagnosable: a marginal system that
-          // ticks the counter while self-healing shows up at debug level
-          crate::debug!(state.log, "{}: {} underrun counts ignored (fill {} >= {})",
-            port.dsp.path, underrun_count, odelay_now, low);
-        }
-      }
+      detect_underrun(port, period_in_bytes, state.ext.cur_timestamp, driver_clock.nsec,
+        &state.callbacks, &state.log);
     }
 
     let mut corr: f64 = 1.0; // DLL rate correction, published as clock.rate_diff below
     let nbytes = if port.ext.xrun_timestamp != 0 {
-
-      // Recover on the first data cycle past the event (ALSA does the same:
-      // snap the fill, resume immediately). Waiting for a particular process
-      // cadence discards real buffers per failed attempt, and a follower
-      // under a corr-steered driver may never hit a fixed window at all.
-      if driver_clock.nsec > port.ext.xrun_timestamp && driver_clock.flags & SPA_IO_CLOCK_FLAG_XRUN_RECOVER == 0 {
-        port.ext.xrun_timestamp = 0;
-
-        port.dll.init();
-        port.bw_adapt.reset();
-
-        // buffer's already sized; re-prime only up to target, accounting for what's
-        // still queued (a full target_delay would push odelay past the buffer)
-        let odelay = port.dsp.odelay();
-        let refill = port.ext.target_delay.saturating_sub(odelay);
-
-        #[cfg(debug_assertions)]
-        crate::warn!(state.log, "{}: re-priming with {} zeroes (odelay {})", port.dsp.path, refill, odelay);
-
-        port.dsp.write_zeroes(refill);
-        // write `size`, not `period_in_bytes`: only `size` bytes at `offset` are owned
-        port.dsp.write(data_0.data.offset(offset as isize), size)
-      } else {
-        #[cfg(debug_assertions)]
-        crate::warn!(state.log, "{}: skipping buffer @ {}", port.dsp.path, driver_clock.nsec);
-
-        size as isize
-      }
+      recover_or_hold(port, driver_clock.nsec, driver_clock.flags,
+        data_0.data.offset(offset as isize), size, &state.log)
     } else {
-      // when driving, the servo runs in on_timeout where the clock is
-      // published; here the DLL only serves rate matching as a follower on a
-      // foreign clock - a same-device follower has nothing to correct, and
-      // updating anyway would wind the integrator (ALSA gates the same way)
       let mut skip_write = false;
       if matching && port.setup_period != 0 && port.ext.period_mismatch == 0 {
-        if !port.was_matching {
-          // matching just engaged; relock rather than apply stale state
-          port.dll.init();
-          port.bw_adapt.reset();
-        }
-        let odelay  = port.dsp.odelay();
-        let err_raw = odelay as f64 - port.ext.target_delay as f64;
-        if err_raw.abs() > port.setup_period as f64 {
-          // Fill snap (ALSA's max_resync): a level error past one period is
-          // beyond what the +/-1% actuator removes promptly and would wind the
-          // integrator against the clamp. Correct the level directly -
-          // refill on underfill, drain a cycle on overfill - and relock.
-          port.dll.init();
-          port.bw_adapt.reset();
-          if err_raw < 0.0 {
-            port.dsp.write_zeroes(port.ext.target_delay.saturating_sub(odelay));
-          } else {
-            skip_write = true;
-          }
-        } else {
-          let max_err = (port.setup_period as f64 / 2.0).max(256.0 * stride as f64);
-          let err = err_raw.clamp(-max_err, max_err);
-          corr = port.dll.update(err);
-          port.bw_adapt.update(&mut port.dll, err, stride, port.setup_blocksize,
-            state.ext.cur_timestamp, port.setup_period, cfg_rate * stride);
-        }
-
-        #[cfg(debug_assertions)]
-        eprintln!("{}: corr = {}, err = {}", port.dsp.path, corr, err_raw);
+        (corr, skip_write) = matching_servo(port, port.dsp.odelay(), stride, cfg_rate, state.ext.cur_timestamp);
       }
 
       if state.following && !matching && port.setup_period != 0 && port.ext.period_mismatch == 0 {
-        // same-device follower: no rate to match, but the level can still
-        // drift on missed cycles; correct it directly
-        let odelay  = port.dsp.odelay();
-        let err_raw = odelay as f64 - port.ext.target_delay as f64;
-        if err_raw < -(port.setup_period as f64) {
-          port.dsp.write_zeroes(port.ext.target_delay.saturating_sub(odelay));
-        } else if err_raw > port.setup_period as f64 {
-          skip_write = true;
-        }
+        skip_write = level_correct(port, port.dsp.odelay());
       }
 
       if skip_write {
