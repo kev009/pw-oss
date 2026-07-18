@@ -973,6 +973,30 @@ pub const OSS_SINK_FACTORY: spa_handle_factory = spa_handle_factory {
 #[cfg(test)]
 mod tests {
   use super::{buffer_request, buffer_required, desired_delay, fill_floor, target_delay};
+  use super::{level_correct, matching_servo, recover_or_hold, SinkDir, SinkPortExt};
+  use crate::sound::test_util::{drain, fill_pipe, free_space, pattern, pipe_pair};
+  use libspa::sys::SPA_IO_CLOCK_FLAG_XRUN_RECOVER;
+
+  // a Port on a pipe-backed device: the pipe's buffer plays the OSS ring
+  // (byte-exact accounting, short writes on a full ring), GETODELAY reads 0
+  // (the ioctl fails on a pipe), so the phase functions get the fill level
+  // passed explicitly where a decision needs it
+  fn test_port(write_fd: libc::c_int, target_delay: u32, period: u32) -> crate::node::Port<SinkDir> {
+    crate::node::Port {
+      config:          None,
+      buffers:         vec![],
+      io:              std::ptr::null_mut(),
+      dsp:             crate::sound::DspWriter::test_on_fd(write_fd, 8),
+      dll:             Default::default(),
+      setup_period:    period,
+      bw_adapt:        Default::default(),
+      setup_blocksize: 1024,
+      resetup_pending: false,
+      was_matching:    false,
+      warn_limit:      crate::utils::RateLimit::new(),
+      ext:             SinkPortExt { target_delay, ..Default::default() }
+    }
+  }
 
   #[test]
   fn target_matches_live_geometry() {
@@ -1023,6 +1047,124 @@ mod tests {
     let (target, capped) = target_delay(65536, 4096, 1024, 4096, u32::MAX);
     assert_eq!(target, 65536 - 4096 - 1024);
     assert!(capped);
+  }
+
+  // The recovery sequencing behind the 0.9.7 underrun fix: on the first
+  // data cycle past the event, the fill re-primes to target FIRST and the
+  // cycle's data follows in the SAME cycle - into a ring that is already
+  // near-full, so both writes short-write and must stay frame-aligned
+  // while the tail drops as whole frames.
+  #[test]
+  fn recovery_reprimes_then_writes_into_a_near_full_ring() {
+    let (r, w) = pipe_pair(true, true);
+    let mut port = test_port(w, 4096, 2048);
+    port.dsp.write_zeroes(0); // a recovering channel is already running
+    port.ext.xrun_timestamp = 1_000;
+
+    // near-full ring: room for the full re-prime (odelay reads 0 on a pipe,
+    // so the refill is the whole target) but only half this cycle's buffer
+    let capacity = fill_pipe(w);
+    free_space(r, 4096 + 1024);
+
+    let data = pattern(2048, 1);
+    let log  = crate::spa::Log::test_null();
+    let n = unsafe { recover_or_hold(&mut port, 2_000, 0, data.as_ptr().cast(), 2048, &log) };
+
+    // the hold cleared and the overfull ring dropped the tail: only the
+    // frames that fit after the re-prime were consumed
+    assert_eq!(port.ext.xrun_timestamp, 0);
+    assert_eq!(n, 1024);
+    let out = drain(r);
+    assert_eq!(out.len(), capacity); // filler + re-prime zeroes + data head
+    let tail = &out[out.len() - 5120..];
+    assert!(tail[..4096].iter().all(|&b| b == 0), "the re-prime must precede the data");
+    assert_eq!(&tail[4096..], &data[..1024]);
+    unsafe { libc::close(r) };
+  }
+
+  // the skip-buffer hold: until the driver clock passes the event (and the
+  // host isn't in its own recovery window), buffers are consumed unwritten
+  // and the hold stays armed
+  #[test]
+  fn recovery_holds_buffers_until_the_clock_passes_the_event() {
+    let (r, w) = pipe_pair(true, true);
+    let mut port = test_port(w, 4096, 2048);
+    port.dsp.write_zeroes(0);
+    port.ext.xrun_timestamp = 5_000;
+
+    let data = pattern(2048, 2);
+    let log  = crate::spa::Log::test_null();
+
+    // same-cycle clock: not past the event yet
+    let n = unsafe { recover_or_hold(&mut port, 5_000, 0, data.as_ptr().cast(), 2048, &log) };
+    assert_eq!(n, 2048);
+    assert_eq!(port.ext.xrun_timestamp, 5_000);
+    assert!(drain(r).is_empty(), "a held buffer must not reach the device");
+
+    // past the event, but the host flags its own xrun recovery: still held
+    let n = unsafe { recover_or_hold(&mut port, 6_000, SPA_IO_CLOCK_FLAG_XRUN_RECOVER, data.as_ptr().cast(), 2048, &log) };
+    assert_eq!(n, 2048);
+    assert_eq!(port.ext.xrun_timestamp, 5_000);
+    assert!(drain(r).is_empty());
+
+    // past the event with no host recovery: re-primes and writes
+    let n = unsafe { recover_or_hold(&mut port, 6_000, 0, data.as_ptr().cast(), 2048, &log) };
+    assert_eq!(n, 2048);
+    assert_eq!(port.ext.xrun_timestamp, 0);
+    let out = drain(r);
+    assert_eq!(out.len(), 4096 + 2048);
+    assert!(out[..4096].iter().all(|&b| b == 0));
+    assert_eq!(&out[4096..], &data[..]);
+    unsafe { libc::close(r) };
+  }
+
+  // the follower fill snap: a level error past one period refills to target
+  // on underfill and skips the cycle's buffer on overfill; in-band errors go
+  // to the DLL instead
+  #[test]
+  fn fill_snap_refills_underfill_and_skips_overfill() {
+    let (r, w) = pipe_pair(true, true);
+    let mut port = test_port(w, 4096, 2048);
+
+    // underfill past one period: refill to target, don't skip
+    let (corr, skip) = matching_servo(&mut port, 1024, 8, 48000, 0);
+    assert_eq!(corr, 1.0);
+    assert!(!skip);
+    let out = drain(r);
+    assert_eq!(out.len(), 4096 - 1024);
+    assert!(out.iter().all(|&b| b == 0));
+
+    // overfill past one period: skip the buffer, write nothing (the device
+    // drains toward target meanwhile)
+    let (corr, skip) = matching_servo(&mut port, 4096 + 2048 + 8, 8, 48000, 0);
+    assert_eq!(corr, 1.0);
+    assert!(skip);
+    assert!(drain(r).is_empty());
+
+    // in-band error: no snap, the DLL absorbs it
+    let (corr, skip) = matching_servo(&mut port, 4096 + 512, 8, 48000, 0);
+    assert!(!skip);
+    assert!((0.9..=1.1).contains(&corr));
+    assert!(drain(r).is_empty());
+    unsafe { libc::close(r) };
+  }
+
+  // the same-device follower's level correction snaps the same way, without
+  // a DLL to relock
+  #[test]
+  fn same_device_level_correct_snaps_the_fill() {
+    let (r, w) = pipe_pair(true, true);
+    let mut port = test_port(w, 4096, 2048);
+
+    assert!(!level_correct(&mut port, 4096)); // on target: nothing to do
+    assert!(drain(r).is_empty());
+    assert!(level_correct(&mut port, 4096 + 2049)); // overfill: drain a cycle
+    assert!(drain(r).is_empty());
+    assert!(!level_correct(&mut port, 1024)); // underfill: refill to target
+    let out = drain(r);
+    assert_eq!(out.len(), 4096 - 1024);
+    assert!(out.iter().all(|&b| b == 0));
+    unsafe { libc::close(r) };
   }
 
   #[test]

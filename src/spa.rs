@@ -579,6 +579,20 @@ impl Log {
   }
 }
 
+// a Log that never emits (level NONE, methods never reached): the data-loop
+// phase functions take &Log, and their pipe-backed tests need one without a
+// live host logger. Safe because the log! macros gate every method call on
+// log_level(), which reads NONE here.
+#[cfg(test)]
+impl Log {
+  pub(crate) fn test_null() -> Self {
+    Self {
+      logger:  Box::leak(Box::new(unsafe { std::mem::zeroed() })),
+      methods: Box::leak(Box::new(unsafe { std::mem::zeroed() }))
+    }
+  }
+}
+
 #[macro_export]
 macro_rules! log {
   ($log:expr, $log_level:expr, $($arg:tt)*) => {

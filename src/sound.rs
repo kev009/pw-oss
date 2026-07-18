@@ -1196,12 +1196,14 @@ pub fn list_pcm_devices(indexes: &[u32]) -> Vec<PcmDevice> {
   result
 }
 
-// pipe-backed constructors for the alignment tests: a pipe write end is
-// byte-granular under O_NONBLOCK exactly like chn_write, with byte-exact
-// buffer accounting, so short writes can be forced deterministically
+// pipe-backed constructors for the alignment and recovery tests: a pipe
+// write end is byte-granular under O_NONBLOCK exactly like chn_write, with
+// byte-exact buffer accounting, so short writes can be forced
+// deterministically. The device starts in setup, like a freshly configured
+// channel; the first write/read transitions it to running.
 #[cfg(test)]
 impl DspWriter {
-  fn test_on_fd(fd: c_int, stride: u32) -> Self {
+  pub(crate) fn test_on_fd(fd: c_int, stride: u32) -> Self {
     Self {
       path:    "test-fd".to_string(),
       hw_quantum_ns: 0,
@@ -1218,7 +1220,7 @@ impl DspWriter {
 
 #[cfg(test)]
 impl Dsp {
-  fn test_on_fd(fd: c_int, stride: u32) -> Self {
+  pub(crate) fn test_on_fd(fd: c_int, stride: u32) -> Self {
     Self {
       path:  CString::new("test-fd").unwrap(),
       hw_quantum_ns: 0,
@@ -1227,6 +1229,68 @@ impl Dsp {
       needs_trigger: false,
       stride,
       skip:  0
+    }
+  }
+}
+
+// pipe plumbing shared by the alignment tests below and the sink/source
+// phase tests (they drive the extracted process_ports phases on pipe fds)
+#[cfg(test)]
+pub(crate) mod test_util {
+  use libc::c_int;
+
+  pub(crate) fn set_nonblock(fd: c_int) {
+    unsafe {
+      let fl = libc::fcntl(fd, libc::F_GETFL);
+      assert_ne!(libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK), -1);
+    }
+  }
+
+  // (read end, write end); nonblock as requested per end
+  pub(crate) fn pipe_pair(nb_read: bool, nb_write: bool) -> (c_int, c_int) {
+    let mut fds = [0 as c_int; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    if nb_read  { set_nonblock(fds[0]); }
+    if nb_write { set_nonblock(fds[1]); }
+    (fds[0], fds[1])
+  }
+
+  pub(crate) fn drain(fd: c_int) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 16384];
+    loop {
+      let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+      if n <= 0 { break; }
+      out.extend_from_slice(&buf[..n as usize]);
+    }
+    out
+  }
+
+  pub(crate) fn pattern(len: usize, seed: usize) -> Vec<u8> {
+    (0..len).map(|i| ((i * 7 + seed) % 251) as u8).collect()
+  }
+
+  // fill a nonblocking pipe to capacity (the "OSS ring" is full); returns
+  // the capacity actually taken
+  pub(crate) fn fill_pipe(w: c_int) -> usize {
+    let fill = vec![0xffu8; 16384];
+    let mut total = 0usize;
+    loop {
+      let n = unsafe { libc::write(w, fill.as_ptr().cast(), fill.len()) };
+      if n <= 0 { break; }
+      total += n as usize;
+    }
+    total
+  }
+
+  // free exactly `n` bytes of a full pipe by consuming them from the read end
+  pub(crate) fn free_space(r: c_int, n: usize) {
+    let mut buf = vec![0u8; n];
+    let mut freed = 0usize;
+    while freed < n {
+      let m = unsafe { libc::read(r, buf.as_mut_ptr().add(freed).cast(), n - freed) };
+      assert!(m > 0);
+      freed += m as usize;
     }
   }
 }
@@ -1269,38 +1333,7 @@ mod tests {
     }
   }
 
-  use libc::c_int;
-
-  fn set_nonblock(fd: c_int) {
-    unsafe {
-      let fl = libc::fcntl(fd, libc::F_GETFL);
-      assert_ne!(libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK), -1);
-    }
-  }
-
-  // (read end, write end); nonblock as requested per end
-  fn pipe_pair(nb_read: bool, nb_write: bool) -> (c_int, c_int) {
-    let mut fds = [0 as c_int; 2];
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-    if nb_read  { set_nonblock(fds[0]); }
-    if nb_write { set_nonblock(fds[1]); }
-    (fds[0], fds[1])
-  }
-
-  fn drain(fd: c_int) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut buf = [0u8; 16384];
-    loop {
-      let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-      if n <= 0 { break; }
-      out.extend_from_slice(&buf[..n as usize]);
-    }
-    out
-  }
-
-  fn pattern(len: usize, seed: usize) -> Vec<u8> {
-    (0..len).map(|i| ((i * 7 + seed) % 251) as u8).collect()
-  }
+  use super::test_util::{drain, pattern, pipe_pair};
 
   #[test]
   fn write_zeroes_floors_to_frames() {

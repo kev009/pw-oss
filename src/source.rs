@@ -841,7 +841,50 @@ pub const OSS_SOURCE_FACTORY: spa_handle_factory = spa_handle_factory {
 
 #[cfg(test)]
 mod tests {
-  use super::{fill_targets, ring_request, ring_required};
+  use super::{bounded_read, fill_targets, ring_request, ring_required, SourceDir, SourcePortExt};
+  use crate::sound::test_util::{pattern, pipe_pair};
+
+  fn test_port(read_fd: libc::c_int, period: u32, read_peak: u32) -> crate::node::Port<SourceDir> {
+    crate::node::Port {
+      config:          None,
+      buffers:         vec![],
+      io:              std::ptr::null_mut(),
+      dsp:             crate::sound::Dsp::test_on_fd(read_fd, 8),
+      dll:             Default::default(),
+      setup_period:    period,
+      bw_adapt:        Default::default(),
+      setup_blocksize: 1024,
+      resetup_pending: false,
+      was_matching:    false,
+      warn_limit:      crate::utils::RateLimit::new(),
+      ext:             SourcePortExt { read_peak, ..Default::default() }
+    }
+  }
+
+  // the read tail on a pipe-backed device: catch-up reads only the backlog
+  // beyond the healthy peak, and a late cycle (nothing queued) still hands
+  // the graph a whole period of silence
+  #[test]
+  fn bounded_read_caps_catchup_and_pads_late_cycles() {
+    let (r, w) = pipe_pair(false, false);
+    let mut port = test_port(r, 1024, 2048);
+    let log = crate::spa::Log::test_null();
+    let mut buf = vec![0xaau8; 8192];
+
+    // backlog past the peak: one period plus the excess is drained, no more
+    let s = pattern(4096, 4);
+    assert_eq!(unsafe { libc::write(w, s.as_ptr().cast(), 4096) }, 4096);
+    let n = unsafe { bounded_read(&mut port, 4096, buf.as_mut_ptr().cast(), 8192, 8, &log) };
+    assert_eq!(n, 1024 + (4096 - 2048));
+    assert_eq!(&buf[..n as usize], &s[..n as usize]);
+
+    // late cycle: nothing queued, so nothing is read from the blocking fd
+    // and the graph still gets a whole period of silence
+    let n = unsafe { bounded_read(&mut port, 0, buf.as_mut_ptr().cast(), 8192, 8, &log) };
+    assert_eq!(n, 1024);
+    assert!(buf[..1024].iter().all(|&b| b == 0));
+    unsafe { libc::close(w) };
+  }
 
   #[test]
   fn fill_targets_track_arrival_granularity() {
