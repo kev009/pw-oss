@@ -567,13 +567,13 @@ fn detect_underrun(
 // window at all. Until the recovery cycle arrives the buffer is consumed
 // unwritten (the skip-buffer hold). Returns the cycle's write result
 // (`size` when held).
-unsafe fn recover_or_hold(
+fn recover_or_hold(
     port: &mut crate::node::Port<SinkDir>,
     clock_nsec: u64,
     clock_flags: u32,
-    data: *const std::os::raw::c_void,
-    size: u32,
+    data: &[u8],
 ) -> isize {
+    let size = data.len() as u32;
     if clock_nsec > port.ext.xrun_timestamp && clock_flags & SPA_IO_CLOCK_FLAG_XRUN_RECOVER == 0 {
         port.ext.xrun_timestamp = 0;
 
@@ -592,8 +592,8 @@ unsafe fn recover_or_hold(
         );
 
         port.dsp.write_zeroes(refill);
-        // write `size`, not the period: only `size` bytes at the offset are owned
-        port.dsp.write(data, size)
+        // write the slice, not the period: only these bytes at the offset are owned
+        port.dsp.write(data)
     } else {
         #[cfg(debug_assertions)]
         eprintln!("{}: skipping buffer @ {}", port.dsp.path, clock_nsec);
@@ -748,6 +748,12 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
         // chunk non-null and maxsize > 0 guaranteed above
         let offset = (*data_0.chunk.as_ptr()).offset % data_0.maxsize;
         let size = (*data_0.chunk.as_ptr()).size.min(data_0.maxsize - offset);
+        // the raw block becomes a slice here: offset/size were just clamped
+        // against maxsize, so the range is in bounds for the cycle
+        let cycle_data = std::slice::from_raw_parts(
+            data_0.data.as_ptr().cast::<u8>().add(offset as usize),
+            size as usize,
+        );
 
         debug_assert_eq!((*data_0.chunk.as_ptr()).stride, stride as i32);
 
@@ -842,13 +848,7 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
 
         let mut corr: f64 = 1.0; // DLL rate correction, published through rate_match below
         let nbytes = if port.ext.xrun_timestamp != 0 {
-            recover_or_hold(
-                port,
-                driver_clock.nsec,
-                driver_clock.flags,
-                data_0.data.as_ptr().offset(offset as isize),
-                size,
-            )
+            recover_or_hold(port, driver_clock.nsec, driver_clock.flags, cycle_data)
         } else {
             let mut skip_write = false;
             if matching && port.setup_period != 0 && port.ext.period_mismatch == 0 {
@@ -867,7 +867,7 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
             if skip_write {
                 size as isize // consumed; the device drains toward target meanwhile
             } else {
-                port.dsp.write(data_0.data.as_ptr().offset(offset as isize), size)
+                port.dsp.write(cycle_data)
             }
         };
 
@@ -1302,7 +1302,7 @@ mod tests {
         free_space(r, 4096 + 1024);
 
         let data = pattern(2048, 1);
-        let n = unsafe { recover_or_hold(&mut port, 2_000, 0, data.as_ptr().cast(), 2048) };
+        let n = recover_or_hold(&mut port, 2_000, 0, &data);
 
         // the hold cleared and the overfull ring dropped the tail: only the
         // frames that fit after the re-prime were consumed
@@ -1332,7 +1332,7 @@ mod tests {
         let data = pattern(2048, 2);
 
         // same-cycle clock: not past the event yet
-        let n = unsafe { recover_or_hold(&mut port, 5_000, 0, data.as_ptr().cast(), 2048) };
+        let n = recover_or_hold(&mut port, 5_000, 0, &data);
         assert_eq!(n, 2048);
         assert_eq!(port.ext.xrun_timestamp, 5_000);
         assert!(
@@ -1341,21 +1341,13 @@ mod tests {
         );
 
         // past the event, but the host flags its own xrun recovery: still held
-        let n = unsafe {
-            recover_or_hold(
-                &mut port,
-                6_000,
-                SPA_IO_CLOCK_FLAG_XRUN_RECOVER,
-                data.as_ptr().cast(),
-                2048,
-            )
-        };
+        let n = recover_or_hold(&mut port, 6_000, SPA_IO_CLOCK_FLAG_XRUN_RECOVER, &data);
         assert_eq!(n, 2048);
         assert_eq!(port.ext.xrun_timestamp, 5_000);
         assert!(drain(r).is_empty());
 
         // past the event with no host recovery: re-primes and writes
-        let n = unsafe { recover_or_hold(&mut port, 6_000, 0, data.as_ptr().cast(), 2048) };
+        let n = recover_or_hold(&mut port, 6_000, 0, &data);
         assert_eq!(n, 2048);
         assert_eq!(port.ext.xrun_timestamp, 0);
         let out = drain(r);

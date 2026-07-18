@@ -174,15 +174,15 @@ fn retune_period(
 // source). Returns the cycle's byte count (the period of silence), or
 // EMPTY_CYCLE before a format is negotiated (unreachable past the caller's
 // gate).
-unsafe fn prime_capture(
+fn prime_capture(
     port: &mut crate::node::Port<SourceDir>,
     period_in_bytes: u32,
     graph_rate: u32,
     oss_fragment: u32,
-    data: *mut std::os::raw::c_void,
-    maxsize: u32,
+    data: &mut [u8],
     log: &crate::spa::Log,
 ) -> isize {
+    let maxsize = data.len() as u32;
     let Some((stride, rate)) = port.stride_rate() else {
         return EMPTY_CYCLE;
     };
@@ -224,7 +224,7 @@ unsafe fn prime_capture(
             if chunk == 0 {
                 break; // a sub-frame tail; it completes into a frame later
             }
-            let n = port.dsp.read(data, chunk as usize);
+            let n = port.dsp.read(&mut data[..chunk as usize]);
             if n <= 0 {
                 break;
             }
@@ -253,7 +253,7 @@ unsafe fn prime_capture(
     }
 
     let len = period_in_bytes.min(maxsize);
-    std::ptr::write_bytes(data.cast::<u8>(), 0, len as usize);
+    data[..len as usize].fill(0);
     len as isize
 }
 
@@ -354,13 +354,13 @@ fn follower_servo(
 // the device is late, keep the graph timeline stable: read only queued
 // bytes from the blocking fd and zero-pad the rest of the period instead of
 // returning an empty or short cycle.
-unsafe fn bounded_read(
+fn bounded_read(
     port: &mut crate::node::Port<SourceDir>,
     queued: u32,
-    data: *mut std::os::raw::c_void,
-    maxsize: u32,
+    data: &mut [u8],
     stride: u32,
 ) -> isize {
+    let maxsize = data.len() as u32;
     let want = if port.setup_period != 0 {
         // catch-up beyond the healthy peak (fill_targets: target plus slack,
         // capped by the granted ring so a fill at the ceiling is drainable);
@@ -376,18 +376,14 @@ unsafe fn bounded_read(
     // mid-frame; an unaligned read would start the next buffer mid-sample
     let ispace = (want.min(queued).min(maxsize) / stride) * stride;
     let nread = if ispace > 0 {
-        port.dsp.read(data, ispace as usize).max(0) as u32
+        port.dsp.read(&mut data[..ispace as usize]).max(0) as u32
     } else {
         0
     };
     let period = port.setup_period.min(maxsize);
     let out = if period > 0 { nread.max(period) } else { nread };
     if out > nread {
-        std::ptr::write_bytes(
-            data.cast::<u8>().add(nread as usize),
-            0,
-            (out - nread) as usize,
-        );
+        data[nread as usize..out as usize].fill(0);
     }
     out as isize
 }
@@ -540,6 +536,13 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
             continue;
         };
 
+        // the raw block becomes a slice here: maxsize > 0 was just
+        // validated, and the cycle owns the block until io publication
+        let cycle_data = std::slice::from_raw_parts_mut(
+            data_0.data.as_ptr().cast::<u8>(),
+            data_0.maxsize as usize,
+        );
+
         let matching =
             state.following && !crate::utils::same_clock(state.position, &state.clock_name);
 
@@ -594,7 +597,7 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
             // skips its reads); the ring overflows meanwhile and the exit edge
             // above re-primes when realtime resumes
             let len = period_in_bytes.min(data_0.maxsize);
-            std::ptr::write_bytes(data_0.data.as_ptr().cast::<u8>(), 0, len as usize);
+            cycle_data[..len as usize].fill(0);
             len as isize
         } else if !port.ext.primed && period_in_bytes > 0 {
             prime_capture(
@@ -602,8 +605,7 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
                 period_in_bytes,
                 graph_rate,
                 state.oss_fragment,
-                data_0.data.as_ptr(),
-                data_0.maxsize,
+                cycle_data,
                 &state.log,
             )
         } else if !port.dsp.is_running() {
@@ -637,7 +639,7 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
                 );
             }
 
-            bounded_read(port, queued, data_0.data.as_ptr(), data_0.maxsize, stride)
+            bounded_read(port, queued, cycle_data, stride)
         };
 
         // Rate-match only as a follower on a foreign clock: when driving, the
@@ -999,13 +1001,13 @@ mod tests {
         // backlog past the peak: one period plus the excess is drained, no more
         let s = pattern(4096, 4);
         assert_eq!(unsafe { libc::write(w, s.as_ptr().cast(), 4096) }, 4096);
-        let n = unsafe { bounded_read(&mut port, 4096, buf.as_mut_ptr().cast(), 8192, 8) };
+        let n = bounded_read(&mut port, 4096, &mut buf, 8);
         assert_eq!(n, 1024 + (4096 - 2048));
         assert_eq!(&buf[..n as usize], &s[..n as usize]);
 
         // late cycle: nothing queued, so nothing is read from the blocking fd
         // and the graph still gets a whole period of silence
-        let n = unsafe { bounded_read(&mut port, 0, buf.as_mut_ptr().cast(), 8192, 8) };
+        let n = bounded_read(&mut port, 0, &mut buf, 8);
         assert_eq!(n, 1024);
         assert!(buf[..1024].iter().all(|&b| b == 0));
         unsafe { libc::close(w) };
@@ -1075,7 +1077,7 @@ mod tests {
         let s = pattern(8, 5);
         assert_eq!(unsafe { libc::write(w, s.as_ptr().cast(), 8) }, 8);
         let mut buf = [0u8; 8];
-        assert_eq!(unsafe { port.dsp.read(buf.as_mut_ptr().cast(), 8) }, 8);
+        assert_eq!(port.dsp.read(&mut buf), 8);
         let log = crate::spa::Log::test_null();
 
         assert!(!retune_period(&mut port, 2048, &log));

@@ -378,7 +378,7 @@ fn native_rates(path: &str, play: bool) -> Vec<u32> {
         return vec![];
     };
     let mode = if play { libc::O_WRONLY } else { libc::O_RDONLY };
-    let fd = unsafe { libc::open(cpath.as_ptr(), mode | libc::O_NONBLOCK) };
+    let fd = unsafe { libc::open(cpath.as_ptr(), mode | libc::O_NONBLOCK | libc::O_CLOEXEC) };
     if fd == -1 {
         return vec![]; // busy: the caller keeps the min..max range
     }
@@ -422,7 +422,7 @@ pub(crate) fn probe_caps(path: &str, play: bool) -> Option<DspCaps> {
 
     let cpath = CString::new(path).ok()?;
     let mode = if play { libc::O_WRONLY } else { libc::O_RDONLY };
-    let fd = unsafe { libc::open(cpath.as_ptr(), mode | libc::O_NONBLOCK) };
+    let fd = unsafe { libc::open(cpath.as_ptr(), mode | libc::O_NONBLOCK | libc::O_CLOEXEC) };
     if fd == -1 {
         // busy or transiently gone: the native info still beats the caller's
         // conservative stereo fallback
@@ -642,7 +642,7 @@ impl Dsp {
         // O_RDONLY, not O_RDWR: on devices with asymmetric play/rec channel
         // counts (e.g. RODECaster) the kernel won't take per-direction counts on
         // one fd (shkhln/pw-oss#3)
-        let fd = unsafe { libc::open(self.path.as_ptr(), libc::O_RDONLY) };
+        let fd = unsafe { libc::open(self.path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
         if fd == -1 {
             return Err(Errno::last());
         }
@@ -733,24 +733,26 @@ impl Dsp {
     /// returns short mid-frame (signals), the torn frame's tail is discarded on
     /// the next call and its consumed head hidden from this one - one frame
     /// dropped, alignment kept. Returns a frame-aligned count.
-    pub(crate) unsafe fn read(&mut self, buf: *mut c_void, count: size_t) -> ssize_t {
+    pub(crate) fn read(&mut self, buf: &mut [u8]) -> ssize_t {
         if self.state == DspState::Setup {
             self.state = DspState::Running;
         }
         assert_eq!(self.state, DspState::Running);
         while self.skip != 0 {
             let mut scratch = [0u8; 64];
-            let n = libc::read(
-                self.fd,
-                scratch.as_mut_ptr().cast(),
-                (self.skip as usize).min(scratch.len()),
-            );
+            let n = unsafe {
+                libc::read(
+                    self.fd,
+                    scratch.as_mut_ptr().cast(),
+                    (self.skip as usize).min(scratch.len()),
+                )
+            };
             if n <= 0 {
                 return n; // capture is running when reads happen; treat as the caller's error
             }
             self.skip -= n as u32;
         }
-        let n = libc::read(self.fd, buf, count);
+        let n = unsafe { libc::read(self.fd, buf.as_mut_ptr().cast(), buf.len()) };
         if n <= 0 {
             return n;
         }
@@ -929,7 +931,12 @@ impl DspWriter {
     pub(crate) fn open(&mut self) -> Result<(), Errno> {
         assert_eq!(self.state, DspState::Closed);
         let path = CString::new(self.path.clone()).unwrap();
-        let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+        let fd = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
         if fd == -1 {
             return Err(Errno::last());
         }
@@ -1030,21 +1037,22 @@ impl DspWriter {
     /// a bounded retry; the ring drains continuously, so the few missing bytes
     /// fit within microseconds. Returns the frame-aligned byte count consumed
     /// from `buf` (callers drop only whole frames).
-    pub(crate) unsafe fn write(&mut self, buf: *const c_void, count: u32) -> ssize_t {
+    pub(crate) fn write(&mut self, buf: &[u8]) -> ssize_t {
+        let count = buf.len() as u32;
         if self.state == DspState::Setup {
             self.state = DspState::Running;
         }
         let ret = if !self.realign_stream() {
             -1 // a previously split frame couldn't be closed; don't compound it
         } else {
-            let n = self.write_buffered(buf, count);
+            let n = self.write_buffered(buf);
             if n > 0 {
                 let mut done = n as u32;
                 if self.frame_off != 0 && done < count {
                     // never read past the caller's buffer: an unaligned `count` that
                     // wrote fully leaves the split for the next call's zero realign
                     let need = (self.stride - self.frame_off).min(count - done);
-                    done += self.write_exact(buf.cast::<u8>().add(done as usize), need);
+                    done += self.write_exact(&buf[done as usize..(done + need) as usize]);
                     // on failure frame_off holds the split; the next call realigns
                 }
                 done as ssize_t
@@ -1062,7 +1070,7 @@ impl DspWriter {
     fn realign_stream(&mut self) -> bool {
         if self.frame_off != 0 {
             let need = self.stride - self.frame_off;
-            unsafe { self.write_exact(ZEROES.as_ptr(), need) };
+            self.write_exact(&ZEROES[..need as usize]);
         }
         self.frame_off == 0
     }
@@ -1071,11 +1079,12 @@ impl DspWriter {
     // briefly: at audio rates the ring frees a byte every few microseconds, so
     // the tail fits well inside the retry budget - unless the channel is
     // trigger-suspended and nothing drains, where waiting is pointless.
-    unsafe fn write_exact(&mut self, buf: *const u8, count: u32) -> u32 {
+    fn write_exact(&mut self, buf: &[u8]) -> u32 {
+        let count = buf.len() as u32;
         let mut done = 0u32;
         let mut tries = 0;
         while done < count {
-            let n = self.write_buffered(buf.add(done as usize).cast(), count - done);
+            let n = self.write_buffered(&buf[done as usize..]);
             if n > 0 {
                 done += n as u32;
                 continue;
@@ -1095,12 +1104,13 @@ impl DspWriter {
                 tv_sec: 0,
                 tv_nsec: 2_000,
             };
-            libc::nanosleep(&ts, std::ptr::null_mut());
+            unsafe { libc::nanosleep(&ts, std::ptr::null_mut()) };
         }
         done
     }
 
-    unsafe fn write_buffered(&mut self, buf: *const c_void, count: u32) -> ssize_t {
+    fn write_buffered(&mut self, buf: &[u8]) -> ssize_t {
+        let count = buf.len() as u32;
         if self.state == DspState::Setup {
             self.state = DspState::Running;
         }
@@ -1111,7 +1121,7 @@ impl DspWriter {
         #[cfg(debug_assertions)]
         let delay = odelay(self.fd);
 
-        let nbytes = libc::write(self.fd, buf, count as size_t);
+        let nbytes = unsafe { libc::write(self.fd, buf.as_ptr().cast(), count as size_t) };
         if nbytes > 0 {
             // frame phase of the stream: every accepted byte counts, whoever wrote it
             self.frame_off = (self.frame_off + nbytes as u32) % self.stride.max(1);
@@ -1159,7 +1169,7 @@ impl DspWriter {
         // next write's realign closes it with zeros.
         while count > 0 {
             let chunk = count.min(ZEROES.len() as u32);
-            let nbytes = unsafe { self.write_buffered(ZEROES.as_ptr().cast(), chunk) };
+            let nbytes = self.write_buffered(&ZEROES[..chunk as usize]);
             if nbytes < 0 {
                 let errno = Errno::last();
                 if errno != Errno::EAGAIN {
@@ -1475,7 +1485,7 @@ mod tests {
         // 2046 = 255 frames + 6 bytes: the kernel takes all of it, the 2-byte
         // frame tail can't fit, and the split is recorded rather than dropped
         let a = pattern(4096, 1);
-        let ret = unsafe { dsp.write(a.as_ptr().cast(), 4096) };
+        let ret = dsp.write(&a);
         assert_eq!(ret, 2046);
         assert_eq!(dsp.frame_off, 6);
 
@@ -1487,7 +1497,7 @@ mod tests {
         // with zeros before any new data: the stream returns to a frame
         // boundary instead of shifting every later sample
         let b = pattern(4096, 2);
-        let ret = unsafe { dsp.write(b.as_ptr().cast(), 4096) };
+        let ret = dsp.write(&b);
         assert_eq!(ret, 4096);
         assert_eq!(dsp.frame_off, 0);
         let tail = drain(r);
@@ -1509,7 +1519,7 @@ mod tests {
 
         // 2046 available < 4096 requested: the pipe returns it all, mid-frame
         let mut buf = vec![0u8; 4096];
-        let n = unsafe { dsp.read(buf.as_mut_ptr().cast(), 4096) };
+        let n = dsp.read(&mut buf[..4096]);
         assert_eq!(n, 2040);
         assert_eq!(&buf[..2040], &s[..2040]);
         assert_eq!(dsp.skip, 2);
@@ -1520,7 +1530,7 @@ mod tests {
             unsafe { libc::write(w, s.as_ptr().add(2046).cast(), 10) },
             10
         );
-        let n = unsafe { dsp.read(buf.as_mut_ptr().cast(), 8) };
+        let n = dsp.read(&mut buf[..8]);
         assert_eq!(n, 8);
         assert_eq!(&buf[..8], &s[2048..2056]);
         assert_eq!(dsp.skip, 0);
