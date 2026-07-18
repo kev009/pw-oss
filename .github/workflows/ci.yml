@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  freebsd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build and test on FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "15.1"
+          usesh: true
+          mem: 4096
+          # pkgconf for libspa-sys's pkg-config probe; pipewire for the native
+          # libspa it links against; llvm19 for the libclang bindgen needs
+          # (mirroring the port's build deps)
+          prepare: |
+            pkg install -y pkgconf rust pipewire llvm19
+          run: |
+            export LIBCLANG_PATH=/usr/local/llvm19/lib
+            cargo build --release
+            cargo test
