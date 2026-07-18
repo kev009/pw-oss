@@ -1963,7 +1963,6 @@ unsafe fn parse_init_dict<D: Direction>(info: *const spa_dict) -> (Option<String
             crate::spa::dump_spa_dict(info);
         }
 
-        //TODO: would be better with an iterator
         unsafe {
             crate::spa::for_each_dict_item(info, |key, value| {
                 if key == crate::keys::OSS_DSP_PATH {
@@ -1995,7 +1994,10 @@ fn publish_static_info<D: Direction>(state: &mut State<D>) {
     } else {
         state.node_info.set_max_output_ports(1);
     }
-    state.node_info.set_flags(SPA_NODE_FLAG_RT as u64); // ?
+    // the RT flag declares process() safe to call from the realtime data
+    // loop (the ALSA plugin nodes set the same flag), and pw-top/clients
+    // read it back from the node info
+    state.node_info.set_flags(SPA_NODE_FLAG_RT as u64);
 
     state
         .node_info
@@ -2004,10 +2006,8 @@ fn publish_static_info<D: Direction>(state: &mut State<D>) {
         .node_info
         .add_prop(crate::spa::key(SPA_KEY_NODE_DRIVER), "true");
 
-    // no EnumPortConfig/PortConfig: dead surface on a follower, see the note
-    // above build_port_format_info
-    //state.node_info.add_param(SPA_PARAM_IO,             SPA_PARAM_INFO_READ);
-    //state.node_info.add_param(SPA_PARAM_EnumFormat,     SPA_PARAM_INFO_READ);
+    // no EnumPortConfig/PortConfig (or node-level IO/EnumFormat): dead
+    // surface on a follower, see the note above build_port_format_info
     state
         .node_info
         .add_param(SPA_PARAM_PropInfo, SPA_PARAM_INFO_READ);
@@ -2023,10 +2023,12 @@ fn publish_static_info<D: Direction>(state: &mut State<D>) {
     state
         .port_info
         .set_flags((SPA_PORT_FLAG_PHYSICAL | SPA_PORT_FLAG_TERMINAL) as u64);
+    // 1/48000 is the pre-negotiation placeholder; publish_format_state
+    // replaces it with the negotiated rate on every port_set_param(Format)
     state.port_info.set_rate(spa_fraction {
         num: 1,
         denom: 48000,
-    }); // ?
+    });
 
     // advertise the format as writable so the host (re)negotiates it; Buffers is
     // unreadable until a format is set (it needs the stride). Flags flip in
@@ -2041,9 +2043,6 @@ fn publish_static_info<D: Direction>(state: &mut State<D>) {
     state
         .port_info
         .add_param(SPA_PARAM_Latency, SPA_PARAM_INFO_READWRITE);
-
-    //state.port_info.add_param(SPA_PARAM_IO,         SPA_PARAM_INFO_READ);
-    //state.port_info.add_param(SPA_PARAM_Buffers,    SPA_PARAM_INFO_WRITE); // ?
 }
 
 pub(crate) unsafe extern "C" fn init<D: Direction>(
