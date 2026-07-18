@@ -620,6 +620,10 @@ impl Dsp {
         self.state == DspState::Closed
     }
 
+    pub fn path(&self) -> &str {
+        self.path.to_str().unwrap_or("") // constructed from &str; always valid
+    }
+
     // on direct opens the hardware blocksize is per-session state; call after
     // configure so the snapshot reflects THIS session (see drain_quantum_ns)
     pub fn refresh_hw_quantum(&mut self) {

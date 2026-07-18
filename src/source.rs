@@ -450,12 +450,8 @@ unsafe fn recover_overrun(
             crate::warn!(log, "OSS reported {:3} overruns @ {} with the ring pinned; re-priming (+{} warnings suppressed)",
         overrun_count, now, suppressed);
         }
-        // report the EVENT to the host (pw-top's xrun counter) only for real
-        // recovery; the length isn't known, so pass 0 delay
-        let node_callbacks = callbacks.funcs.cast::<spa_node_callbacks>().as_ref();
-        if let Some(xrun_fun) = node_callbacks.and_then(|c| c.xrun) {
-            xrun_fun(callbacks.data, now / 1000, 0, std::ptr::null_mut());
-        }
+        // only for real recovery, not per ignored tick
+        crate::node::emit_xrun(callbacks, now / 1000);
 
         // recover like the sink's underrun path: re-enter priming next cycle,
         // which drains the backlog and relocks the DLL - otherwise the
@@ -586,11 +582,7 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
         if port.dsp.is_closed() {
             // Suspend closed the device but the host restarted without a fresh
             // format; rebuild off-loop instead of tripping the dsp state asserts
-            port.resetup_pending = state.main_loop.as_ref().is_some_and(|main_loop| {
-                crate::utils::invoke_on_loop(main_loop, state_ptr, move |state| {
-                    crate::node::resetup_task(state, port_idx)
-                })
-            });
+            port.resetup_pending = crate::node::queue_resetup(state_ptr, port_idx);
             continue;
         }
 
@@ -676,11 +668,7 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
             // rather than commit a fill target the current ring can't hold; if
             // even that fails (no main loop), keep running at the stale
             // geometry - degraded, but nothing stalls
-            port.resetup_pending = state.main_loop.as_ref().is_some_and(|main_loop| {
-                crate::utils::invoke_on_loop(main_loop, state_ptr, move |state| {
-                    crate::node::resetup_task(state, port_idx)
-                })
-            });
+            port.resetup_pending = crate::node::queue_resetup(state_ptr, port_idx);
             if port.resetup_pending {
                 continue;
             }

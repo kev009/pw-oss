@@ -536,18 +536,8 @@ unsafe fn detect_underrun(
             // late cycle
             port.ext.xrun_timestamp = clock_nsec.max(1);
 
-            // report the EVENT to the host (pw-top's xrun counter) once,
-            // not per held cycle; the length isn't known at detection, so
-            // 0 delay
-            let node_callbacks = callbacks.funcs.cast::<spa_node_callbacks>().as_ref();
-            if let Some(xrun_fun) = node_callbacks.and_then(|c| c.xrun) {
-                xrun_fun(
-                    callbacks.data,
-                    cur_timestamp / 1000,
-                    0,
-                    std::ptr::null_mut(),
-                );
-            }
+            // once per event, not per held cycle
+            crate::node::emit_xrun(callbacks, cur_timestamp / 1000);
         }
     } else {
         // suppressed counts stay diagnosable: a marginal system that
@@ -810,11 +800,7 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
         if port.dsp.is_closed() {
             // Suspend closed the device but the host restarted without a fresh
             // format; rebuild off-loop instead of tripping the dsp state asserts
-            port.resetup_pending = state.main_loop.as_ref().is_some_and(|main_loop| {
-                crate::utils::invoke_on_loop(main_loop, state_ptr, move |state| {
-                    crate::node::resetup_task(state, port_idx)
-                })
-            });
+            port.resetup_pending = crate::node::queue_resetup(state_ptr, port_idx);
             (*port.io).status = SPA_STATUS_NEED_DATA as i32;
             result |= SPA_STATUS_NEED_DATA as i32;
             continue;
@@ -828,58 +814,18 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
             continue;
         }
 
-        // buffer_id, n_datas and the data type all come from the peer. Validate them
-        // instead of asserting; a panic here aborts the process across extern "C".
         let buffer_id = (*port.io).buffer_id;
-        let buffer = match port
-            .buffers
-            .get(buffer_id as usize)
-            .copied()
-            .and_then(|b| b.as_ref())
-        {
-            Some(b) if b.n_datas == 1 => b, // we map the block directly, so need exactly one
-            _ => {
-                crate::warn!(
-                    state.log,
-                    "{}: unusable buffer (id {}); skipping",
-                    port.dsp.path,
-                    buffer_id
-                );
-                (*port.io).status = SPA_STATUS_NEED_DATA as i32;
-                result |= SPA_STATUS_NEED_DATA as i32; // return status, not just io, so the host refills
-                continue;
-            }
-        };
-
-        // the code below maps data, derefs chunk and divides by maxsize, so require a
-        // MemPtr block with all three valid. as_ref() (not offset(0)) handles a null
-        // datas pointer without UB.
-        let data_0 = match buffer.datas.as_ref() {
-            Some(d)
-                if d.type_ == SPA_DATA_MemPtr
-                    && !d.data.is_null()
-                    && !d.chunk.is_null()
-                    && d.maxsize > 0 =>
-            {
-                d
-            }
-            _ => {
-                crate::warn!(
-                    state.log,
-                    "{}: buffer data is not a usable MemPtr block; skipping",
-                    port.dsp.path
-                );
-                (*port.io).status = SPA_STATUS_NEED_DATA as i32;
-                result |= SPA_STATUS_NEED_DATA as i32; // return status, not just io, so the host refills
-                continue;
-            }
+        let Some(data_0) = crate::node::valid_data_block(port, buffer_id, &state.log) else {
+            (*port.io).status = SPA_STATUS_NEED_DATA as i32;
+            result |= SPA_STATUS_NEED_DATA as i32; // return status, not just io, so the host refills
+            continue;
         };
 
         // chunk non-null and maxsize > 0 guaranteed above
-        let offset = (*data_0.chunk).offset % data_0.maxsize;
-        let size = (*data_0.chunk).size.min(data_0.maxsize - offset);
+        let offset = (*data_0.chunk.as_ptr()).offset % data_0.maxsize;
+        let size = (*data_0.chunk.as_ptr()).size.min(data_0.maxsize - offset);
 
-        debug_assert_eq!((*data_0.chunk).stride, stride as i32);
+        debug_assert_eq!((*data_0.chunk.as_ptr()).stride, stride as i32);
 
         #[cfg(debug_assertions)]
         if (*state.position).clock.flags & SPA_IO_CLOCK_FLAG_XRUN_RECOVER != 0 {
@@ -896,7 +842,7 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
             crate::trace!(state.log, "offset: {}, chunk size: {}", offset, size);
             spa_debug_mem(
                 0,
-                data_0.data.offset(offset as isize),
+                data_0.data.as_ptr().offset(offset as isize),
                 16.min(size) as usize,
             );
         }
@@ -936,11 +882,7 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
             &state.log,
         ) {
             // the driver refused the trigger stop (dying fd): rebuild off-loop
-            port.resetup_pending = state.main_loop.as_ref().is_some_and(|main_loop| {
-                crate::utils::invoke_on_loop(main_loop, state_ptr, move |state| {
-                    crate::node::resetup_task(state, port_idx)
-                })
-            });
+            port.resetup_pending = crate::node::queue_resetup(state_ptr, port_idx);
             if port.resetup_pending {
                 port.was_matching = false; // the gap invalidates matching history
                 (*port.io).status = SPA_STATUS_NEED_DATA as i32;
@@ -978,7 +920,7 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
                 port,
                 driver_clock.nsec,
                 driver_clock.flags,
-                data_0.data.offset(offset as isize),
+                data_0.data.as_ptr().offset(offset as isize),
                 size,
             )
         } else {
@@ -1004,7 +946,7 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
             if skip_write {
                 size as isize // consumed; the device drains toward target meanwhile
             } else {
-                port.dsp.write(data_0.data.offset(offset as isize), size)
+                port.dsp.write(data_0.data.as_ptr().offset(offset as isize), size)
             }
         };
 

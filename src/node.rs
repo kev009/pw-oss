@@ -17,6 +17,7 @@ pub(crate) const MAX_PORTS: usize = 1;
 // concrete types and are used from the Direction hooks
 pub(crate) trait DeviceOps {
     fn new(path: &str) -> Self;
+    fn path(&self) -> &str;
     fn is_closed(&self) -> bool;
     fn is_running(&self) -> bool;
     fn close(&mut self);
@@ -26,6 +27,9 @@ pub(crate) trait DeviceOps {
 impl DeviceOps for crate::sound::Dsp {
     fn new(path: &str) -> Self {
         crate::sound::Dsp::new(path)
+    }
+    fn path(&self) -> &str {
+        crate::sound::Dsp::path(self)
     }
     fn is_closed(&self) -> bool {
         crate::sound::Dsp::is_closed(self)
@@ -44,6 +48,9 @@ impl DeviceOps for crate::sound::Dsp {
 impl DeviceOps for crate::sound::DspWriter {
     fn new(path: &str) -> Self {
         crate::sound::DspWriter::new(path)
+    }
+    fn path(&self) -> &str {
+        &self.path
     }
     fn is_closed(&self) -> bool {
         crate::sound::DspWriter::is_closed(self)
@@ -227,6 +234,72 @@ pub(crate) struct Port<D: Direction> {
     pub was_matching: bool, // rate matching active last cycle (relock on transition)
     pub warn_limit: crate::utils::RateLimit,
     pub ext: D::PortExt, // direction-specific fields (see sink.rs/source.rs)
+}
+
+// The validated fields of the buffer's single data block, copied out BY
+// VALUE: the block lives in host-owned buffer memory, so a returned
+// reference could only carry a fabricated lifetime. NonNull records what
+// valid_data_block checked; callers deref within the cycle, before any
+// buffer swap can run on this loop.
+#[derive(Clone, Copy)]
+pub(crate) struct DataBlock {
+    pub data: std::ptr::NonNull<c_void>, // the mapped MemPtr block
+    pub chunk: std::ptr::NonNull<spa_chunk>,
+    pub maxsize: u32, // > 0; offsets/sizes must be clamped against it
+}
+
+// The per-cycle buffer validation shared by both process paths. buffer_id
+// and n_datas come from the peer, and the cycle maps/fills the block
+// directly, so require exactly one MemPtr data block with data, chunk and
+// maxsize all valid; validate instead of asserting - a panic here aborts
+// the process across extern "C". as_ref() (not offset(0)) handles a null
+// datas pointer without UB. None = unusable (logged); the caller decides
+// the cycle's status.
+pub(crate) unsafe fn valid_data_block<D: Direction>(
+    port: &Port<D>,
+    buffer_id: u32,
+    log: &crate::spa::Log,
+) -> Option<DataBlock> {
+    let buffer: &spa_buffer = match port
+        .buffers
+        .get(buffer_id as usize)
+        .copied()
+        .and_then(|b| b.as_ref())
+    {
+        Some(b) if b.n_datas == 1 => b,
+        _ => {
+            crate::warn!(
+                log,
+                "{}: unusable buffer (id {}); skipping",
+                port.dsp.path(),
+                buffer_id
+            );
+            return None;
+        }
+    };
+    match buffer.datas.as_ref() {
+        Some(d)
+            if d.type_ == SPA_DATA_MemPtr
+                && !d.data.is_null()
+                && !d.chunk.is_null()
+                && d.maxsize > 0 =>
+        {
+            Some(DataBlock {
+                // non-null: both were checked in the guard above
+                data: std::ptr::NonNull::new(d.data).expect("data checked in the guard"),
+                chunk: std::ptr::NonNull::new(d.chunk).expect("chunk checked in the guard"),
+                maxsize: d.maxsize,
+            })
+        }
+        _ => {
+            crate::warn!(
+                log,
+                "{}: buffer data is not a usable MemPtr block; skipping",
+                port.dsp.path()
+            );
+            None
+        }
+    }
 }
 
 impl<D: Direction> Port<D> {
@@ -618,11 +691,11 @@ unsafe extern "C" fn on_timeout<D: Direction>(source: *mut spa_source) {
     (*state.clock).rate_diff = corr;
     (*state.clock).next_nsec = state.next_time;
 
-    let Some(node_callbacks) = state.callbacks.funcs.cast::<spa_node_callbacks>().as_ref() else {
+    let Some(callbacks) = node_callbacks(&state.callbacks) else {
         set_timeout(state, state.next_time);
         return; // no callbacks (yet, or cleared); keep the clock ticking
     };
-    if let Some(ready_fun) = node_callbacks.ready {
+    if let Some(ready_fun) = callbacks.ready {
         let err = ready_fun(state.callbacks.data, D::READY_STATUS);
         #[cfg(debug_assertions)]
         crate::trace!(state.log, "ready -> {}", err);
@@ -1382,6 +1455,55 @@ unsafe fn emit_format_lost<D: Direction>(state: &mut State<D>) {
     // and never re-issues set_param(Format)
     state.port_info.bump_param(SPA_PARAM_EnumFormat);
     emit_port_info(state);
+}
+
+// queue a main-thread rebuild of `port_idx`'s device (resetup_task); false =
+// no main loop or the invoke failed, and the caller keeps running degraded.
+// Takes the raw state pointer because callers hold &mut Port from the ports
+// iteration; only the disjoint main_loop field is read here.
+pub(crate) unsafe fn queue_resetup<D: Direction>(
+    state_ptr: *mut State<D>,
+    port_idx: usize,
+) -> bool {
+    (*state_ptr).main_loop.as_ref().is_some_and(|main_loop| {
+        crate::utils::invoke_on_loop(main_loop, state_ptr, move |state| {
+            resetup_task(state, port_idx)
+        })
+    })
+}
+
+// spa_node_callbacks leads with `version: u32` (the SPA vtable convention,
+// spa/node/node.h); node_callbacks' prefix read below depends on it
+const _: () = assert!(std::mem::offset_of!(spa_node_callbacks, version) == 0);
+
+// The host's callback table behind its version gate. Read ONLY the version
+// prefix (offset 0, asserted above) first: a host built against an older,
+// shorter table must be rejected before a full spa_node_callbacks - possibly
+// larger in this build - is read out of its allocation. None = no table set
+// (yet, or cleared) or one predating the fields we call.
+//
+// # Safety
+// `callbacks.funcs`, when non-null, must point at a live node-callbacks
+// table (the set_callbacks contract; the host keeps it alive while set).
+pub(crate) unsafe fn node_callbacks(callbacks: &spa_callbacks) -> Option<&spa_node_callbacks> {
+    if callbacks.funcs.is_null() {
+        return None;
+    }
+    // only the version prefix until the gate passes
+    let version = callbacks.funcs.cast::<u32>().read();
+    if version < SPA_VERSION_NODE_CALLBACKS {
+        return None;
+    }
+    // version >= ours: the table spans our whole struct
+    callbacks.funcs.cast::<spa_node_callbacks>().as_ref()
+}
+
+// report an xrun EVENT to the host (pw-top's xrun counter); the length
+// isn't known at detection, so 0 delay
+pub(crate) unsafe fn emit_xrun(callbacks: &spa_callbacks, trigger_us: u64) {
+    if let Some(xrun_fun) = node_callbacks(callbacks).and_then(|c| c.xrun) {
+        xrun_fun(callbacks.data, trigger_us, 0, std::ptr::null_mut());
+    }
 }
 
 // runs on the main thread (queued from the data loop via invoke_on_loop)
