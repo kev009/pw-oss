@@ -20,6 +20,14 @@ pub const SPA_PORT_CHANGE_MASK_ALL: u32 = SPA_PORT_CHANGE_MASK_FLAGS
 // spa/node/node.h:241; the libspa-sys bindings don't carry the set_param flags
 pub const SPA_NODE_PARAM_FLAG_NEAREST: u32 = 1 << 2;
 
+// The listener-vtable version gate. The SPA_VERSION_*_EVENTS constants are
+// currently 0, so a literal `version >= MIN` comparison trips clippy's
+// absurd_extreme_comparisons; routing MIN through a runtime parameter keeps
+// the check future-proof without module-wide allows.
+pub fn version_ok(version: u32, min: u32) -> bool {
+    version >= min
+}
+
 pub unsafe fn for_each_hook(head: *mut spa_hook_list, mut apply: impl FnMut(&spa_hook)) {
     let mut entry = (*head).list.next as *mut spa_hook;
     while (*entry).link != (*head).list {
@@ -46,7 +54,7 @@ pub unsafe fn dev_emit_result(
             .cast::<spa_device_events>()
             .as_ref()
             .expect("hook should be initialized");
-        assert!(f.version >= SPA_VERSION_DEVICE_EVENTS);
+        assert!(version_ok(f.version, SPA_VERSION_DEVICE_EVENTS));
         if let Some(result_fun) = f.result {
             result_fun(
                 entry.cb.data,
@@ -86,7 +94,7 @@ pub unsafe fn node_emit_done(hooks: &mut spa_hook_list, seq: c_int) {
             .cast::<spa_node_events>()
             .as_ref()
             .expect("hook should be initialized");
-        assert!(f.version >= SPA_VERSION_NODE_EVENTS);
+        assert!(version_ok(f.version, SPA_VERSION_NODE_EVENTS));
         if let Some(result_fun) = f.result {
             result_fun(entry.cb.data, seq, 0, 0, std::ptr::null());
         }
@@ -107,7 +115,7 @@ pub unsafe fn node_emit_result(
             .cast::<spa_node_events>()
             .as_ref()
             .expect("hook should be initialized");
-        assert!(f.version >= SPA_VERSION_NODE_EVENTS);
+        assert!(version_ok(f.version, SPA_VERSION_NODE_EVENTS));
         if let Some(result_fun) = f.result {
             result_fun(
                 entry.cb.data,
@@ -534,7 +542,7 @@ impl Loop {
             .cast::<spa_loop_methods>()
             .as_ref()
             .expect("loop methods should be initialized");
-        assert!(methods.version >= SPA_VERSION_LOOP_METHODS);
+        assert!(version_ok(methods.version, SPA_VERSION_LOOP_METHODS));
         Self { loop_, methods }
     }
 
@@ -595,7 +603,7 @@ impl System {
             .cast::<spa_system_methods>()
             .as_ref()
             .expect("system methods should be initialized");
-        assert!(methods.version >= SPA_VERSION_SYSTEM_METHODS);
+        assert!(version_ok(methods.version, SPA_VERSION_SYSTEM_METHODS));
         Self { system, methods }
     }
 
@@ -716,7 +724,7 @@ impl Log {
         // a v0 vtable has no logt slot at all (the C struct is shorter), so
         // the field may only be read behind the version gate; a missing logt
         // on a v1+ logger falls back the same way
-        let logt = if unsafe { (*methods).version } >= SPA_VERSION_LOG_METHODS {
+        let logt = if version_ok(unsafe { (*methods).version }, SPA_VERSION_LOG_METHODS) {
             unsafe { (*methods).logt }
         } else {
             None

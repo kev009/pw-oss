@@ -158,7 +158,7 @@ unsafe fn emit_device_info(state: &mut State) {
             .cast::<spa_device_events>()
             .as_ref()
             .expect("hook should be initialized");
-        assert!(f.version >= SPA_VERSION_DEVICE_EVENTS);
+        assert!(crate::spa::version_ok(f.version, SPA_VERSION_DEVICE_EVENTS));
         if let Some(info_fun) = f.info {
             info_fun(entry.cb.data, state.dev_info.raw());
         }
@@ -470,7 +470,7 @@ unsafe fn emit_object_config(state: &mut State, pos: usize, volume: bool) {
             .cast::<spa_device_events>()
             .as_ref()
             .expect("hook should be initialized");
-        assert!(f.version >= SPA_VERSION_DEVICE_EVENTS);
+        assert!(crate::spa::version_ok(f.version, SPA_VERSION_DEVICE_EVENTS));
         if let Some(event_fun) = f.event {
             event_fun(entry.cb.data, buffer.as_ptr() as *const spa_event);
         }
@@ -753,7 +753,7 @@ unsafe extern "C" fn add_listener(
                 "we just assigned events to this very hook by calling spa_hook_list_isolate",
             );
 
-        assert!(f.version >= SPA_VERSION_DEVICE_EVENTS);
+        assert!(crate::spa::version_ok(f.version, SPA_VERSION_DEVICE_EVENTS));
 
         if let Some(dev_info_fun) = f.info {
             let old_mask = state
@@ -790,7 +790,7 @@ unsafe extern "C" fn sync(object: *mut c_void, seq: c_int) -> c_int {
             .cast::<spa_device_events>()
             .as_ref()
             .expect("hook should be initialized");
-        assert!(f.version >= SPA_VERSION_DEVICE_EVENTS);
+        assert!(crate::spa::version_ok(f.version, SPA_VERSION_DEVICE_EVENTS));
         if let Some(result_fun) = f.result {
             result_fun(entry.cb.data, seq, 0, 0, std::ptr::null());
         }
@@ -1030,7 +1030,7 @@ unsafe fn set_profile_param(state: &mut State, param: *const spa_pod) -> c_int {
                 .cast::<spa_device_events>()
                 .as_ref()
                 .expect("hook should be initialized");
-            assert!(f.version >= SPA_VERSION_DEVICE_EVENTS);
+            assert!(crate::spa::version_ok(f.version, SPA_VERSION_DEVICE_EVENTS));
             emit_objects(
                 f,
                 entry.cb.data,

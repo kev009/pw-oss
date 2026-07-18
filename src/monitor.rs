@@ -75,7 +75,7 @@ unsafe extern "C" fn add_listener(
                 "we just assigned events to this very hook by calling spa_hook_list_isolate",
             );
 
-        assert!(f.version >= SPA_VERSION_DEVICE_EVENTS);
+        assert!(crate::spa::version_ok(f.version, SPA_VERSION_DEVICE_EVENTS));
 
         state.dev_info.change_mask = crate::spa::SPA_DEVICE_CHANGE_MASK_ALL as u64;
 
@@ -223,7 +223,7 @@ unsafe fn resync_devices(state: &mut State, detached: &[String]) {
                         .cast::<spa_device_events>()
                         .as_ref()
                         .expect("callback should be initialized");
-                    assert!(f.version >= SPA_VERSION_DEVICE_EVENTS);
+                    assert!(crate::spa::version_ok(f.version, SPA_VERSION_DEVICE_EVENTS));
                     remove_dev_node(entry, f, &indexes);
                 });
             }
@@ -250,7 +250,7 @@ unsafe fn resync_devices(state: &mut State, detached: &[String]) {
                     .cast::<spa_device_events>()
                     .as_ref()
                     .expect("callback should be initialized");
-                assert!(f.version >= SPA_VERSION_DEVICE_EVENTS);
+                assert!(crate::spa::version_ok(f.version, SPA_VERSION_DEVICE_EVENTS));
                 remove_dev_node(entry, f, old_indexes);
             });
         }
@@ -265,7 +265,7 @@ unsafe fn resync_devices(state: &mut State, detached: &[String]) {
                     .cast::<spa_device_events>()
                     .as_ref()
                     .expect("callback should be initialized");
-                assert!(f.version >= SPA_VERSION_DEVICE_EVENTS);
+                assert!(crate::spa::version_ok(f.version, SPA_VERSION_DEVICE_EVENTS));
                 emit_dev_node(entry, f, driver, new_indexes);
             });
         }

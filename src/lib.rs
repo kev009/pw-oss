@@ -1,16 +1,12 @@
 use libspa::sys::spa_handle_factory;
 use std::os::raw::c_int;
 
-#[allow(clippy::absurd_extreme_comparisons)]
 mod device;
-#[allow(clippy::absurd_extreme_comparisons)]
 mod monitor;
-#[allow(clippy::absurd_extreme_comparisons)]
 mod node;
 mod nv;
 mod sink;
 mod source;
-#[allow(clippy::absurd_extreme_comparisons)]
 mod spa;
 
 mod dll;
@@ -25,7 +21,12 @@ use monitor::OSS_MONITOR_FACTORY;
 use sink::OSS_SINK_FACTORY;
 use source::OSS_SOURCE_FACTORY;
 
-#[allow(clippy::missing_safety_doc)]
+/// The SPA plugin entry point, called by the PipeWire host loader.
+///
+/// # Safety
+/// `factory` and `index` must be valid, writable pointers; `index` selects
+/// the factory to return and is advanced by one on success (the host calls
+/// this in a loop until it returns 0).
 #[no_mangle]
 pub unsafe extern "C" fn spa_handle_factory_enum(
     factory: *mut *const spa_handle_factory,

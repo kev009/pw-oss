@@ -340,7 +340,7 @@ unsafe extern "C" fn add_listener<D: Direction>(
                 "we just assigned events to this very hook by calling spa_hook_list_isolate",
             );
 
-        assert!(f.version >= SPA_VERSION_NODE_EVENTS);
+        assert!(crate::spa::version_ok(f.version, SPA_VERSION_NODE_EVENTS));
 
         if let Some(node_info_fun) = f.info {
             let old_mask = state
@@ -374,7 +374,7 @@ pub(crate) unsafe fn emit_node_info<D: Direction>(state: &mut State<D>) {
             .cast::<spa_node_events>()
             .as_ref()
             .expect("hook should be initialized");
-        if f.version >= SPA_VERSION_NODE_EVENTS {
+        if crate::spa::version_ok(f.version, SPA_VERSION_NODE_EVENTS) {
             if let Some(node_info_fun) = f.info {
                 node_info_fun(entry.cb.data, state.node_info.raw());
             }
@@ -422,7 +422,7 @@ pub(crate) unsafe fn emit_port_info<D: Direction>(state: &mut State<D>) {
             .cast::<spa_node_events>()
             .as_ref()
             .expect("hook should be initialized");
-        if f.version >= SPA_VERSION_NODE_EVENTS {
+        if crate::spa::version_ok(f.version, SPA_VERSION_NODE_EVENTS) {
             if let Some(port_info_fun) = f.port_info {
                 port_info_fun(entry.cb.data, D::DIRECTION, 0, state.port_info.raw());
             }
@@ -1491,7 +1491,7 @@ pub(crate) unsafe fn node_callbacks(callbacks: &spa_callbacks) -> Option<&spa_no
     }
     // only the version prefix until the gate passes
     let version = callbacks.funcs.cast::<u32>().read();
-    if version < SPA_VERSION_NODE_CALLBACKS {
+    if !crate::spa::version_ok(version, SPA_VERSION_NODE_CALLBACKS) {
         return None;
     }
     // version >= ours: the table spans our whole struct
