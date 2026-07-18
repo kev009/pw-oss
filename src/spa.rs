@@ -214,6 +214,59 @@ pub(crate) unsafe fn filter_pod(
     }
 }
 
+// one (id, index) step of a param enumeration (enum_params_loop's build closure)
+pub(crate) enum ParamStep {
+    Built(Vec<u8>), // the serialized pod for this index
+    Skip,           // nothing at this index; keep scanning (inactive routes)
+    Stop(c_int),    // end the enumeration with this return code
+}
+
+/// The shared enum_params frame behind node, port and device param
+/// enumeration: walk indices from `start`, build one pod per step, filter it
+/// against the host's filter pod and emit up to `max` matches as result
+/// events. `state` is threaded through both closures so building may borrow
+/// it mutably (the caps re-probe) and emission may reach the hook list.
+///
+/// # Safety
+/// `filter` must be null or point at a valid pod (the spa_pod_filter
+/// contract); the emit closure receives a pointer into a buffer that is only
+/// valid for the duration of that call.
+pub(crate) unsafe fn enum_params_loop<S>(
+    state: &mut S,
+    (start, max): (u32, u32),
+    filter: *const spa_pod,
+    mut build: impl FnMut(&mut S, u32) -> ParamStep,
+    mut emit: impl FnMut(&mut S, u32, *mut spa_pod),
+) -> c_int {
+    let mut fbuffer = vec![]; // spa_pod_filter output; kept apart from the source pod (see filter_pod)
+
+    let mut index = start;
+    let mut count = 0;
+
+    while count < max {
+        let mut buffer = match build(state, index) {
+            ParamStep::Built(pod) => pod,
+            ParamStep::Skip => {
+                index += 1;
+                continue;
+            }
+            ParamStep::Stop(res) => return res,
+        };
+
+        // the built pod lives in `buffer`, distinct from the filter output
+        if let Some(param) =
+            unsafe { filter_pod(&mut fbuffer, buffer.as_mut_ptr() as *mut spa_pod, filter) }
+        {
+            emit(state, index, param);
+            count += 1;
+        }
+
+        index += 1;
+    }
+
+    0
+}
+
 // sync() replies with an empty result carrying the sequence number
 pub(crate) unsafe fn node_emit_done(hooks: &mut spa_hook_list, seq: c_int) {
     // one emission through the C listener vtables end to end

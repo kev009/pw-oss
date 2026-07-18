@@ -90,9 +90,9 @@ impl PortConfig {
 
 // outcome of a per-(id, index) node param build (the enum_params hook)
 pub(crate) enum ParamBuild {
-    Built,     // a pod was written into the builder
-    Exhausted, // no more values for this param id
-    Unknown,   // unknown param id
+    Built(Vec<u8>), // the serialized pod for this (id, index)
+    Exhausted,      // no more values for this param id
+    Unknown,        // unknown param id
 }
 
 pub(crate) trait Direction: Sized + 'static {
@@ -121,13 +121,8 @@ pub(crate) trait Direction: Sized + 'static {
     // init: after the info dict is parsed (e.g. latching the oss.delay default)
     fn ext_ready(ext: &mut Self::Ext);
 
-    // enum_params: serialize one node param pod for (id, index) into `buffer`
-    fn build_node_param(
-        state: &mut State<Self>,
-        buffer: &mut Vec<u8>,
-        id: u32,
-        index: u32,
-    ) -> ParamBuild;
+    // enum_params: serialize one node param pod for (id, index)
+    fn build_node_param(state: &mut State<Self>, id: u32, index: u32) -> ParamBuild;
     // set_param(Props) with a NULL pod: reset the props to their defaults
     unsafe fn reset_props(state: &mut State<Self>) -> c_int;
     // set_param(Props): the SPA_PROP_params property (the sink's oss.delay)
@@ -466,6 +461,32 @@ unsafe extern "C" fn sync<D: Direction>(object: *mut c_void, seq: c_int) -> c_in
     0
 }
 
+// emit one filtered enum_params result to every listener (node and port
+// enumeration share this shape)
+unsafe fn emit_param_result<D: Direction>(
+    state: &mut State<D>,
+    seq: c_int,
+    id: u32,
+    index: u32,
+    param: *mut spa_pod,
+) {
+    let result = spa_result_node_params {
+        id,
+        index,
+        next: index + 1,
+        param,
+    };
+    unsafe {
+        crate::spa::node_emit_result(
+            &mut state.hooks,
+            seq,
+            0,
+            SPA_RESULT_TYPE_NODE_PARAMS,
+            &result,
+        );
+    }
+}
+
 unsafe extern "C" fn enum_params<D: Direction>(
     object: *mut c_void,
     seq: c_int,
@@ -477,51 +498,20 @@ unsafe extern "C" fn enum_params<D: Direction>(
     let state =
         unsafe { object.cast::<State<D>>().as_mut() }.expect("object is not supposed to be null");
 
-    if max == 0 {
-        return 0;
+    unsafe {
+        crate::spa::enum_params_loop(
+            state,
+            (start, max),
+            filter,
+            |state, index| match D::build_node_param(state, id, index) {
+                ParamBuild::Built(pod) => crate::spa::ParamStep::Built(pod),
+                ParamBuild::Exhausted => crate::spa::ParamStep::Stop(0),
+                // unknown param id (ALSA convention)
+                ParamBuild::Unknown => crate::spa::ParamStep::Stop(-libc::ENOENT),
+            },
+            |state, index, param| emit_param_result(state, seq, id, index, param),
+        )
     }
-
-    let mut buffer = vec![];
-    let mut fbuffer = vec![]; // spa_pod_filter output; kept apart from the source pod (see spa::filter_pod)
-
-    let mut index = start;
-    let mut count = 0;
-
-    while count < max {
-        match D::build_node_param(state, &mut buffer, id, index) {
-            ParamBuild::Built => (),
-            ParamBuild::Exhausted => return 0,
-            ParamBuild::Unknown => return -libc::ENOENT, // unknown param id (ALSA convention)
-        }
-
-        let mut result = spa_result_node_params {
-            id,
-            index,
-            next: index + 1,
-            param: std::ptr::null_mut(),
-        };
-
-        // the built pod lives in `buffer`, distinct from the filter output
-        if let Some(param) = unsafe {
-            crate::spa::filter_pod(&mut fbuffer, buffer.as_mut_ptr() as *mut spa_pod, filter)
-        } {
-            result.param = param;
-            unsafe {
-                crate::spa::node_emit_result(
-                    &mut state.hooks,
-                    seq,
-                    0,
-                    SPA_RESULT_TYPE_NODE_PARAMS,
-                    &result,
-                );
-            }
-            count += 1;
-        }
-
-        index += 1;
-    }
-
-    0
 }
 
 unsafe extern "C" fn set_param<D: Direction>(
@@ -1098,88 +1088,71 @@ unsafe extern "C" fn port_enum_params<D: Direction>(
     if direction != D::DIRECTION || (port_id as usize) >= MAX_PORTS {
         return -libc::EINVAL;
     }
-    if max == 0 {
-        return 0;
-    }
 
-    let mut buffer = vec![];
-    let mut fbuffer = vec![]; // spa_pod_filter output; kept apart from the source pod (see spa::filter_pod)
-
-    let mut index = start;
-    let mut count = 0;
-
-    while count < max {
-        #[allow(non_upper_case_globals)]
-        match (id, index) {
-            (SPA_PARAM_EnumFormat, i) => {
-                if state.caps_fallback {
-                    // the init-time probe hit a busy device and baked in fallback
-                    // caps; retry now (main thread, transient open)
-                    if let Some(caps) = crate::sound::probe_caps(&state.dsp_path, D::PLAYBACK) {
-                        crate::info!(state.log, "re-probed caps: {:?}", caps);
-                        state.caps = caps;
-                        state.caps_fallback = false;
+    unsafe {
+        crate::spa::enum_params_loop(
+            state,
+            (start, max),
+            filter,
+            |state, index| {
+                use crate::spa::ParamStep;
+                #[allow(non_upper_case_globals)]
+                match (id, index) {
+                    (SPA_PARAM_EnumFormat, i) => {
+                        if state.caps_fallback {
+                            // the init-time probe hit a busy device and baked in fallback
+                            // caps; retry now (main thread, transient open)
+                            if let Some(caps) =
+                                crate::sound::probe_caps(&state.dsp_path, D::PLAYBACK)
+                            {
+                                crate::info!(state.log, "re-probed caps: {:?}", caps);
+                                state.caps = caps;
+                                state.caps_fallback = false;
+                            }
+                        }
+                        match crate::utils::build_enum_format_info(&state.caps, i) {
+                            Some(pod) => ParamStep::Built(pod),
+                            None => ParamStep::Stop(0),
+                        }
                     }
+                    (SPA_PARAM_Format, 0) => {
+                        match state.ports[port_id as usize].config.as_ref() {
+                            Some(cfg) => {
+                                ParamStep::Built(build_port_format_info(cfg, SPA_PARAM_Format))
+                            }
+                            None => ParamStep::Stop(-libc::ENOENT), // no format negotiated yet
+                        }
+                    }
+                    (SPA_PARAM_Buffers, 0) => {
+                        match state.ports[port_id as usize].config.as_ref() {
+                            Some(cfg) => {
+                                ParamStep::Built(crate::utils::build_buffers_info(cfg.stride))
+                            }
+                            None => ParamStep::Stop(-libc::ENOENT), // format not negotiated yet
+                        }
+                    }
+                    (SPA_PARAM_Latency, 0 | 1) => {
+                        let mut info = state.latency[index as usize];
+                        // the process latency shifts what we report toward the peer (upstream
+                        // for the sink, downstream for the source)
+                        if info.direction == D::DIRECTION {
+                            crate::utils::process_latency_info_add(
+                                &state.process_latency,
+                                &mut info,
+                            );
+                        }
+                        ParamStep::Built(crate::utils::build_latency_info(&info))
+                    }
+                    // a known id whose indices are exhausted ends the enumeration
+                    (SPA_PARAM_Format | SPA_PARAM_Buffers | SPA_PARAM_Latency, _) => {
+                        ParamStep::Stop(0)
+                    }
+                    _ => ParamStep::Stop(-libc::ENOENT), // unknown param id (ALSA convention)
                 }
-                match crate::utils::build_enum_format_info(&state.caps, i) {
-                    Some(pod) => buffer = pod,
-                    None => return 0,
-                }
-            }
-            (SPA_PARAM_Format, 0) => {
-                match state.ports[port_id as usize].config.as_ref() {
-                    Some(cfg) => buffer = build_port_format_info(cfg, SPA_PARAM_Format),
-                    None => return -libc::ENOENT, // no format negotiated yet
-                }
-            }
-            (SPA_PARAM_Buffers, 0) => {
-                match state.ports[port_id as usize].config.as_ref() {
-                    Some(cfg) => buffer = crate::utils::build_buffers_info(cfg.stride),
-                    None => return -libc::ENOENT, // format not negotiated yet
-                }
-            }
-            (SPA_PARAM_Latency, 0 | 1) => {
-                let mut info = state.latency[index as usize];
-                // the process latency shifts what we report toward the peer (upstream
-                // for the sink, downstream for the source)
-                if info.direction == D::DIRECTION {
-                    crate::utils::process_latency_info_add(&state.process_latency, &mut info);
-                }
-                buffer = crate::utils::build_latency_info(&info);
-            }
-            // a known id whose indices are exhausted ends the enumeration
-            (SPA_PARAM_Format | SPA_PARAM_Buffers | SPA_PARAM_Latency, _) => return 0,
-            _ => return -libc::ENOENT, // unknown param id (ALSA convention)
-        };
-
-        let mut result = spa_result_node_params {
-            id,
-            index,
-            next: index + 1,
-            param: std::ptr::null_mut(),
-        };
-
-        // the built pod lives in `buffer`, distinct from the filter output
-        if let Some(param) = unsafe {
-            crate::spa::filter_pod(&mut fbuffer, buffer.as_mut_ptr() as *mut spa_pod, filter)
-        } {
-            result.param = param;
-            unsafe {
-                crate::spa::node_emit_result(
-                    &mut state.hooks,
-                    seq,
-                    0,
-                    SPA_RESULT_TYPE_NODE_PARAMS,
-                    &result,
-                );
-            }
-            count += 1;
-        }
-
-        index += 1;
+            },
+            |state, index, param| emit_param_result(state, seq, id, index, param),
+        )
     }
-
-    0
 }
 
 // port_set_param(Format): validate the raw format against the format map and

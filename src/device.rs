@@ -788,90 +788,78 @@ unsafe extern "C" fn enum_params(
     let state =
         unsafe { object.cast::<State>().as_mut() }.expect("object is not supposed to be null");
 
-    if max == 0 {
-        return 0;
-    }
+    unsafe {
+        crate::spa::enum_params_loop(
+            state,
+            (start, max),
+            filter,
+            |state, index| {
+                use crate::spa::ParamStep;
+                // only the active route becomes a Route pod; inactive selectable sources
+                // exist as EnumRoute only (acp emits one Route per device with the
+                // active port's index, alsa-acp-device.c:582-600)
+                if id == SPA_PARAM_Route
+                    && (index as usize) < state.routes.len()
+                    && !state.routes[index as usize].active
+                {
+                    return ParamStep::Skip;
+                }
 
-    let mut buffer = vec![];
-    let mut fbuffer = vec![]; // spa_pod_filter output; kept apart from the source pod (see spa::filter_pod)
-
-    let mut index = start;
-    let mut count = 0;
-
-    while count < max {
-        // only the active route becomes a Route pod; inactive selectable sources
-        // exist as EnumRoute only (acp emits one Route per device with the
-        // active port's index, alsa-acp-device.c:582-600)
-        if id == SPA_PARAM_Route
-            && (index as usize) < state.routes.len()
-            && !state.routes[index as usize].active
-        {
-            index += 1;
-            continue;
-        }
-
-        #[allow(non_upper_case_globals)]
-        match (id, index) {
-            (SPA_PARAM_EnumProfile, 0 | 1) => {
-                buffer = build_profile_info(
-                    SPA_PARAM_EnumProfile,
+                #[allow(non_upper_case_globals)]
+                match (id, index) {
+                    (SPA_PARAM_EnumProfile, 0 | 1) => ParamStep::Built(build_profile_info(
+                        SPA_PARAM_EnumProfile,
+                        index,
+                        &state.pcm_devices,
+                        state.profile_save,
+                        false,
+                    )),
+                    (SPA_PARAM_Profile, 0) => ParamStep::Built(build_profile_info(
+                        SPA_PARAM_Profile,
+                        state.profile,
+                        &state.pcm_devices,
+                        state.profile_save,
+                        true,
+                    )),
+                    (SPA_PARAM_EnumRoute, i) if (i as usize) < state.routes.len() => {
+                        ParamStep::Built(build_route_info(
+                            SPA_PARAM_EnumRoute,
+                            &state.routes[i as usize],
+                            i as usize,
+                            state.profile,
+                            false,
+                        ))
+                    }
+                    // no Route pods while Off is active: there is nothing routed
+                    (SPA_PARAM_Route, i)
+                        if state.profile != 0 && (i as usize) < state.routes.len() =>
+                    {
+                        ParamStep::Built(build_route_info(
+                            SPA_PARAM_Route,
+                            &state.routes[i as usize],
+                            i as usize,
+                            state.profile,
+                            true,
+                        ))
+                    }
+                    // a known id whose indices are exhausted ends the enumeration
+                    (
+                        SPA_PARAM_EnumProfile
+                        | SPA_PARAM_Profile
+                        | SPA_PARAM_EnumRoute
+                        | SPA_PARAM_Route,
+                        _,
+                    ) => ParamStep::Stop(0),
+                    _ => ParamStep::Stop(-libc::ENOENT),
+                }
+            },
+            |state, index, param| {
+                let result = spa_result_device_params {
+                    id,
                     index,
-                    &state.pcm_devices,
-                    state.profile_save,
-                    false,
-                );
-            }
-            (SPA_PARAM_Profile, 0) => {
-                buffer = build_profile_info(
-                    SPA_PARAM_Profile,
-                    state.profile,
-                    &state.pcm_devices,
-                    state.profile_save,
-                    true,
-                );
-            }
-            (SPA_PARAM_EnumRoute, i) if (i as usize) < state.routes.len() => {
-                buffer = build_route_info(
-                    SPA_PARAM_EnumRoute,
-                    &state.routes[i as usize],
-                    i as usize,
-                    state.profile,
-                    false,
-                );
-            }
-            // no Route pods while Off is active: there is nothing routed
-            (SPA_PARAM_Route, i) if state.profile != 0 && (i as usize) < state.routes.len() => {
-                buffer = build_route_info(
-                    SPA_PARAM_Route,
-                    &state.routes[i as usize],
-                    i as usize,
-                    state.profile,
-                    true,
-                );
-            }
-            // a known id whose indices are exhausted ends the enumeration
-            (
-                SPA_PARAM_EnumProfile | SPA_PARAM_Profile | SPA_PARAM_EnumRoute | SPA_PARAM_Route,
-                _,
-            ) => {
-                return 0;
-            }
-            _ => return -libc::ENOENT,
-        };
-
-        let mut result = spa_result_device_params {
-            id,
-            index,
-            next: index + 1,
-            param: std::ptr::null_mut(),
-        };
-
-        // the built pod lives in `buffer`, distinct from the filter output
-        if let Some(param) = unsafe {
-            crate::spa::filter_pod(&mut fbuffer, buffer.as_mut_ptr() as *mut spa_pod, filter)
-        } {
-            result.param = param;
-            unsafe {
+                    next: index + 1,
+                    param,
+                };
                 crate::spa::dev_emit_result(
                     &mut state.hooks,
                     seq,
@@ -879,14 +867,9 @@ unsafe extern "C" fn enum_params(
                     SPA_RESULT_TYPE_DEVICE_PARAMS,
                     &result,
                 );
-            }
-            count += 1;
-        }
-
-        index += 1;
+            },
+        )
     }
-
-    0
 }
 
 // apply a Route props object to the hardware and the shadow; unknown props

@@ -705,38 +705,29 @@ impl Direction for SourceDir {
 
     fn ext_ready(_ext: &mut SourceExt) {}
 
-    fn build_node_param(
-        state: &mut State<SourceDir>,
-        buffer: &mut Vec<u8>,
-        id: u32,
-        index: u32,
-    ) -> ParamBuild {
+    fn build_node_param(state: &mut State<SourceDir>, id: u32, index: u32) -> ParamBuild {
         #[allow(non_upper_case_globals)]
-        match (id, index) {
-            (SPA_PARAM_PropInfo, 0) => *buffer = crate::utils::build_latency_offset_prop_info(),
-            (SPA_PARAM_PropInfo, 1) => {
-                *buffer = crate::utils::build_params_prop_info(
-                    crate::keys::OSS_FRAGMENT,
-                    "OSS fragment size (bytes, power of two, 0 = automatic)",
-                    state.oss_fragment,
-                    16384,
-                );
-            }
-            (SPA_PARAM_Props, 0) => {
-                *buffer = crate::utils::build_latency_offset_props(
-                    state.process_latency.ns,
-                    &[(crate::keys::OSS_FRAGMENT, state.oss_fragment)],
-                );
-            }
+        let pod = match (id, index) {
+            (SPA_PARAM_PropInfo, 0) => crate::utils::build_latency_offset_prop_info(),
+            (SPA_PARAM_PropInfo, 1) => crate::utils::build_params_prop_info(
+                crate::keys::OSS_FRAGMENT,
+                "OSS fragment size (bytes, power of two, 0 = automatic)",
+                state.oss_fragment,
+                16384,
+            ),
+            (SPA_PARAM_Props, 0) => crate::utils::build_latency_offset_props(
+                state.process_latency.ns,
+                &[(crate::keys::OSS_FRAGMENT, state.oss_fragment)],
+            ),
             (SPA_PARAM_ProcessLatency, 0) => {
-                *buffer = crate::utils::build_process_latency_info(&state.process_latency);
+                crate::utils::build_process_latency_info(&state.process_latency)
             }
             (SPA_PARAM_PropInfo | SPA_PARAM_Props | SPA_PARAM_ProcessLatency, _) => {
                 return ParamBuild::Exhausted;
             }
             _ => return ParamBuild::Unknown,
         };
-        ParamBuild::Built
+        ParamBuild::Built(pod)
     }
 
     // a NULL Props pod resets the props to their defaults and re-applies them
