@@ -292,12 +292,7 @@ unsafe fn prime_playback(port: &mut crate::node::Port<SinkDir>, period_in_bytes:
   #[cfg(debug_assertions)]
   debug_log_priorities(log);
 
-  // copies, not a borrow (the geometry commit below needs &mut port); the
-  // gate in process_ports guarantees a negotiated config here
-  let (stride, cfg_rate) = {
-    let config = port.config.as_ref().unwrap();
-    (config.stride().max(1), config.rate)
-  };
+  let Some((stride, cfg_rate)) = port.stride_rate() else { return };
 
   // Size the fill to the granted buffer and the device's real fragment.
   // oss_fragment (0 = automatic 1 KiB) only mutates on this loop, so the
@@ -355,12 +350,7 @@ unsafe fn detect_underrun(port: &mut crate::node::Port<SinkDir>, period_in_bytes
   if underrun_count == 0 {
     return;
   }
-  // copies, not a borrow (warn_limit/ext below need &mut port); the gate in
-  // process_ports guarantees a negotiated config here
-  let (stride, cfg_rate) = {
-    let config = port.config.as_ref().unwrap();
-    (config.stride().max(1), config.rate)
-  };
+  let Some((stride, cfg_rate)) = port.stride_rate() else { return };
   // (cached blocksize: the channel can't be retuned while triggered,
   // and the gate must not cost ioctls on healthy cycles)
   let low = period_in_bytes
@@ -588,16 +578,8 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
 
   for (port_idx, port) in state.ports.iter_mut().enumerate() {
 
-    if port.config.is_none() {
-      continue;
-    }
-
-    // copies, not a borrow: a live port.config borrow would block the
-    // &mut Port geometry commits below. stride is normalized once here
-    // (channels >= 1 post-negotiation, so the .max(1) is pure defense).
-    let (stride, cfg_rate) = {
-      let config = port.config.as_ref().unwrap();
-      (config.stride().max(1), config.rate)
+    let Some((stride, cfg_rate)) = port.stride_rate() else {
+      continue; // no format negotiated yet
     };
 
     if port.buffers.is_empty() || port.io.is_null() {

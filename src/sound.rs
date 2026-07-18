@@ -429,13 +429,15 @@ pub fn probe_caps(path: &str, play: bool) -> Option<DspCaps> {
   };
   const PCM_CAP_VIRTUAL: c_int = 0x0004_0000;
 
-  let probe = |req: c_ulong, val: c_int| -> c_int {
+  // None = the ioctl failed (bitperfect devices reject unsupported values
+  // instead of snapping)
+  let probe = |req: c_ulong, val: c_int| {
     let mut v = val;
-    if unsafe { libc::ioctl(fd, req, &mut v) } == -1 { -1 } else { v }
+    (unsafe { libc::ioctl(fd, req, &mut v) } != -1).then_some(v)
   };
 
-  // a failed probe (bitperfect device) defers to the audioinfo limits
-  let pick = |probed: c_int, ai_val: c_int| if probed >= 1 { probed } else { ai_val };
+  // a failed or degenerate probe defers to the audioinfo limits
+  let pick = |probed: Option<c_int>, ai_val: c_int| probed.filter(|&v| v >= 1).unwrap_or(ai_val);
 
   // On a vchan the feeder converts and SETCHANNELS clamps at SND_CHN_MAX, so
   // advertising the engine's wider native count would only fail at configure

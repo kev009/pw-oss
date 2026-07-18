@@ -192,6 +192,18 @@ pub(crate) struct Port<D: Direction> {
   pub ext:             D::PortExt // direction-specific fields (see sink.rs/source.rs)
 }
 
+impl<D: Direction> Port<D> {
+
+  // the negotiated (stride, rate) as copies, not a borrow: the process phases
+  // commit geometry through &mut Port. None until a format is negotiated -
+  // callers skip the cycle then rather than panic across extern "C"
+  // (channels >= 1 post-negotiation, so the .max(1) is pure defense).
+  pub(crate) fn stride_rate(&self) -> Option<(u32, u32)> {
+    let config = self.config.as_ref()?;
+    Some((config.stride().max(1), config.rate()))
+  }
+}
+
 unsafe extern "C" fn add_listener<D: Direction>(object: *mut c_void, listener: *mut spa_hook, events: *const spa_node_events, data: *mut c_void) -> c_int {
 
   let state = object.cast::<State<D>>().as_mut()

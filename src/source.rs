@@ -156,12 +156,7 @@ fn retune_period(port: &mut crate::node::Port<SourceDir>, period_in_bytes: u32, 
 unsafe fn prime_capture(port: &mut crate::node::Port<SourceDir>, period_in_bytes: u32, graph_rate: u32,
                         oss_fragment: u32, data: *mut std::os::raw::c_void, maxsize: u32,
                         log: &crate::spa::Log) -> isize {
-  // copies, not a borrow (the geometry commit below needs &mut port); the
-  // gate in process_ports guarantees a negotiated config here
-  let (stride, rate) = {
-    let config = port.config.as_ref().unwrap();
-    (config.stride.max(1), config.rate)
-  };
+  let Some((stride, rate)) = port.stride_rate() else { return EMPTY_CYCLE };
   // The capture fragment is capped at the period: queued readings move in
   // fragment steps, and a fragment far above the period makes the servo
   // target unreachable - the error pegs at the clamp and the integrator
@@ -461,9 +456,9 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
 
   for (port_idx, port) in state.ports.iter_mut().enumerate() {
 
-    if port.config.is_none() {
-      continue;
-    }
+    let Some((stride, rate)) = port.stride_rate() else {
+      continue; // no format negotiated yet
+    };
 
     if port.buffers.is_empty() || port.io.is_null() {
       continue; // not (fully) negotiated yet
@@ -520,8 +515,6 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
       }
     };
 
-    let stride = port.config.as_ref().unwrap().stride.max(1);
-    let rate   = port.config.as_ref().unwrap().rate;
     let matching = state.following && !crate::utils::same_clock(state.position, &state.clock_name);
 
     let mut corr: f64 = 1.0; // DLL rate correction for the follower rate match
@@ -630,7 +623,7 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
 
       (*data_0.chunk).offset = 0;
       (*data_0.chunk).size   = nbytes as u32;
-      (*data_0.chunk).stride = port.config.as_ref().unwrap().stride as i32;
+      (*data_0.chunk).stride = stride as i32;
       (*data_0.chunk).flags  = 0;
 
       (*port.io).buffer_id   = buffer_id;
