@@ -228,7 +228,13 @@ pub(crate) unsafe fn dump_spa_dict(dict: &spa_dict) {
     }
 }
 
-pub(crate) enum DictionaryString {
+// The inner enum is module-private on purpose: a crate-visible Ptr variant
+// would let safe code smuggle an arbitrary (dangling, non-NUL-terminated)
+// pointer into a dict item. Construction goes through the From impls only,
+// each of which guarantees a valid NUL-terminated pointee.
+pub(crate) struct DictionaryString(DictStr);
+
+enum DictStr {
     CString(CString),
     Ptr(*const c_char),
 }
@@ -236,13 +242,17 @@ pub(crate) enum DictionaryString {
 impl From<&str> for DictionaryString {
     fn from(str: &str) -> Self {
         // host/sysctl strings; a stray interior NUL must not abort the daemon
-        DictionaryString::CString(CString::new(str.replace('\0', " ")).expect("NULs replaced"))
+        DictionaryString(DictStr::CString(
+            CString::new(str.replace('\0', " ")).expect("NULs replaced"),
+        ))
     }
 }
 
 impl From<String> for DictionaryString {
     fn from(str: String) -> Self {
-        DictionaryString::CString(CString::new(str.replace('\0', " ")).expect("NULs replaced"))
+        DictionaryString(DictStr::CString(
+            CString::new(str.replace('\0', " ")).expect("NULs replaced"),
+        ))
     }
 }
 
@@ -250,7 +260,7 @@ impl From<&'static CStr> for DictionaryString {
     fn from(c: &'static CStr) -> Self {
         // NUL-terminated and 'static by construction, so the raw pointer
         // stays valid for the dictionary's lifetime
-        DictionaryString::Ptr(c.as_ptr())
+        DictionaryString(DictStr::Ptr(c.as_ptr()))
     }
 }
 
@@ -300,8 +310,9 @@ impl Dictionary {
     ) {
         assert!(self.items.len() < MAX_ITEMS as usize);
 
-        match (key.into(), value.into()) {
-            (DictionaryString::CString(key), DictionaryString::CString(value)) => {
+        let (key, value): (DictionaryString, DictionaryString) = (key.into(), value.into());
+        match (key.0, value.0) {
+            (DictStr::CString(key), DictStr::CString(value)) => {
                 self.items.push(spa_dict_item {
                     key: key.as_ptr(),
                     value: value.as_ptr(),
@@ -309,21 +320,21 @@ impl Dictionary {
                 self.strings.push(key);
                 self.strings.push(value);
             }
-            (DictionaryString::CString(key), DictionaryString::Ptr(value)) => {
+            (DictStr::CString(key), DictStr::Ptr(value)) => {
                 self.items.push(spa_dict_item {
                     key: key.as_ptr(),
                     value,
                 });
                 self.strings.push(key);
             }
-            (DictionaryString::Ptr(key), DictionaryString::CString(value)) => {
+            (DictStr::Ptr(key), DictStr::CString(value)) => {
                 self.items.push(spa_dict_item {
                     key,
                     value: value.as_ptr(),
                 });
                 self.strings.push(value);
             }
-            (DictionaryString::Ptr(key), DictionaryString::Ptr(value)) => {
+            (DictStr::Ptr(key), DictStr::Ptr(value)) => {
                 self.items.push(spa_dict_item { key, value });
             }
         };

@@ -807,13 +807,22 @@ unsafe extern "C" fn set_io<D: Direction>(
     assert!(!state.is_null());
 
     #[allow(non_upper_case_globals)]
-    let min_size = match id {
-        SPA_IO_Clock => std::mem::size_of::<spa_io_clock>(),
-        SPA_IO_Position => std::mem::size_of::<spa_io_position>(),
+    let (min_size, align) = match id {
+        SPA_IO_Clock => (
+            std::mem::size_of::<spa_io_clock>(),
+            std::mem::align_of::<spa_io_clock>(),
+        ),
+        SPA_IO_Position => (
+            std::mem::size_of::<spa_io_position>(),
+            std::mem::align_of::<spa_io_position>(),
+        ),
         _ => return -libc::ENOENT,
     };
-    // NULL/0 clears the area; only a non-empty-but-short one is an error
-    if !data.is_null() && size < min_size {
+    // NULL/0 clears the area; only a non-empty-but-short (or misaligned) one
+    // is an error. -EINVAL, not -ENOSPC: the installed SPA/pipewire headers
+    // use ENOSPC for map/array exhaustion only and show no undersized-io-area
+    // convention, so stay with the generic invalid-argument errno.
+    if !data.is_null() && (size < min_size || data as usize % align != 0) {
         return -libc::EINVAL;
     }
 
@@ -1753,14 +1762,21 @@ unsafe extern "C" fn port_set_io<D: Direction>(
     }
 
     #[allow(non_upper_case_globals)]
-    let min_size = match id {
-        SPA_IO_Buffers => std::mem::size_of::<spa_io_buffers>(),
-        SPA_IO_RateMatch => std::mem::size_of::<spa_io_rate_match>(),
+    let (min_size, align) = match id {
+        SPA_IO_Buffers => (
+            std::mem::size_of::<spa_io_buffers>(),
+            std::mem::align_of::<spa_io_buffers>(),
+        ),
+        SPA_IO_RateMatch => (
+            std::mem::size_of::<spa_io_rate_match>(),
+            std::mem::align_of::<spa_io_rate_match>(),
+        ),
         _ => return -libc::ENOENT,
     };
-    // NULL/0 clears the area; only a non-empty-but-short one is an error
-    // (process derefs the full struct, as set_io guards for clock/position)
-    if !data.is_null() && size < min_size {
+    // NULL/0 clears the area; only a non-empty-but-short (or misaligned) one
+    // is an error (process derefs the full struct, as set_io guards for
+    // clock/position; see set_io for the -EINVAL-over--ENOSPC note)
+    if !data.is_null() && (size < min_size || data as usize % align != 0) {
         return -libc::EINVAL;
     }
 
