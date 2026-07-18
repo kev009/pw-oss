@@ -518,25 +518,27 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
             continue;
         }
 
-        if unsafe { (*port.io).status } == SPA_STATUS_HAVE_DATA as i32 {
+        // io is non-null here (checked above); the reads stay behind with()
+        let io_status = port.io.with(|io| io.status);
+        if io_status == Some(SPA_STATUS_HAVE_DATA as i32) {
             // a pending buffer the peer hasn't consumed yet: report HAVE_DATA, or
             // the adapter treats the cycle as empty (alsa-pcm-source.c does this)
             result |= SPA_STATUS_HAVE_DATA as i32;
             continue;
         }
-        if unsafe { (*port.io).status } != SPA_STATUS_OK as i32
-            && unsafe { (*port.io).status } != SPA_STATUS_NEED_DATA as i32
+        if io_status != Some(SPA_STATUS_OK as i32) && io_status != Some(SPA_STATUS_NEED_DATA as i32)
         {
             continue;
         }
 
-        let buffer_id = if unsafe { (*port.io).buffer_id } == -1i32 as u32 {
+        let io_buffer_id = port.io.with(|io| io.buffer_id).unwrap_or(-1i32 as u32);
+        let buffer_id = if io_buffer_id == -1i32 as u32 {
             // hand out the next never-used buffer; the host returns ids after that
             let idx = port.ext.active_buffers;
             port.ext.active_buffers += 1;
             idx as u32
         } else {
-            unsafe { (*port.io).buffer_id }
+            io_buffer_id
         };
 
         // buffer_id may be our fallback index; the validation is the shared
@@ -556,15 +558,17 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
         };
 
         let matching = state.following
-            && !unsafe { crate::utils::same_clock(state.position, &state.clock_name) };
+            && !state
+                .position
+                .with(|p| crate::utils::same_clock(p, &state.clock_name))
+                .unwrap_or(false);
 
         let mut corr: f64 = 1.0; // DLL rate correction for the follower rate match
 
         // one period in device bytes (0 while position is absent)
         let mut period_in_bytes = 0u32;
         let mut graph_rate = 0u32;
-        if !state.position.is_null() {
-            let driver_clock = unsafe { (*state.position).clock };
+        if let Some(driver_clock) = state.position.with(|p| p.clock) {
             if driver_clock.target_rate.denom > 0 {
                 graph_rate = driver_clock.target_rate.denom;
                 period_in_bytes = crate::utils::device_period_bytes(
@@ -587,8 +591,8 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
             }
         }
 
-        let freewheel = !state.position.is_null()
-            && unsafe { (*state.position).clock.flags } & SPA_IO_CLOCK_FLAG_FREEWHEEL != 0;
+        let freewheel =
+            state.position.with(|p| p.clock.flags).unwrap_or(0) & SPA_IO_CLOCK_FLAG_FREEWHEEL != 0;
 
         // realtime resumed after freewheeling: the ring overflowed by design
         // while reads were skipped, so re-prime explicitly for a known fill
@@ -661,18 +665,16 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
         port.was_matching = matching;
         // Realtime capture cycles are period-padded if the device is late; keep
         // rate matching coherent with the buffer we handed to the graph.
-        if nbytes >= 0 && !port.rate_match.is_null() {
-            if matching {
-                unsafe {
-                    (*port.rate_match).flags |= SPA_IO_RATE_MATCH_FLAG_ACTIVE;
-                    (*port.rate_match).rate = (1.0 / corr).clamp(0.99, 1.01);
+        if nbytes >= 0 {
+            port.rate_match.with(|rm| {
+                if matching {
+                    rm.flags |= SPA_IO_RATE_MATCH_FLAG_ACTIVE;
+                    rm.rate = (1.0 / corr).clamp(0.99, 1.01);
+                } else {
+                    rm.flags &= !SPA_IO_RATE_MATCH_FLAG_ACTIVE;
+                    rm.rate = 1.0;
                 }
-            } else {
-                unsafe {
-                    (*port.rate_match).flags &= !SPA_IO_RATE_MATCH_FLAG_ACTIVE;
-                    (*port.rate_match).rate = 1.0;
-                }
-            }
+            });
         }
 
         let overruns = if port.dsp.is_running() && !freewheel {
@@ -700,24 +702,25 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
                 unsafe { spa_debug_mem(0, data_0.data.as_ptr(), 16.min(nbytes) as usize) };
             }
 
-            // chunk and io were validated non-null above for this cycle
+            // chunk was validated non-null above for this cycle
             unsafe {
                 let chunk = data_0.chunk.as_ptr();
                 (*chunk).offset = 0;
                 (*chunk).size = nbytes as u32;
                 (*chunk).stride = stride as i32;
                 (*chunk).flags = 0;
-
-                (*port.io).buffer_id = buffer_id;
-                (*port.io).status = SPA_STATUS_HAVE_DATA as i32;
             }
+            port.io.with(|io| {
+                io.buffer_id = buffer_id;
+                io.status = SPA_STATUS_HAVE_DATA as i32;
+            });
 
             result |= SPA_STATUS_HAVE_DATA as i32;
         } else {
-            unsafe {
-                (*port.io).buffer_id = buffer_id; // -1i32 as u32;
-                (*port.io).status = SPA_STATUS_OK as i32;
-            }
+            port.io.with(|io| {
+                io.buffer_id = buffer_id; // -1i32 as u32;
+                io.status = SPA_STATUS_OK as i32;
+            });
         }
     }
 
@@ -1015,8 +1018,8 @@ mod tests {
         crate::node::Port {
             config: None,
             buffers: vec![],
-            io: std::ptr::null_mut(),
-            rate_match: std::ptr::null_mut(),
+            io: crate::spa::IoArea::null(),
+            rate_match: crate::spa::IoArea::null(),
             dsp: crate::sound::Dsp::test_on_fd(read_fd, 8),
             dll: Default::default(),
             setup_period: period,

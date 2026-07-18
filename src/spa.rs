@@ -156,6 +156,46 @@ pub(crate) unsafe fn dev_emit_result(
     }
 }
 
+// A host-shared io area (spa_io_clock/position/buffers/rate_match): a typed
+// wrapper over the raw pointer the host hands to set_io/port_set_io. Plain
+// data (one pointer), so it marshals through the SendWrap/block_on_loop
+// paths unchanged. The single unsafe point is set(); read()/with() lean on
+// its contract.
+pub(crate) struct IoArea<T> {
+    ptr: *mut T,
+}
+
+impl<T> IoArea<T> {
+    pub(crate) const fn null() -> Self {
+        Self {
+            ptr: std::ptr::null_mut(),
+        }
+    }
+
+    /// Point the area at host memory, or clear it with NULL.
+    ///
+    /// # Safety
+    /// The caller has validated `data` against the area's size and alignment
+    /// and the host keeps it valid while set (the set_io /
+    /// port_set_io contract). The memory is host-shared by design; the
+    /// data-loop invoke is what serializes our accesses against the swap.
+    pub(crate) unsafe fn set(&mut self, data: *mut std::os::raw::c_void) {
+        self.ptr = data.cast();
+    }
+
+    pub(crate) fn is_null(&self) -> bool {
+        self.ptr.is_null()
+    }
+
+    // run `f` on the live area; None while cleared. &self on purpose: the
+    // pointee is host-shared either way, and callers hold &mut elsewhere
+    // (ports iteration) while touching disjoint areas.
+    pub(crate) fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> Option<R> {
+        // sound per set()'s contract (validity and serialization)
+        unsafe { self.ptr.as_mut() }.map(f)
+    }
+}
+
 // Run spa_pod_filter with the output going into `out` through its own builder.
 // The source pod must NOT live in `out`: the builder's overflow callback grows
 // the Vec by reallocating, which would move the source out from under the

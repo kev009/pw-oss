@@ -196,8 +196,8 @@ pub(crate) struct State<D: Direction> {
     pub data_loop: crate::spa::Loop,
     pub data_system: crate::spa::System,
     pub log: crate::spa::Log,
-    pub clock: *mut spa_io_clock,
-    pub position: *mut spa_io_position,
+    pub clock: crate::spa::IoArea<spa_io_clock>,
+    pub position: crate::spa::IoArea<spa_io_position>,
     pub clock_name: std::ffi::CString, // stamped into spa_io_clock.name
     pub main_loop: Option<crate::spa::Loop>, // for deferring device rebuilds off the data loop
     pub dsp_path: String,
@@ -222,17 +222,17 @@ pub(crate) struct State<D: Direction> {
 
 impl<D: Direction> State<D> {
     fn node_is_follower(&self) -> bool {
-        !self.clock.is_null()
-            && !self.position.is_null()
-            && unsafe { (*self.position).clock.id != (*self.clock).id }
+        let driver = self.position.with(|p| p.clock.id);
+        let ours = self.clock.with(|c| c.id);
+        matches!((driver, ours), (Some(d), Some(o)) if d != o)
     }
 }
 
 pub(crate) struct Port<D: Direction> {
     pub config: Option<D::Config>,
     pub buffers: Vec<*mut spa_buffer>,
-    pub io: *mut spa_io_buffers,
-    pub rate_match: *mut spa_io_rate_match, // per-port io area (port_set_io)
+    pub io: crate::spa::IoArea<spa_io_buffers>,
+    pub rate_match: crate::spa::IoArea<spa_io_rate_match>, // per-port io area (port_set_io)
     pub dsp: D::Device,
     pub dll: crate::dll::SpaDLL,
     pub setup_period: u32, // device bytes per graph cycle the stream/servo was set up for
@@ -633,12 +633,7 @@ unsafe fn timeout_servo<D: Direction>(state: &mut State<D>, nsec: u64, rate: u32
         let fill = D::servo_fill(port);
         // device frames scale to the graph rate; the resampler queue is already
         // graph-side (audioconvert reports it unscaled, like ALSA adds it)
-        let resamp = if port.rate_match.is_null() {
-            0
-        } else {
-            // the host keeps the io area valid while it is set (port_set_io)
-            unsafe { (*port.rate_match).delay as i64 }
-        };
+        let resamp = port.rate_match.with(|rm| rm.delay as i64).unwrap_or(0);
         delay = (fill as i64 / stride as i64) * rate as i64 / device_rate as i64 + resamp;
 
         if D::servo_hold(port) {
@@ -729,8 +724,10 @@ unsafe extern "C" fn on_timeout<D: Direction>(source: *mut spa_source) {
     unsafe { D::debug_cycle(state, now, nsec) };
 
     // position and clock were null-checked above and stay set for the cycle
-    let duration = unsafe { (*state.position).clock.target_duration };
-    let rate = unsafe { (*state.position).clock.target_rate.denom };
+    let (duration, rate) = state
+        .position
+        .with(|p| (p.clock.target_duration, p.clock.target_rate.denom))
+        .unwrap_or((0, 0));
     if duration == 0 || rate == 0 {
         // malformed position: idle-tick, and advance next_time so the deadline
         // isn't stale when the position recovers
@@ -747,15 +744,16 @@ unsafe extern "C" fn on_timeout<D: Direction>(source: *mut spa_source) {
     state.next_time =
         nsec + (duration as f64 * SPA_NSEC_PER_SEC as f64 / (rate as f64 * corr)) as u64;
 
-    unsafe {
-        (*state.clock).nsec = nsec;
-        (*state.clock).rate = (*state.clock).target_rate;
-        (*state.clock).position += (*state.clock).duration;
-        (*state.clock).duration = duration;
-        (*state.clock).delay = delay;
-        (*state.clock).rate_diff = corr;
-        (*state.clock).next_nsec = state.next_time;
-    }
+    let next_time = state.next_time;
+    state.clock.with(|c| {
+        c.nsec = nsec;
+        c.rate = c.target_rate;
+        c.position += c.duration;
+        c.duration = duration;
+        c.delay = delay;
+        c.rate_diff = corr;
+        c.next_nsec = next_time;
+    });
 
     let Some(callbacks) = (unsafe { node_callbacks(&state.callbacks) }) else {
         unsafe { set_timeout(state, state.next_time) };
@@ -837,13 +835,18 @@ unsafe extern "C" fn set_io<D: Direction>(
             #[allow(non_upper_case_globals)]
             match id {
                 SPA_IO_Clock => {
-                    state.clock = data.cast(); // null clears
+                    // SAFETY: size/alignment validated above; the host keeps
+                    // the area valid while set (the set_io contract)
+                    state.clock.set(data); // null clears
 
                     // identify our clock so same-device followers can skip rate matching
-                    crate::utils::set_clock_name(state.clock, &state.clock_name);
+                    state
+                        .clock
+                        .with(|c| crate::utils::set_clock_name(c, &state.clock_name));
                 }
-                SPA_IO_Position => state.position = data.cast(), // null clears
-                _ => (),                                         // filtered above
+                // SAFETY: as above
+                SPA_IO_Position => state.position.set(data), // null clears
+                _ => (),                                     // filtered above
             };
 
             if state.started {
@@ -899,10 +902,10 @@ unsafe extern "C" fn send_command<D: Direction>(
             if !unsafe {
                 crate::utils::block_on_loop(&(*state).data_loop, state, |state| {
                     // sane clock delay/rate_diff until process() publishes measured values
-                    if !state.clock.is_null() {
-                        (*state.clock).delay = 0;
-                        (*state.clock).rate_diff = 1.0;
-                    }
+                    state.clock.with(|c| {
+                        c.delay = 0;
+                        c.rate_diff = 1.0;
+                    });
 
                     D::on_start_loop(state);
 
@@ -1791,12 +1794,14 @@ unsafe extern "C" fn port_set_io<D: Direction>(
     let applied = unsafe {
         crate::utils::block_on_loop(&(*state).data_loop, state, move |state| {
             let data = data.into_inner();
+            // SAFETY (both arms): size/alignment validated above; the host
+            // keeps the area valid while set (the port_set_io contract)
             #[allow(non_upper_case_globals)]
             match id {
-                SPA_IO_Buffers => state.ports[port_id as usize].io = data.cast(), // null clears
+                SPA_IO_Buffers => state.ports[port_id as usize].io.set(data), // null clears
                 // you'd think RateMatch would be a node parameter instead; ACTIVE is
                 // managed per cycle in process(), only set while matching
-                SPA_IO_RateMatch => state.ports[port_id as usize].rate_match = data.cast(),
+                SPA_IO_RateMatch => state.ports[port_id as usize].rate_match.set(data),
                 _ => (),
             }
         })
@@ -2070,8 +2075,8 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
                 data_system,
                 log,
 
-                clock: std::ptr::null_mut(),
-                position: std::ptr::null_mut(),
+                clock: crate::spa::IoArea::null(),
+                position: crate::spa::IoArea::null(),
                 clock_name: std::ffi::CString::new(format!(
                     "freebsd-oss.{}",
                     dsp_path.trim_start_matches("/dev/")
@@ -2111,8 +2116,8 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
                 ports: [Port {
                     config: None,
                     buffers: vec![],
-                    io: std::ptr::null_mut(),
-                    rate_match: std::ptr::null_mut(),
+                    io: crate::spa::IoArea::null(),
+                    rate_match: crate::spa::IoArea::null(),
                     dsp: D::Device::new(&dsp_path),
                     dll: std::default::Default::default(),
                     setup_period: 0,

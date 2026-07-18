@@ -104,12 +104,10 @@ fn desired_delay(period: u32, oss_delay: u32) -> u32 {
 
 // the resampler's per-cycle output can exceed a quantum; its size bounds the
 // largest single write and so the headroom the fill ceiling must reserve
-unsafe fn rate_match_bytes(rate_match: *const spa_io_rate_match, stride: u32) -> u32 {
-    if rate_match.is_null() {
-        0
-    } else {
-        unsafe { (*rate_match).size }.saturating_mul(stride)
-    }
+fn rate_match_bytes(rate_match: &crate::spa::IoArea<spa_io_rate_match>, stride: u32) -> u32 {
+    rate_match
+        .with(|rm| rm.size.saturating_mul(stride))
+        .unwrap_or(0)
 }
 
 // the fill target's floor: one period plus a jitter margin (a quarter period,
@@ -273,7 +271,7 @@ fn retune_period(
     // prime) cannot have changed; reusing it avoids an ioctl here
     let blocksize = port.setup_blocksize;
     let desired = desired_delay(period_in_bytes, oss_delay);
-    let write_max = period_in_bytes.max(unsafe { rate_match_bytes(port.rate_match, stride) });
+    let write_max = period_in_bytes.max(rate_match_bytes(&port.rate_match, stride));
     if port.ext.buffer_size >= buffer_required(period_in_bytes, desired, blocksize, write_max) {
         let old_period = port.setup_period;
         let delay_capped = commit_geometry(
@@ -434,7 +432,7 @@ fn prime_playback(
     // the ceiling above the floor.
     let desired = desired_delay(period_in_bytes, oss_delay);
     let chunk = crate::utils::ns_to_frame_bytes(port.dsp.hw_quantum_ns, cfg_rate, stride);
-    let write_max = period_in_bytes.max(unsafe { rate_match_bytes(port.rate_match, stride) });
+    let write_max = period_in_bytes.max(rate_match_bytes(&port.rate_match, stride));
     let max_period = crate::sound::max_ring_period_bytes(stride, cfg_rate, graph_rate);
     let request = buffer_request(
         period_in_bytes,
@@ -701,6 +699,14 @@ fn try_open_configure(
     0
 }
 
+// the shared not-ready/consumed exit of the sink cycle: publish NEED_DATA on
+// the port io AND fold it into the returned status - the host prefetches the
+// next buffer only on the return bit
+fn need_data(io: &crate::spa::IoArea<spa_io_buffers>, result: &mut c_int) {
+    io.with(|io| io.status = SPA_STATUS_NEED_DATA as i32);
+    *result |= SPA_STATUS_NEED_DATA as i32;
+}
+
 unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
     state.ext.old_timestamp = state.ext.cur_timestamp;
     state.ext.cur_timestamp = crate::utils::now_ns(&state.data_system);
@@ -710,11 +716,9 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
     // looks odd for a sink but matches alsa-pcm-sink.c:788-791; it is what
     // keeps the freewheel pump running.
     // position is non-null on the process path (checked by on_timeout/process)
-    if unsafe { (*state.position).clock.flags } & SPA_IO_CLOCK_FLAG_FREEWHEEL != 0 {
+    if state.position.with(|p| p.clock.flags).unwrap_or(0) & SPA_IO_CLOCK_FLAG_FREEWHEEL != 0 {
         for port in &mut state.ports {
-            if !port.io.is_null() {
-                unsafe { (*port.io).status = SPA_STATUS_NEED_DATA as i32 };
-            }
+            port.io.with(|io| io.status = SPA_STATUS_NEED_DATA as i32);
         }
         return SPA_STATUS_HAVE_DATA as i32;
     }
@@ -733,8 +737,7 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
 
         if port.resetup_pending {
             // the main thread is rebuilding the device; drop cycles until it lands
-            unsafe { (*port.io).status = SPA_STATUS_NEED_DATA as i32 };
-            result |= SPA_STATUS_NEED_DATA as i32;
+            need_data(&port.io, &mut result);
             continue;
         }
 
@@ -742,24 +745,23 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
             // Suspend closed the device but the host restarted without a fresh
             // format; rebuild off-loop instead of tripping the dsp state asserts
             port.resetup_pending = unsafe { crate::node::queue_resetup(state_ptr, port_idx) };
-            unsafe { (*port.io).status = SPA_STATUS_NEED_DATA as i32 };
-            result |= SPA_STATUS_NEED_DATA as i32;
+            need_data(&port.io, &mut result);
             continue;
         }
 
-        if unsafe { (*port.io).status } != SPA_STATUS_HAVE_DATA as i32 {
+        if port.io.with(|io| io.status) != Some(SPA_STATUS_HAVE_DATA as i32) {
             // no input this cycle (e.g. draining after stop); the clock (incl. the
             // draining delay) is published from on_timeout now, so just ask for data
-            unsafe { (*port.io).status = SPA_STATUS_NEED_DATA as i32 };
-            result |= SPA_STATUS_NEED_DATA as i32; // in the return too: the host prefetches only on this bit
+            need_data(&port.io, &mut result);
             continue;
         }
 
-        let buffer_id = unsafe { (*port.io).buffer_id };
+        // io is non-null here (the HAVE_DATA gate above read through it)
+        let buffer_id = port.io.with(|io| io.buffer_id).unwrap_or(u32::MAX);
         let Some(data_0) = (unsafe { crate::node::valid_data_block(port, buffer_id, &state.log) })
         else {
-            unsafe { (*port.io).status = SPA_STATUS_NEED_DATA as i32 };
-            result |= SPA_STATUS_NEED_DATA as i32; // return status, not just io, so the host refills
+            // return status, not just io, so the host refills
+            need_data(&port.io, &mut result);
             continue;
         };
 
@@ -778,7 +780,8 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
         debug_assert_eq!(unsafe { (*data_0.chunk.as_ptr()).stride }, stride as i32);
 
         #[cfg(debug_assertions)]
-        if unsafe { (*state.position).clock.flags } & SPA_IO_CLOCK_FLAG_XRUN_RECOVER != 0 {
+        if state.position.with(|p| p.clock.flags).unwrap_or(0) & SPA_IO_CLOCK_FLAG_XRUN_RECOVER != 0
+        {
             crate::warn!(
                 state.log,
                 "{}: SPA_IO_CLOCK_FLAG_XRUN_RECOVER @ {}",
@@ -800,9 +803,17 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
             }
         }
 
-        let driver_clock = unsafe { (*state.position).clock };
+        // position is non-null on the process path (checked by process); the
+        // else arm is pure defense
+        let Some(driver_clock) = state.position.with(|p| p.clock) else {
+            need_data(&port.io, &mut result);
+            continue;
+        };
         let matching = state.following
-            && !unsafe { crate::utils::same_clock(state.position, &state.clock_name) };
+            && !state
+                .position
+                .with(|p| crate::utils::same_clock(p, &state.clock_name))
+                .unwrap_or(false);
 
         // the resampler can legitimately hand us a few frames over a quantum; warn
         // rather than debug_assert!, which would abort the process (panic across the
@@ -838,8 +849,7 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
             port.resetup_pending = unsafe { crate::node::queue_resetup(state_ptr, port_idx) };
             if port.resetup_pending {
                 port.was_matching = false; // the gap invalidates matching history
-                unsafe { (*port.io).status = SPA_STATUS_NEED_DATA as i32 };
-                result |= SPA_STATUS_NEED_DATA as i32;
+                need_data(&port.io, &mut result);
                 continue;
             }
             // no main loop (unusual host): keep running at the stale size; the
@@ -853,8 +863,7 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
                 // == 0 and the channel would run with degenerate geometry that
                 // retune_period never corrects. Not ready this cycle; ask for
                 // data like the other not-ready paths.
-                unsafe { (*port.io).status = SPA_STATUS_NEED_DATA as i32 };
-                result |= SPA_STATUS_NEED_DATA as i32;
+                need_data(&port.io, &mut result);
                 continue;
             }
             prime_playback(
@@ -910,19 +919,15 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
         // from our clock so there is nothing to match (ALSA gates on the clock
         // name the same way).
         port.was_matching = matching;
-        if !port.rate_match.is_null() {
+        port.rate_match.with(|rm| {
             if matching {
-                unsafe {
-                    (*port.rate_match).flags |= SPA_IO_RATE_MATCH_FLAG_ACTIVE;
-                    (*port.rate_match).rate = corr.clamp(0.99, 1.01);
-                }
+                rm.flags |= SPA_IO_RATE_MATCH_FLAG_ACTIVE;
+                rm.rate = corr.clamp(0.99, 1.01);
             } else {
-                unsafe {
-                    (*port.rate_match).flags &= !SPA_IO_RATE_MATCH_FLAG_ACTIVE;
-                    (*port.rate_match).rate = 1.0;
-                }
+                rm.flags &= !SPA_IO_RATE_MATCH_FLAG_ACTIVE;
+                rm.rate = 1.0;
             }
-        }
+        });
 
         if nbytes < size as isize {
             if let Some(suppressed) = port.warn_limit.check(state.ext.cur_timestamp) {
@@ -940,11 +945,9 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
             }
         }
 
-        unsafe { (*port.io).status = SPA_STATUS_NEED_DATA as i32 };
-
         // a sink has no output, so the return bit is NEED_DATA ("can accept input
         // next cycle"), matching the port io status, not HAVE_DATA.
-        result |= SPA_STATUS_NEED_DATA as i32;
+        need_data(&port.io, &mut result);
     }
 
     result
@@ -1187,7 +1190,7 @@ impl Direction for SinkDir {
         eprintln!(
             "cycle: {}, delay: {} ms @ {}",
             // position is non-null on the process path (as in process_ports)
-            unsafe { (*_state.position).clock.cycle },
+            _state.position.with(|p| p.clock.cycle).unwrap_or(0),
             _now.saturating_sub(_nsec) as f64 / 1000000.0,
             _now
         );
@@ -1263,8 +1266,8 @@ mod tests {
         crate::node::Port {
             config: None,
             buffers: vec![],
-            io: std::ptr::null_mut(),
-            rate_match: std::ptr::null_mut(),
+            io: crate::spa::IoArea::null(),
+            rate_match: crate::spa::IoArea::null(),
             dsp: crate::sound::DspWriter::test_on_fd(write_fd, 8),
             dll: Default::default(),
             setup_period: period,
