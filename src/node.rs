@@ -141,7 +141,7 @@ pub(crate) trait Direction: Sized + 'static {
     // install_device: direction-specific resets inside the loop-side swap
     unsafe fn on_device_swapped(state: &mut State<Self>, port_idx: usize);
     // port_use_buffers: direction-specific resets inside the loop-side swap
-    unsafe fn on_buffers_swapped(state: &mut State<Self>);
+    unsafe fn on_buffers_swapped(state: &mut State<Self>, port_idx: usize);
 
     // send_command(Start): direction-specific resets, on the data loop
     unsafe fn on_start_loop(state: &mut State<Self>);
@@ -153,8 +153,13 @@ pub(crate) trait Direction: Sized + 'static {
     unsafe fn update_timers(state: &mut State<Self>);
     // on_timeout: debug-build cycle tracing (the sink prints one line)
     unsafe fn debug_cycle(state: &State<Self>, now: u64, nsec: u64);
-    // on_timeout: run the DLL servo; returns (corr, delay) for the clock
-    unsafe fn timeout_servo(state: &mut State<Self>, nsec: u64, rate: u32) -> (f64, i64);
+    // on_timeout servo hooks (see node::timeout_servo): the extra readiness
+    // gate (the source's primed flag), the fill measurement, the recovery
+    // hold (the sink's xrun window) and the signed servo error for a fill
+    unsafe fn servo_ready(port: &Port<Self>) -> bool;
+    unsafe fn servo_fill(port: &mut Port<Self>) -> u32;
+    unsafe fn servo_hold(port: &Port<Self>) -> bool;
+    fn servo_err(port: &Port<Self>, fill: u32) -> f64;
 
     // process(): the direction-specific data path over the ports
     unsafe fn process_ports(state: &mut State<Self>) -> c_int;
@@ -190,7 +195,6 @@ pub(crate) struct State<D: Direction> {
     pub log: crate::spa::Log,
     pub clock: *mut spa_io_clock,
     pub position: *mut spa_io_position,
-    pub rate_match: *mut spa_io_rate_match,
     pub clock_name: std::ffi::CString, // stamped into spa_io_clock.name
     pub main_loop: Option<crate::spa::Loop>, // for deferring device rebuilds off the data loop
     pub dsp_path: String,
@@ -225,6 +229,7 @@ pub(crate) struct Port<D: Direction> {
     pub config: Option<D::Config>,
     pub buffers: Vec<*mut spa_buffer>,
     pub io: *mut spa_io_buffers,
+    pub rate_match: *mut spa_io_rate_match, // per-port io area (port_set_io)
     pub dsp: D::Device,
     pub dll: crate::dll::SpaDLL,
     pub setup_period: u32, // device bytes per graph cycle the stream/servo was set up for
@@ -608,6 +613,67 @@ unsafe extern "C" fn set_param<D: Direction>(
     }
 }
 
+// Run the servo before the clock is published so every field below belongs
+// to this cycle (the shape of ALSA's update_time); both directions share
+// the skeleton, with the fill measurement and error sign supplied through
+// the Direction servo_* hooks. Returns (corr, delay) for the clock.
+unsafe fn timeout_servo<D: Direction>(state: &mut State<D>, nsec: u64, rate: u32) -> (f64, i64) {
+    let mut corr: f64 = 1.0;
+    let mut delay: i64 = 0;
+    for port in &mut state.ports {
+        let Some((stride, device_rate)) = port.stride_rate() else {
+            continue;
+        };
+        let device_rate = device_rate.max(1);
+        if !port.dsp.is_running()
+            || port.setup_period == 0
+            || port.resetup_pending
+            || !D::servo_ready(port)
+        {
+            continue;
+        }
+
+        let fill = D::servo_fill(port);
+        // device frames scale to the graph rate; the resampler queue is already
+        // graph-side (audioconvert reports it unscaled, like ALSA adds it)
+        let resamp = if port.rate_match.is_null() {
+            0
+        } else {
+            (*port.rate_match).delay as i64
+        };
+        delay = (fill as i64 / stride as i64) * rate as i64 / device_rate as i64 + resamp;
+
+        if D::servo_hold(port) {
+            continue; // recovering; process() is discarding buffers, hold the servo
+        }
+
+        // clamp the error so a wakeup-jitter spike can't wind up the integrator
+        // against an actuator that moves slowly (ALSA clamps to max_error too)
+        let err_raw = D::servo_err(port, fill);
+        let max_err = (port.setup_period as f64 / 2.0).max(256.0 * stride as f64);
+        let err = err_raw.clamp(-max_err, max_err);
+        corr = port.dll.update(err);
+        port.bw_adapt.update(&mut port.dll, err, nsec);
+
+        // a diverged servo must not wedge the graph clock
+        if !(0.5..=2.0).contains(&corr) {
+            crate::warn!(
+                state.log,
+                "{}: DLL diverged (corr {}); relocking",
+                port.dsp.path(),
+                corr
+            );
+            port.dll.init();
+            port.bw_adapt.reset();
+            corr = 1.0;
+        }
+
+        #[cfg(debug_assertions)]
+        eprintln!("{}: corr = {}, err = {}", port.dsp.path(), corr, err_raw);
+    }
+    (corr, delay)
+}
+
 // ALSA adapts the DLL bandwidth continuously from the error variance
 // (alsa-pcm.c, BW_PERIOD); we approximate with two stages: a fast lock at
 // BW_MAX after (re)start, then the low steady-state bandwidth
@@ -675,7 +741,7 @@ unsafe extern "C" fn on_timeout<D: Direction>(source: *mut spa_source) {
         return;
     }
 
-    let (corr, delay) = D::timeout_servo(state, nsec, rate);
+    let (corr, delay) = timeout_servo(state, nsec, rate);
 
     // steer the timer by the correction so the published clock genuinely follows
     // the device (ALSA warps next_time the same way); this also closes the loop
@@ -1633,7 +1699,7 @@ unsafe extern "C" fn port_use_buffers<D: Direction>(
     let state_ptr: *mut State<D> = state;
     if !crate::utils::block_on_loop(&(*state_ptr).data_loop, state_ptr, move |state| {
         state.ports[port_idx].buffers = new_buffers;
-        D::on_buffers_swapped(state);
+        D::on_buffers_swapped(state, port_idx);
     }) {
         return -libc::EIO; // keeping stale host buffer pointers would be a UAF
     }
@@ -1672,7 +1738,7 @@ unsafe extern "C" fn port_set_io<D: Direction>(
             SPA_IO_Buffers => state.ports[port_id as usize].io = data.cast(), // null clears
             // you'd think RateMatch would be a node parameter instead; ACTIVE is
             // managed per cycle in process(), only set while matching
-            SPA_IO_RateMatch => state.rate_match = data as *mut spa_io_rate_match,
+            SPA_IO_RateMatch => state.ports[port_id as usize].rate_match = data.cast(),
             _ => (),
         }
     });
@@ -1931,7 +1997,6 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
 
             clock: std::ptr::null_mut(),
             position: std::ptr::null_mut(),
-            rate_match: std::ptr::null_mut(),
             clock_name: std::ffi::CString::new(format!(
                 "freebsd-oss.{}",
                 dsp_path.trim_start_matches("/dev/")
@@ -1972,6 +2037,7 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
                 config: None,
                 buffers: vec![],
                 io: std::ptr::null_mut(),
+                rate_match: std::ptr::null_mut(),
                 dsp: D::Device::new(&dsp_path),
                 dll: std::default::Default::default(),
                 setup_period: 0,

@@ -4,8 +4,8 @@ use libspa::sys::*;
 
 use crate::node::{Direction, ParamBuild, State, MAX_PORTS};
 
-// several State fields are per-port in disguise (rate_match, active_buffers,
-// the single PortInfo); fix those before raising this
+// the single PortInfo in State is per-port in disguise; fix it before
+// raising this
 const _: () = assert!(MAX_PORTS == 1);
 const EMPTY_CYCLE: isize = -1; // no data queued this cycle (scheduling jitter)
 
@@ -13,9 +13,7 @@ pub(crate) enum SourceDir {}
 
 // direction-specific State fields (State.ext)
 #[derive(Default)]
-pub(crate) struct SourceExt {
-    pub active_buffers: usize,
-}
+pub(crate) struct SourceExt {}
 
 // consecutive overrun-ticking cycles with the ring pinned at the ceiling
 // before recovery re-primes; gives the catch-up read a chance to drain a
@@ -26,11 +24,12 @@ const PINNED_CYCLE_LIMIT: u32 = 3;
 #[derive(Default)]
 pub(crate) struct SourcePortExt {
     pub primed: bool,
-    pub target_fill: u32,     // servo fill target; a period plus half an arrival
-    pub read_peak: u32,       // catch-up threshold, capped by the granted ring
-    pub ring_size: u32,       // granted soft ring in bytes (GETISPACE totals; 0 = unknown)
-    pub pinned_cycles: u32,   // consecutive overrun ticks with the ring pinned full
-    pub period_mismatch: u32, // consecutive cycles at a different period (debounce)
+    pub active_buffers: usize,  // next never-used buffer id to hand out
+    pub target_fill: u32,       // servo fill target; a period plus half an arrival
+    pub read_peak: u32,         // catch-up threshold, capped by the granted ring
+    pub ring_size: u32,         // granted soft ring in bytes (GETISPACE totals; 0 = unknown)
+    pub pinned_cycles: u32,     // consecutive overrun ticks with the ring pinned full
+    pub period_mismatch: u32,   // consecutive cycles at a different period (debounce)
     pub was_freewheeling: bool, // freewheel active last cycle (re-prime on exit)
 }
 
@@ -464,58 +463,6 @@ unsafe fn recover_overrun(
     }
 }
 
-// Run the servo before the clock is published so every field below belongs
-// to this cycle (the shape of ALSA's update_time). The pre-read fill level
-// here and process()'s post-drain accounting see the same signal: we drain
-// the ring every cycle, so what's queued is one period's accumulation.
-unsafe fn timeout_servo(state: &mut State<SourceDir>, nsec: u64, rate: u32) -> (f64, i64) {
-    let mut corr: f64 = 1.0;
-    let mut delay: i64 = 0;
-    for port in &mut state.ports {
-        let Some(cfg) = port.config.as_ref() else {
-            continue;
-        };
-        let stride = cfg.stride.max(1);
-        let device_rate = cfg.rate.max(1);
-        if !port.dsp.is_running()
-            || !port.ext.primed
-            || port.setup_period == 0
-            || port.resetup_pending
-        {
-            continue;
-        }
-
-        let queued = port.dsp.ispace_in_bytes().max(0) as u32;
-        // device frames scale to the graph rate; the resampler queue is already
-        // graph-side (matching the sink's publication)
-        let resamp = if state.rate_match.is_null() {
-            0
-        } else {
-            (*state.rate_match).delay as i64
-        };
-        delay = (queued / stride) as i64 * rate as i64 / device_rate as i64 + resamp;
-
-        // capture error is inverted vs the sink: a slow device queues less than a
-        // period; clamp so wakeup jitter can't wind up the integrator
-        let max_err = (port.setup_period as f64 / 2.0).max(256.0 * stride as f64);
-        let err = (port.ext.target_fill as f64 - queued as f64).clamp(-max_err, max_err);
-        corr = port.dll.update(err);
-        port.bw_adapt.update(&mut port.dll, err, nsec);
-
-        // a diverged servo must not wedge the graph clock
-        if !(0.5..=2.0).contains(&corr) {
-            crate::warn!(state.log, "capture DLL diverged (corr {}); relocking", corr);
-            port.dll.init();
-            port.bw_adapt.reset();
-            corr = 1.0;
-        }
-
-        #[cfg(debug_assertions)]
-        eprintln!("capture: corr = {}, queued = {}", corr, queued);
-    }
-    (corr, delay)
-}
-
 // used from the main thread only; returns 0 or -errno with the device closed
 fn try_open_configure(
     dsp: &mut crate::sound::Dsp,
@@ -579,46 +526,17 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
 
         let buffer_id = if (*port.io).buffer_id == -1i32 as u32 {
             // hand out the next never-used buffer; the host returns ids after that
-            let idx = state.ext.active_buffers;
-            state.ext.active_buffers += 1;
+            let idx = port.ext.active_buffers;
+            port.ext.active_buffers += 1;
             idx as u32
         } else {
             (*port.io).buffer_id
         };
 
-        // buffer_id (or our fallback index) and n_datas come from outside. Validate
-        // them instead of asserting; a panic here aborts the process across extern "C".
-        let buffer = match port
-            .buffers
-            .get(buffer_id as usize)
-            .copied()
-            .and_then(|b| b.as_ref())
-        {
-            Some(b) if b.n_datas == 1 => b, // we fill the block directly, so need exactly one
-            _ => {
-                crate::warn!(state.log, "unusable buffer (id {}); skipping", buffer_id);
-                continue;
-            }
-        };
-
-        // we read straight into the block, so require a MemPtr with data, chunk and
-        // maxsize all valid. as_ref() (not offset(0)) handles a null datas pointer.
-        let data_0 = match buffer.datas.as_ref() {
-            Some(d)
-                if d.type_ == SPA_DATA_MemPtr
-                    && !d.data.is_null()
-                    && !d.chunk.is_null()
-                    && d.maxsize > 0 =>
-            {
-                d
-            }
-            _ => {
-                crate::warn!(
-                    state.log,
-                    "buffer data is not a usable MemPtr block; skipping"
-                );
-                continue;
-            }
+        // buffer_id may be our fallback index; the validation is the shared
+        // per-cycle gate (a source cycle just skips, no status to publish)
+        let Some(data_0) = crate::node::valid_data_block(port, buffer_id, &state.log) else {
+            continue;
         };
 
         let matching =
@@ -675,7 +593,7 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
             // skips its reads); the ring overflows meanwhile and the exit edge
             // above re-primes when realtime resumes
             let len = period_in_bytes.min(data_0.maxsize);
-            std::ptr::write_bytes(data_0.data.cast::<u8>(), 0, len as usize);
+            std::ptr::write_bytes(data_0.data.as_ptr().cast::<u8>(), 0, len as usize);
             len as isize
         } else if !port.ext.primed && period_in_bytes > 0 {
             prime_capture(
@@ -683,7 +601,7 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
                 period_in_bytes,
                 graph_rate,
                 state.oss_fragment,
-                data_0.data,
+                data_0.data.as_ptr(),
                 data_0.maxsize,
                 &state.log,
             )
@@ -718,7 +636,7 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
                 );
             }
 
-            bounded_read(port, queued, data_0.data, data_0.maxsize, stride)
+            bounded_read(port, queued, data_0.data.as_ptr(), data_0.maxsize, stride)
         };
 
         // Rate-match only as a follower on a foreign clock: when driving, the
@@ -728,13 +646,13 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
         port.was_matching = matching;
         // Realtime capture cycles are period-padded if the device is late; keep
         // rate matching coherent with the buffer we handed to the graph.
-        if nbytes >= 0 && !state.rate_match.is_null() {
+        if nbytes >= 0 && !port.rate_match.is_null() {
             if matching {
-                (*state.rate_match).flags |= SPA_IO_RATE_MATCH_FLAG_ACTIVE;
-                (*state.rate_match).rate = (1.0 / corr).clamp(0.99, 1.01);
+                (*port.rate_match).flags |= SPA_IO_RATE_MATCH_FLAG_ACTIVE;
+                (*port.rate_match).rate = (1.0 / corr).clamp(0.99, 1.01);
             } else {
-                (*state.rate_match).flags &= !SPA_IO_RATE_MATCH_FLAG_ACTIVE;
-                (*state.rate_match).rate = 1.0;
+                (*port.rate_match).flags &= !SPA_IO_RATE_MATCH_FLAG_ACTIVE;
+                (*port.rate_match).rate = 1.0;
             }
         }
 
@@ -760,13 +678,14 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
             #[cfg(debug_assertions)]
             if state.log.log_level() >= SPA_LOG_LEVEL_TRACE {
                 crate::trace!(state.log, "nbytes: {}", nbytes);
-                spa_debug_mem(0, data_0.data, 16.min(nbytes) as usize);
+                spa_debug_mem(0, data_0.data.as_ptr(), 16.min(nbytes) as usize);
             }
 
-            (*data_0.chunk).offset = 0;
-            (*data_0.chunk).size = nbytes as u32;
-            (*data_0.chunk).stride = stride as i32;
-            (*data_0.chunk).flags = 0;
+            let chunk = data_0.chunk.as_ptr();
+            (*chunk).offset = 0;
+            (*chunk).size = nbytes as u32;
+            (*chunk).stride = stride as i32;
+            (*chunk).flags = 0;
 
             (*port.io).buffer_id = buffer_id;
             (*port.io).status = SPA_STATUS_HAVE_DATA as i32;
@@ -927,11 +846,11 @@ impl Direction for SourceDir {
         let port = &mut state.ports[port_idx];
         port.dll.init(); // fresh device, fresh servo
         port.ext.primed = false;
-        state.ext.active_buffers = 0;
+        port.ext.active_buffers = 0;
     }
 
-    unsafe fn on_buffers_swapped(state: &mut State<SourceDir>) {
-        state.ext.active_buffers = 0;
+    unsafe fn on_buffers_swapped(state: &mut State<SourceDir>, port_idx: usize) {
+        state.ports[port_idx].ext.active_buffers = 0;
     }
 
     unsafe fn on_start_loop(state: &mut State<SourceDir>) {
@@ -981,8 +900,25 @@ impl Direction for SourceDir {
 
     unsafe fn debug_cycle(_state: &State<SourceDir>, _now: u64, _nsec: u64) {}
 
-    unsafe fn timeout_servo(state: &mut State<SourceDir>, nsec: u64, rate: u32) -> (f64, i64) {
-        timeout_servo(state, nsec, rate)
+    unsafe fn servo_ready(port: &crate::node::Port<SourceDir>) -> bool {
+        port.ext.primed
+    }
+
+    // the pre-read fill here and process()'s post-drain accounting see the
+    // same signal: we drain the ring every cycle, so what's queued is one
+    // period's accumulation
+    unsafe fn servo_fill(port: &mut crate::node::Port<SourceDir>) -> u32 {
+        port.dsp.ispace_in_bytes().max(0) as u32
+    }
+
+    unsafe fn servo_hold(_port: &crate::node::Port<SourceDir>) -> bool {
+        false // the primed gate already covers recovery
+    }
+
+    // capture error is inverted vs the sink: a slow device queues less than
+    // a period
+    fn servo_err(port: &crate::node::Port<SourceDir>, fill: u32) -> f64 {
+        port.ext.target_fill as f64 - fill as f64
     }
 
     unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
@@ -1034,6 +970,7 @@ mod tests {
             config: None,
             buffers: vec![],
             io: std::ptr::null_mut(),
+            rate_match: std::ptr::null_mut(),
             dsp: crate::sound::Dsp::test_on_fd(read_fd, 8),
             dll: Default::default(),
             setup_period: period,
@@ -1201,8 +1138,24 @@ mod tests {
         let corr = follower_servo(&mut port, 2560 + 1500, 0, 8);
         assert_eq!(corr, 1.0); // snapped: relock only
 
-        let corr = follower_servo(&mut port, 2560 - 512, 0, 8);
+        // with a negotiated config the geometry latches and the DLL engages:
+        // the first in-band update cold-starts the gains, the second must
+        // produce a real (non-unity) correction
+        port.config = Some(super::PortConfig {
+            format: libspa::param::audio::AudioFormat::S32LE,
+            rate: 48000,
+            channels: 2,
+            positions: vec![],
+            flags: 0,
+            stride: 8,
+        });
+        super::commit_geometry(&mut port, 1024, 1024);
+        port.ext.target_fill = 2560;
+        follower_servo(&mut port, 2560 - 512, 1, 8);
+        port.was_matching = true; // the caller latches this after each cycle
+        let corr = follower_servo(&mut port, 2560 - 512, 2, 8);
         assert!((0.9..=1.1).contains(&corr)); // in-band: the DLL absorbs it
+        assert!(corr != 1.0, "the DLL never engaged");
         unsafe { libc::close(w) };
     }
 

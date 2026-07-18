@@ -4,9 +4,8 @@ use libspa::sys::*;
 
 use crate::node::{Direction, ParamBuild, State, MAX_PORTS};
 
-// several State fields are per-port in disguise (rate_match, the single
-// PortInfo, on_timeout's last-port-wins clock delay); fix those before
-// raising this
+// several State fields are per-port in disguise (the single PortInfo,
+// on_timeout's last-port-wins clock delay); fix those before raising this
 const _: () = assert!(MAX_PORTS == 1);
 
 pub(crate) enum SinkDir {}
@@ -243,7 +242,6 @@ unsafe fn retune_period(
     period_in_bytes: u32,
     stride: u32,
     oss_delay: u32,
-    rate_match: *const spa_io_rate_match,
     log: &crate::spa::Log,
 ) -> bool {
     if !port.dsp.is_running()
@@ -267,7 +265,7 @@ unsafe fn retune_period(
     // prime) cannot have changed; reusing it avoids an ioctl here
     let blocksize = port.setup_blocksize;
     let desired = desired_delay(period_in_bytes, oss_delay);
-    let write_max = period_in_bytes.max(rate_match_bytes(rate_match, stride));
+    let write_max = period_in_bytes.max(rate_match_bytes(port.rate_match, stride));
     if port.ext.buffer_size >= buffer_required(period_in_bytes, desired, blocksize, write_max) {
         let old_period = port.setup_period;
         let delay_capped = commit_geometry(
@@ -399,7 +397,6 @@ unsafe fn prime_playback(
     graph_rate: u32,
     oss_delay: u32,
     oss_fragment: u32,
-    rate_match: *const spa_io_rate_match,
     log: &crate::spa::Log,
 ) {
     #[cfg(debug_assertions)]
@@ -421,7 +418,7 @@ unsafe fn prime_playback(
     // the ceiling above the floor.
     let desired = desired_delay(period_in_bytes, oss_delay);
     let chunk = crate::utils::ns_to_frame_bytes(port.dsp.hw_quantum_ns, cfg_rate, stride);
-    let write_max = period_in_bytes.max(rate_match_bytes(rate_match, stride));
+    let write_max = period_in_bytes.max(rate_match_bytes(port.rate_match, stride));
     let max_period = crate::sound::max_ring_period_bytes(stride, cfg_rate, graph_rate);
     let request = buffer_request(
         period_in_bytes,
@@ -659,70 +656,6 @@ fn level_correct(port: &mut crate::node::Port<SinkDir>, odelay: u32) -> bool {
     false
 }
 
-// Run the servo before the clock is published so every field below belongs
-// to this cycle (the shape of ALSA's update_time). One FreeBSD difference:
-// GETODELAY reports the soft buffer only - the kernel pre-fills the hardware
-// buffer at trigger and never counts it - so the absolute delay is
-// understated by bufhard; the servo only needs cycle-to-cycle consistency
-// and is unaffected.
-unsafe fn timeout_servo(state: &mut State<SinkDir>, nsec: u64, rate: u32) -> (f64, i64) {
-    let mut corr: f64 = 1.0;
-    let mut delay: i64 = 0;
-    for port in &mut state.ports {
-        let Some(cfg) = port.config.as_ref() else {
-            continue;
-        };
-        let stride = cfg.stride().max(1);
-        let device_rate = cfg.rate.max(1);
-        if !port.dsp.is_running() || port.setup_period == 0 || port.resetup_pending {
-            continue;
-        }
-
-        let odelay = port.dsp.odelay();
-        // device frames scale to the graph rate; the resampler queue is already
-        // graph-side (audioconvert reports it unscaled, like ALSA adds it)
-        let resamp = if state.rate_match.is_null() {
-            0
-        } else {
-            (*state.rate_match).delay as i64
-        };
-        delay = (odelay as i64 / stride as i64) * rate as i64 / device_rate as i64 + resamp;
-
-        if port.ext.xrun_timestamp != 0 {
-            continue; // recovering; process() is discarding buffers, hold the servo
-        }
-
-        // clamp the error so a wakeup-jitter spike can't wind up the integrator
-        // against an actuator that moves slowly (ALSA clamps to max_error too)
-        let max_err = (port.setup_period as f64 / 2.0).max(256.0 * stride as f64);
-        let err = (odelay as f64 - port.ext.target_delay as f64).clamp(-max_err, max_err);
-        corr = port.dll.update(err);
-        port.bw_adapt.update(&mut port.dll, err, nsec);
-
-        // a diverged servo must not wedge the graph clock
-        if !(0.5..=2.0).contains(&corr) {
-            crate::warn!(
-                state.log,
-                "{}: DLL diverged (corr {}); relocking",
-                port.dsp.path,
-                corr
-            );
-            port.dll.init();
-            port.bw_adapt.reset();
-            corr = 1.0;
-        }
-
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "{}: corr = {}, err = {}",
-            port.dsp.path,
-            corr,
-            odelay as f64 - port.ext.target_delay as f64
-        );
-    }
-    (corr, delay)
-}
-
 // used from the main thread only; returns 0 or -errno with the device closed
 fn try_open_configure(
     dsp: &mut crate::sound::DspWriter,
@@ -863,7 +796,6 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
             period_in_bytes,
             stride,
             state.ext.oss_delay,
-            state.rate_match,
             &state.log,
         ) {
             // the driver refused the trigger stop (dying fd): rebuild off-loop
@@ -885,7 +817,6 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
                 driver_clock.target_rate.denom,
                 state.ext.oss_delay,
                 state.oss_fragment,
-                state.rate_match,
                 &state.log,
             );
         } else {
@@ -939,13 +870,13 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
         // from our clock so there is nothing to match (ALSA gates on the clock
         // name the same way).
         port.was_matching = matching;
-        if !state.rate_match.is_null() {
+        if !port.rate_match.is_null() {
             if matching {
-                (*state.rate_match).flags |= SPA_IO_RATE_MATCH_FLAG_ACTIVE;
-                (*state.rate_match).rate = corr.clamp(0.99, 1.01);
+                (*port.rate_match).flags |= SPA_IO_RATE_MATCH_FLAG_ACTIVE;
+                (*port.rate_match).rate = corr.clamp(0.99, 1.01);
             } else {
-                (*state.rate_match).flags &= !SPA_IO_RATE_MATCH_FLAG_ACTIVE;
-                (*state.rate_match).rate = 1.0;
+                (*port.rate_match).flags &= !SPA_IO_RATE_MATCH_FLAG_ACTIVE;
+                (*port.rate_match).rate = 1.0;
             }
         }
 
@@ -1159,7 +1090,7 @@ impl Direction for SinkDir {
         state.ports[port_idx].ext.xrun_timestamp = 0;
     }
 
-    unsafe fn on_buffers_swapped(_state: &mut State<SinkDir>) {}
+    unsafe fn on_buffers_swapped(_state: &mut State<SinkDir>, _port_idx: usize) {}
 
     unsafe fn on_start_loop(state: &mut State<SinkDir>) {
         for port in &mut state.ports {
@@ -1209,8 +1140,24 @@ impl Direction for SinkDir {
         );
     }
 
-    unsafe fn timeout_servo(state: &mut State<SinkDir>, nsec: u64, rate: u32) -> (f64, i64) {
-        timeout_servo(state, nsec, rate)
+    unsafe fn servo_ready(_port: &crate::node::Port<SinkDir>) -> bool {
+        true
+    }
+
+    // One FreeBSD note: GETODELAY reports the soft buffer only - the kernel
+    // pre-fills the hardware buffer at trigger and never counts it - so the
+    // absolute delay is understated by bufhard; the servo only needs
+    // cycle-to-cycle consistency and is unaffected.
+    unsafe fn servo_fill(port: &mut crate::node::Port<SinkDir>) -> u32 {
+        port.dsp.odelay()
+    }
+
+    unsafe fn servo_hold(port: &crate::node::Port<SinkDir>) -> bool {
+        port.ext.xrun_timestamp != 0
+    }
+
+    fn servo_err(port: &crate::node::Port<SinkDir>, fill: u32) -> f64 {
+        fill as f64 - port.ext.target_delay as f64
     }
 
     unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
@@ -1264,6 +1211,7 @@ mod tests {
             config: None,
             buffers: vec![],
             io: std::ptr::null_mut(),
+            rate_match: std::ptr::null_mut(),
             dsp: crate::sound::DspWriter::test_on_fd(write_fd, 8),
             dll: Default::default(),
             setup_period: period,
@@ -1466,10 +1414,25 @@ mod tests {
         assert!(skip);
         assert!(drain(r).is_empty());
 
-        // in-band error: no snap, the DLL absorbs it
-        let (corr, skip) = follower_servo(&mut port, 4096 + 512, 8, 0);
+        // in-band error: no snap, the DLL absorbs it. With a negotiated
+        // config the geometry latches and the DLL engages: the first update
+        // cold-starts the gains, the second produces a real correction
+        port.config = Some(super::PortConfig {
+            format: libspa::param::audio::AudioFormat::S16LE,
+            rate: 48000,
+            channels: 4,
+            positions: vec![],
+            flags: 0,
+        });
+        super::commit_geometry(&mut port, 65536, 2048, 1024, 2048, 4096);
+        port.setup_period = 2048;
+        port.ext.target_delay = 4096;
+        follower_servo(&mut port, 4096 + 512, 8, 1);
+        port.was_matching = true; // the caller latches this after each cycle
+        let (corr, skip) = follower_servo(&mut port, 4096 + 512, 8, 2);
         assert!(!skip);
         assert!((0.9..=1.1).contains(&corr));
+        assert!(corr != 1.0, "the DLL never engaged");
         assert!(drain(r).is_empty());
         unsafe { libc::close(r) };
     }
@@ -1503,13 +1466,13 @@ mod tests {
         let log = crate::spa::Log::test_null();
 
         // one flip is debounced: write at the old geometry for a cycle
-        assert!(!unsafe { retune_period(&mut port, 4096, 8, 0, std::ptr::null(), &log) });
+        assert!(!unsafe { retune_period(&mut port, 4096, 8, 0, &log) });
         assert_eq!(port.setup_period, 2048);
         assert!(drain(r).is_empty());
 
         // sustained: retune in place and fill to the new target (odelay
         // reads 0 on a pipe, so the snap writes the whole target)
-        assert!(!unsafe { retune_period(&mut port, 4096, 8, 0, std::ptr::null(), &log) });
+        assert!(!unsafe { retune_period(&mut port, 4096, 8, 0, &log) });
         assert_eq!(port.setup_period, 4096);
         assert_eq!(port.ext.target_delay, 5120); // fill_floor(4096, 1024) binds
         assert_eq!(port.ext.period_mismatch, 0);
@@ -1529,8 +1492,8 @@ mod tests {
         port.dsp.write_zeroes(0);
         let log = crate::spa::Log::test_null();
 
-        assert!(!unsafe { retune_period(&mut port, 4096, 8, 0, std::ptr::null(), &log) });
-        assert!(unsafe { retune_period(&mut port, 4096, 8, 0, std::ptr::null(), &log) });
+        assert!(!unsafe { retune_period(&mut port, 4096, 8, 0, &log) });
+        assert!(unsafe { retune_period(&mut port, 4096, 8, 0, &log) });
         assert_eq!(port.setup_period, 2048); // untouched; the rebuild replaces the device
         assert!(port.ext.period_mismatch >= 2);
         assert!(drain(r).is_empty());
