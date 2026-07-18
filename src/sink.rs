@@ -488,7 +488,7 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
       // include it, or a device that honors the request grants no room for
       // the ceiling above the floor.
       let desired    = desired_delay(period_in_bytes, state.ext.oss_delay);
-      let chunk      = crate::utils::ns_to_bytes(port.dsp.hw_quantum_ns, cfg_rate, stride);
+      let chunk      = crate::utils::ns_to_frame_bytes(port.dsp.hw_quantum_ns, cfg_rate, stride);
       let write_max  = period_in_bytes.max(rate_match_bytes(state.rate_match, stride));
       let max_period = crate::sound::max_ring_period_bytes(stride, cfg_rate, driver_clock.target_rate.denom);
       let request    = buffer_request(period_in_bytes, max_period, crate::sound::ring_byte_cap(stride, cfg_rate),

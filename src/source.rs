@@ -385,7 +385,12 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
       if ready {
         let mut backlog = backlog;
         while backlog > 0 {
-          let chunk = backlog.min(data_0.maxsize);
+          // whole frames only: GETISPACE is byte-granular and can sit
+          // mid-frame; an unaligned read would tear every later sample
+          let chunk = (backlog.min(data_0.maxsize) / stride) * stride;
+          if chunk == 0 {
+            break; // a sub-frame tail; it completes into a frame later
+          }
           let n = port.dsp.read(data_0.data, chunk as usize);
           if n <= 0 {
             break;
@@ -398,7 +403,7 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
       // the measurement/arrival quantum is the granted fragment or the
       // hardware cadence sndstat reports, whichever is coarser (see the
       // sink); data arrives in these lumps regardless of the soft fragment
-      let chunk = crate::utils::ns_to_bytes(port.dsp.hw_quantum_ns, rate, stride);
+      let chunk = crate::utils::ns_to_frame_bytes(port.dsp.hw_quantum_ns, rate, stride);
       commit_geometry(port, period_in_bytes, fragsize.max(chunk));
       port.ext.pinned_cycles = 0;
       if port.ext.ring_size > 0 && port.ext.ring_size < ring_required(period_in_bytes, port.setup_blocksize) {
@@ -479,7 +484,9 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
       } else {
         queued
       };
-      let ispace = want.min(queued).min(data_0.maxsize);
+      // floored to whole frames: `queued` is byte-granular and can sit
+      // mid-frame; an unaligned read would start the next buffer mid-sample
+      let ispace = (want.min(queued).min(data_0.maxsize) / stride) * stride;
       #[cfg(debug_assertions)]
       crate::trace!(state.log, "ispace: {}", ispace);
       let nread = if ispace > 0 {

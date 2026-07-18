@@ -681,6 +681,15 @@ pub fn ns_to_bytes(ns: u64, rate: u32, stride: u32) -> u32 {
     .min(u32::MAX as u128) as u32
 }
 
+// ns_to_bytes rounded up to a whole frame (the division floors: a 2048-byte
+// hardware quantum reads as 2047); a saturated conversion stays saturated at
+// the largest frame multiple instead of overflowing the round-up
+pub fn ns_to_frame_bytes(ns: u64, rate: u32, stride: u32) -> u32 {
+  let stride = stride.max(1);
+  ns_to_bytes(ns, rate, stride).checked_next_multiple_of(stride)
+    .unwrap_or(u32::MAX - u32::MAX % stride)
+}
+
 // Deserialize a host-supplied pod without trusting it: libspa's
 // deserializer divides by a pod-declared child size (Choice pods) and
 // pre-allocates from declared lengths, so a hostile pod can panic it -

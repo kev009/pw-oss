@@ -558,7 +558,9 @@ pub struct Dsp {
   pub hw_quantum_ns: u64, // the hardware drain quantum (sndstat); 0 = fragment-accurate
   fd:    c_int,
   state: DspState,
-  needs_trigger: bool // trigger-suspended: NOTRIGGER must be cleared on restart
+  needs_trigger: bool, // trigger-suspended: NOTRIGGER must be cleared on restart
+  stride: u32, // negotiated frame bytes; reads must consume whole frames
+  skip:   u32  // tail bytes of a torn frame to discard before the next read
 }
 
 impl Dsp {
@@ -569,7 +571,9 @@ impl Dsp {
       hw_quantum_ns: drain_quantum_ns(path, false),
       fd: -1,
       state: DspState::Closed,
-      needs_trigger: false
+      needs_trigger: false,
+      stride: 1,
+      skip:   0
     }
   }
 
@@ -612,10 +616,13 @@ impl Dsp {
     self.fd    = -1;
     self.state = DspState::Closed;
     self.needs_trigger = false;
+    self.skip  = 0;
   }
 
   pub fn configure(&mut self, format: u32, channels: u32, rate: u32) -> Result<(), Errno> {
     assert_eq!(self.state, DspState::Setup);
+    // plain AFMT selector (no channel field), so this yields the sample width
+    self.stride = afmt_frame_bytes(format).max(1).saturating_mul(channels.max(1));
     set_value(self.fd, SNDCTL_DSP_SETFMT,   format,   0)?;
     set_value(self.fd, SNDCTL_DSP_CHANNELS, channels, 0)?;
     set_value(self.fd, SNDCTL_DSP_SPEED,    rate,     feeder_rate_round())
@@ -666,15 +673,40 @@ impl Dsp {
     }
     self.state = DspState::Setup;
     self.needs_trigger = true;
+    self.skip  = 0; // the ring reset discarded the torn frame with it
     true
   }
 
+  /// Read up to `count` bytes, keeping every returned buffer frame-aligned:
+  /// the stream's sample boundaries are fixed by total bytes consumed, so an
+  /// unaligned read makes the NEXT buffer start mid-sample and turns it into
+  /// static. Callers floor their requests to the stride; if the kernel still
+  /// returns short mid-frame (signals), the torn frame's tail is discarded on
+  /// the next call and its consumed head hidden from this one - one frame
+  /// dropped, alignment kept. Returns a frame-aligned count.
   pub unsafe fn read(&mut self, buf: *mut c_void, count: size_t) -> ssize_t {
     if self.state == DspState::Setup {
       self.state = DspState::Running;
     }
     assert_eq!(self.state, DspState::Running);
-    libc::read(self.fd, buf, count)
+    while self.skip != 0 {
+      let mut scratch = [0u8; 64];
+      let n = libc::read(self.fd, scratch.as_mut_ptr().cast(), (self.skip as usize).min(scratch.len()));
+      if n <= 0 {
+        return n; // capture is running when reads happen; treat as the caller's error
+      }
+      self.skip -= n as u32;
+    }
+    let n = libc::read(self.fd, buf, count);
+    if n <= 0 {
+      return n;
+    }
+    let rem = n as usize % self.stride.max(1) as usize;
+    if rem != 0 {
+      self.skip = self.stride - rem as u32;
+      return (n as usize - rem) as ssize_t; // hide the torn frame's head
+    }
+    n
   }
 
   pub fn ready_for_reading(&mut self, timeout_ms: usize) -> bool {
@@ -800,6 +832,8 @@ pub struct DspWriter {
   fd:      c_int,
   state:   DspState,
   needs_trigger: bool, // trigger-suspended: writes buffer until armed
+  stride:    u32, // negotiated frame bytes; the byte stream must stay frame-aligned
+  frame_off: u32, // bytes into a frame a short write left the stream at (0 = aligned)
   #[cfg(debug_assertions)]
   prev_ns: u64
 }
@@ -815,6 +849,8 @@ impl DspWriter {
       fd:      -1,
       state:   DspState::Closed,
       needs_trigger: false,
+      stride:    1,
+      frame_off: 0,
       #[cfg(debug_assertions)]
       prev_ns: 0
     }
@@ -848,6 +884,7 @@ impl DspWriter {
     self.fd    = -1;
     self.state = DspState::Closed;
     self.needs_trigger = false;
+    self.frame_off = 0;
   }
 
   // Stop the channel but keep the fd: SETTRIGGER(0) aborts, resets the ring
@@ -865,6 +902,7 @@ impl DspWriter {
     }
     self.state = DspState::Setup;
     self.needs_trigger = true;
+    self.frame_off = 0; // the ring reset discarded any split frame with it
     true
   }
 
@@ -880,6 +918,8 @@ impl DspWriter {
 
   pub fn configure(&mut self, format: u32, channels: u32, rate: u32) -> Result<(), Errno> {
     assert_eq!(self.state, DspState::Setup);
+    // plain AFMT selector (no channel field), so this yields the sample width
+    self.stride = afmt_frame_bytes(format).max(1).saturating_mul(channels.max(1));
     set_value(self.fd, SNDCTL_DSP_SETFMT,   format,   0)?;
     set_value(self.fd, SNDCTL_DSP_CHANNELS, channels, 0)?;
     set_value(self.fd, SNDCTL_DSP_SPEED,    rate,     feeder_rate_round())
@@ -911,11 +951,76 @@ impl DspWriter {
     ospace_in_bytes(self.fd).max(0) as u32
   }
 
+  /// Write `count` bytes, keeping the device byte stream frame-aligned. The
+  /// fd is O_NONBLOCK and chn_write is byte-granular: a short return can
+  /// split a frame, after which the kernel parses every later sample offset
+  /// by the remainder - loud static with the audio faintly underneath. A
+  /// split frame is completed from `buf` (the true continuation bytes) with
+  /// a bounded retry; the ring drains continuously, so the few missing bytes
+  /// fit within microseconds. Returns the frame-aligned byte count consumed
+  /// from `buf` (callers drop only whole frames).
   pub unsafe fn write(&mut self, buf: *const c_void, count: u32) -> ssize_t {
-    let n = self.write_buffered(buf, count);
+    if self.state == DspState::Setup {
+      self.state = DspState::Running;
+    }
+    let ret = if !self.realign_stream() {
+      -1 // a previously split frame couldn't be closed; don't compound it
+    } else {
+      let n = self.write_buffered(buf, count);
+      if n > 0 {
+        let mut done = n as u32;
+        if self.frame_off != 0 && done < count {
+          // never read past the caller's buffer: an unaligned `count` that
+          // wrote fully leaves the split for the next call's zero realign
+          let need = (self.stride - self.frame_off).min(count - done);
+          done += self.write_exact(buf.cast::<u8>().add(done as usize), need);
+          // on failure frame_off holds the split; the next call realigns
+        }
+        done as ssize_t
+      } else {
+        n
+      }
+    };
     // a trigger-suspended channel starts once real data is buffered
     self.arm();
-    n
+    ret
+  }
+
+  // close an open frame with zeros (one corrupt sample beats a permanently
+  // misaligned stream); true = the stream is back on a frame boundary
+  fn realign_stream(&mut self) -> bool {
+    if self.frame_off != 0 {
+      let need = self.stride - self.frame_off;
+      unsafe { self.write_exact(ZEROES.as_ptr(), need) };
+    }
+    self.frame_off == 0
+  }
+
+  // push exactly `count` bytes (a partial frame's tail), waiting out EAGAIN
+  // briefly: at audio rates the ring frees a byte every few microseconds, so
+  // the tail fits well inside the retry budget - unless the channel is
+  // trigger-suspended and nothing drains, where waiting is pointless.
+  unsafe fn write_exact(&mut self, buf: *const u8, count: u32) -> u32 {
+    let mut done = 0u32;
+    let mut tries = 0;
+    while done < count {
+      let n = self.write_buffered(buf.add(done as usize).cast(), count - done);
+      if n > 0 {
+        done += n as u32;
+        continue;
+      }
+      if (n < 0 && Errno::last() != Errno::EAGAIN) || self.needs_trigger {
+        break;
+      }
+      tries += 1;
+      if tries > 100 {
+        eprintln!("{}: could not complete a split frame ({} of {} bytes)", self.path, done, count);
+        break;
+      }
+      let ts = libc::timespec { tv_sec: 0, tv_nsec: 2_000 };
+      libc::nanosleep(&ts, std::ptr::null_mut());
+    }
+    done
   }
 
   unsafe fn write_buffered(&mut self, buf: *const c_void, count: u32) -> ssize_t {
@@ -930,6 +1035,10 @@ impl DspWriter {
     let delay = odelay(self.fd);
 
     let nbytes = libc::write(self.fd, buf, count as size_t);
+    if nbytes > 0 {
+      // frame phase of the stream: every accepted byte counts, whoever wrote it
+      self.frame_off = (self.frame_off + nbytes as u32) % self.stride.max(1);
+    }
 
     #[cfg(debug_assertions)]
     {
@@ -950,9 +1059,18 @@ impl DspWriter {
     if self.state == DspState::Setup {
       self.state = DspState::Running;
     }
+    if !self.realign_stream() {
+      return;
+    }
+    // whole frames only: callers derive `count` from byte-granular ioctls
+    // (odelay through a vchan can sit mid-frame), and a split frame turns
+    // every later sample into static
+    count -= count % self.stride.max(1);
     // chunk from ZEROES (`count` can exceed its len). The fd is O_NONBLOCK, so a
     // short write or EAGAIN is normal; prime best-effort rather than asserting and
     // panicking out of the `extern "C"` callback (which aborts the process).
+    // An early break can leave a frame split; frame_off records it and the
+    // next write's realign closes it with zeros.
     while count > 0 {
       let chunk  = count.min(ZEROES.len() as u32);
       let nbytes = unsafe { self.write_buffered(ZEROES.as_ptr().cast(), chunk) };
@@ -1078,6 +1196,41 @@ pub fn list_pcm_devices(indexes: &[u32]) -> Vec<PcmDevice> {
   result
 }
 
+// pipe-backed constructors for the alignment tests: a pipe write end is
+// byte-granular under O_NONBLOCK exactly like chn_write, with byte-exact
+// buffer accounting, so short writes can be forced deterministically
+#[cfg(test)]
+impl DspWriter {
+  fn test_on_fd(fd: c_int, stride: u32) -> Self {
+    Self {
+      path:    "test-fd".to_string(),
+      hw_quantum_ns: 0,
+      fd,
+      state:   DspState::Setup,
+      needs_trigger: false,
+      stride,
+      frame_off: 0,
+      #[cfg(debug_assertions)]
+      prev_ns: 0
+    }
+  }
+}
+
+#[cfg(test)]
+impl Dsp {
+  fn test_on_fd(fd: c_int, stride: u32) -> Self {
+    Self {
+      path:  CString::new("test-fd").unwrap(),
+      hw_quantum_ns: 0,
+      fd,
+      state: DspState::Setup,
+      needs_trigger: false,
+      stride,
+      skip:  0
+    }
+  }
+}
+
 #[cfg(test)]
 mod tests {
   #[test]
@@ -1114,5 +1267,127 @@ mod tests {
       println!("{}: play {} ns, rec {} ns", node,
         super::drain_quantum_ns(&node, true), super::drain_quantum_ns(&node, false));
     }
+  }
+
+  use libc::c_int;
+
+  fn set_nonblock(fd: c_int) {
+    unsafe {
+      let fl = libc::fcntl(fd, libc::F_GETFL);
+      assert_ne!(libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK), -1);
+    }
+  }
+
+  // (read end, write end); nonblock as requested per end
+  fn pipe_pair(nb_read: bool, nb_write: bool) -> (c_int, c_int) {
+    let mut fds = [0 as c_int; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    if nb_read  { set_nonblock(fds[0]); }
+    if nb_write { set_nonblock(fds[1]); }
+    (fds[0], fds[1])
+  }
+
+  fn drain(fd: c_int) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 16384];
+    loop {
+      let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+      if n <= 0 { break; }
+      out.extend_from_slice(&buf[..n as usize]);
+    }
+    out
+  }
+
+  fn pattern(len: usize, seed: usize) -> Vec<u8> {
+    (0..len).map(|i| ((i * 7 + seed) % 251) as u8).collect()
+  }
+
+  #[test]
+  fn write_zeroes_floors_to_frames() {
+    let (r, w) = pipe_pair(true, true);
+    let mut dsp = super::DspWriter::test_on_fd(w, 8);
+    dsp.write_zeroes(2047); // odelay through a vchan can produce counts like this
+    let got = drain(r);
+    assert_eq!(got.len(), 2040);
+    assert!(got.iter().all(|&b| b == 0));
+    unsafe { libc::close(r) };
+  }
+
+  // The 2026-07-17 noise bug: a short write that splits a frame must never
+  // leave the device byte stream mid-sample - every sample after an
+  // unaligned boundary is stitched from two neighbors (white noise with the
+  // audio faintly underneath).
+  #[test]
+  fn short_write_keeps_stream_frame_aligned() {
+    let (r, w) = pipe_pair(true, true);
+    let mut dsp = super::DspWriter::test_on_fd(w, 8);
+
+    // fill the pipe to capacity, then free a mid-frame hole: the next write
+    // is forced short at an unaligned count, like a full OSS ring
+    let fill = vec![0xffu8; 16384];
+    let mut total_fill = 0usize;
+    loop {
+      let n = unsafe { libc::write(w, fill.as_ptr().cast(), fill.len()) };
+      if n <= 0 { break; }
+      total_fill += n as usize;
+    }
+    let mut hole = [0u8; 2046];
+    let mut freed = 0usize;
+    while freed < hole.len() {
+      let n = unsafe { libc::read(r, hole.as_mut_ptr().add(freed).cast(), hole.len() - freed) };
+      assert!(n > 0);
+      freed += n as usize;
+    }
+
+    // 2046 = 255 frames + 6 bytes: the kernel takes all of it, the 2-byte
+    // frame tail can't fit, and the split is recorded rather than dropped
+    let a = pattern(4096, 1);
+    let ret = unsafe { dsp.write(a.as_ptr().cast(), 4096) };
+    assert_eq!(ret, 2046);
+    assert_eq!(dsp.frame_off, 6);
+
+    let queued = drain(r); // remaining filler, then the accepted head
+    assert_eq!(queued.len(), total_fill - hole.len() + 2046);
+    assert_eq!(&queued[queued.len() - 2046..], &a[..2046]);
+
+    // with space available again, the next write closes the split frame
+    // with zeros before any new data: the stream returns to a frame
+    // boundary instead of shifting every later sample
+    let b = pattern(4096, 2);
+    let ret = unsafe { dsp.write(b.as_ptr().cast(), 4096) };
+    assert_eq!(ret, 4096);
+    assert_eq!(dsp.frame_off, 0);
+    let tail = drain(r);
+    assert_eq!(&tail[..2], &[0, 0]);
+    assert_eq!(&tail[2..], &b[..]);
+    assert_eq!((2046 + tail.len()) % 8, 0); // the stream is whole frames again
+    unsafe { libc::close(r) };
+  }
+
+  // capture mirror image: a read that lands mid-frame must hide the torn
+  // frame's head and discard its tail, so every returned buffer starts on a
+  // frame boundary
+  #[test]
+  fn read_hides_torn_frame_and_realigns() {
+    let (r, w) = pipe_pair(false, false);
+    let mut dsp = super::Dsp::test_on_fd(r, 8);
+    let s = pattern(2056, 3);
+    assert_eq!(unsafe { libc::write(w, s.as_ptr().cast(), 2046) }, 2046);
+
+    // 2046 available < 4096 requested: the pipe returns it all, mid-frame
+    let mut buf = vec![0u8; 4096];
+    let n = unsafe { dsp.read(buf.as_mut_ptr().cast(), 4096) };
+    assert_eq!(n, 2040);
+    assert_eq!(&buf[..2040], &s[..2040]);
+    assert_eq!(dsp.skip, 2);
+
+    // the stream continues; the torn frame's tail is skipped and the next
+    // buffer starts exactly on the following frame boundary
+    assert_eq!(unsafe { libc::write(w, s.as_ptr().add(2046).cast(), 10) }, 10);
+    let n = unsafe { dsp.read(buf.as_mut_ptr().cast(), 8) };
+    assert_eq!(n, 8);
+    assert_eq!(&buf[..8], &s[2048..2056]);
+    assert_eq!(dsp.skip, 0);
+    unsafe { libc::close(w) };
   }
 }
