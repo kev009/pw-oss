@@ -121,10 +121,10 @@ pub(crate) trait Direction: Sized + 'static {
     // init: after the info dict is parsed (e.g. latching the oss.delay default)
     fn ext_ready(ext: &mut Self::Ext);
 
-    // enum_params: build one node param pod for (id, index)
+    // enum_params: serialize one node param pod for (id, index) into `buffer`
     fn build_node_param(
         state: &mut State<Self>,
-        b: &mut libspa::pod::builder::Builder,
+        buffer: &mut Vec<u8>,
         id: u32,
         index: u32,
     ) -> ParamBuild;
@@ -488,17 +488,11 @@ unsafe extern "C" fn enum_params<D: Direction>(
     let mut count = 0;
 
     while count < max {
-        use libspa::pod::builder::Builder;
-
-        let mut builder = Builder::new(&mut buffer);
-
-        match D::build_node_param(state, &mut builder, id, index) {
+        match D::build_node_param(state, &mut buffer, id, index) {
             ParamBuild::Built => (),
             ParamBuild::Exhausted => return 0,
             ParamBuild::Unknown => return -libc::ENOENT, // unknown param id (ALSA convention)
         }
-
-        drop(builder); // its borrow of `buffer` must end before we take the source pointer
 
         let mut result = spa_result_node_params {
             id,
@@ -1063,12 +1057,10 @@ unsafe extern "C" fn remove_port(
 // the port directly (negotiate_buffers/negotiate_format short-circuit when
 // follower == target, audioadapter.c:445, :995).
 
-// replays the negotiated format exactly, for port_enum_params(Format)
-unsafe fn build_port_format_info(
-    builder: &mut libspa::pod::builder::Builder,
-    config: &PortConfig,
-    id: u32,
-) {
+// replays the negotiated format exactly, for port_enum_params(Format);
+// kept on the C spa_format_audio_raw_build FFI (unlike the Value-tree
+// builders in utils.rs) so the pod stays byte-identical to the C helper
+fn build_port_format_info(config: &PortConfig, id: u32) -> Vec<u8> {
     let mut position = [0u32; 64];
     for (slot, &p) in position.iter_mut().zip(config.positions.iter()) {
         *slot = p;
@@ -1082,8 +1074,12 @@ unsafe fn build_port_format_info(
         position,
     };
 
+    let mut buffer = vec![];
+    let builder = libspa::pod::builder::Builder::new(&mut buffer);
     // the raw struct is fully initialized above; output goes into the builder
     unsafe { spa_format_audio_raw_build(builder.as_raw_ptr(), id, &raw) };
+    drop(builder);
+    buffer
 }
 
 unsafe extern "C" fn port_enum_params<D: Direction>(
@@ -1113,10 +1109,6 @@ unsafe extern "C" fn port_enum_params<D: Direction>(
     let mut count = 0;
 
     while count < max {
-        use libspa::pod::builder::Builder;
-
-        let mut builder = Builder::new(&mut buffer);
-
         #[allow(non_upper_case_globals)]
         match (id, index) {
             (SPA_PARAM_EnumFormat, i) => {
@@ -1129,23 +1121,20 @@ unsafe extern "C" fn port_enum_params<D: Direction>(
                         state.caps_fallback = false;
                     }
                 }
-                if !crate::utils::build_enum_format_info(&mut builder, &state.caps, i).unwrap() {
-                    return 0;
+                match crate::utils::build_enum_format_info(&state.caps, i) {
+                    Some(pod) => buffer = pod,
+                    None => return 0,
                 }
             }
             (SPA_PARAM_Format, 0) => {
                 match state.ports[port_id as usize].config.as_ref() {
-                    Some(cfg) => {
-                        unsafe { build_port_format_info(&mut builder, cfg, SPA_PARAM_Format) };
-                    }
+                    Some(cfg) => buffer = build_port_format_info(cfg, SPA_PARAM_Format),
                     None => return -libc::ENOENT, // no format negotiated yet
                 }
             }
             (SPA_PARAM_Buffers, 0) => {
                 match state.ports[port_id as usize].config.as_ref() {
-                    Some(cfg) => {
-                        crate::utils::build_buffers_info(&mut builder, cfg.stride).unwrap();
-                    }
+                    Some(cfg) => buffer = crate::utils::build_buffers_info(cfg.stride),
                     None => return -libc::ENOENT, // format not negotiated yet
                 }
             }
@@ -1156,14 +1145,12 @@ unsafe extern "C" fn port_enum_params<D: Direction>(
                 if info.direction == D::DIRECTION {
                     crate::utils::process_latency_info_add(&state.process_latency, &mut info);
                 }
-                crate::utils::build_latency_info(&mut builder, &info).unwrap();
+                buffer = crate::utils::build_latency_info(&info);
             }
             // a known id whose indices are exhausted ends the enumeration
             (SPA_PARAM_Format | SPA_PARAM_Buffers | SPA_PARAM_Latency, _) => return 0,
             _ => return -libc::ENOENT, // unknown param id (ALSA convention)
         };
-
-        drop(builder); // its borrow of `buffer` must end before we take the source pointer
 
         let mut result = spa_result_node_params {
             id,

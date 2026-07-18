@@ -927,40 +927,40 @@ impl Direction for SinkDir {
 
     fn build_node_param(
         state: &mut State<SinkDir>,
-        b: &mut libspa::pod::builder::Builder,
+        buffer: &mut Vec<u8>,
         id: u32,
         index: u32,
     ) -> ParamBuild {
         #[allow(non_upper_case_globals)]
         match (id, index) {
-            (SPA_PARAM_PropInfo, 0) => crate::utils::build_latency_offset_prop_info(b).unwrap(),
-            (SPA_PARAM_PropInfo, 1) => crate::utils::build_params_prop_info(
-                b,
-                crate::keys::OSS_DELAY,
-                "OSS buffer fill target (1/8ths of a period)",
-                state.ext.oss_delay,
-                1024,
-            )
-            .unwrap(),
-            (SPA_PARAM_PropInfo, 2) => crate::utils::build_params_prop_info(
-                b,
-                crate::keys::OSS_FRAGMENT,
-                "OSS fragment size (bytes, power of two, 0 = automatic)",
-                state.oss_fragment,
-                16384,
-            )
-            .unwrap(),
-            (SPA_PARAM_Props, 0) => crate::utils::build_latency_offset_props(
-                b,
-                state.process_latency.ns,
-                &[
-                    (crate::keys::OSS_DELAY, state.ext.oss_delay),
-                    (crate::keys::OSS_FRAGMENT, state.oss_fragment),
-                ],
-            )
-            .unwrap(),
+            (SPA_PARAM_PropInfo, 0) => *buffer = crate::utils::build_latency_offset_prop_info(),
+            (SPA_PARAM_PropInfo, 1) => {
+                *buffer = crate::utils::build_params_prop_info(
+                    crate::keys::OSS_DELAY,
+                    "OSS buffer fill target (1/8ths of a period)",
+                    state.ext.oss_delay,
+                    1024,
+                );
+            }
+            (SPA_PARAM_PropInfo, 2) => {
+                *buffer = crate::utils::build_params_prop_info(
+                    crate::keys::OSS_FRAGMENT,
+                    "OSS fragment size (bytes, power of two, 0 = automatic)",
+                    state.oss_fragment,
+                    16384,
+                );
+            }
+            (SPA_PARAM_Props, 0) => {
+                *buffer = crate::utils::build_latency_offset_props(
+                    state.process_latency.ns,
+                    &[
+                        (crate::keys::OSS_DELAY, state.ext.oss_delay),
+                        (crate::keys::OSS_FRAGMENT, state.oss_fragment),
+                    ],
+                );
+            }
             (SPA_PARAM_ProcessLatency, 0) => {
-                crate::utils::build_process_latency_info(b, &state.process_latency).unwrap();
+                *buffer = crate::utils::build_process_latency_info(&state.process_latency);
             }
             (SPA_PARAM_PropInfo | SPA_PARAM_Props | SPA_PARAM_ProcessLatency, _) => {
                 return ParamBuild::Exhausted;

@@ -272,172 +272,157 @@ fn enum_format_widths(min_channels: u32, max_channels: u32) -> Vec<u32> {
     counts
 }
 
-// One EnumFormat pod per offered channel width (enum_format_widths order),
-// positions from the kernel interleave. Returns false when `index` is past
-// the last result.
-pub(crate) fn build_enum_format_info(
-    b: &mut libspa::pod::builder::Builder,
-    caps: &crate::sound::DspCaps,
-    index: u32,
-) -> Result<bool, rustix::io::Errno> {
-    // SAFETY: the frame pushes/pops below act on locally-owned frames in
-    // strict LIFO order; the pod bytes land in the caller-owned builder
-    unsafe {
-        use libspa::sys::*;
+// Serialize a Value tree into a standalone pod byte buffer. Infallible in
+// practice: the output is in-memory and every Value we build is
+// serializable, so an error here is a programming bug.
+pub(crate) fn serialize_pod(value: &libspa::pod::Value) -> Vec<u8> {
+    use libspa::pod::serialize::PodSerializer;
+    PodSerializer::serialize(std::io::Cursor::new(Vec::new()), value)
+        .expect("serializing a pod Value into a Vec cannot fail")
+        .0
+        .into_inner()
+}
 
-        // formats supported by both us and the device, best first
-        let formats = offered_formats(caps);
-        if formats.is_empty() {
-            return Ok(false);
-        }
-
-        let counts = enum_format_widths(caps.min_channels, caps.max_channels);
-        let Some(&channels) = counts.get(index as usize) else {
-            return Ok(false);
-        };
-
-        let mut outer = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
-        let mut inner = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
-
-        b.push_object(&mut outer, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat)?;
-
-        b.add_prop(SPA_FORMAT_mediaType, 0)?;
-        b.add_id(libspa::utils::Id(SPA_MEDIA_TYPE_audio))?;
-
-        b.add_prop(SPA_FORMAT_mediaSubtype, 0)?;
-        b.add_id(libspa::utils::Id(SPA_MEDIA_SUBTYPE_raw))?;
-
-        b.add_prop(SPA_FORMAT_AUDIO_format, 0)?;
-        if formats.len() == 1 {
-            b.add_id(libspa::utils::Id(formats[0]))?;
-        } else {
-            b.push_choice(&mut inner, SPA_CHOICE_Enum, 0)?;
-            for fmt in &formats {
-                b.add_id(libspa::utils::Id(*fmt))?;
-            }
-            b.pop(inner.assume_init_mut());
-        }
-
-        b.add_prop(SPA_FORMAT_AUDIO_rate, 0)?;
-        if caps.rates.len() > 1 {
-            // discrete native rates (exclusive devices); a range would admit
-            // in-between rates the hardware can't run (see sound::native_rates)
-            let target = caps.preferred_rate.unwrap_or(48000);
-            let default = *caps
-                .rates
-                .iter()
-                .min_by_key(|r| r.abs_diff(target))
-                .unwrap();
-            b.push_choice(&mut inner, SPA_CHOICE_Enum, 0)?;
-            b.add_int(default as i32)?;
-            for rate in &caps.rates {
-                b.add_int(*rate as i32)?;
-            }
-            b.pop(inner.assume_init_mut());
-        } else if let [rate] = caps.rates[..] {
-            b.add_int(rate as i32)?;
-        } else if caps.min_rate == caps.max_rate {
-            b.add_int(caps.min_rate as i32)?;
-        } else {
-            b.push_choice(&mut inner, SPA_CHOICE_Range, 0)?;
-            b.add_int(
-                caps.preferred_rate
-                    .unwrap_or(48000)
-                    .clamp(caps.min_rate, caps.max_rate) as i32,
-            )?;
-            b.add_int(caps.min_rate as i32)?;
-            b.add_int(caps.max_rate as i32)?;
-            b.pop(inner.assume_init_mut());
-        }
-
-        b.add_prop(SPA_FORMAT_AUDIO_channels, 0)?;
-        b.add_int(channels as i32)?;
-
-        let aux_positions;
-        let positions: &[u32] = match channel_positions(channels) {
-            Some(positions) => positions,
-            None => {
-                aux_positions = (0..channels)
-                    .map(|i| SPA_AUDIO_CHANNEL_AUX0 + i)
-                    .collect::<Vec<u32>>();
-                &aux_positions
-            }
-        };
-
-        b.add_prop(SPA_FORMAT_AUDIO_position, 0)?;
-        b.add_array(
-            std::mem::size_of::<u32>() as u32,
-            SPA_TYPE_Id,
-            positions.len() as u32,
-            positions.as_ptr().cast(),
-        )?;
-
-        b.pop(outer.assume_init_mut());
-
-        Ok(true)
+// a flag-less object property (the common case)
+pub(crate) fn pod_prop(key: u32, value: libspa::pod::Value) -> libspa::pod::Property {
+    libspa::pod::Property {
+        key,
+        flags: libspa::pod::PropertyFlags::empty(),
+        value,
     }
 }
 
-pub(crate) fn build_buffers_info(
-    b: &mut libspa::pod::builder::Builder,
-    stride: u32,
-) -> Result<(), rustix::io::Errno> {
-    // SAFETY: the frame pushes/pops below act on locally-owned frames in
-    // strict LIFO order; the pod bytes land in the caller-owned builder
-    unsafe {
-        use libspa::sys::*;
+// an Int range choice (default, min, max)
+fn pod_int_range(default: i32, min: i32, max: i32) -> libspa::pod::Value {
+    use libspa::pod::{ChoiceValue, Value};
+    use libspa::utils::{Choice, ChoiceEnum, ChoiceFlags};
+    Value::Choice(ChoiceValue::Int(Choice(
+        ChoiceFlags::empty(),
+        ChoiceEnum::Range { default, min, max },
+    )))
+}
 
-        // The point here is dataType = MemPtr: process() maps the buffer memory
-        // directly, so a MemFd/DmaBuf block would be unusable.
-        //
-        // Capacity floors at two graph periods (2048 frames at the 1024-frame
-        // reference quantum). The capture catch-up read (source.rs) drains a device
-        // ring excursion by handing the graph MORE than one period in a cycle; a
-        // one-period buffer clamps that read back to a period, so the ring stays
-        // pinned at its ceiling and the kernel overruns every late cycle. Two
-        // periods of *capacity* cost no latency - we still deliver one period per
-        // cycle - it only widens the container so the drain can happen. The adapter
-        // sizes the buffer to the graph quantum and clamps up to this floor, so the
-        // headroom is present at the common quanta (a quantum coarser than the floor
-        // needs the ring-quantum cap in node.rs to stay glitch-free anyway).
-        let floor = 2048 * stride;
-        let max = 16384 * stride;
+// One EnumFormat pod per offered channel width (enum_format_widths order),
+// positions from the kernel interleave. None when `index` is past the last
+// result.
+pub(crate) fn build_enum_format_info(caps: &crate::sound::DspCaps, index: u32) -> Option<Vec<u8>> {
+    use libspa::pod::{ChoiceValue, Object, Value, ValueArray};
+    use libspa::sys::*;
+    use libspa::utils::{Choice, ChoiceEnum, ChoiceFlags, Id};
 
-        let mut obj = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
-        let mut choice = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
-
-        b.push_object(&mut obj, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers)?;
-
-        b.add_prop(SPA_PARAM_BUFFERS_buffers, 0)?;
-        b.push_choice(&mut choice, SPA_CHOICE_Range, 0)?;
-        b.add_int(2)?;
-        b.add_int(1)?;
-        b.add_int(32)?; // default, min, max
-        b.pop(choice.assume_init_mut());
-
-        b.add_prop(SPA_PARAM_BUFFERS_blocks, 0)?;
-        b.add_int(1)?;
-
-        b.add_prop(SPA_PARAM_BUFFERS_size, 0)?;
-        b.push_choice(&mut choice, SPA_CHOICE_Range, 0)?;
-        b.add_int(floor as i32)?;
-        b.add_int(floor as i32)?;
-        b.add_int(max as i32)?; // default, min, max
-        b.pop(choice.assume_init_mut());
-
-        b.add_prop(SPA_PARAM_BUFFERS_stride, 0)?;
-        b.add_int(stride as i32)?;
-
-        b.add_prop(SPA_PARAM_BUFFERS_align, 0)?;
-        b.add_int(16)?;
-
-        b.add_prop(SPA_PARAM_BUFFERS_dataType, 0)?;
-        b.add_int(1i32 << SPA_DATA_MemPtr)?;
-
-        b.pop(obj.assume_init_mut());
-
-        Ok(())
+    // formats supported by both us and the device, best first
+    let formats = offered_formats(caps);
+    if formats.is_empty() {
+        return None;
     }
+
+    let counts = enum_format_widths(caps.min_channels, caps.max_channels);
+    let &channels = counts.get(index as usize)?;
+
+    let format = if let [format] = formats[..] {
+        Value::Id(Id(format))
+    } else {
+        Value::Choice(ChoiceValue::Id(Choice(
+            ChoiceFlags::empty(),
+            ChoiceEnum::Enum {
+                default: Id(formats[0]),
+                alternatives: formats[1..].iter().map(|f| Id(*f)).collect(),
+            },
+        )))
+    };
+
+    let rate = if caps.rates.len() > 1 {
+        // discrete native rates (exclusive devices); a range would admit
+        // in-between rates the hardware can't run (see sound::native_rates)
+        let target = caps.preferred_rate.unwrap_or(48000);
+        let default = *caps
+            .rates
+            .iter()
+            .min_by_key(|r| r.abs_diff(target))
+            .unwrap();
+        Value::Choice(ChoiceValue::Int(Choice(
+            ChoiceFlags::empty(),
+            ChoiceEnum::Enum {
+                default: default as i32,
+                alternatives: caps.rates.iter().map(|r| *r as i32).collect(),
+            },
+        )))
+    } else if let [rate] = caps.rates[..] {
+        Value::Int(rate as i32)
+    } else if caps.min_rate == caps.max_rate {
+        Value::Int(caps.min_rate as i32)
+    } else {
+        pod_int_range(
+            caps.preferred_rate
+                .unwrap_or(48000)
+                .clamp(caps.min_rate, caps.max_rate) as i32,
+            caps.min_rate as i32,
+            caps.max_rate as i32,
+        )
+    };
+
+    let positions: Vec<Id> = match channel_positions(channels) {
+        Some(positions) => positions.iter().map(|&p| Id(p)).collect(),
+        None => (0..channels)
+            .map(|i| Id(SPA_AUDIO_CHANNEL_AUX0 + i))
+            .collect(),
+    };
+
+    Some(serialize_pod(&Value::Object(Object {
+        type_: SPA_TYPE_OBJECT_Format,
+        id: SPA_PARAM_EnumFormat,
+        properties: vec![
+            pod_prop(SPA_FORMAT_mediaType, Value::Id(Id(SPA_MEDIA_TYPE_audio))),
+            pod_prop(
+                SPA_FORMAT_mediaSubtype,
+                Value::Id(Id(SPA_MEDIA_SUBTYPE_raw)),
+            ),
+            pod_prop(SPA_FORMAT_AUDIO_format, format),
+            pod_prop(SPA_FORMAT_AUDIO_rate, rate),
+            pod_prop(SPA_FORMAT_AUDIO_channels, Value::Int(channels as i32)),
+            pod_prop(
+                SPA_FORMAT_AUDIO_position,
+                Value::ValueArray(ValueArray::Id(positions)),
+            ),
+        ],
+    })))
+}
+
+pub(crate) fn build_buffers_info(stride: u32) -> Vec<u8> {
+    use libspa::pod::{Object, Value};
+    use libspa::sys::*;
+
+    // The point here is dataType = MemPtr: process() maps the buffer memory
+    // directly, so a MemFd/DmaBuf block would be unusable.
+    //
+    // Capacity floors at two graph periods (2048 frames at the 1024-frame
+    // reference quantum). The capture catch-up read (source.rs) drains a device
+    // ring excursion by handing the graph MORE than one period in a cycle; a
+    // one-period buffer clamps that read back to a period, so the ring stays
+    // pinned at its ceiling and the kernel overruns every late cycle. Two
+    // periods of *capacity* cost no latency - we still deliver one period per
+    // cycle - it only widens the container so the drain can happen. The adapter
+    // sizes the buffer to the graph quantum and clamps up to this floor, so the
+    // headroom is present at the common quanta (a quantum coarser than the floor
+    // needs the ring-quantum cap in node.rs to stay glitch-free anyway).
+    let floor = (2048 * stride) as i32;
+    let max = (16384 * stride) as i32;
+
+    serialize_pod(&Value::Object(Object {
+        type_: SPA_TYPE_OBJECT_ParamBuffers,
+        id: SPA_PARAM_Buffers,
+        properties: vec![
+            pod_prop(SPA_PARAM_BUFFERS_buffers, pod_int_range(2, 1, 32)),
+            pod_prop(SPA_PARAM_BUFFERS_blocks, Value::Int(1)),
+            pod_prop(SPA_PARAM_BUFFERS_size, pod_int_range(floor, floor, max)),
+            pod_prop(SPA_PARAM_BUFFERS_stride, Value::Int(stride as i32)),
+            pod_prop(SPA_PARAM_BUFFERS_align, Value::Int(16)),
+            pod_prop(
+                SPA_PARAM_BUFFERS_dataType,
+                Value::Int(1i32 << SPA_DATA_MemPtr),
+            ),
+        ],
+    }))
 }
 
 // Marks a captured value as allowed to cross onto the loop thread inside an
@@ -565,41 +550,24 @@ pub(crate) unsafe fn parse_latency_info(
 }
 
 // spa_latency_build is static inline C, so reimplemented here
-pub(crate) fn build_latency_info(
-    b: &mut libspa::pod::builder::Builder,
-    info: &libspa::sys::spa_latency_info,
-) -> Result<(), rustix::io::Errno> {
-    // SAFETY: the frame pushes/pops below act on locally-owned frames in
-    // strict LIFO order; the pod bytes land in the caller-owned builder
-    unsafe {
-        use libspa::sys::*;
+pub(crate) fn build_latency_info(info: &libspa::sys::spa_latency_info) -> Vec<u8> {
+    use libspa::pod::{Object, Value};
+    use libspa::sys::*;
+    use libspa::utils::Id;
 
-        let mut frame = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
-
-        b.push_object(&mut frame, SPA_TYPE_OBJECT_ParamLatency, SPA_PARAM_Latency)?;
-
-        b.add_prop(SPA_PARAM_LATENCY_direction, 0)?;
-        b.add_id(libspa::utils::Id(info.direction))?;
-
-        b.add_prop(SPA_PARAM_LATENCY_minQuantum, 0)?;
-        b.add_float(info.min_quantum)?;
-        b.add_prop(SPA_PARAM_LATENCY_maxQuantum, 0)?;
-        b.add_float(info.max_quantum)?;
-
-        b.add_prop(SPA_PARAM_LATENCY_minRate, 0)?;
-        b.add_int(info.min_rate)?;
-        b.add_prop(SPA_PARAM_LATENCY_maxRate, 0)?;
-        b.add_int(info.max_rate)?;
-
-        b.add_prop(SPA_PARAM_LATENCY_minNs, 0)?;
-        b.add_long(info.min_ns)?;
-        b.add_prop(SPA_PARAM_LATENCY_maxNs, 0)?;
-        b.add_long(info.max_ns)?;
-
-        b.pop(frame.assume_init_mut());
-
-        Ok(())
-    }
+    serialize_pod(&Value::Object(Object {
+        type_: SPA_TYPE_OBJECT_ParamLatency,
+        id: SPA_PARAM_Latency,
+        properties: vec![
+            pod_prop(SPA_PARAM_LATENCY_direction, Value::Id(Id(info.direction))),
+            pod_prop(SPA_PARAM_LATENCY_minQuantum, Value::Float(info.min_quantum)),
+            pod_prop(SPA_PARAM_LATENCY_maxQuantum, Value::Float(info.max_quantum)),
+            pod_prop(SPA_PARAM_LATENCY_minRate, Value::Int(info.min_rate)),
+            pod_prop(SPA_PARAM_LATENCY_maxRate, Value::Int(info.max_rate)),
+            pod_prop(SPA_PARAM_LATENCY_minNs, Value::Long(info.min_ns)),
+            pod_prop(SPA_PARAM_LATENCY_maxNs, Value::Long(info.max_ns)),
+        ],
+    }))
 }
 
 pub(crate) fn process_latency_default() -> libspa::sys::spa_process_latency_info {
@@ -638,34 +606,22 @@ pub(crate) unsafe fn parse_process_latency_info(
 }
 
 // spa_process_latency_build is static inline C, so reimplemented here
-pub(crate) fn build_process_latency_info(
-    b: &mut libspa::pod::builder::Builder,
-    info: &libspa::sys::spa_process_latency_info,
-) -> Result<(), rustix::io::Errno> {
-    // SAFETY: the frame pushes/pops below act on locally-owned frames in
-    // strict LIFO order; the pod bytes land in the caller-owned builder
-    unsafe {
-        use libspa::sys::*;
+pub(crate) fn build_process_latency_info(info: &libspa::sys::spa_process_latency_info) -> Vec<u8> {
+    use libspa::pod::{Object, Value};
+    use libspa::sys::*;
 
-        let mut frame = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
-
-        b.push_object(
-            &mut frame,
-            SPA_TYPE_OBJECT_ParamProcessLatency,
-            SPA_PARAM_ProcessLatency,
-        )?;
-
-        b.add_prop(SPA_PARAM_PROCESS_LATENCY_quantum, 0)?;
-        b.add_float(info.quantum)?;
-        b.add_prop(SPA_PARAM_PROCESS_LATENCY_rate, 0)?;
-        b.add_int(info.rate)?;
-        b.add_prop(SPA_PARAM_PROCESS_LATENCY_ns, 0)?;
-        b.add_long(info.ns)?;
-
-        b.pop(frame.assume_init_mut());
-
-        Ok(())
-    }
+    serialize_pod(&Value::Object(Object {
+        type_: SPA_TYPE_OBJECT_ParamProcessLatency,
+        id: SPA_PARAM_ProcessLatency,
+        properties: vec![
+            pod_prop(
+                SPA_PARAM_PROCESS_LATENCY_quantum,
+                Value::Float(info.quantum),
+            ),
+            pod_prop(SPA_PARAM_PROCESS_LATENCY_rate, Value::Int(info.rate)),
+            pod_prop(SPA_PARAM_PROCESS_LATENCY_ns, Value::Long(info.ns)),
+        ],
+    }))
 }
 
 // spa_process_latency_info_add is static inline C, so reimplemented here
@@ -681,112 +637,85 @@ pub(crate) fn process_latency_info_add(
     info.max_ns += process.ns;
 }
 
-pub(crate) fn build_latency_offset_prop_info(
-    b: &mut libspa::pod::builder::Builder,
-) -> Result<(), rustix::io::Errno> {
-    // SAFETY: the frame pushes/pops below act on locally-owned frames in
-    // strict LIFO order; the pod bytes land in the caller-owned builder
-    unsafe {
-        use libspa::sys::*;
+pub(crate) fn build_latency_offset_prop_info() -> Vec<u8> {
+    use libspa::pod::{ChoiceValue, Object, Value};
+    use libspa::sys::*;
+    use libspa::utils::{Choice, ChoiceEnum, ChoiceFlags, Id};
 
-        let mut outer = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
-        let mut inner = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
-
-        b.push_object(&mut outer, SPA_TYPE_OBJECT_PropInfo, SPA_PARAM_PropInfo)?;
-
-        b.add_prop(SPA_PROP_INFO_id, 0)?;
-        b.add_id(libspa::utils::Id(SPA_PROP_latencyOffsetNsec))?;
-
-        b.add_prop(SPA_PROP_INFO_description, 0)?;
-        b.add_string("Latency offset (ns)")?;
-
-        b.add_prop(SPA_PROP_INFO_type, 0)?;
-        b.push_choice(&mut inner, SPA_CHOICE_Range, 0)?;
-        b.add_long(0)?;
-        b.add_long(0)?;
-        b.add_long(2 * SPA_NSEC_PER_SEC as i64)?;
-        b.pop(inner.assume_init_mut());
-
-        b.pop(outer.assume_init_mut());
-
-        Ok(())
-    }
+    serialize_pod(&Value::Object(Object {
+        type_: SPA_TYPE_OBJECT_PropInfo,
+        id: SPA_PARAM_PropInfo,
+        properties: vec![
+            pod_prop(SPA_PROP_INFO_id, Value::Id(Id(SPA_PROP_latencyOffsetNsec))),
+            pod_prop(
+                SPA_PROP_INFO_description,
+                Value::String("Latency offset (ns)".to_string()),
+            ),
+            pod_prop(
+                SPA_PROP_INFO_type,
+                Value::Choice(ChoiceValue::Long(Choice(
+                    ChoiceFlags::empty(),
+                    ChoiceEnum::Range {
+                        default: 0,
+                        min: 0,
+                        max: 2 * SPA_NSEC_PER_SEC as i64,
+                    },
+                ))),
+            ),
+        ],
+    }))
 }
 
-pub(crate) fn build_latency_offset_props(
-    b: &mut libspa::pod::builder::Builder,
-    ns: i64,
-    params: &[(&str, u32)],
-) -> Result<(), rustix::io::Errno> {
-    // SAFETY: the frame pushes/pops below act on locally-owned frames in
-    // strict LIFO order; the pod bytes land in the caller-owned builder
-    unsafe {
-        use libspa::sys::*;
+pub(crate) fn build_latency_offset_props(ns: i64, params: &[(&str, u32)]) -> Vec<u8> {
+    use libspa::pod::{Object, Value};
+    use libspa::sys::*;
 
-        let mut frame = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
+    let mut properties = vec![pod_prop(SPA_PROP_latencyOffsetNsec, Value::Long(ns))];
 
-        b.push_object(&mut frame, SPA_TYPE_OBJECT_Props, SPA_PARAM_Props)?;
-
-        b.add_prop(SPA_PROP_latencyOffsetNsec, 0)?;
-        b.add_long(ns)?;
-
-        // custom key/value props (oss.delay, oss.fragment) ride in the params struct
-        if !params.is_empty() {
-            let mut inner = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
-            b.add_prop(SPA_PROP_params, 0)?;
-            b.push_struct(&mut inner)?;
-            for (key, value) in params {
-                b.add_string(key)?;
-                b.add_int(*value as i32)?;
-            }
-            b.pop(inner.assume_init_mut());
-        }
-
-        b.pop(frame.assume_init_mut());
-
-        Ok(())
+    // custom key/value props (oss.delay, oss.fragment) ride in the params struct
+    if !params.is_empty() {
+        let fields = params
+            .iter()
+            .flat_map(|(key, value)| [Value::String((*key).to_string()), Value::Int(*value as i32)])
+            .collect();
+        properties.push(pod_prop(SPA_PROP_params, Value::Struct(fields)));
     }
+
+    serialize_pod(&Value::Object(Object {
+        type_: SPA_TYPE_OBJECT_Props,
+        id: SPA_PARAM_Props,
+        properties,
+    }))
 }
 
 // PropInfo for a custom u32 tunable carried in the Props params struct; the
 // advertised default is the CURRENT (effective) value, like the ALSA plugin
 pub(crate) fn build_params_prop_info(
-    b: &mut libspa::pod::builder::Builder,
     name: &str,
     description: &str,
     current: u32,
     max: u32,
-) -> Result<(), rustix::io::Errno> {
-    // SAFETY: the frame pushes/pops below act on locally-owned frames in
-    // strict LIFO order; the pod bytes land in the caller-owned builder
-    unsafe {
-        use libspa::sys::*;
+) -> Vec<u8> {
+    use libspa::pod::{Object, Value};
+    use libspa::sys::*;
 
-        let mut outer = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
-        let mut inner = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
-
-        b.push_object(&mut outer, SPA_TYPE_OBJECT_PropInfo, SPA_PARAM_PropInfo)?;
-
-        b.add_prop(SPA_PROP_INFO_name, 0)?;
-        b.add_string(name)?;
-
-        b.add_prop(SPA_PROP_INFO_description, 0)?;
-        b.add_string(description)?;
-
-        b.add_prop(SPA_PROP_INFO_type, 0)?;
-        b.push_choice(&mut inner, SPA_CHOICE_Range, 0)?;
-        b.add_int(current as i32)?;
-        b.add_int(0)?;
-        b.add_int(max as i32)?;
-        b.pop(inner.assume_init_mut());
-
-        b.add_prop(SPA_PROP_INFO_params, 0)?;
-        b.add_bool(true)?; // settable through the Props params struct
-
-        b.pop(outer.assume_init_mut());
-
-        Ok(())
-    }
+    serialize_pod(&Value::Object(Object {
+        type_: SPA_TYPE_OBJECT_PropInfo,
+        id: SPA_PARAM_PropInfo,
+        properties: vec![
+            pod_prop(SPA_PROP_INFO_name, Value::String(name.to_string())),
+            pod_prop(
+                SPA_PROP_INFO_description,
+                Value::String(description.to_string()),
+            ),
+            pod_prop(
+                SPA_PROP_INFO_type,
+                pod_int_range(current as i32, 0, max as i32),
+            ),
+            // settable through the Props params struct
+            pod_prop(SPA_PROP_INFO_params, Value::Bool(true)),
+        ],
+    }))
 }
 
 // identify our device clock (spa_io_clock.name) so consumers can tell whether
@@ -870,6 +799,16 @@ pub(crate) unsafe fn deserialize_pod(
         // the parse remainder rode a lifetime fabricated from the raw pod;
         // every caller wants only the owned Value
         .map(|(_, value)| value)
+}
+
+// Test-only: parse a serialized pod back through the same PodDeserializer
+// consumers run, insisting the buffer holds exactly one complete pod.
+#[cfg(test)]
+pub(crate) fn parse_back(pod: &[u8]) -> libspa::pod::Value {
+    let (rest, value) = libspa::pod::deserialize::PodDeserializer::deserialize_any_from(pod)
+        .expect("an advertised pod must deserialize");
+    assert!(rest.is_empty(), "trailing bytes after the pod");
+    value
 }
 
 // Fire-and-forget: queue `f` to run once on the given loop (from any thread;
@@ -1003,6 +942,129 @@ pub(crate) fn spa_command_to_str(body: &libspa::sys::spa_pod_object_body) -> &'s
 #[cfg(test)]
 mod tests {
     use super::{device_period_bytes, enum_format_widths, ns_to_bytes, ns_to_frame_bytes};
+
+    fn caps(
+        formats: u32,
+        channels: (u32, u32),
+        rate_range: (u32, u32),
+        rates: &[u32],
+        preferred_rate: Option<u32>,
+        convertless: bool,
+    ) -> crate::sound::DspCaps {
+        crate::sound::DspCaps {
+            formats,
+            min_channels: channels.0,
+            max_channels: channels.1,
+            min_rate: rate_range.0,
+            max_rate: rate_range.1,
+            preferred_rate,
+            rates: rates.to_vec(),
+            convertless,
+        }
+    }
+
+    // Parse-back semantics: run representative pods that WirePlumber and the
+    // audio adapter parse off the wire back through the same libspa
+    // PodDeserializer those consumers use, and pin what they depend on -
+    // property keys and order, values, choice types, array contents and
+    // per-property flags. (A byte-identical old-vs-new comparison proved the
+    // serializer migration once; the lasting invariant is the parsed
+    // meaning, not the encoding.)
+    #[test]
+    fn enum_format_parses_back_with_expected_choices() {
+        use crate::sound::{AFMT_S16_LE, AFMT_S32_LE};
+        use libspa::pod::{ChoiceValue, Object, Value, ValueArray};
+        use libspa::sys::*;
+        use libspa::utils::{Choice, ChoiceEnum, ChoiceFlags, Id};
+
+        // a multi-format device with a rate range: choice-enum of formats,
+        // choice-range of rates, ids, ints and the id-array of positions
+        let caps = caps(
+            AFMT_S16_LE | AFMT_S32_LE,
+            (1, 2),
+            (8000, 192000),
+            &[],
+            None,
+            false,
+        );
+        let pod = super::build_enum_format_info(&caps, 0).unwrap();
+        assert_eq!(
+            super::parse_back(&pod),
+            Value::Object(Object {
+                type_: SPA_TYPE_OBJECT_Format,
+                id: SPA_PARAM_EnumFormat,
+                properties: vec![
+                    super::pod_prop(SPA_FORMAT_mediaType, Value::Id(Id(SPA_MEDIA_TYPE_audio))),
+                    super::pod_prop(
+                        SPA_FORMAT_mediaSubtype,
+                        Value::Id(Id(SPA_MEDIA_SUBTYPE_raw)),
+                    ),
+                    // the best (widest) native format is the enum default
+                    super::pod_prop(
+                        SPA_FORMAT_AUDIO_format,
+                        Value::Choice(ChoiceValue::Id(Choice(
+                            ChoiceFlags::empty(),
+                            ChoiceEnum::Enum {
+                                default: Id(SPA_AUDIO_FORMAT_S32_LE),
+                                alternatives: vec![Id(SPA_AUDIO_FORMAT_S16_LE)],
+                            },
+                        ))),
+                    ),
+                    // a rate range defaults to the host reference 48000
+                    super::pod_prop(
+                        SPA_FORMAT_AUDIO_rate,
+                        Value::Choice(ChoiceValue::Int(Choice(
+                            ChoiceFlags::empty(),
+                            ChoiceEnum::Range {
+                                default: 48000,
+                                min: 8000,
+                                max: 192000,
+                            },
+                        ))),
+                    ),
+                    // stereo first (the 9875023 invariant), FL/FR positions
+                    super::pod_prop(SPA_FORMAT_AUDIO_channels, Value::Int(2)),
+                    super::pod_prop(
+                        SPA_FORMAT_AUDIO_position,
+                        Value::ValueArray(ValueArray::Id(vec![
+                            Id(SPA_AUDIO_CHANNEL_FL),
+                            Id(SPA_AUDIO_CHANNEL_FR),
+                        ])),
+                    ),
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn latency_offset_props_parse_back_with_params_struct() {
+        use libspa::pod::{Object, Value};
+        use libspa::sys::*;
+
+        // the sink's Props shape: a long, plus the params struct of
+        // string/int pairs
+        let pod =
+            super::build_latency_offset_props(50_000_000, &[("oss.delay", 4), ("oss.fragment", 0)]);
+        assert_eq!(
+            super::parse_back(&pod),
+            Value::Object(Object {
+                type_: SPA_TYPE_OBJECT_Props,
+                id: SPA_PARAM_Props,
+                properties: vec![
+                    super::pod_prop(SPA_PROP_latencyOffsetNsec, Value::Long(50_000_000)),
+                    super::pod_prop(
+                        SPA_PROP_params,
+                        Value::Struct(vec![
+                            Value::String("oss.delay".to_string()),
+                            Value::Int(4),
+                            Value::String("oss.fragment".to_string()),
+                            Value::Int(0),
+                        ]),
+                    ),
+                ],
+            })
+        );
+    }
 
     #[test]
     fn frame_bytes_round_up_and_stay_saturated() {

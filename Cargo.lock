@@ -394,7 +394,6 @@ dependencies = [
  "libspa",
  "nix",
  "regex",
- "rustix",
  "uds",
 ]
 

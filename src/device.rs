@@ -180,292 +180,263 @@ unsafe fn emit_device_info(state: &mut State) {
 }
 
 fn build_profile_info(
-    b: &mut libspa::pod::builder::Builder,
     id: u32,
     index: u32,
-    state: &State,
+    pcm_devices: &[crate::sound::PcmDevice],
+    profile_save: bool,
     current: bool,
-) -> Result<(), rustix::io::Errno> {
-    // SAFETY: the frame pushes/pops below act on locally-owned frames in
-    // strict LIFO order; the pod bytes land in the caller-owned builder
-    unsafe {
-        let (name, description, priority) = if index == 0 {
-            ("off", "Off", 0)
-        } else {
-            ("default", "Default", 100)
-        };
+) -> Vec<u8> {
+    use libspa::pod::{Object, Value, ValueArray};
+    use libspa::utils::Id;
 
-        let mut frame = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
-        let mut inner = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
+    let (name, description, priority) = if index == 0 {
+        ("off", "Off", 0)
+    } else {
+        ("default", "Default", 100)
+    };
 
-        b.push_object(&mut frame, SPA_TYPE_OBJECT_ParamProfile, id)?;
-
-        b.add_prop(SPA_PARAM_PROFILE_index, 0)?;
-        b.add_int(index as i32)?;
-        b.add_prop(SPA_PARAM_PROFILE_name, 0)?;
-        b.add_string(name)?;
-        b.add_prop(SPA_PARAM_PROFILE_description, 0)?;
-        b.add_string(description)?;
-        b.add_prop(SPA_PARAM_PROFILE_priority, 0)?;
-        b.add_int(priority)?;
-        b.add_prop(SPA_PARAM_PROFILE_available, 0)?;
-        b.add_id(libspa::utils::Id(SPA_PARAM_AVAILABILITY_yes))?;
-
-        // The classes struct is what WirePlumber's select-routes walks to map
-        // nodes to this profile; without it no route is ever applied. Every node
-        // is listed, routed or not (pod shape: alsa-acp-device.c:326-384).
-        let mut capture: Vec<i32> = vec![];
-        let mut playback: Vec<i32> = vec![];
-        for device in &state.pcm_devices {
-            if device.play {
-                playback.push((device.index * 2) as i32);
-            }
-            if device.rec {
-                capture.push((device.index * 2 + 1) as i32);
-            }
+    // The classes struct is what WirePlumber's select-routes walks to map
+    // nodes to this profile; without it no route is ever applied. Every node
+    // is listed, routed or not (pod shape: alsa-acp-device.c:326-384).
+    let mut capture: Vec<i32> = vec![];
+    let mut playback: Vec<i32> = vec![];
+    for device in pcm_devices {
+        if device.play {
+            playback.push((device.index * 2) as i32);
         }
-
-        let classes: [(&str, &Vec<i32>); 2] =
-            [("Audio/Source", &capture), ("Audio/Sink", &playback)];
-        let n_classes = if index == 0 {
-            0
-        } else {
-            classes.iter().filter(|(_, ids)| !ids.is_empty()).count()
-        };
-
-        b.add_prop(SPA_PARAM_PROFILE_classes, 0)?;
-        b.push_struct(&mut inner)?;
-        b.add_int(n_classes as i32)?;
-        if index != 0 {
-            for (class, ids) in classes {
-                if ids.is_empty() {
-                    continue;
-                }
-                let mut cls = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
-                b.push_struct(&mut cls)?;
-                b.add_string(class)?;
-                b.add_int(ids.len() as i32)?;
-                b.add_string("card.profile.devices")?;
-                b.add_array(
-                    std::mem::size_of::<i32>() as u32,
-                    SPA_TYPE_Int,
-                    ids.len() as u32,
-                    ids.as_ptr().cast(),
-                )?;
-                b.pop(cls.assume_init_mut());
-            }
+        if device.rec {
+            capture.push((device.index * 2 + 1) as i32);
         }
-        b.pop(inner.assume_init_mut());
-
-        if current {
-            b.add_prop(SPA_PARAM_PROFILE_save, 0)?;
-            b.add_bool(state.profile_save)?;
-        }
-
-        b.pop(frame.assume_init_mut());
-
-        Ok(())
     }
+
+    let classes: [(&str, &Vec<i32>); 2] = [("Audio/Source", &capture), ("Audio/Sink", &playback)];
+    let n_classes = if index == 0 {
+        0
+    } else {
+        classes.iter().filter(|(_, ids)| !ids.is_empty()).count()
+    };
+
+    let mut class_fields = vec![Value::Int(n_classes as i32)];
+    if index != 0 {
+        for (class, ids) in classes {
+            if ids.is_empty() {
+                continue;
+            }
+            class_fields.push(Value::Struct(vec![
+                Value::String(class.to_string()),
+                Value::Int(ids.len() as i32),
+                Value::String("card.profile.devices".to_string()),
+                Value::ValueArray(ValueArray::Int(ids.clone())),
+            ]));
+        }
+    }
+
+    let mut properties = vec![
+        crate::utils::pod_prop(SPA_PARAM_PROFILE_index, Value::Int(index as i32)),
+        crate::utils::pod_prop(SPA_PARAM_PROFILE_name, Value::String(name.to_string())),
+        crate::utils::pod_prop(
+            SPA_PARAM_PROFILE_description,
+            Value::String(description.to_string()),
+        ),
+        crate::utils::pod_prop(SPA_PARAM_PROFILE_priority, Value::Int(priority)),
+        crate::utils::pod_prop(
+            SPA_PARAM_PROFILE_available,
+            Value::Id(Id(SPA_PARAM_AVAILABILITY_yes)),
+        ),
+        crate::utils::pod_prop(SPA_PARAM_PROFILE_classes, Value::Struct(class_fields)),
+    ];
+
+    if current {
+        properties.push(crate::utils::pod_prop(
+            SPA_PARAM_PROFILE_save,
+            Value::Bool(profile_save),
+        ));
+    }
+
+    crate::utils::serialize_pod(&Value::Object(Object {
+        type_: SPA_TYPE_OBJECT_ParamProfile,
+        id,
+        properties,
+    }))
 }
 
 // EnumRoute (full = false) carries the static description only; Route
 // (full = true) adds device/profile/save and the volume props object
 // (pod shape: alsa-acp-device.c build_route)
-fn build_route_info(
-    b: &mut libspa::pod::builder::Builder,
-    id: u32,
-    state: &State,
-    pos: usize,
-    full: bool,
-) -> Result<(), rustix::io::Errno> {
-    // SAFETY: the frame pushes/pops below act on locally-owned frames in
-    // strict LIFO order; the pod bytes land in the caller-owned builder
-    unsafe {
-        let route = &state.routes[pos];
+fn build_route_info(id: u32, route: &RouteState, pos: usize, profile: u32, full: bool) -> Vec<u8> {
+    use libspa::pod::{Object, Property, PropertyFlags, Value, ValueArray};
+    use libspa::utils::Id;
 
-        let mut frame = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
-        let mut inner = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
-
-        b.push_object(&mut frame, SPA_TYPE_OBJECT_ParamRoute, id)?;
-
-        b.add_prop(SPA_PARAM_ROUTE_index, 0)?;
-        b.add_int(pos as i32)?;
+    let mut properties = vec![
+        crate::utils::pod_prop(SPA_PARAM_ROUTE_index, Value::Int(pos as i32)),
         // note: PLAYBACK maps to OUTPUT here (the route points out of the graph)
-        b.add_prop(SPA_PARAM_ROUTE_direction, 0)?;
-        b.add_id(libspa::utils::Id(if route.rec {
-            SPA_DIRECTION_INPUT
-        } else {
-            SPA_DIRECTION_OUTPUT
-        }))?;
-        b.add_prop(SPA_PARAM_ROUTE_name, 0)?;
-        b.add_string(&route.name)?;
-        b.add_prop(SPA_PARAM_ROUTE_description, 0)?;
-        b.add_string(&route.description)?;
-        b.add_prop(SPA_PARAM_ROUTE_priority, 0)?;
-        b.add_int(route.priority)?;
+        crate::utils::pod_prop(
+            SPA_PARAM_ROUTE_direction,
+            Value::Id(Id(if route.rec {
+                SPA_DIRECTION_INPUT
+            } else {
+                SPA_DIRECTION_OUTPUT
+            })),
+        ),
+        crate::utils::pod_prop(SPA_PARAM_ROUTE_name, Value::String(route.name.clone())),
+        crate::utils::pod_prop(
+            SPA_PARAM_ROUTE_description,
+            Value::String(route.description.clone()),
+        ),
+        crate::utils::pod_prop(SPA_PARAM_ROUTE_priority, Value::Int(route.priority)),
         // Constant yes: FreeBSD exposes no per-jack state userland can read (the
         // SND CONN devctl names a preferred device, not a jack - see
         // on_devd_event), and "no" would make WirePlumber's find-best-routes skip
         // the route and state-routes refuse to save its volume. acp would say
         // "unknown" where detection is absent, but flipping v1's "yes" carries no
         // information and only churns session-manager behavior.
-        b.add_prop(SPA_PARAM_ROUTE_available, 0)?;
-        b.add_id(libspa::utils::Id(SPA_PARAM_AVAILABILITY_yes))?;
+        crate::utils::pod_prop(
+            SPA_PARAM_ROUTE_available,
+            Value::Id(Id(SPA_PARAM_AVAILABILITY_yes)),
+        ),
+        crate::utils::pod_prop(
+            SPA_PARAM_ROUTE_profiles,
+            Value::ValueArray(ValueArray::Int(vec![1])),
+        ),
+        crate::utils::pod_prop(
+            SPA_PARAM_ROUTE_devices,
+            Value::ValueArray(ValueArray::Int(vec![route.node_id as i32])),
+        ),
+    ];
 
-        let profiles = [1i32];
-        b.add_prop(SPA_PARAM_ROUTE_profiles, 0)?;
-        b.add_array(
-            std::mem::size_of::<i32>() as u32,
-            SPA_TYPE_Int,
-            profiles.len() as u32,
-            profiles.as_ptr().cast(),
-        )?;
+    if full {
+        properties.push(crate::utils::pod_prop(
+            SPA_PARAM_ROUTE_device,
+            Value::Int(route.node_id as i32),
+        ));
 
-        let devices = [route.node_id as i32];
-        b.add_prop(SPA_PARAM_ROUTE_devices, 0)?;
-        b.add_array(
-            std::mem::size_of::<i32>() as u32,
-            SPA_TYPE_Int,
-            devices.len() as u32,
-            devices.as_ptr().cast(),
-        )?;
+        // Volume writers (pulse, the session manager) direct volume at the card
+        // whenever an ACTIVE Route exists, regardless of props presence
+        // (pulse-server.c:3004-3010 gates on active_port) - so even a source
+        // with no level control must carry props, backed by a soft shadow that
+        // audioconvert applies (the acp softvol model). The HARDWARE flag and
+        // unity softVolumes apply only when a real control exists.
+        let hw = route.control.is_some();
+        let flag = if hw {
+            PropertyFlags::HARDWARE
+        } else {
+            PropertyFlags::empty()
+        };
+        let volumes = vec![oss_to_linear(route.levels.0), oss_to_linear(route.levels.1)];
+        // with hardware attenuation the node's software volume must stay at
+        // unity or the signal is attenuated twice; a soft route IS the
+        // software volume, so it mirrors the levels
+        let soft = if hw {
+            vec![1.0; ROUTE_CHANNELS as usize]
+        } else {
+            volumes.clone()
+        };
+        properties.push(crate::utils::pod_prop(
+            SPA_PARAM_ROUTE_props,
+            Value::Object(Object {
+                type_: SPA_TYPE_OBJECT_Props,
+                id,
+                properties: vec![
+                    Property {
+                        key: SPA_PROP_mute,
+                        flags: flag,
+                        value: Value::Bool(route.mute),
+                    },
+                    Property {
+                        key: SPA_PROP_channelVolumes,
+                        flags: flag,
+                        value: Value::ValueArray(ValueArray::Float(volumes)),
+                    },
+                    Property {
+                        key: SPA_PROP_volumeBase,
+                        flags: PropertyFlags::READONLY,
+                        value: Value::Float(1.0),
+                    },
+                    Property {
+                        key: SPA_PROP_volumeStep,
+                        flags: PropertyFlags::READONLY,
+                        value: Value::Float(1.0 / 101.0),
+                    },
+                    crate::utils::pod_prop(
+                        SPA_PROP_channelMap,
+                        Value::ValueArray(ValueArray::Id(
+                            ROUTE_MAP.iter().map(|&c| Id(c)).collect(),
+                        )),
+                    ),
+                    crate::utils::pod_prop(
+                        SPA_PROP_softVolumes,
+                        Value::ValueArray(ValueArray::Float(soft)),
+                    ),
+                ],
+            }),
+        ));
 
-        if full {
-            b.add_prop(SPA_PARAM_ROUTE_device, 0)?;
-            b.add_int(route.node_id as i32)?;
-
-            // Volume writers (pulse, the session manager) direct volume at the card
-            // whenever an ACTIVE Route exists, regardless of props presence
-            // (pulse-server.c:3004-3010 gates on active_port) - so even a source
-            // with no level control must carry props, backed by a soft shadow that
-            // audioconvert applies (the acp softvol model). The HARDWARE flag and
-            // unity softVolumes apply only when a real control exists.
-            {
-                let hw = route.control.is_some();
-                let flag = if hw { SPA_POD_PROP_FLAG_HARDWARE } else { 0 };
-                b.add_prop(SPA_PARAM_ROUTE_props, 0)?;
-                b.push_object(&mut inner, SPA_TYPE_OBJECT_Props, id)?;
-
-                b.add_prop(SPA_PROP_mute, flag)?;
-                b.add_bool(route.mute)?;
-
-                let volumes = [oss_to_linear(route.levels.0), oss_to_linear(route.levels.1)];
-                b.add_prop(SPA_PROP_channelVolumes, flag)?;
-                b.add_array(
-                    std::mem::size_of::<f32>() as u32,
-                    SPA_TYPE_Float,
-                    ROUTE_CHANNELS,
-                    volumes.as_ptr().cast(),
-                )?;
-
-                b.add_prop(SPA_PROP_volumeBase, SPA_POD_PROP_FLAG_READONLY)?;
-                b.add_float(1.0)?;
-                b.add_prop(SPA_PROP_volumeStep, SPA_POD_PROP_FLAG_READONLY)?;
-                b.add_float(1.0 / 101.0)?;
-
-                b.add_prop(SPA_PROP_channelMap, 0)?;
-                b.add_array(
-                    std::mem::size_of::<u32>() as u32,
-                    SPA_TYPE_Id,
-                    ROUTE_CHANNELS,
-                    ROUTE_MAP.as_ptr().cast(),
-                )?;
-
-                // with hardware attenuation the node's software volume must stay at
-                // unity or the signal is attenuated twice; a soft route IS the
-                // software volume, so it mirrors the levels
-                let soft: [f32; ROUTE_CHANNELS as usize] = if hw {
-                    [1.0; ROUTE_CHANNELS as usize]
-                } else {
-                    [oss_to_linear(route.levels.0), oss_to_linear(route.levels.1)]
-                };
-                b.add_prop(SPA_PROP_softVolumes, 0)?;
-                b.add_array(
-                    std::mem::size_of::<f32>() as u32,
-                    SPA_TYPE_Float,
-                    ROUTE_CHANNELS,
-                    soft.as_ptr().cast(),
-                )?;
-
-                b.pop(inner.assume_init_mut());
-            }
-
-            b.add_prop(SPA_PARAM_ROUTE_profile, 0)?;
-            b.add_int(state.profile as i32)?;
-            b.add_prop(SPA_PARAM_ROUTE_save, 0)?;
-            b.add_bool(route.save)?;
-        }
-
-        b.pop(frame.assume_init_mut());
-
-        Ok(())
+        properties.push(crate::utils::pod_prop(
+            SPA_PARAM_ROUTE_profile,
+            Value::Int(profile as i32),
+        ));
+        properties.push(crate::utils::pod_prop(
+            SPA_PARAM_ROUTE_save,
+            Value::Bool(route.save),
+        ));
     }
+
+    crate::utils::serialize_pod(&Value::Object(Object {
+        type_: SPA_TYPE_OBJECT_ParamRoute,
+        id,
+        properties,
+    }))
 }
 
 fn build_object_config(
-    b: &mut libspa::pod::builder::Builder,
     node_id: u32,
     volume: Option<((u32, u32), bool)>,
     mute: Option<bool>,
-) -> Result<(), rustix::io::Errno> {
-    // SAFETY: the frame pushes/pops below act on locally-owned frames in
-    // strict LIFO order; the pod bytes land in the caller-owned builder
-    unsafe {
-        let mut frame = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
-        let mut inner = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
+) -> Vec<u8> {
+    use libspa::pod::{Object, Value, ValueArray};
+    use libspa::utils::Id;
 
-        b.push_object(
-            &mut frame,
-            SPA_TYPE_EVENT_Device,
-            SPA_DEVICE_EVENT_ObjectConfig,
-        )?;
+    let mut props = vec![];
 
-        b.add_prop(SPA_EVENT_DEVICE_Object, 0)?;
-        b.add_int(node_id as i32)?;
-
-        b.add_prop(SPA_EVENT_DEVICE_Props, 0)?;
-        b.push_object(&mut inner, SPA_TYPE_OBJECT_Props, SPA_EVENT_DEVICE_Props)?;
-
-        if let Some(((left, right), hw)) = volume {
-            let volumes = [oss_to_linear(left), oss_to_linear(right)];
-            b.add_prop(SPA_PROP_channelVolumes, 0)?;
-            b.add_array(
-                std::mem::size_of::<f32>() as u32,
-                SPA_TYPE_Float,
-                ROUTE_CHANNELS,
-                volumes.as_ptr().cast(),
-            )?;
-            b.add_prop(SPA_PROP_channelMap, 0)?;
-            b.add_array(
-                std::mem::size_of::<u32>() as u32,
-                SPA_TYPE_Id,
-                ROUTE_CHANNELS,
-                ROUTE_MAP.as_ptr().cast(),
-            )?;
-            // hardware attenuation keeps the node at unity; a soft route IS the
-            // node's software volume, so audioconvert applies the levels
-            let soft: [f32; ROUTE_CHANNELS as usize] = if hw { [1.0; 2] } else { volumes };
-            b.add_prop(SPA_PROP_softVolumes, 0)?;
-            b.add_array(
-                std::mem::size_of::<f32>() as u32,
-                SPA_TYPE_Float,
-                ROUTE_CHANNELS,
-                soft.as_ptr().cast(),
-            )?;
-        }
-
-        if let Some(mute) = mute {
-            b.add_prop(SPA_PROP_mute, 0)?;
-            b.add_bool(mute)?;
-            b.add_prop(SPA_PROP_softMute, 0)?;
-            b.add_bool(mute)?;
-        }
-
-        b.pop(inner.assume_init_mut());
-        b.pop(frame.assume_init_mut());
-
-        Ok(())
+    if let Some(((left, right), hw)) = volume {
+        let volumes = vec![oss_to_linear(left), oss_to_linear(right)];
+        // hardware attenuation keeps the node at unity; a soft route IS the
+        // node's software volume, so audioconvert applies the levels
+        let soft = if hw { vec![1.0; 2] } else { volumes.clone() };
+        props.push(crate::utils::pod_prop(
+            SPA_PROP_channelVolumes,
+            Value::ValueArray(ValueArray::Float(volumes)),
+        ));
+        props.push(crate::utils::pod_prop(
+            SPA_PROP_channelMap,
+            Value::ValueArray(ValueArray::Id(ROUTE_MAP.iter().map(|&c| Id(c)).collect())),
+        ));
+        props.push(crate::utils::pod_prop(
+            SPA_PROP_softVolumes,
+            Value::ValueArray(ValueArray::Float(soft)),
+        ));
     }
+
+    if let Some(mute) = mute {
+        props.push(crate::utils::pod_prop(SPA_PROP_mute, Value::Bool(mute)));
+        props.push(crate::utils::pod_prop(SPA_PROP_softMute, Value::Bool(mute)));
+    }
+
+    crate::utils::serialize_pod(&Value::Object(Object {
+        type_: SPA_TYPE_EVENT_Device,
+        id: SPA_DEVICE_EVENT_ObjectConfig,
+        properties: vec![
+            crate::utils::pod_prop(SPA_EVENT_DEVICE_Object, Value::Int(node_id as i32)),
+            crate::utils::pod_prop(
+                SPA_EVENT_DEVICE_Props,
+                Value::Object(Object {
+                    type_: SPA_TYPE_OBJECT_Props,
+                    id: SPA_EVENT_DEVICE_Props,
+                    properties: props,
+                }),
+            ),
+        ],
+    }))
 }
 
 // Tell the session manager to push the new hardware state into the child
@@ -477,17 +448,11 @@ unsafe fn emit_object_config(state: &mut State, pos: usize, volume: bool) {
     let (node_id, levels, mute) = (route.node_id, route.levels, route.mute);
     let hw = route.control.is_some();
 
-    let mut buffer = vec![];
-    let mut builder = libspa::pod::builder::Builder::new(&mut buffer);
-    let built = if volume {
-        build_object_config(&mut builder, node_id, Some((levels, hw)), None)
+    let buffer = if volume {
+        build_object_config(node_id, Some((levels, hw)), None)
     } else {
-        build_object_config(&mut builder, node_id, None, Some(mute))
+        build_object_config(node_id, None, Some(mute))
     };
-    drop(builder);
-    if built.is_err() {
-        return;
-    }
 
     // one emission through the C listener vtables end to end
     unsafe {
@@ -834,8 +799,6 @@ unsafe extern "C" fn enum_params(
     let mut count = 0;
 
     while count < max {
-        use libspa::pod::builder::Builder;
-
         // only the active route becomes a Route pod; inactive selectable sources
         // exist as EnumRoute only (acp emits one Route per device with the
         // active port's index, alsa-acp-device.c:582-600)
@@ -847,25 +810,44 @@ unsafe extern "C" fn enum_params(
             continue;
         }
 
-        let mut builder = Builder::new(&mut buffer);
-
         #[allow(non_upper_case_globals)]
         match (id, index) {
             (SPA_PARAM_EnumProfile, 0 | 1) => {
-                build_profile_info(&mut builder, SPA_PARAM_EnumProfile, index, state, false)
-                    .unwrap();
+                buffer = build_profile_info(
+                    SPA_PARAM_EnumProfile,
+                    index,
+                    &state.pcm_devices,
+                    state.profile_save,
+                    false,
+                );
             }
             (SPA_PARAM_Profile, 0) => {
-                build_profile_info(&mut builder, SPA_PARAM_Profile, state.profile, state, true)
-                    .unwrap();
+                buffer = build_profile_info(
+                    SPA_PARAM_Profile,
+                    state.profile,
+                    &state.pcm_devices,
+                    state.profile_save,
+                    true,
+                );
             }
             (SPA_PARAM_EnumRoute, i) if (i as usize) < state.routes.len() => {
-                build_route_info(&mut builder, SPA_PARAM_EnumRoute, state, i as usize, false)
-                    .unwrap();
+                buffer = build_route_info(
+                    SPA_PARAM_EnumRoute,
+                    &state.routes[i as usize],
+                    i as usize,
+                    state.profile,
+                    false,
+                );
             }
             // no Route pods while Off is active: there is nothing routed
             (SPA_PARAM_Route, i) if state.profile != 0 && (i as usize) < state.routes.len() => {
-                build_route_info(&mut builder, SPA_PARAM_Route, state, i as usize, true).unwrap();
+                buffer = build_route_info(
+                    SPA_PARAM_Route,
+                    &state.routes[i as usize],
+                    i as usize,
+                    state.profile,
+                    true,
+                );
             }
             // a known id whose indices are exhausted ends the enumeration
             (
@@ -876,8 +858,6 @@ unsafe extern "C" fn enum_params(
             }
             _ => return -libc::ENOENT,
         };
-
-        drop(builder); // its borrow of `buffer` must end before we take the source pointer
 
         let mut result = spa_result_device_params {
             id,
@@ -1802,3 +1782,199 @@ pub(crate) static mut OSS_DEVICE_TOPIC: spa_log_topic = spa_log_topic {
     level: SPA_LOG_LEVEL_NONE,
     has_custom_level: false,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::RouteState;
+
+    fn pcm_device(index: u32, play: bool, rec: bool) -> crate::sound::PcmDevice {
+        crate::sound::PcmDevice {
+            index,
+            desc: format!("pcm{index}"),
+            location: "hdac0".to_string(),
+            play,
+            rec,
+        }
+    }
+
+    fn route(control: Option<u32>, rec: bool) -> RouteState {
+        RouteState {
+            node_id: if rec { 3 } else { 2 },
+            rec,
+            name: "analog-output".to_string(),
+            description: "Analog Output".to_string(),
+            priority: 100,
+            mixer: 0,
+            control,
+            follows_recsrc: false,
+            source: None,
+            active: true,
+            levels: (75, 50),
+            mute: rec,
+            save: !rec,
+        }
+    }
+
+    // Parse-back semantics (see the note on the utils tests): run the
+    // Profile and Route pods back through the same libspa PodDeserializer
+    // WirePlumber uses and pin the parsed content it depends on - keys,
+    // values, the nested classes/props shape and especially the
+    // per-property HARDWARE/READONLY flags no other test covers.
+    #[test]
+    fn profile_parses_back_with_classes_struct() {
+        use libspa::pod::{Object, Value, ValueArray};
+        use libspa::sys::*;
+        use libspa::utils::Id;
+
+        // the current default profile of a duplex card: strings, nested
+        // structs, an int array and the save bool
+        let pod = super::build_profile_info(
+            SPA_PARAM_Profile,
+            1,
+            &[pcm_device(0, true, true)],
+            true,
+            true,
+        );
+        let prop = crate::utils::pod_prop;
+        assert_eq!(
+            crate::utils::parse_back(&pod),
+            Value::Object(Object {
+                type_: SPA_TYPE_OBJECT_ParamProfile,
+                id: SPA_PARAM_Profile,
+                properties: vec![
+                    prop(SPA_PARAM_PROFILE_index, Value::Int(1)),
+                    prop(SPA_PARAM_PROFILE_name, Value::String("default".to_string())),
+                    prop(
+                        SPA_PARAM_PROFILE_description,
+                        Value::String("Default".to_string()),
+                    ),
+                    prop(SPA_PARAM_PROFILE_priority, Value::Int(100)),
+                    prop(
+                        SPA_PARAM_PROFILE_available,
+                        Value::Id(Id(SPA_PARAM_AVAILABILITY_yes)),
+                    ),
+                    // the classes struct select-routes walks: a count, then
+                    // one class struct with the node ids (capture odd,
+                    // playback even)
+                    prop(
+                        SPA_PARAM_PROFILE_classes,
+                        Value::Struct(vec![
+                            Value::Int(2),
+                            Value::Struct(vec![
+                                Value::String("Audio/Source".to_string()),
+                                Value::Int(1),
+                                Value::String("card.profile.devices".to_string()),
+                                Value::ValueArray(ValueArray::Int(vec![1])),
+                            ]),
+                            Value::Struct(vec![
+                                Value::String("Audio/Sink".to_string()),
+                                Value::Int(1),
+                                Value::String("card.profile.devices".to_string()),
+                                Value::ValueArray(ValueArray::Int(vec![0])),
+                            ]),
+                        ]),
+                    ),
+                    prop(SPA_PARAM_PROFILE_save, Value::Bool(true)),
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn route_parses_back_with_hardware_volume_flags() {
+        use libspa::pod::{Object, Property, PropertyFlags, Value, ValueArray};
+        use libspa::sys::*;
+        use libspa::utils::Id;
+
+        // a full playback route with a hardware control: the nested Props
+        // object, float/id arrays and the HARDWARE/READONLY prop flags
+        let pod = super::build_route_info(SPA_PARAM_Route, &route(Some(0), false), 1, 1, true);
+        let prop = crate::utils::pod_prop;
+        assert_eq!(
+            crate::utils::parse_back(&pod),
+            Value::Object(Object {
+                type_: SPA_TYPE_OBJECT_ParamRoute,
+                id: SPA_PARAM_Route,
+                properties: vec![
+                    prop(SPA_PARAM_ROUTE_index, Value::Int(1)),
+                    prop(
+                        SPA_PARAM_ROUTE_direction,
+                        Value::Id(Id(SPA_DIRECTION_OUTPUT)),
+                    ),
+                    prop(
+                        SPA_PARAM_ROUTE_name,
+                        Value::String("analog-output".to_string()),
+                    ),
+                    prop(
+                        SPA_PARAM_ROUTE_description,
+                        Value::String("Analog Output".to_string()),
+                    ),
+                    prop(SPA_PARAM_ROUTE_priority, Value::Int(100)),
+                    prop(
+                        SPA_PARAM_ROUTE_available,
+                        Value::Id(Id(SPA_PARAM_AVAILABILITY_yes)),
+                    ),
+                    prop(
+                        SPA_PARAM_ROUTE_profiles,
+                        Value::ValueArray(ValueArray::Int(vec![1])),
+                    ),
+                    prop(
+                        SPA_PARAM_ROUTE_devices,
+                        Value::ValueArray(ValueArray::Int(vec![2])),
+                    ),
+                    prop(SPA_PARAM_ROUTE_device, Value::Int(2)),
+                    prop(
+                        SPA_PARAM_ROUTE_props,
+                        Value::Object(Object {
+                            type_: SPA_TYPE_OBJECT_Props,
+                            id: SPA_PARAM_Route,
+                            properties: vec![
+                                // HARDWARE on mute and channelVolumes: the
+                                // mixer control owns them, so pulse and the
+                                // session manager write them at the card
+                                Property {
+                                    key: SPA_PROP_mute,
+                                    flags: PropertyFlags::HARDWARE,
+                                    value: Value::Bool(false),
+                                },
+                                // the cubic taper: (75/100)^3, (50/100)^3
+                                Property {
+                                    key: SPA_PROP_channelVolumes,
+                                    flags: PropertyFlags::HARDWARE,
+                                    value: Value::ValueArray(ValueArray::Float(vec![
+                                        0.421875, 0.125,
+                                    ])),
+                                },
+                                Property {
+                                    key: SPA_PROP_volumeBase,
+                                    flags: PropertyFlags::READONLY,
+                                    value: Value::Float(1.0),
+                                },
+                                Property {
+                                    key: SPA_PROP_volumeStep,
+                                    flags: PropertyFlags::READONLY,
+                                    value: Value::Float(1.0 / 101.0),
+                                },
+                                prop(
+                                    SPA_PROP_channelMap,
+                                    Value::ValueArray(ValueArray::Id(vec![
+                                        Id(SPA_AUDIO_CHANNEL_FL),
+                                        Id(SPA_AUDIO_CHANNEL_FR),
+                                    ])),
+                                ),
+                                // unity soft volume: the hardware control
+                                // attenuates, audioconvert must not double it
+                                prop(
+                                    SPA_PROP_softVolumes,
+                                    Value::ValueArray(ValueArray::Float(vec![1.0, 1.0])),
+                                ),
+                            ],
+                        }),
+                    ),
+                    prop(SPA_PARAM_ROUTE_profile, Value::Int(1)),
+                    prop(SPA_PARAM_ROUTE_save, Value::Bool(true)),
+                ],
+            })
+        );
+    }
+}

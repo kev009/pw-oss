@@ -17,5 +17,4 @@ libc   = "0.2.186"
 libspa = "0.10.0"
 nix    = { version = "0.31.3", features = ["ioctl"] }
 regex  = "1.13.1"
-rustix = "1" # same version as in libspa's dependencies; its pod builder returns rustix::io::Errno
 uds    = "=0.4.2"
