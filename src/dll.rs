@@ -74,11 +74,30 @@ pub struct BwAdapt {
     err_avg: f64,
     err_var: f64,
     base_time: u64,
+    // the committed servo geometry, latched by configure(): the device
+    // fragment (noise), byte-domain period/rate and the frame stride only
+    // change when the geometry is re-committed, not per cycle
+    stride: u32,
+    noise: u32,
+    period: u32,
+    rate: u32,
 }
 
 impl BwAdapt {
     pub fn reset(&mut self) {
-        *self = Self::default();
+        // the latched geometry survives: a relock (dll.init + reset) must
+        // cold-start at the same committed geometry
+        self.err_avg = 0.0;
+        self.err_var = 0.0;
+        self.base_time = 0;
+    }
+
+    // latch the committed geometry; update() no-ops until this ran (rate 0)
+    pub fn configure(&mut self, stride: u32, noise: u32, period: u32, rate: u32) {
+        self.stride = stride;
+        self.noise = noise;
+        self.period = period;
+        self.rate = rate;
     }
 
     fn bw_cap(period: u32, noise: u32) -> f64 {
@@ -88,23 +107,16 @@ impl BwAdapt {
         (SPA_DLL_BW_MAX * period as f64 / noise as f64).clamp(SPA_DLL_BW_MIN, SPA_DLL_BW_MAX)
     }
 
-    // one call site per servo path; the tuple of scalars beats a param struct
-    #[allow(clippy::too_many_arguments)]
-    // `err` is the clamped servo error as fed to the DLL; `noise` the device
-    // fragment size; `period`/`rate` byte-domain like set_bw (stride cancels
-    // everywhere except the /1000 heuristic, hence the explicit stride).
-    // Cold-starts the DLL at the granularity cap when bw == 0 (i.e. after
-    // init()), making dll.init() + reset() the whole relock idiom.
-    pub fn update(
-        &mut self,
-        dll: &mut SpaDLL,
-        err: f64,
-        stride: u32,
-        noise: u32,
-        now: u64,
-        period: u32,
-        rate: u32,
-    ) {
+    // `err` is the clamped servo error as fed to the DLL; the geometry
+    // (stride cancels everywhere except the /1000 heuristic) comes latched
+    // from configure(). Cold-starts the DLL at the granularity cap when
+    // bw == 0 (i.e. after init()), making dll.init() + reset() the whole
+    // relock idiom.
+    pub fn update(&mut self, dll: &mut SpaDLL, err: f64, now: u64) {
+        let (stride, noise, period, rate) = (self.stride, self.noise, self.period, self.rate);
+        if rate == 0 {
+            return; // unconfigured; nothing to steer safely
+        }
         if dll.bw() == 0.0 {
             dll.set_bw(Self::bw_cap(period, noise), period, rate);
             self.err_avg = 0.0;
@@ -195,7 +207,8 @@ mod tests {
         let mut dll = SpaDLL::default();
         dll.init();
         let mut bw = BwAdapt::default();
-        bw.update(&mut dll, 0.0, 8, 2048, 1_000, 16384, 48000 * 8);
+        bw.configure(8, 2048, 16384, 48000 * 8);
+        bw.update(&mut dll, 0.0, 1_000);
         assert_eq!(dll.bw(), BwAdapt::bw_cap(16384, 2048));
         assert_eq!(dll.bw(), SPA_DLL_BW_MAX); // fragment under the period: uncapped
     }
@@ -205,11 +218,12 @@ mod tests {
         let mut dll = SpaDLL::default();
         dll.init();
         let mut bw = BwAdapt::default();
+        bw.configure(8, 2048, 16384, 48000 * 8);
         let mut now = 1u64;
         // cold start, then over 3 s of dead-quiet errors: the retune window
         // sees zero mean and zero variance and relaxes to the ALSA floor
         for _ in 0..50 {
-            bw.update(&mut dll, 0.0, 8, 2048, now, 16384, 48000 * 8);
+            bw.update(&mut dll, 0.0, now);
             now += 100_000_000;
         }
         assert_eq!(dll.bw(), SPA_ALSA_DLL_BW_MIN);
@@ -220,20 +234,13 @@ mod tests {
         let mut dll = SpaDLL::default();
         dll.init();
         let mut bw = BwAdapt::default();
+        bw.configure(8, 2048, 16384, 48000 * 8);
         let mut now = 1u64;
         let mut sign = 1.0;
         // errors well above the fragment-quantization floor: the variance term
         // must keep the loop gain off the ALSA floor
         for _ in 0..50 {
-            bw.update(
-                &mut dll,
-                sign * 4.0 * 2048.0,
-                8,
-                2048,
-                now,
-                16384,
-                48000 * 8,
-            );
+            bw.update(&mut dll, sign * 4.0 * 2048.0, now);
             sign = -sign;
             now += 100_000_000;
         }

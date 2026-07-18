@@ -216,6 +216,9 @@ fn commit_geometry(
     port.ext.target_delay = target;
     port.dll.init();
     port.bw_adapt.reset(); // cold-starts at the granularity cap next servo cycle
+    let (stride, rate) = port.stride_rate().unwrap_or((1, 0));
+    port.bw_adapt
+        .configure(stride, blocksize, period, rate.saturating_mul(stride));
     delay_capped
 }
 
@@ -481,18 +484,17 @@ unsafe fn prime_playback(
 // gating on the fragment size would fire recovery on every accounting tick
 // there. Arms the recovery hold (xrun_timestamp) and reports the EVENT to
 // the host once, not per held cycle.
+// `underrun_count` is the counter the caller read this cycle (nonzero, or
+// this isn't called); measured outside so tests can drive the gate.
 unsafe fn detect_underrun(
     port: &mut crate::node::Port<SinkDir>,
     period_in_bytes: u32,
+    underrun_count: u32,
     cur_timestamp: u64,
     clock_nsec: u64,
     callbacks: &spa_callbacks,
     log: &crate::spa::Log,
 ) {
-    let underrun_count = port.dsp.underruns();
-    if underrun_count == 0 {
-        return;
-    }
     let Some((stride, cfg_rate)) = port.stride_rate() else {
         return;
     };
@@ -607,7 +609,6 @@ fn follower_servo(
     port: &mut crate::node::Port<SinkDir>,
     odelay: u32,
     stride: u32,
-    cfg_rate: u32,
     nsec: u64,
 ) -> (f64, bool) {
     let mut corr: f64 = 1.0;
@@ -635,15 +636,7 @@ fn follower_servo(
         let max_err = (port.setup_period as f64 / 2.0).max(256.0 * stride as f64);
         let err = err_raw.clamp(-max_err, max_err);
         corr = port.dll.update(err);
-        port.bw_adapt.update(
-            &mut port.dll,
-            err,
-            stride,
-            port.setup_blocksize,
-            nsec,
-            port.setup_period,
-            cfg_rate * stride,
-        );
+        port.bw_adapt.update(&mut port.dll, err, nsec);
     }
 
     #[cfg(debug_assertions)]
@@ -704,15 +697,7 @@ unsafe fn timeout_servo(state: &mut State<SinkDir>, nsec: u64, rate: u32) -> (f6
         let max_err = (port.setup_period as f64 / 2.0).max(256.0 * stride as f64);
         let err = (odelay as f64 - port.ext.target_delay as f64).clamp(-max_err, max_err);
         corr = port.dll.update(err);
-        port.bw_adapt.update(
-            &mut port.dll,
-            err,
-            stride,
-            port.setup_blocksize,
-            nsec,
-            port.setup_period,
-            device_rate * stride,
-        );
+        port.bw_adapt.update(&mut port.dll, err, nsec);
 
         // a diverged servo must not wedge the graph clock
         if !(0.5..=2.0).contains(&corr) {
@@ -904,14 +889,18 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
                 &state.log,
             );
         } else {
-            detect_underrun(
-                port,
-                period_in_bytes,
-                state.ext.cur_timestamp,
-                driver_clock.nsec,
-                &state.callbacks,
-                &state.log,
-            );
+            let underruns = port.dsp.underruns();
+            if underruns > 0 {
+                detect_underrun(
+                    port,
+                    period_in_bytes,
+                    underruns,
+                    state.ext.cur_timestamp,
+                    driver_clock.nsec,
+                    &state.callbacks,
+                    &state.log,
+                );
+            }
         }
 
         let mut corr: f64 = 1.0; // DLL rate correction, published through rate_match below
@@ -926,13 +915,8 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
         } else {
             let mut skip_write = false;
             if matching && port.setup_period != 0 && port.ext.period_mismatch == 0 {
-                (corr, skip_write) = follower_servo(
-                    port,
-                    port.dsp.odelay(),
-                    stride,
-                    cfg_rate,
-                    state.ext.cur_timestamp,
-                );
+                (corr, skip_write) =
+                    follower_servo(port, port.dsp.odelay(), stride, state.ext.cur_timestamp);
             }
 
             if state.following
@@ -1261,10 +1245,11 @@ pub(crate) static mut OSS_SINK_TOPIC: spa_log_topic = spa_log_topic {
 mod tests {
     use super::{buffer_request, buffer_required, desired_delay, fill_floor, target_delay};
     use super::{
-        follower_servo, level_correct, recover_or_hold, retune_period, SinkDir, SinkPortExt,
+        detect_underrun, follower_servo, level_correct, recover_or_hold, retune_period, SinkDir,
+        SinkPortExt,
     };
     use crate::sound::test_util::{drain, fill_pipe, free_space, pattern, pipe_pair};
-    use libspa::sys::SPA_IO_CLOCK_FLAG_XRUN_RECOVER;
+    use libspa::sys::{spa_callbacks, SPA_IO_CLOCK_FLAG_XRUN_RECOVER};
 
     // a Port on a pipe-backed device: the pipe's buffer plays the OSS ring
     // (byte-exact accounting, short writes on a full ring), GETODELAY reads 0
@@ -1427,6 +1412,36 @@ mod tests {
         unsafe { libc::close(r) };
     }
 
+    // the underrun gate arms the recovery hold once per event: the driver
+    // clock is snapshotted on the first detection and held cycles must not
+    // re-stamp it (odelay reads 0 on a pipe - a truly empty ring)
+    #[test]
+    fn underrun_detection_arms_the_hold_once() {
+        let (r, w) = pipe_pair(true, true);
+        let mut port = test_port(w, 4096, 2048);
+        port.dsp.write_zeroes(0); // the gate runs on a running channel
+        port.config = Some(super::PortConfig {
+            format: libspa::param::audio::AudioFormat::S16LE,
+            rate: 48000,
+            channels: 4,
+            positions: vec![],
+            flags: 0,
+        });
+        let callbacks = spa_callbacks {
+            funcs: std::ptr::null(),
+            data: std::ptr::null_mut(),
+        };
+        let log = crate::spa::Log::test_null();
+
+        unsafe { detect_underrun(&mut port, 2048, 3, 1_000_000, 500_000, &callbacks, &log) };
+        assert_eq!(port.ext.xrun_timestamp, 500_000);
+
+        // a later cycle's count must not move the armed snapshot
+        unsafe { detect_underrun(&mut port, 2048, 5, 2_000_000, 700_000, &callbacks, &log) };
+        assert_eq!(port.ext.xrun_timestamp, 500_000);
+        unsafe { libc::close(r) };
+    }
+
     // the follower fill snap: a level error past one period refills to target
     // on underfill and skips the cycle's buffer on overfill; in-band errors go
     // to the DLL instead
@@ -1436,7 +1451,7 @@ mod tests {
         let mut port = test_port(w, 4096, 2048);
 
         // underfill past one period: refill to target, don't skip
-        let (corr, skip) = follower_servo(&mut port, 1024, 8, 48000, 0);
+        let (corr, skip) = follower_servo(&mut port, 1024, 8, 0);
         assert_eq!(corr, 1.0);
         assert!(!skip);
         let out = drain(r);
@@ -1446,13 +1461,13 @@ mod tests {
         // overfill past one period: skip the buffer, write nothing (the device
         // drains toward target meanwhile)
         // target + one period + one frame: just past the snap threshold
-        let (corr, skip) = follower_servo(&mut port, 4096 + 2048 + 8, 8, 48000, 0);
+        let (corr, skip) = follower_servo(&mut port, 4096 + 2048 + 8, 8, 0);
         assert_eq!(corr, 1.0);
         assert!(skip);
         assert!(drain(r).is_empty());
 
         // in-band error: no snap, the DLL absorbs it
-        let (corr, skip) = follower_servo(&mut port, 4096 + 512, 8, 48000, 0);
+        let (corr, skip) = follower_servo(&mut port, 4096 + 512, 8, 0);
         assert!(!skip);
         assert!((0.9..=1.1).contains(&corr));
         assert!(drain(r).is_empty());

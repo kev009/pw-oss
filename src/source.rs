@@ -105,6 +105,9 @@ fn commit_geometry(port: &mut crate::node::Port<SourceDir>, period: u32, blocksi
     port.ext.read_peak = peak;
     port.dll.init();
     port.bw_adapt.reset(); // cold-starts at the granularity cap next servo cycle
+    let (stride, rate) = port.stride_rate().unwrap_or((1, 0));
+    port.bw_adapt
+        .configure(stride, blocksize, period, rate.saturating_mul(stride));
 }
 
 // The retune phase. A period change re-tunes the servo: the fill target and
@@ -311,7 +314,6 @@ fn follower_servo(
     queued: u32,
     now: u64,
     stride: u32,
-    rate: u32,
 ) -> f64 {
     let mut corr: f64 = 1.0;
     if !port.was_matching {
@@ -336,15 +338,7 @@ fn follower_servo(
         let max_err = (port.setup_period as f64 / 2.0).max(256.0 * stride as f64);
         let err = err_raw.clamp(-max_err, max_err);
         corr = port.dll.update(err);
-        port.bw_adapt.update(
-            &mut port.dll,
-            err,
-            stride,
-            port.setup_blocksize,
-            now,
-            port.setup_period,
-            rate * stride,
-        );
+        port.bw_adapt.update(&mut port.dll, err, now);
     }
 
     #[cfg(debug_assertions)]
@@ -412,23 +406,17 @@ unsafe fn bounded_read(
 // The freewheel branch never triggers the device (it may still be in
 // setup), and while freewheeling the ring overruns by design - the exit
 // edge re-primes, so don't flood the counter meanwhile.
+// `overrun_count` is the counter the caller read this cycle (nonzero, or
+// this isn't called) and `now` the caller's timestamp; measured outside so
+// tests can drive the pin gate.
 unsafe fn recover_overrun(
     port: &mut crate::node::Port<SourceDir>,
-    freewheel: bool,
+    overrun_count: u32,
     pre_read_fill: Option<u32>,
-    data_system: &crate::spa::System,
+    now: u64,
     callbacks: &spa_callbacks,
     log: &crate::spa::Log,
 ) {
-    let overrun_count = if port.dsp.is_running() && !freewheel {
-        port.dsp.overruns()
-    } else {
-        0
-    };
-    if overrun_count == 0 {
-        port.ext.pinned_cycles = 0;
-        return;
-    }
     // pinned = pre-read fill within one arrival of the ring end; with an
     // unknown ring treat every tick as pinned (can't gate what we can't
     // measure). A cycle without a pre-read sample (prime/freewheel) just
@@ -445,7 +433,6 @@ unsafe fn recover_overrun(
     };
     if port.ext.pinned_cycles >= PINNED_CYCLE_LIMIT {
         port.ext.pinned_cycles = 0;
-        let now = crate::utils::now_ns(data_system);
         if let Some(suppressed) = port.warn_limit.check(now) {
             crate::warn!(log, "OSS reported {:3} overruns @ {} with the ring pinned; re-priming (+{} warnings suppressed)",
         overrun_count, now, suppressed);
@@ -513,15 +500,7 @@ unsafe fn timeout_servo(state: &mut State<SourceDir>, nsec: u64, rate: u32) -> (
         let max_err = (port.setup_period as f64 / 2.0).max(256.0 * stride as f64);
         let err = (port.ext.target_fill as f64 - queued as f64).clamp(-max_err, max_err);
         corr = port.dll.update(err);
-        port.bw_adapt.update(
-            &mut port.dll,
-            err,
-            stride,
-            port.setup_blocksize,
-            nsec,
-            port.setup_period,
-            device_rate * stride,
-        );
+        port.bw_adapt.update(&mut port.dll, err, nsec);
 
         // a diverged servo must not wedge the graph clock
         if !(0.5..=2.0).contains(&corr) {
@@ -736,7 +715,6 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
                     queued,
                     crate::utils::now_ns(&state.data_system),
                     stride,
-                    rate,
                 );
             }
 
@@ -760,14 +738,23 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
             }
         }
 
-        recover_overrun(
-            port,
-            freewheel,
-            pre_read_fill,
-            &state.data_system,
-            &state.callbacks,
-            &state.log,
-        );
+        let overruns = if port.dsp.is_running() && !freewheel {
+            port.dsp.overruns()
+        } else {
+            0
+        };
+        if overruns > 0 {
+            recover_overrun(
+                port,
+                overruns,
+                pre_read_fill,
+                crate::utils::now_ns(&state.data_system),
+                &state.callbacks,
+                &state.log,
+            );
+        } else {
+            port.ext.pinned_cycles = 0;
+        }
 
         if nbytes != -1 {
             #[cfg(debug_assertions)]
@@ -1029,10 +1016,11 @@ pub(crate) static mut OSS_SOURCE_TOPIC: spa_log_topic = spa_log_topic {
 #[cfg(test)]
 mod tests {
     use super::{
-        bounded_read, fill_targets, follower_servo, retune_period, ring_request, ring_required,
-        SourceDir, SourcePortExt,
+        bounded_read, fill_targets, follower_servo, recover_overrun, retune_period, ring_request,
+        ring_required, SourceDir, SourcePortExt,
     };
     use crate::sound::test_util::{pattern, pipe_pair};
+    use libspa::sys::spa_callbacks;
 
     // a Port on a pipe-backed device: the pipe plays the capture ring
     // (byte-exact accounting), GETISPACE fails on a pipe, so the phase
@@ -1166,6 +1154,41 @@ mod tests {
         unsafe { libc::close(w) };
     }
 
+    // the overrun gate: ticks with a drainable ring are ignored, and only a
+    // ring PINNED at the ceiling across PINNED_CYCLE_LIMIT consecutive
+    // cycles triggers the re-prime recovery
+    #[test]
+    fn overruns_recover_only_when_the_ring_stays_pinned() {
+        let (r, w) = pipe_pair(false, false);
+        let mut port = test_port(r, 1024, 0);
+        port.ext.primed = true;
+        port.ext.ring_size = 8192; // blocksize 1024: pinned above 7168
+        let callbacks = spa_callbacks {
+            funcs: std::ptr::null(),
+            data: std::ptr::null_mut(),
+        };
+        let log = crate::spa::Log::test_null();
+
+        // two pinned cycles: counted, no recovery yet
+        unsafe { recover_overrun(&mut port, 4, Some(8000), 0, &callbacks, &log) };
+        unsafe { recover_overrun(&mut port, 4, Some(8000), 0, &callbacks, &log) };
+        assert_eq!(port.ext.pinned_cycles, 2);
+        assert!(port.ext.primed);
+
+        // a drainable fill resets the pin streak (kernel disposed upstream)
+        unsafe { recover_overrun(&mut port, 4, Some(100), 0, &callbacks, &log) };
+        assert_eq!(port.ext.pinned_cycles, 0);
+        assert!(port.ext.primed);
+
+        // three consecutive pinned cycles: recovery re-primes
+        for _ in 0..3 {
+            unsafe { recover_overrun(&mut port, 4, Some(8000), 0, &callbacks, &log) };
+        }
+        assert_eq!(port.ext.pinned_cycles, 0);
+        assert!(!port.ext.primed);
+        unsafe { libc::close(w) };
+    }
+
     // the follower servo: in-band errors feed the DLL, a level error past
     // the snap threshold (period.max(blocksize/2 + period/2)) relocks
     // instead of winding the integrator
@@ -1175,10 +1198,10 @@ mod tests {
         let mut port = test_port(r, 1024, 0);
         port.ext.target_fill = 2560;
 
-        let corr = follower_servo(&mut port, 2560 + 1500, 0, 8, 48000);
+        let corr = follower_servo(&mut port, 2560 + 1500, 0, 8);
         assert_eq!(corr, 1.0); // snapped: relock only
 
-        let corr = follower_servo(&mut port, 2560 - 512, 0, 8, 48000);
+        let corr = follower_servo(&mut port, 2560 - 512, 0, 8);
         assert!((0.9..=1.1).contains(&corr)); // in-band: the DLL absorbs it
         unsafe { libc::close(w) };
     }
