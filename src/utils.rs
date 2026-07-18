@@ -145,16 +145,26 @@ pub(crate) fn channel_positions(channels: u32) -> Option<&'static [u32]> {
     }
 }
 
-// (OSS AFMT, SPA audio format) pairs we can produce, best first; keep in
-// sync with the per-direction parse_config/oss_format matches
-// (hand-formatted: one pair per line keeps the mapping scannable)
+// (OSS AFMT, SPA audio format, bytes per sample) triples we can produce,
+// best first; the single source of truth for the format surface - EnumFormat,
+// the negotiation snap and the per-config stride all derive from it
+// (hand-formatted: one triple per line keeps the mapping scannable)
 #[rustfmt::skip]
-pub(crate) const FORMAT_MAP: [(u32, u32); 4] = [
-    (crate::sound::AFMT_S32_LE, libspa::sys::SPA_AUDIO_FORMAT_S32_LE),
-    (crate::sound::AFMT_S32_BE, libspa::sys::SPA_AUDIO_FORMAT_S32_BE),
-    (crate::sound::AFMT_S16_LE, libspa::sys::SPA_AUDIO_FORMAT_S16_LE),
-    (crate::sound::AFMT_S16_BE, libspa::sys::SPA_AUDIO_FORMAT_S16_BE)
+pub(crate) const FORMAT_MAP: [(u32, u32, u32); 4] = [
+    (crate::sound::AFMT_S32_LE, libspa::sys::SPA_AUDIO_FORMAT_S32_LE, 4),
+    (crate::sound::AFMT_S32_BE, libspa::sys::SPA_AUDIO_FORMAT_S32_BE, 4),
+    (crate::sound::AFMT_S16_LE, libspa::sys::SPA_AUDIO_FORMAT_S16_LE, 2),
+    (crate::sound::AFMT_S16_BE, libspa::sys::SPA_AUDIO_FORMAT_S16_BE, 2)
 ];
+
+// the (OSS AFMT, bytes per sample) behind a SPA audio format; None for
+// anything outside the map (rejected at negotiation)
+pub(crate) fn oss_format_info(spa_format: u32) -> Option<(u32, u32)> {
+    FORMAT_MAP
+        .iter()
+        .find(|(_, f, _)| *f == spa_format)
+        .map(|(m, _, b)| (*m, *b))
+}
 
 // the formats a device gets offered: native ones when any exist, all of ours
 // otherwise (the kernel feeder converts), nothing on a convertless device
@@ -163,15 +173,15 @@ pub(crate) const FORMAT_MAP: [(u32, u32); 4] = [
 fn offered_formats(caps: &crate::sound::DspCaps) -> Vec<u32> {
     let native = FORMAT_MAP
         .iter()
-        .filter(|(m, _)| caps.formats & m != 0)
-        .map(|(_, f)| *f)
+        .filter(|(m, _, _)| caps.formats & m != 0)
+        .map(|(_, f, _)| *f)
         .collect::<Vec<_>>();
     if !native.is_empty() {
         native
     } else if caps.convertless {
         vec![]
     } else {
-        FORMAT_MAP.iter().map(|(_, f)| *f).collect()
+        FORMAT_MAP.iter().map(|(_, f, _)| *f).collect()
     }
 }
 

@@ -2,7 +2,7 @@ use std::os::raw::c_int;
 
 use libspa::sys::*;
 
-use crate::node::{Direction, MAX_PORTS, ParamBuild, State};
+use crate::node::{Direction, MAX_PORTS, ParamBuild, PortConfig, State};
 
 // the single PortInfo in State is per-port in disguise; fix it before
 // raising this
@@ -259,52 +259,6 @@ fn prime_capture(
     let len = period_in_bytes.min(maxsize);
     data[..len as usize].fill(0);
     len as isize
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct PortConfig {
-    pub format: libspa::param::audio::AudioFormat,
-    pub rate: u32,
-    pub channels: u32,
-    pub positions: Vec<u32>, // the negotiated channel positions, replayed in the Format readback
-    pub flags: u32,
-    pub stride: u32,
-}
-
-impl PortConfig {
-    fn oss_format(&self) -> u32 {
-        match self.format {
-            libspa::param::audio::AudioFormat::S32LE => crate::sound::AFMT_S32_LE,
-            libspa::param::audio::AudioFormat::S32BE => crate::sound::AFMT_S32_BE,
-            libspa::param::audio::AudioFormat::S16LE => crate::sound::AFMT_S16_LE,
-            libspa::param::audio::AudioFormat::S16BE => crate::sound::AFMT_S16_BE,
-            _ => unreachable!(), // rejected at negotiation
-        }
-    }
-}
-
-impl crate::node::ConfigOps for PortConfig {
-    fn oss_format(&self) -> u32 {
-        PortConfig::oss_format(self)
-    }
-    fn rate(&self) -> u32 {
-        self.rate
-    }
-    fn channels(&self) -> u32 {
-        self.channels
-    }
-    fn stride(&self) -> u32 {
-        self.stride
-    }
-    fn format_raw(&self) -> u32 {
-        self.format.0
-    }
-    fn flags(&self) -> u32 {
-        self.flags
-    }
-    fn positions(&self) -> &[u32] {
-        &self.positions
-    }
 }
 
 // The follower-servo phase, matching a foreign clock: the DLL serves rate
@@ -737,7 +691,6 @@ impl Direction for SourceDir {
     const CMD_WARN_PREFIX: &'static str = "oss-source: ";
 
     type Device = crate::sound::Dsp;
-    type Config = PortConfig;
     type Ext = SourceExt;
     type PortExt = SourcePortExt;
 
@@ -831,39 +784,6 @@ impl Direction for SourceDir {
             _ => (),
         }
         0
-    }
-
-    fn parse_config(
-        state: &mut State<SourceDir>,
-        raw: &spa_audio_info_raw,
-    ) -> Result<PortConfig, c_int> {
-        let format = libspa::param::audio::AudioFormat(raw.format);
-
-        // only formats from our EnumFormat are expected; reject the rest
-        let (oss_format, bytes_per_sample) = match format {
-            libspa::param::audio::AudioFormat::S32LE => (crate::sound::AFMT_S32_LE, 4),
-            libspa::param::audio::AudioFormat::S32BE => (crate::sound::AFMT_S32_BE, 4),
-            libspa::param::audio::AudioFormat::S16LE => (crate::sound::AFMT_S16_LE, 2),
-            libspa::param::audio::AudioFormat::S16BE => (crate::sound::AFMT_S16_BE, 2),
-            _ => {
-                crate::warn!(state.log, "rejecting unsupported format {:?}", format);
-                return Err(-libc::ENOTSUP);
-            }
-        };
-
-        let config = PortConfig {
-            format,
-            rate: raw.rate,
-            channels: raw.channels,
-            positions: raw.position[..raw.channels as usize].to_vec(),
-            flags: raw.flags,
-            stride: bytes_per_sample * raw.channels, // bytes per interleaved frame
-        };
-
-        crate::debug!(state.log, "reconfiguring with {:?}", config);
-
-        let _ = oss_format;
-        Ok(config)
     }
 
     fn try_open_configure(
@@ -1186,7 +1106,7 @@ mod tests {
         // with a negotiated config the geometry latches and the DLL engages:
         // the first in-band update cold-starts the gains, the second must
         // produce a real (non-unity) correction
-        port.config = Some(super::PortConfig {
+        port.config = Some(crate::node::PortConfig {
             format: libspa::param::audio::AudioFormat::S32LE,
             rate: 48000,
             channels: 2,

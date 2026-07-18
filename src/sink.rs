@@ -2,7 +2,7 @@ use std::os::raw::c_int;
 
 use libspa::sys::*;
 
-use crate::node::{Direction, MAX_PORTS, ParamBuild, State};
+use crate::node::{Direction, MAX_PORTS, ParamBuild, PortConfig, State};
 
 // several State fields are per-port in disguise (the single PortInfo,
 // on_timeout's last-port-wins clock delay); fix those before raising this
@@ -37,65 +37,6 @@ pub(crate) struct SinkPortExt {
     pub target_delay: u32,   // OSS buffer fill target in bytes, clamped to the granted buffer
     pub buffer_size: u32,    // granted OSS playback ring capacity in bytes
     pub period_mismatch: u32, // consecutive cycles at a different period (debounce)
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct PortConfig {
-    pub format: libspa::param::audio::AudioFormat,
-    pub rate: u32,
-    pub channels: u32,
-    pub positions: Vec<u32>, // the negotiated channel positions, replayed in the Format readback
-    pub flags: u32,
-}
-
-impl PortConfig {
-    fn bytes_per_sample(&self) -> u32 {
-        match self.format {
-            libspa::param::audio::AudioFormat::S32LE => 4,
-            libspa::param::audio::AudioFormat::S32BE => 4,
-            libspa::param::audio::AudioFormat::S16LE => 2,
-            libspa::param::audio::AudioFormat::S16BE => 2,
-            _ => unreachable!(),
-        }
-    }
-
-    fn stride(&self) -> u32 {
-        self.bytes_per_sample() * self.channels
-    }
-
-    fn oss_format(&self) -> u32 {
-        match self.format {
-            libspa::param::audio::AudioFormat::S32LE => crate::sound::AFMT_S32_LE,
-            libspa::param::audio::AudioFormat::S32BE => crate::sound::AFMT_S32_BE,
-            libspa::param::audio::AudioFormat::S16LE => crate::sound::AFMT_S16_LE,
-            libspa::param::audio::AudioFormat::S16BE => crate::sound::AFMT_S16_BE,
-            _ => unreachable!(), // rejected at negotiation
-        }
-    }
-}
-
-impl crate::node::ConfigOps for PortConfig {
-    fn oss_format(&self) -> u32 {
-        PortConfig::oss_format(self)
-    }
-    fn rate(&self) -> u32 {
-        self.rate
-    }
-    fn channels(&self) -> u32 {
-        self.channels
-    }
-    fn stride(&self) -> u32 {
-        PortConfig::stride(self)
-    }
-    fn format_raw(&self) -> u32 {
-        self.format.0
-    }
-    fn flags(&self) -> u32 {
-        self.flags
-    }
-    fn positions(&self) -> &[u32] {
-        &self.positions
-    }
 }
 
 fn desired_delay(period: u32, oss_delay: u32) -> u32 {
@@ -961,7 +902,6 @@ impl Direction for SinkDir {
     const CMD_WARN_PREFIX: &'static str = "";
 
     type Device = crate::sound::DspWriter;
-    type Config = PortConfig;
     type Ext = SinkExt;
     type PortExt = SinkPortExt;
 
@@ -1094,42 +1034,6 @@ impl Direction for SinkDir {
         0
     }
 
-    fn parse_config(
-        state: &mut State<SinkDir>,
-        raw: &spa_audio_info_raw,
-    ) -> Result<PortConfig, c_int> {
-        let format = libspa::param::audio::AudioFormat(raw.format);
-
-        let config = PortConfig {
-            format,
-            rate: raw.rate,
-            channels: raw.channels,
-            positions: raw.position[..raw.channels as usize].to_vec(),
-            flags: raw.flags,
-        };
-
-        crate::debug!(state.log, "reconfiguring with {:?}", config);
-
-        // only formats from our EnumFormat are expected; reject the rest
-        let oss_format = match config.format {
-            libspa::param::audio::AudioFormat::S32LE => crate::sound::AFMT_S32_LE,
-            libspa::param::audio::AudioFormat::S32BE => crate::sound::AFMT_S32_BE,
-            libspa::param::audio::AudioFormat::S16LE => crate::sound::AFMT_S16_LE,
-            libspa::param::audio::AudioFormat::S16BE => crate::sound::AFMT_S16_BE,
-            _ => {
-                crate::warn!(
-                    state.log,
-                    "rejecting unsupported format {:?}",
-                    config.format
-                );
-                return Err(-libc::ENOTSUP);
-            }
-        };
-
-        let _ = oss_format;
-        Ok(config)
-    }
-
     fn try_open_configure(
         dsp: &mut crate::sound::DspWriter,
         config: &PortConfig,
@@ -1251,6 +1155,7 @@ mod tests {
         retune_period,
     };
     use super::{buffer_request, buffer_required, desired_delay, fill_floor, target_delay};
+    use crate::node::PortConfig;
     use crate::sound::test_util::{drain, fill_pipe, free_space, pattern, pipe_pair};
     use libspa::sys::{SPA_IO_CLOCK_FLAG_XRUN_RECOVER, spa_callbacks};
 
@@ -1444,12 +1349,13 @@ mod tests {
         let (r, w) = pipe_pair(true, true);
         let mut port = test_port(w, 4096, 2048);
         port.dsp.write_zeroes(0); // the gate runs on a running channel
-        port.config = Some(super::PortConfig {
+        port.config = Some(PortConfig {
             format: libspa::param::audio::AudioFormat::S16LE,
             rate: 48000,
             channels: 4,
             positions: vec![],
             flags: 0,
+            stride: 8,
         });
         let callbacks = spa_callbacks {
             funcs: std::ptr::null(),
@@ -1493,12 +1399,13 @@ mod tests {
         // in-band error: no snap, the DLL absorbs it. With a negotiated
         // config the geometry latches and the DLL engages: the first update
         // cold-starts the gains, the second produces a real correction
-        port.config = Some(super::PortConfig {
+        port.config = Some(PortConfig {
             format: libspa::param::audio::AudioFormat::S16LE,
             rate: 48000,
             channels: 4,
             positions: vec![],
             flags: 0,
+            stride: 8,
         });
         super::commit_geometry(&mut port, 65536, 2048, 1024, 2048, 4096);
         port.setup_period = 2048;

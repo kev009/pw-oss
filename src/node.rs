@@ -66,16 +66,26 @@ impl DeviceOps for crate::sound::DspWriter {
     }
 }
 
-// the negotiated format as the generic core needs it; the concrete PortConfig
-// types (whose Debug readback differs) stay per direction
-pub(crate) trait ConfigOps: std::fmt::Debug + Clone {
-    fn oss_format(&self) -> u32;
-    fn rate(&self) -> u32;
-    fn channels(&self) -> u32;
-    fn stride(&self) -> u32;
-    fn format_raw(&self) -> u32;
-    fn flags(&self) -> u32;
-    fn positions(&self) -> &[u32];
+// the negotiated format, shared by both directions (the stride is derived
+// from the format map at parse time and stored)
+#[derive(Debug, Clone)]
+pub(crate) struct PortConfig {
+    pub format: libspa::param::audio::AudioFormat,
+    pub rate: u32,
+    pub channels: u32,
+    pub positions: Vec<u32>, // the negotiated channel positions, replayed in the Format readback
+    pub flags: u32,
+    pub stride: u32, // bytes per interleaved frame
+}
+
+impl PortConfig {
+    pub(crate) fn oss_format(&self) -> u32 {
+        // parse_config admits only formats from the map, so the lookup can't
+        // miss; 0 (matching no AFMT) beats a panic across extern "C"
+        crate::utils::oss_format_info(self.format.0)
+            .map(|(m, _)| m)
+            .unwrap_or(0)
+    }
 }
 
 // outcome of a per-(id, index) node param build (the enum_params hook)
@@ -97,9 +107,8 @@ pub(crate) trait Direction: Sized + 'static {
     /// historical prefix of the unknown-command warning ("oss-source: " there)
     const CMD_WARN_PREFIX: &'static str;
 
-    // Send: both cross onto the data loop through install_device's swap
+    // Send: crosses onto the data loop through install_device's swap
     type Device: DeviceOps + Send;
-    type Config: ConfigOps + Send;
     type Ext: Default; // direction-specific State fields
     type PortExt: Default; // direction-specific Port fields
 
@@ -124,18 +133,13 @@ pub(crate) trait Direction: Sized + 'static {
     // set_param(Props): the SPA_PROP_params property (the sink's oss.delay)
     unsafe fn set_props_params(state: &mut State<Self>, value: &libspa::pod::Value) -> c_int;
 
-    // port_set_param(Format): validate the format and build the config
-    fn parse_config(
-        state: &mut State<Self>,
-        raw: &spa_audio_info_raw,
-    ) -> Result<Self::Config, c_int>;
     // used from the main thread only; returns 0 or -errno with the device
     // closed. `fragment` is the normalized oss.fragment (0 = automatic); the
     // source applies it at open time, the sink at prime time (the period is
     // only known then)
     fn try_open_configure(
         dsp: &mut Self::Device,
-        config: &Self::Config,
+        config: &PortConfig,
         fragment: u32,
         log: &crate::spa::Log,
     ) -> c_int;
@@ -229,7 +233,7 @@ impl<D: Direction> State<D> {
 }
 
 pub(crate) struct Port<D: Direction> {
-    pub config: Option<D::Config>,
+    pub config: Option<PortConfig>,
     pub buffers: Vec<*mut spa_buffer>,
     pub io: crate::spa::IoArea<spa_io_buffers>,
     pub rate_match: crate::spa::IoArea<spa_io_rate_match>, // per-port io area (port_set_io)
@@ -318,7 +322,7 @@ impl<D: Direction> Port<D> {
     // (stride >= 1 post-negotiation, so the .max(1) is pure defense).
     pub(crate) fn stride_rate(&self) -> Option<(u32, u32)> {
         let config = self.config.as_ref()?;
-        Some((config.stride().max(1), config.rate()))
+        Some((config.stride.max(1), config.rate))
     }
 }
 
@@ -1001,21 +1005,21 @@ unsafe extern "C" fn remove_port(
 // follower == target, audioadapter.c:445, :995).
 
 // replays the negotiated format exactly, for port_enum_params(Format)
-unsafe fn build_port_format_info<C: ConfigOps>(
+unsafe fn build_port_format_info(
     builder: &mut libspa::pod::builder::Builder,
-    config: &C,
+    config: &PortConfig,
     id: u32,
 ) {
     let mut position = [0u32; 64];
-    for (slot, &p) in position.iter_mut().zip(config.positions().iter()) {
+    for (slot, &p) in position.iter_mut().zip(config.positions.iter()) {
         *slot = p;
     }
 
     let raw = spa_audio_info_raw {
-        format: config.format_raw(),
-        flags: config.flags(),
-        rate: config.rate(),
-        channels: config.channels(),
+        format: config.format.0,
+        flags: config.flags,
+        rate: config.rate,
+        channels: config.channels,
         position,
     };
 
@@ -1082,7 +1086,7 @@ unsafe extern "C" fn port_enum_params<D: Direction>(
             (SPA_PARAM_Buffers, 0) => {
                 match state.ports[port_id as usize].config.as_ref() {
                     Some(cfg) => {
-                        crate::utils::build_buffers_info(&mut builder, cfg.stride()).unwrap();
+                        crate::utils::build_buffers_info(&mut builder, cfg.stride).unwrap();
                     }
                     None => return -libc::ENOENT, // format not negotiated yet
                 }
@@ -1131,6 +1135,34 @@ unsafe extern "C" fn port_enum_params<D: Direction>(
     }
 
     0
+}
+
+// port_set_param(Format): validate the raw format against the format map and
+// build the shared config (the stride falls out of the map's bytes/sample)
+fn parse_config<D: Direction>(
+    state: &mut State<D>,
+    raw: &spa_audio_info_raw,
+) -> Result<PortConfig, c_int> {
+    let format = libspa::param::audio::AudioFormat(raw.format);
+
+    // only formats from our EnumFormat are expected; reject the rest
+    let Some((_, bytes_per_sample)) = crate::utils::oss_format_info(raw.format) else {
+        crate::warn!(state.log, "rejecting unsupported format {:?}", format);
+        return Err(-libc::ENOTSUP);
+    };
+
+    let config = PortConfig {
+        format,
+        rate: raw.rate,
+        channels: raw.channels,
+        positions: raw.position[..raw.channels as usize].to_vec(),
+        flags: raw.flags,
+        stride: bytes_per_sample * raw.channels, // bytes per interleaved frame
+    };
+
+    crate::debug!(state.log, "reconfiguring with {:?}", config);
+
+    Ok(config)
 }
 
 // port_set_param(Format) with a pod: parse and validate the requested raw
@@ -1191,10 +1223,8 @@ unsafe fn set_format_param<D: Direction>(
     // (audioadapter.c:758, :1059); snap only what the exact path
     // below would reject, so in-caps requests stay untouched
     let admitted = |caps: &crate::sound::DspCaps, raw: &spa_audio_info_raw| {
-        crate::utils::FORMAT_MAP
-            .iter()
-            .find(|(_, f)| *f == raw.format)
-            .is_some_and(|(m, _)| caps.admits(*m, raw.channels, raw.rate))
+        crate::utils::oss_format_info(raw.format)
+            .is_some_and(|(m, _)| caps.admits(m, raw.channels, raw.rate))
     };
     let mut snapped = false;
     if flags & crate::spa::SPA_NODE_PARAM_FLAG_NEAREST != 0 && !admitted(&state.caps, &raw) {
@@ -1210,7 +1240,7 @@ unsafe fn set_format_param<D: Direction>(
         }
     }
 
-    let config = D::parse_config(state, &raw)?;
+    let config = parse_config(state, &raw)?;
 
     // Validate against the advertised caps first: an out-of-caps
     // request on an exclusive device would EBUSY-retire the WORKING
@@ -1282,7 +1312,7 @@ unsafe fn publish_format_state<D: Direction>(state: &mut State<D>, port_idx: usi
     if let Some(cfg) = state.ports[port_idx].config.as_ref() {
         state.port_info.set_rate(spa_fraction {
             num: 1,
-            denom: cfg.rate(),
+            denom: cfg.rate,
         });
         state
             .port_info
@@ -1439,7 +1469,7 @@ pub(crate) unsafe fn apply_props_param<D: Direction>(
 pub(crate) unsafe fn install_device<D: Direction>(
     state: &mut State<D>,
     port_idx: usize,
-    config: D::Config,
+    config: PortConfig,
 ) -> c_int {
     let mut new_dsp = D::Device::new(&state.dsp_path);
     // oss_fragment only mutates from main-thread calls, serialized with us
@@ -1511,8 +1541,8 @@ unsafe fn publish_ring_quantum_cap<D: Direction>(state: &mut State<D>, port_idx:
     let Some(config) = state.ports[port_idx].config.as_ref() else {
         return;
     };
-    let stride = config.stride().max(1);
-    let rate = config.rate();
+    let stride = config.stride.max(1);
+    let rate = config.rate;
     // the shared ring policy (sound.rs); the published fraction is time-based
     // (frames/device rate), so it needs no graph-rate scaling
     let Some(frames) = crate::sound::advertised_quantum_cap_frames(stride, rate) else {
