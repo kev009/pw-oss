@@ -138,13 +138,13 @@ fn retune_period(
     if port.ext.period_mismatch < 2 {
         return false;
     }
-    port.ext.period_mismatch = 0;
     // cached blocksize: the triggered channel refuses SETFRAGMENT and the
     // hw cadence is per-session, so the grant can't have changed since
     // prime (the sink reuses its cache for the same reason)
     let blocksize = port.setup_blocksize;
     if port.ext.ring_size >= ring_required(period_in_bytes, blocksize) {
         commit_geometry(port, period_in_bytes, blocksize);
+        port.ext.period_mismatch = 0;
         false
     } else if port.dsp.suspend() {
         // re-enter priming IN THIS CYCLE: it re-applies the fragment layout at
@@ -158,9 +158,13 @@ fn retune_period(
             period_in_bytes,
             port.ext.ring_size
         );
+        port.ext.period_mismatch = 0;
         port.ext.primed = false;
         false
     } else {
+        // period_mismatch stays >= 2 on purpose: if the caller can't queue the
+        // rebuild (no main loop), the next cycle retries this retune
+        // immediately instead of re-running the debounce
         true
     }
 }
@@ -895,7 +899,16 @@ impl Direction for SourceDir {
         }
     }
 
-    fn on_role_flip(_state: &mut State<SourceDir>) {}
+    fn on_role_flip(state: &mut State<SourceDir>) {
+        // as the sink: a role flip shifts the servo's measurement phase, and
+        // stale integrator state would briefly steer the published clock on a
+        // follower -> driver transition; relock instead
+        for port in &mut state.ports {
+            port.dll.init();
+            port.bw_adapt.reset();
+            port.was_matching = false;
+        }
+    }
 
     // data loop only
     unsafe fn update_timers(state: &mut State<SourceDir>) {
@@ -911,7 +924,12 @@ impl Direction for SourceDir {
                 .data_system
                 .clock_gettime(libc::CLOCK_MONOTONIC, &mut now)
         };
-        assert!(err >= 0);
+        if err < 0 {
+            // a failed clock read must not abort the data loop (process and
+            // on_timeout degrade the same way); park the timer instead
+            unsafe { crate::node::set_timeout(state, 0) };
+            return;
+        }
 
         state.next_time = (now.tv_sec * SPA_NSEC_PER_SEC as i64 + now.tv_nsec) as u64;
 
@@ -1109,6 +1127,9 @@ mod tests {
         assert!(retune_period(&mut port, 2048, &log));
         assert!(port.ext.primed); // not re-primed; the rebuild replaces the device
         assert_eq!(port.setup_period, 1024);
+        // armed for an immediate retry if the rebuild can't be queued (the
+        // sink's refused-suspend arm keeps the counter the same way)
+        assert!(port.ext.period_mismatch >= 2);
         unsafe { libc::close(w) };
     }
 

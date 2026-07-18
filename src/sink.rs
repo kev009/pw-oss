@@ -209,6 +209,13 @@ fn commit_geometry(
     write_max: u32,
     desired: u32,
 ) -> bool {
+    // defense in depth (the prime path gates on the period too): a committed
+    // setup_period of 0 would flip the channel to Running with degenerate
+    // geometry, and retune_period's setup_period == 0 early-exit would never
+    // re-commit - stuck until a full rebuild
+    if period == 0 {
+        return false;
+    }
     let (target, delay_capped) = target_delay(granted, period, blocksize, write_max, desired);
     port.setup_period = period;
     port.setup_blocksize = blocksize; // the effective quantum, incl. hw chunk
@@ -242,6 +249,7 @@ fn retune_period(
     period_in_bytes: u32,
     stride: u32,
     oss_delay: u32,
+    now: u64,
     log: &crate::spa::Log,
 ) -> bool {
     if !port.dsp.is_running()
@@ -277,7 +285,8 @@ fn retune_period(
             desired,
         );
         port.ext.period_mismatch = 0;
-        port.was_matching = false;
+        // no was_matching reset here: commit_geometry already cold-started the
+        // servo, and the stream continues without a gap (unlike the arms below)
 
         // Level snap (ALSA's resync does the same): a sustained quantum
         // change is a re-prime in place. When driving, nothing else
@@ -327,14 +336,18 @@ fn retune_period(
     } else {
         // period_mismatch stays >= 2 on purpose: if the caller can't queue the
         // rebuild (no main loop), the next cycle retries this retune
-        // immediately instead of re-running the debounce
-        crate::info!(
-            log,
-            "{}: period {} -> {} bytes; re-setting up",
-            port.dsp.path,
-            port.setup_period,
-            period_in_bytes
-        );
+        // immediately instead of re-running the debounce - so this arm can run
+        // every cycle; rate-limit the log
+        if let Some(suppressed) = port.warn_limit.check(now) {
+            crate::info!(
+                log,
+                "{}: period {} -> {} bytes; re-setting up (+{} messages suppressed)",
+                port.dsp.path,
+                port.setup_period,
+                period_in_bytes,
+                suppressed
+            );
+        }
         true
     }
 }
@@ -405,6 +418,9 @@ fn prime_playback(
     let Some((stride, cfg_rate)) = port.stride_rate() else {
         return;
     };
+    if period_in_bytes == 0 {
+        return; // see commit_geometry: zero-period geometry is never committed
+    }
 
     // Size the fill to the granted buffer and the device's real fragment.
     // oss_fragment (0 = automatic 1 KiB) only mutates on this loop, so the
@@ -464,7 +480,7 @@ fn prime_playback(
       explicitly, so hw.snd.latency has no effect",
             port.dsp.path,
             granted,
-            period_in_bytes * 2
+            period_in_bytes.saturating_mul(2)
         );
     }
 
@@ -815,6 +831,7 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
             period_in_bytes,
             stride,
             state.ext.oss_delay,
+            state.ext.cur_timestamp,
             &state.log,
         ) {
             // the driver refused the trigger stop (dying fd): rebuild off-loop
@@ -830,6 +847,16 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
         }
 
         if !port.dsp.is_running() {
+            if period_in_bytes == 0 {
+                // No usable position yet (the source's prime arm gates on the
+                // period the same way): priming now would commit setup_period
+                // == 0 and the channel would run with degenerate geometry that
+                // retune_period never corrects. Not ready this cycle; ask for
+                // data like the other not-ready paths.
+                unsafe { (*port.io).status = SPA_STATUS_NEED_DATA as i32 };
+                result |= SPA_STATUS_NEED_DATA as i32;
+                continue;
+            }
             prime_playback(
                 port,
                 period_in_bytes,
@@ -1512,13 +1539,13 @@ mod tests {
         let log = crate::spa::Log::test_null();
 
         // one flip is debounced: write at the old geometry for a cycle
-        assert!(!retune_period(&mut port, 4096, 8, 0, &log));
+        assert!(!retune_period(&mut port, 4096, 8, 0, 0, &log));
         assert_eq!(port.setup_period, 2048);
         assert!(drain(r).is_empty());
 
         // sustained: retune in place and fill to the new target (odelay
         // reads 0 on a pipe, so the snap writes the whole target)
-        assert!(!retune_period(&mut port, 4096, 8, 0, &log));
+        assert!(!retune_period(&mut port, 4096, 8, 0, 0, &log));
         assert_eq!(port.setup_period, 4096);
         assert_eq!(port.ext.target_delay, 5120); // fill_floor(4096, 1024) binds
         assert_eq!(port.ext.period_mismatch, 0);
@@ -1538,10 +1565,25 @@ mod tests {
         port.dsp.write_zeroes(0);
         let log = crate::spa::Log::test_null();
 
-        assert!(!retune_period(&mut port, 4096, 8, 0, &log));
-        assert!(retune_period(&mut port, 4096, 8, 0, &log));
+        assert!(!retune_period(&mut port, 4096, 8, 0, 0, &log));
+        assert!(retune_period(&mut port, 4096, 8, 0, 0, &log));
         assert_eq!(port.setup_period, 2048); // untouched; the rebuild replaces the device
         assert!(port.ext.period_mismatch >= 2);
+        assert!(drain(r).is_empty());
+        unsafe { libc::close(r) };
+    }
+
+    // zero-period geometry is never committed: setup_period == 0
+    // short-circuits retune_period, so a commit here would wedge the
+    // geometry until a full rebuild (the prime gate in process_ports is
+    // the first line of defense; this is the backstop)
+    #[test]
+    fn zero_period_is_never_committed() {
+        let (r, w) = pipe_pair(true, true);
+        let mut port = test_port(w, 4096, 2048);
+        assert!(!super::commit_geometry(&mut port, 65536, 0, 1024, 2048, 0));
+        assert_eq!(port.setup_period, 2048); // untouched
+        assert_eq!(port.ext.target_delay, 4096); // untouched
         assert!(drain(r).is_empty());
         unsafe { libc::close(r) };
     }
