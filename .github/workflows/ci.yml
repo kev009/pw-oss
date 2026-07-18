@@ -25,6 +25,7 @@ jobs:
             pkg install -y pkgconf rust pipewire llvm19
           run: |
             export LIBCLANG_PATH=/usr/local/llvm19/lib
+            cargo fmt --check
             cargo build --release
             cargo test
             cargo clippy --all-targets -- -D warnings
