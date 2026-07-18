@@ -28,16 +28,52 @@ pub(crate) fn version_ok(version: u32, min: u32) -> bool {
     version >= min
 }
 
+// Iterate with a cursor hook woven into the list (the C spa_hook_list_call
+// pattern): the cursor hops past each entry BEFORE its callback runs, so a
+// listener may remove any hook - its own, the next one, any other - and the
+// plain list unlink fixes the cursor's neighbor pointers like any node's.
+// The former grab-next-first walk only survived self-removal.
 pub(crate) unsafe fn for_each_hook(head: *mut spa_hook_list, mut apply: impl FnMut(&spa_hook)) {
-    let mut entry = (*head).list.next as *mut spa_hook;
-    while (*entry).link != (*head).list {
-        // grab next first: a listener may remove (and free) its own hook from
-        // inside the callback, which SPA allows. (Removing a *different* hook is
-        // still unsafe here; the C helpers use a shared cursor for that.)
-        let next = (*entry).link.next as *mut spa_hook;
-        apply(entry.as_ref().expect("broken spa_hook_list"));
-        entry = next;
+    let list = std::ptr::addr_of_mut!((*head).list);
+    let mut cursor: spa_hook = std::mem::zeroed();
+    let cur = std::ptr::addr_of_mut!(cursor.link);
+
+    // insert the cursor at the front
+    (*cur).prev = list;
+    (*cur).next = (*list).next;
+    (*(*list).next).prev = cur;
+    (*list).next = cur;
+
+    loop {
+        let item = (*cur).next;
+        if item == list {
+            break;
+        }
+        // hop the cursor over the item: unlink, then relink after it
+        (*(*cur).prev).next = (*cur).next;
+        (*(*cur).next).prev = (*cur).prev;
+        (*cur).prev = item;
+        (*cur).next = (*item).next;
+        (*(*item).next).prev = cur;
+        (*item).next = cur;
+
+        // spa_hook's link is its first field, so the list node IS the hook.
+        // Null funcs marks another iteration's cursor woven into this list
+        // (a listener callback re-entering an emission path); skip it like
+        // C's spa_callback_check does.
+        let hook = item
+            .cast::<spa_hook>()
+            .as_ref()
+            .expect("broken spa_hook_list");
+        if hook.cb.funcs.is_null() {
+            continue;
+        }
+        apply(hook);
     }
+
+    // unlink the cursor
+    (*(*cur).prev).next = (*cur).next;
+    (*(*cur).next).prev = (*cur).prev;
 }
 
 pub(crate) unsafe fn dev_emit_result(
@@ -826,4 +862,84 @@ macro_rules! trace {
     ($log:expr, $($arg:tt)*) => {
         $crate::log!($log, SPA_LOG_LEVEL_TRACE, $($arg)*)
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // hand-woven intrusive list: n hooks whose cb.data carries their index
+    // (boxed nodes on purpose: the links are intrusive, so growth must not
+    // move them)
+    #[allow(clippy::vec_box)]
+    fn hook_list(n: usize) -> (Box<spa_hook_list>, Vec<Box<spa_hook>>) {
+        let mut head: Box<spa_hook_list> = Box::new(unsafe { std::mem::zeroed() });
+        let list = std::ptr::addr_of_mut!(head.list);
+        unsafe {
+            (*list).next = list;
+            (*list).prev = list;
+        }
+        let mut hooks = Vec::new();
+        for i in 0..n {
+            let mut h: Box<spa_hook> = Box::new(unsafe { std::mem::zeroed() });
+            h.cb.funcs = std::ptr::dangling(); // non-null marks a real hook; never called
+            h.cb.data = i as *mut std::os::raw::c_void;
+            let link = std::ptr::addr_of_mut!(h.link);
+            unsafe {
+                // append
+                (*link).prev = (*list).prev;
+                (*link).next = list;
+                (*(*list).prev).next = link;
+                (*list).prev = link;
+            }
+            hooks.push(h);
+        }
+        (head, hooks)
+    }
+
+    fn unlink(h: &mut spa_hook) {
+        let link = std::ptr::addr_of_mut!(h.link);
+        unsafe {
+            (*(*link).prev).next = (*link).next;
+            (*(*link).next).prev = (*link).prev;
+        }
+    }
+
+    // a callback removing the NEXT hook must not dangle the walk (a
+    // grab-next-before-calling walk would)
+    #[test]
+    fn hook_callback_may_remove_the_next_hook() {
+        let (mut head, mut hooks) = hook_list(3);
+        let h1 = std::ptr::addr_of_mut!(*hooks[1]);
+        let mut seen = Vec::new();
+        unsafe {
+            for_each_hook(&mut *head, |h| {
+                seen.push(h.cb.data as usize);
+                if h.cb.data as usize == 0 {
+                    unlink(&mut *h1); // hook 0's callback frees hook 1
+                }
+            });
+        }
+        assert_eq!(seen, [0, 2]);
+    }
+
+    // a callback re-entering an emission path iterates the same list; the
+    // outer walk's cursor (null funcs) must be invisible to the inner one
+    #[test]
+    fn nested_iteration_skips_the_outer_cursor() {
+        let (mut head, _hooks) = hook_list(2);
+        let head_ptr = std::ptr::addr_of_mut!(*head);
+        let mut outer = Vec::new();
+        let mut inner = Vec::new();
+        unsafe {
+            for_each_hook(head_ptr, |h| {
+                outer.push(h.cb.data as usize);
+                if h.cb.data as usize == 0 {
+                    for_each_hook(head_ptr, |ih| inner.push(ih.cb.data as usize));
+                }
+            });
+        }
+        assert_eq!(outer, [0, 1]);
+        assert_eq!(inner, [0, 1]); // both real hooks, no phantom cursor
+    }
 }
