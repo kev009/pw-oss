@@ -704,7 +704,9 @@ impl Log {
     pub fn log(&self, level: spa_log_level, file: &str, line: c_int, func: &str, msg: &str) {
         let file = CString::new(file).unwrap(); // ours, no interior NULs
         let func = CString::new(func).unwrap(); // ditto
-                                                // the message can carry host-derived strings; don't abort on an interior NUL
+
+        // the message can carry host-derived strings; don't abort on an
+        // interior NUL
         let msg = CString::new(msg).unwrap_or_else(|_| c"<message contained NUL>".to_owned());
         let topic = self
             .topic
@@ -749,47 +751,47 @@ impl Log {
 
 #[macro_export]
 macro_rules! log {
-  ($log:expr, $log_level:expr, $($arg:tt)*) => {
-    if $log.log_level() >= $log_level {
-      let file = file!();
-      let line = line!();
-      let func = ""; //TODO: add something there?
-      $log.log($log_level, file, line as c_int, func, &format!($($arg)*));
-    }
-  };
+    ($log:expr, $log_level:expr, $($arg:tt)*) => {
+        if $log.log_level() >= $log_level {
+            let file = file!();
+            let line = line!();
+            let func = ""; //TODO: add something there?
+            $log.log($log_level, file, line as c_int, func, &format!($($arg)*));
+        }
+    };
 }
 
 #[macro_export]
 macro_rules! error {
-  ($log:expr, $($arg:tt)*) => {
-    $crate::log!($log, SPA_LOG_LEVEL_ERROR, $($arg)*)
-  };
+    ($log:expr, $($arg:tt)*) => {
+        $crate::log!($log, SPA_LOG_LEVEL_ERROR, $($arg)*)
+    };
 }
 
 #[macro_export]
 macro_rules! warn {
-  ($log:expr, $($arg:tt)*) => {
-    $crate::log!($log, SPA_LOG_LEVEL_WARN, $($arg)*)
-  };
+    ($log:expr, $($arg:tt)*) => {
+        $crate::log!($log, SPA_LOG_LEVEL_WARN, $($arg)*)
+    };
 }
 
 #[macro_export]
 macro_rules! info {
-  ($log:expr, $($arg:tt)*) => {
-    $crate::log!($log, SPA_LOG_LEVEL_INFO, $($arg)*)
-  };
+    ($log:expr, $($arg:tt)*) => {
+        $crate::log!($log, SPA_LOG_LEVEL_INFO, $($arg)*)
+    };
 }
 
 #[macro_export]
 macro_rules! debug {
-  ($log:expr, $($arg:tt)*) => {
-    $crate::log!($log, SPA_LOG_LEVEL_DEBUG, $($arg)*)
-  };
+    ($log:expr, $($arg:tt)*) => {
+        $crate::log!($log, SPA_LOG_LEVEL_DEBUG, $($arg)*)
+    };
 }
 
 #[macro_export]
 macro_rules! trace {
-  ($log:expr, $($arg:tt)*) => {
-    $crate::log!($log, SPA_LOG_LEVEL_TRACE, $($arg)*)
-  };
+    ($log:expr, $($arg:tt)*) => {
+        $crate::log!($log, SPA_LOG_LEVEL_TRACE, $($arg)*)
+    };
 }

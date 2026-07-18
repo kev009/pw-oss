@@ -1186,13 +1186,11 @@ unsafe fn set_route_param(state: &mut State, param: *const spa_pod) -> c_int {
         mute_changed = false;
     }
     if let Some(active_pos) = switched {
-        {
-            if !(active_pos == pos && vol_changed) {
-                emit_object_config(state, active_pos, true);
-            }
-            if !(active_pos == pos && mute_changed) {
-                emit_object_config(state, active_pos, false);
-            }
+        if !(active_pos == pos && vol_changed) {
+            emit_object_config(state, active_pos, true);
+        }
+        if !(active_pos == pos && mute_changed) {
+            emit_object_config(state, active_pos, false);
         }
     }
 
@@ -1479,7 +1477,8 @@ unsafe fn parse_device_dict(info: *const spa_dict) -> (Option<String>, Vec<u32>)
 }
 
 // the device description shared by every aggregated pcm unit: the longest
-// common prefix of their descriptions, trimmed of a dangling " (" tail
+// common prefix of their descriptions, trimmed of a dangling " (" tail.
+// `pcm_devices` must be non-empty (init rejects an empty list first).
 fn common_description(pcm_devices: &[crate::sound::PcmDevice]) -> String {
     let mut common_desc = pcm_devices[0].desc.clone();
     for pcm_device in &pcm_devices[1..] {

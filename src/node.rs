@@ -233,7 +233,7 @@ impl<D: Direction> Port<D> {
     // the negotiated (stride, rate) as copies, not a borrow: the process phases
     // commit geometry through &mut Port. None until a format is negotiated -
     // callers skip the cycle then rather than panic across extern "C"
-    // (channels >= 1 post-negotiation, so the .max(1) is pure defense).
+    // (stride >= 1 post-negotiation, so the .max(1) is pure defense).
     pub(crate) fn stride_rate(&self) -> Option<(u32, u32)> {
         let config = self.config.as_ref()?;
         Some((config.stride().max(1), config.rate()))
@@ -684,7 +684,8 @@ unsafe extern "C" fn set_io<D: Direction>(
         match id {
             SPA_IO_Clock => {
                 state.clock = data.cast(); // null clears
-                                           // identify our clock so same-device followers can skip rate matching
+
+                // identify our clock so same-device followers can skip rate matching
                 crate::utils::set_clock_name(state.clock, &state.clock_name);
             }
             SPA_IO_Position => state.position = data.cast(), // null clears
@@ -1109,7 +1110,7 @@ unsafe fn release_format<D: Direction>(state: &mut State<D>, port_idx: usize) ->
 // update the port rate and flip Format/Buffers flags to reflect whether a
 // format is negotiated, then re-emit so the host re-reads them (PipeWire
 // ALSA sink/source pattern)
-unsafe fn publish_format_flags<D: Direction>(state: &mut State<D>, port_idx: usize) {
+unsafe fn publish_format_state<D: Direction>(state: &mut State<D>, port_idx: usize) {
     let _ = state.port_info.replace_change_mask(0);
     if let Some(cfg) = state.ports[port_idx].config.as_ref() {
         state.port_info.set_rate(spa_fraction {
@@ -1189,7 +1190,7 @@ unsafe extern "C" fn port_set_param<D: Direction>(
                 }
             };
             // emit even on failure: the flags derive from the (now cleared) config
-            publish_format_flags(state, port_id as usize);
+            publish_format_state(state, port_id as usize);
             res
         }
         SPA_PARAM_Latency => set_latency_param(state, direction, param),

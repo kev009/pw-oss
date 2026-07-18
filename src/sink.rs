@@ -195,7 +195,7 @@ fn target_delay(
         let want = desired.max(floor);
         (want.min(ceil).max(period), want > ceil)
     } else {
-        (granted / 2, false) // buffer too small for two quanta; best-effort, will drop (warned below)
+        (granted / 2, false) // buffer too small for two quanta; best-effort, will drop (prime_playback warns)
     }
 }
 
@@ -285,7 +285,7 @@ unsafe fn retune_period(
         // would sit one late wakeup away from an underrun for the seconds
         // the skew needs; fill to target like the prime and xrun-recovery
         // paths do. Overfill after a shrink is latency only and drains via
-        // the servo (or the follower fill snap below).
+        // the servo (or follower_servo's fill snap).
         let odelay = port.dsp.odelay();
         port.dsp
             .write_zeroes(port.ext.target_delay.saturating_sub(odelay));
@@ -324,6 +324,9 @@ unsafe fn retune_period(
         port.was_matching = false;
         false
     } else {
+        // period_mismatch stays >= 2 on purpose: if the caller can't queue the
+        // rebuild (no main loop), the next cycle retries this retune
+        // immediately instead of re-running the debounce
         crate::info!(
             log,
             "{}: period {} -> {} bytes; re-setting up",
@@ -610,7 +613,7 @@ unsafe fn recover_or_hold(
 // anyway would wind the integrator; ALSA gates the same way). `odelay` is
 // the fill the caller measured this cycle. Returns the rate correction and
 // whether this cycle's buffer must be skipped (overfill drain).
-fn matching_servo(
+fn follower_servo(
     port: &mut crate::node::Port<SinkDir>,
     odelay: u32,
     stride: u32,
@@ -969,7 +972,7 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
             );
         }
 
-        let mut corr: f64 = 1.0; // DLL rate correction, published as clock.rate_diff below
+        let mut corr: f64 = 1.0; // DLL rate correction, published through rate_match below
         let nbytes = if port.ext.xrun_timestamp != 0 {
             recover_or_hold(
                 port,
@@ -981,7 +984,7 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
         } else {
             let mut skip_write = false;
             if matching && port.setup_period != 0 && port.ext.period_mismatch == 0 {
-                (corr, skip_write) = matching_servo(
+                (corr, skip_write) = follower_servo(
                     port,
                     port.dsp.odelay(),
                     stride,
@@ -1315,7 +1318,7 @@ pub(crate) static mut OSS_SINK_TOPIC: spa_log_topic = spa_log_topic {
 #[cfg(test)]
 mod tests {
     use super::{buffer_request, buffer_required, desired_delay, fill_floor, target_delay};
-    use super::{level_correct, matching_servo, recover_or_hold, SinkDir, SinkPortExt};
+    use super::{follower_servo, level_correct, recover_or_hold, SinkDir, SinkPortExt};
     use crate::sound::test_util::{drain, fill_pipe, free_space, pattern, pipe_pair};
     use libspa::sys::SPA_IO_CLOCK_FLAG_XRUN_RECOVER;
 
@@ -1489,7 +1492,7 @@ mod tests {
         let mut port = test_port(w, 4096, 2048);
 
         // underfill past one period: refill to target, don't skip
-        let (corr, skip) = matching_servo(&mut port, 1024, 8, 48000, 0);
+        let (corr, skip) = follower_servo(&mut port, 1024, 8, 48000, 0);
         assert_eq!(corr, 1.0);
         assert!(!skip);
         let out = drain(r);
@@ -1498,13 +1501,14 @@ mod tests {
 
         // overfill past one period: skip the buffer, write nothing (the device
         // drains toward target meanwhile)
-        let (corr, skip) = matching_servo(&mut port, 4096 + 2048 + 8, 8, 48000, 0);
+        // target + one period + one frame: just past the snap threshold
+        let (corr, skip) = follower_servo(&mut port, 4096 + 2048 + 8, 8, 48000, 0);
         assert_eq!(corr, 1.0);
         assert!(skip);
         assert!(drain(r).is_empty());
 
         // in-band error: no snap, the DLL absorbs it
-        let (corr, skip) = matching_servo(&mut port, 4096 + 512, 8, 48000, 0);
+        let (corr, skip) = follower_servo(&mut port, 4096 + 512, 8, 48000, 0);
         assert!(!skip);
         assert!((0.9..=1.1).contains(&corr));
         assert!(drain(r).is_empty());

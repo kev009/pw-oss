@@ -169,7 +169,9 @@ fn retune_period(
 // real data: an empty first cycle reads as a missed deadline to the graph.
 // Re-apply the fragment layout while the channel is in setup (legal after a
 // trigger suspend too, so live oss.fragment changes reach a suspended
-// source). Returns the cycle's byte count (the period of silence).
+// source). Returns the cycle's byte count (the period of silence), or
+// EMPTY_CYCLE before a format is negotiated (unreachable past the caller's
+// gate).
 unsafe fn prime_capture(
     port: &mut crate::node::Port<SourceDir>,
     period_in_bytes: u32,
@@ -304,7 +306,7 @@ impl crate::node::ConfigOps for PortConfig {
 // is published; a same-device follower has nothing to correct). `queued` is
 // the pre-read fill the caller measured this cycle. Returns the rate
 // correction.
-fn capture_servo(
+fn follower_servo(
     port: &mut crate::node::Port<SourceDir>,
     queued: u32,
     now: u64,
@@ -410,7 +412,7 @@ unsafe fn bounded_read(
 // The freewheel branch never triggers the device (it may still be in
 // setup), and while freewheeling the ring overruns by design - the exit
 // edge re-primes, so don't flood the counter meanwhile.
-unsafe fn detect_overrun(
+unsafe fn recover_overrun(
     port: &mut crate::node::Port<SourceDir>,
     freewheel: bool,
     pre_read_fill: Option<u32>,
@@ -741,7 +743,7 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
                 && port.setup_period != 0
                 && port.ext.period_mismatch == 0
             {
-                corr = capture_servo(
+                corr = follower_servo(
                     port,
                     queued,
                     crate::utils::now_ns(&state.data_system),
@@ -770,7 +772,7 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
             }
         }
 
-        detect_overrun(
+        recover_overrun(
             port,
             freewheel,
             pre_read_fill,
@@ -1043,6 +1045,9 @@ mod tests {
     };
     use crate::sound::test_util::{pattern, pipe_pair};
 
+    // a Port on a pipe-backed device: the pipe plays the capture ring
+    // (byte-exact accounting), GETISPACE fails on a pipe, so the phase
+    // functions get the queued fill passed explicitly (as the callers do)
     fn test_port(
         read_fd: libc::c_int,
         period: u32,

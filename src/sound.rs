@@ -1465,23 +1465,8 @@ mod tests {
 
         // fill the pipe to capacity, then free a mid-frame hole: the next write
         // is forced short at an unaligned count, like a full OSS ring
-        let fill = vec![0xffu8; 16384];
-        let mut total_fill = 0usize;
-        loop {
-            let n = unsafe { libc::write(w, fill.as_ptr().cast(), fill.len()) };
-            if n <= 0 {
-                break;
-            }
-            total_fill += n as usize;
-        }
-        let mut hole = [0u8; 2046];
-        let mut freed = 0usize;
-        while freed < hole.len() {
-            let n =
-                unsafe { libc::read(r, hole.as_mut_ptr().add(freed).cast(), hole.len() - freed) };
-            assert!(n > 0);
-            freed += n as usize;
-        }
+        let total_fill = super::test_util::fill_pipe(w);
+        super::test_util::free_space(r, 2046);
 
         // 2046 = 255 frames + 6 bytes: the kernel takes all of it, the 2-byte
         // frame tail can't fit, and the split is recorded rather than dropped
@@ -1491,7 +1476,7 @@ mod tests {
         assert_eq!(dsp.frame_off, 6);
 
         let queued = drain(r); // remaining filler, then the accepted head
-        assert_eq!(queued.len(), total_fill - hole.len() + 2046);
+        assert_eq!(queued.len(), total_fill); // the 2046-byte hole was exactly refilled
         assert_eq!(&queued[queued.len() - 2046..], &a[..2046]);
 
         // with space available again, the next write closes the split frame
