@@ -2,7 +2,7 @@ use std::os::raw::c_int;
 
 use libspa::sys::*;
 
-use crate::node::{Direction, ParamBuild, State, MAX_PORTS};
+use crate::node::{Direction, MAX_PORTS, ParamBuild, State};
 
 // several State fields are per-port in disguise (the single PortInfo,
 // on_timeout's last-port-wins clock delay); fix those before raising this
@@ -1196,13 +1196,13 @@ pub(crate) static mut OSS_SINK_TOPIC: spa_log_topic = spa_log_topic {
 
 #[cfg(test)]
 mod tests {
-    use super::{buffer_request, buffer_required, desired_delay, fill_floor, target_delay};
     use super::{
-        detect_underrun, follower_servo, level_correct, recover_or_hold, retune_period, SinkDir,
-        SinkPortExt,
+        SinkDir, SinkPortExt, detect_underrun, follower_servo, level_correct, recover_or_hold,
+        retune_period,
     };
+    use super::{buffer_request, buffer_required, desired_delay, fill_floor, target_delay};
     use crate::sound::test_util::{drain, fill_pipe, free_space, pattern, pipe_pair};
-    use libspa::sys::{spa_callbacks, SPA_IO_CLOCK_FLAG_XRUN_RECOVER};
+    use libspa::sys::{SPA_IO_CLOCK_FLAG_XRUN_RECOVER, spa_callbacks};
 
     // a Port on a pipe-backed device: the pipe's buffer plays the OSS ring
     // (byte-exact accounting, short writes on a full ring), GETODELAY reads 0
@@ -1257,11 +1257,22 @@ mod tests {
                         for granted in [required, required + 1, required.saturating_mul(2)] {
                             let (target, _) =
                                 target_delay(granted, period, blocksize, write_max, desired);
-                            assert!(target >= fill_floor(period, blocksize),
-                "starved: target {} < floor {} (granted {}, period {}, blocksize {}, write_max {}, desired {})",
-                target, fill_floor(period, blocksize), granted, period, blocksize, write_max, desired);
-                            assert!(target.saturating_add(write_max).saturating_add(blocksize) <= granted,
-                "will drop: target {target} + write_max {write_max} + blocksize {blocksize} > granted {granted} (period {period}, desired {desired})");
+                            assert!(
+                                target >= fill_floor(period, blocksize),
+                                "starved: target {} < floor {} (granted {}, period {}, blocksize {}, write_max {}, desired {})",
+                                target,
+                                fill_floor(period, blocksize),
+                                granted,
+                                period,
+                                blocksize,
+                                write_max,
+                                desired
+                            );
+                            assert!(
+                                target.saturating_add(write_max).saturating_add(blocksize)
+                                    <= granted,
+                                "will drop: target {target} + write_max {write_max} + blocksize {blocksize} > granted {granted} (period {period}, desired {desired})"
+                            );
                         }
                     }
                 }

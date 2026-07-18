@@ -2,11 +2,13 @@
 // spa_log_topic_enum registration below; everything else is crate-internal,
 // and pub items would otherwise be exempt from dead_code analysis
 #![warn(unreachable_pub)]
-// unsafe_op_in_unsafe_fn is deliberately NOT warned: for the remaining
-// unsafe fns (FFI vtable entries, the raw-pointer process paths) the whole
-// body is the unsafe surface, and rustc's migration wraps entire bodies in
-// one block - indentation churn with no added precision. Fns whose unsafe
-// obligations are local already carry safe signatures with narrow blocks.
+// unsafe_op_in_unsafe_fn (warn-by-default on edition 2024) is deliberately
+// allowed: for the remaining unsafe fns (FFI vtable entries, the raw-pointer
+// process paths) the whole body is the unsafe surface, and rustc's migration
+// wraps entire bodies in one block - indentation churn with no added
+// precision. Fns whose unsafe obligations are local already carry safe
+// signatures with narrow blocks.
+#![allow(unsafe_op_in_unsafe_fn)]
 // mechanical-style clippy gates on top of the default set
 // (not unreadable_literal: the hex masks mirror sys/soundcard.h and grep
 // better without separators)
@@ -42,7 +44,7 @@ use source::OSS_SOURCE_FACTORY;
 /// `factory` and `index` must be valid, writable pointers; `index` selects
 /// the factory to return and is advanced by one on success (the host calls
 /// this in a loop until it returns 0).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn spa_handle_factory_enum(
     factory: *mut *const spa_handle_factory,
     index: *mut u32,

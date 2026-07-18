@@ -2,7 +2,7 @@ use std::os::raw::c_int;
 
 use libspa::sys::*;
 
-use crate::node::{Direction, ParamBuild, State, MAX_PORTS};
+use crate::node::{Direction, MAX_PORTS, ParamBuild, State};
 
 // the single PortInfo in State is per-port in disguise; fix it before
 // raising this
@@ -429,8 +429,13 @@ fn recover_overrun(
     if port.ext.pinned_cycles >= PINNED_CYCLE_LIMIT {
         port.ext.pinned_cycles = 0;
         if let Some(suppressed) = port.warn_limit.check(now) {
-            crate::warn!(log, "OSS reported {:3} overruns @ {} with the ring pinned; re-priming (+{} warnings suppressed)",
-        overrun_count, now, suppressed);
+            crate::warn!(
+                log,
+                "OSS reported {:3} overruns @ {} with the ring pinned; re-priming (+{} warnings suppressed)",
+                overrun_count,
+                now,
+                suppressed
+            );
         }
         // only for real recovery, not per ignored tick
         // the host callback table outlives the node (set_callbacks contract)
@@ -955,8 +960,8 @@ pub(crate) static mut OSS_SOURCE_TOPIC: spa_log_topic = spa_log_topic {
 #[cfg(test)]
 mod tests {
     use super::{
-        bounded_read, fill_targets, follower_servo, recover_overrun, retune_period, ring_request,
-        ring_required, SourceDir, SourcePortExt,
+        SourceDir, SourcePortExt, bounded_read, fill_targets, follower_servo, recover_overrun,
+        retune_period, ring_request, ring_required,
     };
     use crate::sound::test_util::{pattern, pipe_pair};
     use libspa::sys::spa_callbacks;

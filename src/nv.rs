@@ -11,7 +11,7 @@ use std::os::raw::c_void;
 // with ZFS's libnvpair); C callers get the mapping from sys/nv_namespace.h,
 // which a raw extern block bypasses - hence the explicit link names.
 #[link(name = "nv")]
-extern "C" {
+unsafe extern "C" {
     #[link_name = "FreeBSD_nvlist_unpack"]
     fn nvlist_unpack(buf: *const c_void, size: usize, flags: c_int) -> *mut c_void;
     #[link_name = "FreeBSD_nvlist_destroy"]

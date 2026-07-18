@@ -483,11 +483,7 @@ pub(crate) unsafe fn block_on_loop<T, F: FnOnce(&mut T) + Send>(
         let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             f(target.as_mut().expect("target is not supposed to be null"));
         }));
-        if ok.is_err() {
-            -libc::ECANCELED
-        } else {
-            0
-        }
+        if ok.is_err() { -libc::ECANCELED } else { 0 }
     }
 
     // blocking, so `ctx` outlives the call
