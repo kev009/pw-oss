@@ -155,7 +155,6 @@ pub(crate) trait Direction: Sized + 'static {
     // set_io: the driver/follower role flipped on a live node
     fn on_role_flip(state: &mut State<Self>);
 
-    unsafe fn update_timers(state: &mut State<Self>);
     // on_timeout: debug-build cycle tracing (the sink prints one line)
     unsafe fn debug_cycle(state: &State<Self>, now: u64, nsec: u64);
     // on_timeout servo hooks (see node::timeout_servo): the extra readiness
@@ -710,7 +709,11 @@ unsafe extern "C" fn on_timeout<D: Direction>(source: *mut spa_source) {
         return; // ios cleared while the timer was armed; skip the cycle
     }
 
-    let now = crate::utils::now_ns(&state.data_system);
+    // a failed clock read parks the timer (one-shot; only set_timeout re-arms)
+    // instead of aborting the data loop
+    let Some(now) = crate::utils::try_now_ns(&state.data_system) else {
+        return;
+    };
 
     // resync after a long stall instead of replaying a burst of stale cycles
     // (ALSA snaps when more than a second behind)
@@ -772,6 +775,27 @@ unsafe extern "C" fn on_timeout<D: Direction>(source: *mut spa_source) {
     }
 
     unsafe { set_timeout(state, state.next_time) };
+}
+
+// Data loop only. Arm the wakeup timer from now when this node drives the
+// graph (started, not following, position present); park it otherwise. A
+// failed clock read parks too - process()/on_timeout degrade the same way -
+// rather than aborting the data loop (the sink's former copy assert!()ed).
+pub(crate) unsafe fn update_timers<D: Direction>(state: &mut State<D>) {
+    #[cfg(debug_assertions)]
+    crate::trace!(state.log, "update_timers");
+
+    let next = if state.started && !state.following && !state.position.is_null() {
+        crate::utils::try_now_ns(&state.data_system).unwrap_or(0)
+    } else {
+        0
+    };
+    if next != 0 {
+        state.next_time = next;
+    }
+    #[cfg(debug_assertions)]
+    crate::trace!(state.log, "next time {}", next);
+    unsafe { set_timeout(state, next) };
 }
 
 pub(crate) unsafe fn set_timeout<D: Direction>(state: &mut State<D>, next_time: u64) {
@@ -864,7 +888,7 @@ unsafe extern "C" fn set_io<D: Direction>(
                 // rearm/park only on a real transition (io presence or role); resetting
                 // the timer phase on every re-point causes cycle bunching
                 if flipped || was_armed != armed {
-                    D::update_timers(state);
+                    update_timers(state);
                 }
             }
         })
@@ -916,7 +940,7 @@ unsafe extern "C" fn send_command<D: Direction>(
                     state.started = true;
                     state.following = state.node_is_follower();
 
-                    D::update_timers(state);
+                    update_timers(state);
                 })
             } {
                 return -libc::EIO;
@@ -928,7 +952,7 @@ unsafe extern "C" fn send_command<D: Direction>(
             if !unsafe {
                 crate::utils::block_on_loop(&(*state).data_loop, state, |state| {
                     state.started = false;
-                    D::update_timers(state);
+                    update_timers(state);
                 })
             } {
                 return -libc::EIO;
@@ -944,7 +968,7 @@ unsafe extern "C" fn send_command<D: Direction>(
             if !unsafe {
                 crate::utils::block_on_loop(&(*state).data_loop, state, |state| {
                     state.started = false;
-                    D::update_timers(state);
+                    update_timers(state);
                     D::on_suspend_loop(state);
                 })
             } {

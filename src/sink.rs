@@ -650,7 +650,10 @@ fn need_data(io: &crate::spa::IoArea<spa_io_buffers>, result: &mut c_int) {
 
 unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
     state.ext.old_timestamp = state.ext.cur_timestamp;
-    state.ext.cur_timestamp = crate::utils::now_ns(&state.data_system);
+    // on a failed clock read reuse the previous stamp (rate limits and the
+    // underrun gate degrade for a cycle) rather than abort the data loop
+    state.ext.cur_timestamp =
+        crate::utils::try_now_ns(&state.data_system).unwrap_or(state.ext.old_timestamp);
 
     // Freewheeling: the graph runs faster than realtime, so consume the input
     // without touching the device. The io NEED_DATA + return HAVE_DATA pair
@@ -1069,23 +1072,6 @@ impl Direction for SinkDir {
             port.dll.init();
             port.bw_adapt.reset();
             port.was_matching = false;
-        }
-    }
-
-    // data loop only
-    unsafe fn update_timers(state: &mut State<SinkDir>) {
-        #[cfg(debug_assertions)]
-        crate::trace!(state.log, "update_timers");
-
-        if state.started && !state.following && !state.position.is_null() {
-            state.next_time = crate::utils::now_ns(&state.data_system);
-            #[cfg(debug_assertions)]
-            crate::trace!(state.log, "next time {}", state.next_time);
-            unsafe { crate::node::set_timeout(state, state.next_time) };
-        } else {
-            #[cfg(debug_assertions)]
-            crate::trace!(state.log, "next time {}", 0);
-            unsafe { crate::node::set_timeout(state, 0) };
         }
     }
 

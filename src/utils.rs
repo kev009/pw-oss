@@ -959,14 +959,20 @@ impl RateLimit {
     }
 }
 
-pub(crate) fn now_ns(system: &crate::spa::System) -> u64 {
+// CLOCK_MONOTONIC through the host system vtable; None when the read fails.
+// Fallible on purpose: every caller runs on the data loop under extern "C",
+// where an assert would abort the whole daemon - each caller has a soft
+// path (park the timer, reuse the previous stamp, skip a cycle).
+pub(crate) fn try_now_ns(system: &crate::spa::System) -> Option<u64> {
     let mut now = libspa::sys::timespec {
         tv_sec: 0,
         tv_nsec: 0,
     };
     let err = unsafe { system.clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
-    assert!(err != -1);
-    (now.tv_sec * libspa::sys::SPA_NSEC_PER_SEC as i64 + now.tv_nsec) as u64
+    if err < 0 {
+        return None;
+    }
+    Some((now.tv_sec * libspa::sys::SPA_NSEC_PER_SEC as i64 + now.tv_nsec) as u64)
 }
 
 #[cfg(debug_assertions)]

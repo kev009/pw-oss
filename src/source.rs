@@ -601,10 +601,12 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
                 && port.setup_period != 0
                 && port.ext.period_mismatch == 0
             {
+                // 0 on a failed clock read: the bandwidth adaptation loses
+                // this cycle's window, nothing aborts
                 corr = follower_servo(
                     port,
                     queued,
-                    crate::utils::now_ns(&state.data_system),
+                    crate::utils::try_now_ns(&state.data_system).unwrap_or(0),
                     stride,
                 );
             }
@@ -637,11 +639,12 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
             0
         };
         if overruns > 0 {
+            // 0 on a failed clock read only mis-stamps the warn rate limit
             recover_overrun(
                 port,
                 overruns,
                 pre_read_fill,
-                crate::utils::now_ns(&state.data_system),
+                crate::utils::try_now_ns(&state.data_system).unwrap_or(0),
                 &state.callbacks,
                 &state.log,
             );
@@ -830,40 +833,6 @@ impl Direction for SourceDir {
             port.dll.init();
             port.bw_adapt.reset();
             port.was_matching = false;
-        }
-    }
-
-    // data loop only
-    unsafe fn update_timers(state: &mut State<SourceDir>) {
-        #[cfg(debug_assertions)]
-        crate::trace!(state.log, "update_timers");
-
-        let mut now = timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        let err = unsafe {
-            state
-                .data_system
-                .clock_gettime(libc::CLOCK_MONOTONIC, &mut now)
-        };
-        if err < 0 {
-            // a failed clock read must not abort the data loop (process and
-            // on_timeout degrade the same way); park the timer instead
-            unsafe { crate::node::set_timeout(state, 0) };
-            return;
-        }
-
-        state.next_time = (now.tv_sec * SPA_NSEC_PER_SEC as i64 + now.tv_nsec) as u64;
-
-        if state.started && !state.following && !state.position.is_null() {
-            #[cfg(debug_assertions)]
-            crate::trace!(state.log, "next time {}", state.next_time);
-            unsafe { crate::node::set_timeout(state, state.next_time) };
-        } else {
-            #[cfg(debug_assertions)]
-            crate::trace!(state.log, "next time {}", 0);
-            unsafe { crate::node::set_timeout(state, 0) };
         }
     }
 
