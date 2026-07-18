@@ -1058,11 +1058,8 @@ impl Direction for SinkDir {
     type Ext = SinkExt;
     type PortExt = SinkPortExt;
 
-    fn log_topic() -> &'static spa_log_topic {
-        #[allow(static_mut_refs)]
-        unsafe {
-            &OSS_SINK_TOPIC
-        }
+    fn log_topic() -> std::ptr::NonNull<spa_log_topic> {
+        std::ptr::NonNull::new(&raw mut OSS_SINK_TOPIC).expect("a static's address is never null")
     }
 
     fn info_item(ext: &mut SinkExt, key: &str, value: &str) {
@@ -1310,7 +1307,7 @@ pub const OSS_SINK_FACTORY: spa_handle_factory = spa_handle_factory {
 // mut: the host logger writes level/has_custom_level back after registration
 pub(crate) static mut OSS_SINK_TOPIC: spa_log_topic = spa_log_topic {
     version: SPA_VERSION_LOG_TOPIC,
-    topic: c"oss.sink".as_ptr(),
+    topic: c"spa.oss.sink".as_ptr(),
     level: SPA_LOG_LEVEL_NONE,
     has_custom_level: false,
 };

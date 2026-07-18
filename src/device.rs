@@ -930,7 +930,7 @@ unsafe fn apply_route_props(
                 // any width is accepted: mixer channel i reads v[i % n], so a mono
                 // request fans out and a wider-than-stereo one folds down
                 // log what the session manager actually sent; misapplied volumes
-                // are hard to attribute after the fact (PIPEWIRE_DEBUG=spa.oss:4)
+                // are hard to attribute after the fact (PIPEWIRE_DEBUG="spa.oss.*:4")
                 crate::debug!(
                     state.log,
                     "route {} channelVolumes {:?}",
@@ -1590,8 +1590,7 @@ unsafe extern "C" fn init(
 ) -> c_int {
     let log = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Log.as_ptr().cast())
         as *mut spa_log;
-    #[allow(static_mut_refs)]
-    let log = crate::spa::Log::wrap(log, Some(&OSS_DEVICE_TOPIC));
+    let log = crate::spa::Log::wrap(log, std::ptr::NonNull::new(&raw mut OSS_DEVICE_TOPIC));
 
     // the main loop and system drive the mixer poll timer; both are optional -
     // without them external mixer changes just go unnoticed
@@ -1781,7 +1780,7 @@ pub const OSS_DEVICE_FACTORY: spa_handle_factory = spa_handle_factory {
 // mut: the host logger writes level/has_custom_level back after registration
 pub(crate) static mut OSS_DEVICE_TOPIC: spa_log_topic = spa_log_topic {
     version: SPA_VERSION_LOG_TOPIC,
-    topic: c"oss.device".as_ptr(),
+    topic: c"spa.oss.device".as_ptr(),
     level: SPA_LOG_LEVEL_NONE,
     has_custom_level: false,
 };

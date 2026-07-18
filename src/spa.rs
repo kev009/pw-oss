@@ -644,27 +644,29 @@ impl System {
 }
 
 pub struct Log {
-    logger: &'static spa_log, // not really 'static, but it should outlive our plugin anyway
-    methods: &'static spa_log_methods, // ditto
-    // the module's registered topic (see the lib.rs section entries); the
-    // host enumerates and initializes the topics at plugin load
-    topic: Option<&'static spa_log_topic>,
+    // Raw pointers end to end, never long-lived references: the host logger
+    // mutates the spa_log pointee (level) and the registered topic
+    // (level/has_custom_level) at runtime, so holding a &'static over
+    // host-mutated memory would be unsound. The methods vtable gets the
+    // same treatment - nothing guarantees the host never touches it, and a
+    // per-call raw read costs nothing.
+    logger: std::ptr::NonNull<spa_log>,
+    methods: std::ptr::NonNull<spa_log_methods>,
+    // the module's registered topic (see the lib.rs section entries)
+    topic: Option<std::ptr::NonNull<spa_log_topic>>,
 }
 
 impl Log {
-    pub unsafe fn wrap(log: *mut spa_log, topic: Option<&'static spa_log_topic>) -> Self {
-        let logger = log
-            .cast::<spa_log>()
-            .as_ref()
-            .expect("log should be initialized");
-        let methods = logger
-            .iface
-            .cb
-            .funcs
-            .cast::<spa_log_methods>()
-            .as_ref()
+    pub unsafe fn wrap(log: *mut spa_log, topic: Option<std::ptr::NonNull<spa_log_topic>>) -> Self {
+        let logger = std::ptr::NonNull::new(log).expect("log should be initialized");
+        // the vtable pointer is read once here; the vtable fields are read
+        // per call through the raw pointer
+        let funcs = (*log).iface.cb.funcs;
+        let methods = std::ptr::NonNull::new(funcs.cast::<spa_log_methods>().cast_mut())
             .expect("log methods should be initialized");
-        assert!(methods.version >= SPA_VERSION_LOG_METHODS);
+        // no minimum-version assert: version 0 (predating the logt slot) is
+        // accepted - log() gates every logt read on the vtable being v1+,
+        // and the v0 `log` method covers the rest
         Self {
             logger,
             methods,
@@ -673,15 +675,30 @@ impl Log {
     }
 
     pub fn log_level(&self) -> spa_log_level {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        // The host logger rewrites the registered topic's level (and the
+        // logger's own level) from its own threads on runtime log-level
+        // changes (inherent to the C API). Per-call atomic views over the
+        // C-layout fields remove our side's contribution to the race, but
+        // the writer side stays plain C stores, so the mixed access
+        // formally remains a data race - UB, with no bounded worst case to
+        // appeal to. The host writes directly into the structs we handed
+        // it, so no plugin-side synchronization can intercept the stores,
+        // and every C plugin shares the pattern; the atomics merely narrow
+        // the practical exposure (aligned single-word loads, level-check
+        // only). The only sound alternative (an FFI shim serializing every
+        // read with the logger) would put a call on every log-level check.
         if let Some(topic) = self.topic {
-            if topic.has_custom_level {
-                topic.level
-            } else {
-                self.logger.level
+            let topic = topic.as_ptr();
+            unsafe {
+                let custom = AtomicBool::from_ptr(&raw mut (*topic).has_custom_level);
+                if custom.load(Ordering::Relaxed) {
+                    return AtomicU32::from_ptr(&raw mut (*topic).level).load(Ordering::Relaxed);
+                }
             }
-        } else {
-            self.logger.level
         }
+        let logger = self.logger.as_ptr();
+        unsafe { AtomicU32::from_ptr(&raw mut (*logger).level).load(Ordering::Relaxed) }
     }
 
     pub fn log(&self, level: spa_log_level, file: &str, line: c_int, func: &str, msg: &str) {
@@ -691,11 +708,21 @@ impl Log {
         let msg = CString::new(msg).unwrap_or_else(|_| c"<message contained NUL>".to_owned());
         let topic = self
             .topic
-            .map_or(std::ptr::null(), |topic| &raw const *topic);
+            .map_or(std::ptr::null(), |topic| topic.as_ptr().cast_const());
+        let methods = self.methods.as_ptr();
+        let data = unsafe { (*self.logger.as_ptr()).iface.cb.data };
+        // a v0 vtable has no logt slot at all (the C struct is shorter), so
+        // the field may only be read behind the version gate; a missing logt
+        // on a v1+ logger falls back the same way
+        let logt = if unsafe { (*methods).version } >= SPA_VERSION_LOG_METHODS {
+            unsafe { (*methods).logt }
+        } else {
+            None
+        };
         unsafe {
-            if let Some(logt) = self.methods.logt {
+            if let Some(logt) = logt {
                 logt(
-                    self.logger.iface.cb.data,
+                    data,
                     level,
                     topic,
                     file.as_ptr(),
@@ -705,9 +732,9 @@ impl Log {
                     msg.as_ptr(),
                 );
             } else {
-                let log = self.methods.log.expect("log should be initialized");
+                let log = (*methods).log.expect("log should be initialized");
                 log(
-                    self.logger.iface.cb.data,
+                    data,
                     level,
                     file.as_ptr(),
                     line,

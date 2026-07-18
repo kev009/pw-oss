@@ -818,11 +818,8 @@ impl Direction for SourceDir {
     type Ext = SourceExt;
     type PortExt = SourcePortExt;
 
-    fn log_topic() -> &'static spa_log_topic {
-        #[allow(static_mut_refs)]
-        unsafe {
-            &OSS_SOURCE_TOPIC
-        }
+    fn log_topic() -> std::ptr::NonNull<spa_log_topic> {
+        std::ptr::NonNull::new(&raw mut OSS_SOURCE_TOPIC).expect("a static's address is never null")
     }
 
     fn info_item(_ext: &mut SourceExt, _key: &str, _value: &str) {}
@@ -1034,7 +1031,7 @@ pub const OSS_SOURCE_FACTORY: spa_handle_factory = spa_handle_factory {
 // mut: the host logger writes level/has_custom_level back after registration
 pub(crate) static mut OSS_SOURCE_TOPIC: spa_log_topic = spa_log_topic {
     version: SPA_VERSION_LOG_TOPIC,
-    topic: c"oss.source".as_ptr(),
+    topic: c"spa.oss.source".as_ptr(),
     level: SPA_LOG_LEVEL_NONE,
     has_custom_level: false,
 };

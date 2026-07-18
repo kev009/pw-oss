@@ -281,8 +281,7 @@ unsafe extern "C" fn init(
 ) -> c_int {
     let log = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Log.as_ptr().cast())
         as *mut spa_log;
-    #[allow(static_mut_refs)]
-    let log = crate::spa::Log::wrap(log, Some(&OSS_MONITOR_TOPIC));
+    let log = crate::spa::Log::wrap(log, std::ptr::NonNull::new(&raw mut OSS_MONITOR_TOPIC));
 
     let main_loop = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Loop.as_ptr().cast())
         as *mut spa_loop;
@@ -418,7 +417,7 @@ pub const OSS_MONITOR_FACTORY: spa_handle_factory = spa_handle_factory {
 // mut: the host logger writes level/has_custom_level back after registration
 pub(crate) static mut OSS_MONITOR_TOPIC: spa_log_topic = spa_log_topic {
     version: SPA_VERSION_LOG_TOPIC,
-    topic: c"oss.monitor".as_ptr(),
+    topic: c"spa.oss.monitor".as_ptr(),
     level: SPA_LOG_LEVEL_NONE,
     has_custom_level: false,
 };

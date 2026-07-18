@@ -95,8 +95,9 @@ pub(crate) trait Direction: Sized + 'static {
     type Ext: Default; // direction-specific State fields
     type PortExt: Default; // direction-specific Port fields
 
-    // init: the module's registered log topic (see the lib.rs section entries)
-    fn log_topic() -> &'static spa_log_topic;
+    // init: the module's registered log topic (see the lib.rs section
+    // entries); a raw pointer because the host mutates the pointee
+    fn log_topic() -> std::ptr::NonNull<spa_log_topic>;
 
     // init: direction-specific node property keys (e.g. the sink's oss.delay)
     fn info_item(ext: &mut Self::Ext, key: &str, value: &str);
@@ -1265,8 +1266,8 @@ pub(crate) unsafe fn apply_props_param<D: Direction>(
 // tens of ms and must stay off the shared data loop - then swap only the
 // pointers there and close the old device back here. Exclusive devices
 // (bitperfect, vchans off) allow a single open per direction, so EBUSY retires
-// the old device first and retries, accepting a brief gap (the v0.9.1 order).
-// On failure the port is left cleared.
+// the old device first and retries, accepting a brief gap. On failure the
+// port is left cleared.
 pub(crate) unsafe fn install_device<D: Direction>(
     state: &mut State<D>,
     port_idx: usize,

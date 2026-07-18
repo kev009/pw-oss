@@ -93,8 +93,9 @@ Each source uses its own level control when it has one, the shared `rec`
 sources with no hardware control get a software route volume (applied in
 the graph, still selectable and persisted like any other route).
 
-Log verbosity follows the `spa.oss` topic, e.g.
-`PIPEWIRE_DEBUG='spa.oss:3' pipewire`.
+Log verbosity follows the `spa.oss.{device,sink,source,monitor}` topics;
+the quoted glob covers them all, e.g.
+`PIPEWIRE_DEBUG='spa.oss.*:3' pipewire`.
 
 ## Usage
 
