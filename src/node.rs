@@ -796,6 +796,152 @@ unsafe extern "C" fn port_enum_params<D: Direction>(
   0
 }
 
+// port_set_param(Format) with a pod: parse and validate the requested raw
+// format, snap it onto the caps under the NEAREST flag, and install the
+// device. Ok(res) falls through to the port-info re-emit (even on a failed
+// install - the flags derive from the then-cleared config); Err returns to
+// the host without emitting, matching the ALSA plugin's early rejects.
+// Ok(1) = the format deviates from the request (the adapter then re-reads
+// our Format param, alsa-pcm.c:2548 / audioadapter.c:596).
+unsafe fn set_format_param<D: Direction>(state: &mut State<D>, port_idx: usize, flags: u32, param: *const spa_pod) -> Result<c_int, c_int> {
+  use libspa::param::format::{MediaType, MediaSubtype};
+  use libspa::param::format_utils::parse_format;
+
+  match parse_format(libspa::pod::Pod::from_raw(param)) {
+    Ok((MediaType::Audio, MediaSubtype::Raw)) => (),
+    Ok((t, st)) => {
+      crate::warn!(state.log, "unknown media type combination: {:?}, {:?}", t, st);
+      return Err(-libc::ENOENT);
+    },
+    Err(err) => {
+      crate::warn!(state.log, "parse_format failed: {}", err);
+      return Err(-libc::EINVAL);
+    }
+  }
+
+  let mut raw = MaybeUninit::<spa_audio_info_raw>::uninit();
+  if spa_format_audio_raw_parse(param, raw.as_mut_ptr()) < 0 {
+    crate::warn!(state.log, "spa_format_audio_raw_parse failed");
+    return Err(-libc::EINVAL);
+  }
+
+  let mut raw = raw.assume_init();
+
+  // reject bad values rather than assert (an FFI panic aborts pipewire);
+  // format flags are stored but unused, OSS writes interleaved frames
+  if raw.rate == 0 || raw.channels == 0 || raw.channels > SPA_AUDIO_MAX_CHANNELS {
+    crate::warn!(state.log, "rejecting format: rate={} channels={}", raw.rate, raw.channels);
+    return Err(-libc::EINVAL);
+  }
+
+  // audioadapter always sets the follower format with NEAREST
+  // (audioadapter.c:758, :1059); snap only what the exact path
+  // below would reject, so in-caps requests stay untouched
+  let admitted = |caps: &crate::sound::DspCaps, raw: &spa_audio_info_raw| {
+    crate::utils::FORMAT_MAP.iter().find(|(_, f)| *f == raw.format)
+      .is_some_and(|(m, _)| caps.admits(*m, raw.channels, raw.rate))
+  };
+  let mut snapped = false;
+  if flags & crate::spa::SPA_NODE_PARAM_FLAG_NEAREST != 0 && !admitted(&state.caps, &raw) {
+    snapped = crate::utils::snap_raw_to_caps(&state.caps, &mut raw);
+    if snapped {
+      crate::info!(state.log, "snapped requested format to caps: format={} rate={} channels={}",
+        raw.format, raw.rate, raw.channels);
+    }
+  }
+
+  let config = D::parse_config(state, &raw)?;
+
+  // Validate against the advertised caps first: an out-of-caps
+  // request on an exclusive device would EBUSY-retire the WORKING
+  // fd and then fail configure, killing the stream for nothing.
+  // configure() stays as the backstop for stale caps (a rejection
+  // there re-probes and re-announces).
+  if !state.caps.admits(config.oss_format(), raw.channels, raw.rate) {
+    crate::warn!(state.log, "rejecting out-of-caps format: rate={} channels={}", raw.rate, raw.channels);
+    return Err(-libc::EINVAL);
+  }
+
+  let mut res = install_device(state, port_idx, config);
+  if res == 0 && snapped {
+    res = 1;
+  }
+  if res == -libc::EINVAL || res == -libc::ENOTSUP {
+    // the device rejected caps-derived values: the snapshot may be
+    // stale (vchans/bitperfect toggled at runtime); re-probe and
+    // re-announce EnumFormat so the host renegotiates from reality
+    if let Some(caps) = crate::sound::probe_caps(&state.dsp_path.clone(), D::PLAYBACK) {
+      state.caps_fallback = false;
+      // bump only on a real change: the serial flip re-triggers the
+      // adapter's negotiation, and an unchanged snapshot would loop
+      // it against the same rejection
+      if caps != state.caps {
+        crate::info!(state.log, "re-probed caps after rejection: {:?}", caps);
+        state.caps = caps;
+        state.port_info.bump_param(SPA_PARAM_EnumFormat);
+      }
+    }
+  }
+  Ok(res)
+}
+
+// port_set_param(Format) with a NULL pod: release the format. Close the
+// device and drop the buffers (the refused trigger-suspend may have closed
+// the dsp, hence the guard); all three are read by process(), so do it from
+// the data loop.
+unsafe fn release_format<D: Direction>(state: &mut State<D>, port_idx: usize) -> c_int {
+  let state_ptr: *mut State<D> = state;
+  if !crate::utils::block_on_loop(&(*state_ptr).data_loop, state_ptr, move |state| {
+    let port = &mut state.ports[port_idx];
+    if !port.dsp.is_closed() {
+      port.dsp.close();
+    }
+    port.buffers.clear();
+    port.config = None;
+  }) {
+    return -libc::EIO; // the loop still holds the buffers; freeing them would dangle
+  }
+  0
+}
+
+// update the port rate and flip Format/Buffers flags to reflect whether a
+// format is negotiated, then re-emit so the host re-reads them (PipeWire
+// ALSA sink/source pattern)
+unsafe fn publish_format_flags<D: Direction>(state: &mut State<D>, port_idx: usize) {
+  let _ = state.port_info.replace_change_mask(0);
+  if let Some(cfg) = state.ports[port_idx].config.as_ref() {
+    state.port_info.set_rate(spa_fraction { num: 1, denom: cfg.rate() });
+    state.port_info.set_param_flags(SPA_PARAM_Format,  SPA_PARAM_INFO_READWRITE);
+    state.port_info.set_param_flags(SPA_PARAM_Buffers, SPA_PARAM_INFO_READ);
+  } else {
+    state.port_info.set_param_flags(SPA_PARAM_Format,  SPA_PARAM_INFO_WRITE);
+    state.port_info.set_param_flags(SPA_PARAM_Buffers, 0);
+  }
+  emit_port_info(state);
+}
+
+// the host writes the reverse-direction latency (downstream for the sink,
+// upstream for the source); store it and re-emit so it propagates through
+// the graph
+unsafe fn set_latency_param<D: Direction>(state: &mut State<D>, direction: spa_direction, param: *const spa_pod) -> c_int {
+  let other = direction ^ 1;
+  let info = if param.is_null() {
+    crate::utils::latency_info_default(other)
+  } else {
+    match crate::utils::parse_latency_info(param) {
+      Some(info) if info.direction == other => info,
+      _ => return -libc::EINVAL
+    }
+  };
+  state.latency[info.direction as usize] = info;
+
+  let _ = state.port_info.replace_change_mask(0);
+  state.port_info.bump_param(SPA_PARAM_Latency);
+  emit_port_info(state);
+
+  0
+}
+
 unsafe extern "C" fn port_set_param<D: Direction>(object: *mut c_void, direction: spa_direction, port_id: u32, id: u32, flags: u32, param: *const spa_pod) -> c_int {
 
   let state = object.cast::<State<D>>().as_mut()
@@ -808,148 +954,22 @@ unsafe extern "C" fn port_set_param<D: Direction>(object: *mut c_void, direction
   #[allow(non_upper_case_globals)]
   match id {
     SPA_PARAM_Format => {
-      let mut res: c_int = 0;
-      if !param.is_null() {
-        use libspa::param::format::{MediaType, MediaSubtype};
-        use libspa::param::format_utils::parse_format;
-
-        match parse_format(libspa::pod::Pod::from_raw(param)) {
-          Ok((MediaType::Audio, MediaSubtype::Raw)) => {
-            let mut raw = MaybeUninit::<spa_audio_info_raw>::uninit();
-            if spa_format_audio_raw_parse(param, raw.as_mut_ptr()) < 0 {
-              crate::warn!(state.log, "spa_format_audio_raw_parse failed");
-              return -libc::EINVAL;
-            }
-
-            let mut raw = raw.assume_init();
-
-            // reject bad values rather than assert (an FFI panic aborts pipewire);
-            // format flags are stored but unused, OSS writes interleaved frames
-            if raw.rate == 0 || raw.channels == 0 || raw.channels > SPA_AUDIO_MAX_CHANNELS {
-              crate::warn!(state.log, "rejecting format: rate={} channels={}", raw.rate, raw.channels);
-              return -libc::EINVAL;
-            }
-
-            // audioadapter always sets the follower format with NEAREST
-            // (audioadapter.c:758, :1059); snap only what the exact path
-            // below would reject, so in-caps requests stay untouched
-            let admitted = |caps: &crate::sound::DspCaps, raw: &spa_audio_info_raw| {
-              crate::utils::FORMAT_MAP.iter().find(|(_, f)| *f == raw.format)
-                .is_some_and(|(m, _)| caps.admits(*m, raw.channels, raw.rate))
-            };
-            let mut snapped = false;
-            if flags & crate::spa::SPA_NODE_PARAM_FLAG_NEAREST != 0 && !admitted(&state.caps, &raw) {
-              snapped = crate::utils::snap_raw_to_caps(&state.caps, &mut raw);
-              if snapped {
-                crate::info!(state.log, "snapped requested format to caps: format={} rate={} channels={}",
-                  raw.format, raw.rate, raw.channels);
-              }
-            }
-
-            let config = match D::parse_config(state, &raw) {
-              Ok(config) => config,
-              Err(err)   => return err
-            };
-
-            // Validate against the advertised caps first: an out-of-caps
-            // request on an exclusive device would EBUSY-retire the WORKING
-            // fd and then fail configure, killing the stream for nothing.
-            // configure() stays as the backstop for stale caps (a rejection
-            // there re-probes and re-announces).
-            if !state.caps.admits(config.oss_format(), raw.channels, raw.rate) {
-              crate::warn!(state.log, "rejecting out-of-caps format: rate={} channels={}", raw.rate, raw.channels);
-              return -libc::EINVAL;
-            }
-
-            res = install_device(state, port_id as usize, config);
-            if res == 0 && snapped {
-              // we deviated from the request: return 1 (alsa-pcm.c:2548) so
-              // configure_format re-reads our Format param for the actual
-              // values (audioadapter.c:596)
-              res = 1;
-            }
-            if res == -libc::EINVAL || res == -libc::ENOTSUP {
-              // the device rejected caps-derived values: the snapshot may be
-              // stale (vchans/bitperfect toggled at runtime); re-probe and
-              // re-announce EnumFormat so the host renegotiates from reality
-              if let Some(caps) = crate::sound::probe_caps(&state.dsp_path.clone(), D::PLAYBACK) {
-                state.caps_fallback = false;
-                // bump only on a real change: the serial flip re-triggers the
-                // adapter's negotiation, and an unchanged snapshot would loop
-                // it against the same rejection
-                if caps != state.caps {
-                  crate::info!(state.log, "re-probed caps after rejection: {:?}", caps);
-                  state.caps = caps;
-                  state.port_info.bump_param(SPA_PARAM_EnumFormat);
-                }
-              }
-            }
-          },
-          Ok((t, st)) => {
-            crate::warn!(state.log, "unknown media type combination: {:?}, {:?}", t, st);
-            return -libc::ENOENT;
-          },
-          Err(err) => {
-            crate::warn!(state.log, "parse_format failed: {}", err);
-            return -libc::EINVAL
-          }
-        };
-      } else {
-        // releasing the format: close the device and drop the buffers (the
-        // refused trigger-suspend may have closed the dsp, hence the guard); all
-        // three are read by process(), so do it from the data loop
-        let port_idx = port_id as usize;
-        let state_ptr: *mut State<D> = state;
-        if !crate::utils::block_on_loop(&(*state_ptr).data_loop, state_ptr, move |state| {
-          let port = &mut state.ports[port_idx];
-          if !port.dsp.is_closed() {
-            port.dsp.close();
-          }
-          port.buffers.clear();
-          port.config = None;
-        }) {
-          return -libc::EIO; // the loop still holds the buffers; freeing them would dangle
+      let res = if !param.is_null() {
+        match set_format_param(state, port_id as usize, flags, param) {
+          Ok(res)  => res,
+          Err(err) => return err
         }
-      }
-
-      // update the port rate and flip Format/Buffers flags to reflect whether a
-      // format is negotiated, then re-emit so the host re-reads them (PipeWire
-      // ALSA sink/source pattern)
-      let _ = state.port_info.replace_change_mask(0);
-      if let Some(cfg) = state.ports[port_id as usize].config.as_ref() {
-        state.port_info.set_rate(spa_fraction { num: 1, denom: cfg.rate() });
-        state.port_info.set_param_flags(SPA_PARAM_Format,  SPA_PARAM_INFO_READWRITE);
-        state.port_info.set_param_flags(SPA_PARAM_Buffers, SPA_PARAM_INFO_READ);
       } else {
-        state.port_info.set_param_flags(SPA_PARAM_Format,  SPA_PARAM_INFO_WRITE);
-        state.port_info.set_param_flags(SPA_PARAM_Buffers, 0);
-      }
-      // emit even on failure: the flags derive from the (now cleared) config
-      emit_port_info(state);
-
-      res
-    },
-    SPA_PARAM_Latency => {
-      // the host writes the reverse-direction latency (downstream for the
-      // sink, upstream for the source); store it and re-emit so it propagates
-      // through the graph
-      let other = direction ^ 1;
-      let info = if param.is_null() {
-        crate::utils::latency_info_default(other)
-      } else {
-        match crate::utils::parse_latency_info(param) {
-          Some(info) if info.direction == other => info,
-          _ => return -libc::EINVAL
+        match release_format(state, port_id as usize) {
+          0   => 0,
+          err => return err
         }
       };
-      state.latency[info.direction as usize] = info;
-
-      let _ = state.port_info.replace_change_mask(0);
-      state.port_info.bump_param(SPA_PARAM_Latency);
-      emit_port_info(state);
-
-      0
+      // emit even on failure: the flags derive from the (now cleared) config
+      publish_format_flags(state, port_id as usize);
+      res
     },
+    SPA_PARAM_Latency => set_latency_param(state, direction, param),
     SPA_PARAM_Tag     => 0,
     id => {
       crate::warn!(state.log, "port_set_param: unknown param {}", id);
@@ -1316,6 +1336,78 @@ pub(crate) unsafe extern "C" fn get_size<D: Direction>(_factory: *const spa_hand
   std::mem::size_of::<State<D>>()
 }
 
+// the init-dict node properties: the device path, the shared oss.fragment
+// default and whatever direction-specific keys D::info_item consumes
+unsafe fn parse_init_dict<D: Direction>(info: *const spa_dict) -> (Option<String>, u32, D::Ext) {
+  let mut dsp_path     = None;
+  let mut oss_fragment = 0u32; // automatic (today's layout) unless the dict says otherwise
+  let mut ext          = D::Ext::default();
+
+  if let Some(info) = info.as_ref() {
+    #[cfg(debug_assertions)]
+    crate::spa::dump_spa_dict(info);
+
+    //TODO: would be better with an iterator
+    crate::spa::for_each_dict_item(info, |key, value| {
+      if key == crate::keys::OSS_DSP_PATH {
+        dsp_path = Some(value.to_string());
+      } else if key == crate::keys::OSS_FRAGMENT {
+        // direction-shared per-device default, e.g. from a wireplumber node
+        // rule; stored normalized so readback reports the effective value
+        if let Ok(v) = value.parse::<u32>() {
+          oss_fragment = normalize_fragment(v);
+        }
+      } else {
+        D::info_item(&mut ext, key, value);
+      }
+    });
+  }
+  D::ext_ready(&mut ext);
+
+  (dsp_path, oss_fragment, ext)
+}
+
+// the static node/port info published at init: flags, props and the param
+// directory (the readable/writable flags flip later in port_set_param)
+unsafe fn publish_static_info<D: Direction>(state: &mut State<D>) {
+
+  state.node_info.fix_pointers();
+
+  if D::DIRECTION == SPA_DIRECTION_INPUT {
+    state.node_info.set_max_input_ports(1);
+  } else {
+    state.node_info.set_max_output_ports(1);
+  }
+  state.node_info.set_flags(SPA_NODE_FLAG_RT as u64); // ?
+
+  state.node_info.add_prop(SPA_KEY_MEDIA_CLASS.as_ptr(), D::MEDIA_CLASS);
+  state.node_info.add_prop(SPA_KEY_NODE_DRIVER.as_ptr(), "true");
+
+  // no EnumPortConfig/PortConfig: dead surface on a follower, see the note
+  // above build_port_format_info
+  //state.node_info.add_param(SPA_PARAM_IO,             SPA_PARAM_INFO_READ);
+  //state.node_info.add_param(SPA_PARAM_EnumFormat,     SPA_PARAM_INFO_READ);
+  state.node_info.add_param(SPA_PARAM_PropInfo,       SPA_PARAM_INFO_READ);
+  state.node_info.add_param(SPA_PARAM_Props,          SPA_PARAM_INFO_READWRITE);
+  state.node_info.add_param(SPA_PARAM_ProcessLatency, SPA_PARAM_INFO_READWRITE);
+
+  state.port_info.fix_pointers();
+
+  state.port_info.set_flags((SPA_PORT_FLAG_PHYSICAL | SPA_PORT_FLAG_TERMINAL) as u64);
+  state.port_info.set_rate(spa_fraction { num: 1, denom: 48000 }); // ?
+
+  // advertise the format as writable so the host (re)negotiates it; Buffers is
+  // unreadable until a format is set (it needs the stride). Flags flip in
+  // port_set_param.
+  state.port_info.add_param(SPA_PARAM_EnumFormat, SPA_PARAM_INFO_READ);
+  state.port_info.add_param(SPA_PARAM_Format,     SPA_PARAM_INFO_WRITE);
+  state.port_info.add_param(SPA_PARAM_Buffers,    0);
+  state.port_info.add_param(SPA_PARAM_Latency,    SPA_PARAM_INFO_READWRITE);
+
+  //state.port_info.add_param(SPA_PARAM_IO,         SPA_PARAM_INFO_READ);
+  //state.port_info.add_param(SPA_PARAM_Buffers,    SPA_PARAM_INFO_WRITE); // ?
+}
+
 pub(crate) unsafe extern "C" fn init<D: Direction>(
   _factory:  *const spa_handle_factory,
   handle:    *mut   spa_handle,
@@ -1343,30 +1435,7 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
     return timer_fd; // fd exhaustion fails node creation, not the daemon
   }
 
-  let mut dsp_path     = None;
-  let mut oss_fragment = 0u32; // automatic (today's layout) unless the dict says otherwise
-  let mut ext          = D::Ext::default();
-
-  if let Some(info) = info.as_ref() {
-    #[cfg(debug_assertions)]
-    crate::spa::dump_spa_dict(info);
-
-    //TODO: would be better with an iterator
-    crate::spa::for_each_dict_item(info, |key, value| {
-      if key == crate::keys::OSS_DSP_PATH {
-        dsp_path = Some(value.to_string());
-      } else if key == crate::keys::OSS_FRAGMENT {
-        // direction-shared per-device default, e.g. from a wireplumber node
-        // rule; stored normalized so readback reports the effective value
-        if let Ok(v) = value.parse::<u32>() {
-          oss_fragment = normalize_fragment(v);
-        }
-      } else {
-        D::info_item(&mut ext, key, value);
-      }
-    });
-  }
-  D::ext_ready(&mut ext);
+  let (dsp_path, oss_fragment, ext) = parse_init_dict::<D>(info);
 
   let Some(dsp_path) = dsp_path else {
     data_system.close(timer_fd);
@@ -1483,41 +1552,7 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
     ext
   });
 
-  state.node_info.fix_pointers();
-
-  if D::DIRECTION == SPA_DIRECTION_INPUT {
-    state.node_info.set_max_input_ports(1);
-  } else {
-    state.node_info.set_max_output_ports(1);
-  }
-  state.node_info.set_flags(SPA_NODE_FLAG_RT as u64); // ?
-
-  state.node_info.add_prop(SPA_KEY_MEDIA_CLASS.as_ptr(), D::MEDIA_CLASS);
-  state.node_info.add_prop(SPA_KEY_NODE_DRIVER.as_ptr(), "true");
-
-  // no EnumPortConfig/PortConfig: dead surface on a follower, see the note
-  // above build_port_format_info
-  //state.node_info.add_param(SPA_PARAM_IO,             SPA_PARAM_INFO_READ);
-  //state.node_info.add_param(SPA_PARAM_EnumFormat,     SPA_PARAM_INFO_READ);
-  state.node_info.add_param(SPA_PARAM_PropInfo,       SPA_PARAM_INFO_READ);
-  state.node_info.add_param(SPA_PARAM_Props,          SPA_PARAM_INFO_READWRITE);
-  state.node_info.add_param(SPA_PARAM_ProcessLatency, SPA_PARAM_INFO_READWRITE);
-
-  state.port_info.fix_pointers();
-
-  state.port_info.set_flags((SPA_PORT_FLAG_PHYSICAL | SPA_PORT_FLAG_TERMINAL) as u64);
-  state.port_info.set_rate(spa_fraction { num: 1, denom: 48000 }); // ?
-
-  // advertise the format as writable so the host (re)negotiates it; Buffers is
-  // unreadable until a format is set (it needs the stride). Flags flip in
-  // port_set_param.
-  state.port_info.add_param(SPA_PARAM_EnumFormat, SPA_PARAM_INFO_READ);
-  state.port_info.add_param(SPA_PARAM_Format,     SPA_PARAM_INFO_WRITE);
-  state.port_info.add_param(SPA_PARAM_Buffers,    0);
-  state.port_info.add_param(SPA_PARAM_Latency,    SPA_PARAM_INFO_READWRITE);
-
-  //state.port_info.add_param(SPA_PARAM_IO,         SPA_PARAM_INFO_READ);
-  //state.port_info.add_param(SPA_PARAM_Buffers,    SPA_PARAM_INFO_WRITE); // ?
+  publish_static_info(state);
 
   spa_hook_list_init(&mut state.hooks);
 

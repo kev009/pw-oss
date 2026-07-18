@@ -765,219 +765,232 @@ unsafe fn apply_route_props(state: &mut State, pos: usize, props: libspa::pod::O
   }
 }
 
+// set_param(Profile): switch between Off (0) and the default profile (1),
+// addressed by index or name; a NULL pod resets to the boot default (on)
+unsafe fn set_profile_param(state: &mut State, param: *const spa_pod) -> c_int {
+
+  use libspa::pod::Value;
+
+  let mut index = None;
+  let mut name  = None;
+  let mut save  = false;
+  if param.is_null() {
+    index = Some(1);
+  } else {
+    match crate::utils::deserialize_pod(param) {
+    Some((_, Value::Object(o))) if o.type_ == SPA_TYPE_OBJECT_ParamProfile => {
+      for p in o.properties {
+        #[allow(non_upper_case_globals)]
+        match (p.key, p.value) {
+          (SPA_PARAM_PROFILE_index, Value::Int(v)) if (0..=1).contains(&v) => index = Some(v as u32),
+          (SPA_PARAM_PROFILE_name,  Value::String(v)) => name = Some(v),
+          (SPA_PARAM_PROFILE_save,  Value::Bool(v))   => save = v,
+          _ => ()
+        }
+      }
+    },
+    _ => return -libc::EINVAL
+    }
+  }
+
+  // session managers may address profiles by name instead of index
+  if index.is_none() {
+    index = match name.as_deref() {
+      Some("off")     => Some(0),
+      Some("default") => Some(1),
+      _               => None
+    };
+  }
+
+  let Some(index) = index else {
+    return -libc::EINVAL;
+  };
+
+  let profile_save_changed = state.profile_save != save;
+  state.profile_save = save;
+
+  if state.profile != index {
+    state.profile = index;
+    crate::info!(state.log, "profile -> {}", if index == 0 { "off" } else { "default" });
+
+    // The poll idles while Off, so external mixer changes may have gone
+    // unseen; refresh every shadow BEFORE the bump re-announces Route
+    // pods, or consumers read stale volumes for up to a tick.
+    if index != 0 {
+      // the recording source may have moved too; re-derive the active
+      // routes before their shadows are read
+      for mi in 0..state.mixers.len() {
+        let _ = sync_recsrc(state, mi);
+      }
+      for pos in 0..state.routes.len() {
+        refresh_route_shadow(state, pos);
+      }
+    }
+
+    // add or remove the nodes, then re-announce the params tied to the
+    // active profile (Route pods appear/vanish with it)
+    crate::spa::for_each_hook(&mut state.hooks, |entry| {
+      let f = entry.cb.funcs.cast::<spa_device_events>().as_ref()
+        .expect("hook should be initialized");
+      assert!(f.version >= SPA_VERSION_DEVICE_EVENTS);
+      emit_objects(f, entry.cb.data, &state.pcm_devices, &state.routes, &state.description, index != 0);
+    });
+
+    let _ = state.dev_info.replace_change_mask(0);
+    state.dev_info.bump_param(SPA_PARAM_Profile);
+    state.dev_info.bump_param(SPA_PARAM_EnumRoute);
+    state.dev_info.bump_param(SPA_PARAM_Route);
+    emit_device_info(state);
+  } else if profile_save_changed {
+    // the save flag is part of the Profile readback; keep it fresh
+    let _ = state.dev_info.replace_change_mask(0);
+    state.dev_info.bump_param(SPA_PARAM_Profile);
+    emit_device_info(state);
+  }
+
+  0
+}
+
+// resolve a Route pod's (index, name, device) triple to a routes[] position.
+// Device consistency is required: a stale in-range index (route set changed
+// since the state was saved) must lose to the durable name instead of
+// winning and then failing the device check.
+fn resolve_route_pos(state: &State, index: Option<usize>, name: Option<&str>, device: u32) -> Option<usize> {
+  index
+    .filter(|i| *i < state.routes.len() && state.routes[*i].node_id == device)
+    // sibling source routes share node_id, so a stale index passes the
+    // device filter; the durable name wins whenever it disagrees
+    .filter(|i| match name {
+      Some(nm) => state.routes[*i].name == nm,
+      None     => true
+    })
+    .or_else(|| name.and_then(|n|
+      state.routes.iter().position(|r| r.name == n && r.node_id == device)))
+}
+
+// set_param(Route): a volume/mute write to a route's props, a recording
+// port switch (selecting an inactive source route), or both
+unsafe fn set_route_param(state: &mut State, param: *const spa_pod) -> c_int {
+
+  use libspa::pod::Value;
+
+  if param.is_null() || state.profile == 0 {
+    return -libc::EINVAL; // no routes exist under the Off profile
+  }
+
+  let object = match crate::utils::deserialize_pod(param) {
+    Some((_, Value::Object(o))) if o.type_ == SPA_TYPE_OBJECT_ParamRoute => o,
+    _ => return -libc::EINVAL
+  };
+
+  let mut index  = None;
+  let mut name   = None;
+  let mut device = None;
+  let mut save   = false;
+  let mut props  = None;
+
+  for p in object.properties {
+    #[allow(non_upper_case_globals)]
+    match (p.key, p.value) {
+      (SPA_PARAM_ROUTE_index,  Value::Int(v)) if v >= 0 => index  = Some(v as usize),
+      (SPA_PARAM_ROUTE_name,   Value::String(v))        => name   = Some(v),
+      (SPA_PARAM_ROUTE_device, Value::Int(v)) if v >= 0 => device = Some(v as u32),
+      (SPA_PARAM_ROUTE_save,   Value::Bool(v))          => save   = v,
+      (SPA_PARAM_ROUTE_props,  Value::Object(o)) if o.type_ == SPA_TYPE_OBJECT_Props => props = Some(o),
+      _ => ()
+    }
+  }
+
+  let Some(device) = device else {
+    return -libc::EINVAL;
+  };
+  let Some(pos) = resolve_route_pos(state, index, name.as_deref(), device) else {
+    return -libc::EINVAL;
+  };
+
+  let save_changed = state.routes[pos].save != save;
+  state.routes[pos].save = save;
+
+  // Selecting an inactive source route is a port switch: write RECSRC
+  // with that source's bit. The kernel may strip it or fall back
+  // (mixer.c:347-357) and the driver decides what it really applied, so
+  // the readback in sync_recsrc names the route that became active.
+  let mut switched = None;
+  if state.routes[pos].source.is_some() && !state.routes[pos].active {
+    let mi  = state.routes[pos].mixer;
+    let bit = state.routes[pos].source.unwrap_or(0);
+    if state.mixers[mi].mixer.set_recsrc(1 << bit) {
+      switched = sync_recsrc(state, mi);
+      if switched != Some(pos) {
+        crate::info!(state.log, "kernel did not move the recording source to route {}",
+          state.routes[pos].name);
+        // re-announce even so: the session manager applied the switch
+        // optimistically and must re-read what really happened
+        announce_route_change(state);
+      }
+    } else {
+      crate::warn!(state.log, "can't select the recording source for route {}", state.routes[pos].name);
+    }
+  }
+
+  // a port-switch message carries no props and must not touch the volume
+  let mut vol_changed  = false;
+  let mut mute_changed = false;
+  if let Some(props) = props {
+    apply_route_props(state, pos, props, &mut vol_changed, &mut mute_changed);
+  }
+
+  // refresh the counter baseline in the same open as our own writes so
+  // the poll doesn't echo them back as an external change
+  let mi = state.routes[pos].mixer;
+  if let Some(counter) = state.mixers[mi].mixer.modify_counter() {
+    state.mixers[mi].counter = counter;
+  }
+
+  // bump only on an observable change: every spurious serial flip costs
+  // the session manager a full param re-enumeration
+  if vol_changed || mute_changed || save_changed || switched.is_some() {
+    announce_route_change(state);
+  }
+
+  // A switch changes which control feeds the node, so push the newly
+  // active route's state unless the props above already did. Props that
+  // rode a DEFLECTED switch were applied to a now-inactive route; the
+  // active gate keeps them off the node.
+  if vol_changed && !state.routes[pos].active {
+    vol_changed  = false;
+    mute_changed = false;
+  }
+  if let Some(active_pos) = switched {
+    {
+      if !(active_pos == pos && vol_changed) {
+        emit_object_config(state, active_pos, true);
+      }
+      if !(active_pos == pos && mute_changed) {
+        emit_object_config(state, active_pos, false);
+      }
+    }
+  }
+
+  if vol_changed {
+    emit_object_config(state, pos, true);
+  }
+  if mute_changed {
+    emit_object_config(state, pos, false);
+  }
+
+  0
+}
+
 unsafe extern "C" fn set_param(object: *mut c_void, id: u32, _flags: u32, param: *const spa_pod) -> c_int {
 
   let state = object.cast::<State>().as_mut()
     .expect("object is not supposed to be null");
 
-  use libspa::pod::Value;
-
   #[allow(non_upper_case_globals)]
   match id {
-    SPA_PARAM_Profile => {
-
-      let mut index = None;
-      let mut name  = None;
-      let mut save  = false;
-      if param.is_null() {
-        index = Some(1); // a NULL pod resets to the boot default (on)
-      } else {
-        match crate::utils::deserialize_pod(param) {
-        Some((_, Value::Object(o))) if o.type_ == SPA_TYPE_OBJECT_ParamProfile => {
-          for p in o.properties {
-            #[allow(non_upper_case_globals)]
-            match (p.key, p.value) {
-              (SPA_PARAM_PROFILE_index, Value::Int(v)) if (0..=1).contains(&v) => index = Some(v as u32),
-              (SPA_PARAM_PROFILE_name,  Value::String(v)) => name = Some(v),
-              (SPA_PARAM_PROFILE_save,  Value::Bool(v))   => save = v,
-              _ => ()
-            }
-          }
-        },
-        _ => return -libc::EINVAL
-        }
-      }
-
-      // session managers may address profiles by name instead of index
-      if index.is_none() {
-        index = match name.as_deref() {
-          Some("off")     => Some(0),
-          Some("default") => Some(1),
-          _               => None
-        };
-      }
-
-      let Some(index) = index else {
-        return -libc::EINVAL;
-      };
-
-      let profile_save_changed = state.profile_save != save;
-      state.profile_save = save;
-
-      if state.profile != index {
-        state.profile = index;
-        crate::info!(state.log, "profile -> {}", if index == 0 { "off" } else { "default" });
-
-        // The poll idles while Off, so external mixer changes may have gone
-        // unseen; refresh every shadow BEFORE the bump re-announces Route
-        // pods, or consumers read stale volumes for up to a tick.
-        if index != 0 {
-          // the recording source may have moved too; re-derive the active
-          // routes before their shadows are read
-          for mi in 0..state.mixers.len() {
-            let _ = sync_recsrc(state, mi);
-          }
-          for pos in 0..state.routes.len() {
-            refresh_route_shadow(state, pos);
-          }
-        }
-
-        // add or remove the nodes, then re-announce the params tied to the
-        // active profile (Route pods appear/vanish with it)
-        crate::spa::for_each_hook(&mut state.hooks, |entry| {
-          let f = entry.cb.funcs.cast::<spa_device_events>().as_ref()
-            .expect("hook should be initialized");
-          assert!(f.version >= SPA_VERSION_DEVICE_EVENTS);
-          emit_objects(f, entry.cb.data, &state.pcm_devices, &state.routes, &state.description, index != 0);
-        });
-
-        let _ = state.dev_info.replace_change_mask(0);
-        state.dev_info.bump_param(SPA_PARAM_Profile);
-        state.dev_info.bump_param(SPA_PARAM_EnumRoute);
-        state.dev_info.bump_param(SPA_PARAM_Route);
-        emit_device_info(state);
-      } else if profile_save_changed {
-        // the save flag is part of the Profile readback; keep it fresh
-        let _ = state.dev_info.replace_change_mask(0);
-        state.dev_info.bump_param(SPA_PARAM_Profile);
-        emit_device_info(state);
-      }
-
-      0
-    },
-    SPA_PARAM_Route => {
-
-      if param.is_null() || state.profile == 0 {
-        return -libc::EINVAL; // no routes exist under the Off profile
-      }
-
-      let object = match crate::utils::deserialize_pod(param) {
-        Some((_, Value::Object(o))) if o.type_ == SPA_TYPE_OBJECT_ParamRoute => o,
-        _ => return -libc::EINVAL
-      };
-
-      let mut index  = None;
-      let mut name   = None;
-      let mut device = None;
-      let mut save   = false;
-      let mut props  = None;
-
-      for p in object.properties {
-        #[allow(non_upper_case_globals)]
-        match (p.key, p.value) {
-          (SPA_PARAM_ROUTE_index,  Value::Int(v)) if v >= 0 => index  = Some(v as usize),
-          (SPA_PARAM_ROUTE_name,   Value::String(v))        => name   = Some(v),
-          (SPA_PARAM_ROUTE_device, Value::Int(v)) if v >= 0 => device = Some(v as u32),
-          (SPA_PARAM_ROUTE_save,   Value::Bool(v))          => save   = v,
-          (SPA_PARAM_ROUTE_props,  Value::Object(o)) if o.type_ == SPA_TYPE_OBJECT_Props => props = Some(o),
-          _ => ()
-        }
-      }
-
-      let Some(device) = device else {
-        return -libc::EINVAL;
-      };
-
-      // Resolve with device consistency required: a stale in-range index
-      // (route set changed since the state was saved) must lose to the
-      // durable name instead of winning and then failing the device check.
-      let pos = index
-        .filter(|i| *i < state.routes.len() && state.routes[*i].node_id == device)
-        // sibling source routes share node_id, so a stale index passes the
-        // device filter; the durable name wins whenever it disagrees
-        .filter(|i| match name.as_deref() {
-          Some(nm) => state.routes[*i].name == nm,
-          None     => true
-        })
-        .or_else(|| name.as_deref().and_then(|n|
-          state.routes.iter().position(|r| r.name == n && r.node_id == device)));
-      let Some(pos) = pos else {
-        return -libc::EINVAL;
-      };
-
-      let save_changed = state.routes[pos].save != save;
-      state.routes[pos].save = save;
-
-      // Selecting an inactive source route is a port switch: write RECSRC
-      // with that source's bit. The kernel may strip it or fall back
-      // (mixer.c:347-357) and the driver decides what it really applied, so
-      // the readback in sync_recsrc names the route that became active.
-      let mut switched = None;
-      if state.routes[pos].source.is_some() && !state.routes[pos].active {
-        let mi  = state.routes[pos].mixer;
-        let bit = state.routes[pos].source.unwrap_or(0);
-        if state.mixers[mi].mixer.set_recsrc(1 << bit) {
-          switched = sync_recsrc(state, mi);
-          if switched != Some(pos) {
-            crate::info!(state.log, "kernel did not move the recording source to route {}",
-              state.routes[pos].name);
-            // re-announce even so: the session manager applied the switch
-            // optimistically and must re-read what really happened
-            announce_route_change(state);
-          }
-        } else {
-          crate::warn!(state.log, "can't select the recording source for route {}", state.routes[pos].name);
-        }
-      }
-
-      // a port-switch message carries no props and must not touch the volume
-      let mut vol_changed  = false;
-      let mut mute_changed = false;
-      if let Some(props) = props {
-        apply_route_props(state, pos, props, &mut vol_changed, &mut mute_changed);
-      }
-
-      // refresh the counter baseline in the same open as our own writes so
-      // the poll doesn't echo them back as an external change
-      let mi = state.routes[pos].mixer;
-      if let Some(counter) = state.mixers[mi].mixer.modify_counter() {
-        state.mixers[mi].counter = counter;
-      }
-
-      // bump only on an observable change: every spurious serial flip costs
-      // the session manager a full param re-enumeration
-      if vol_changed || mute_changed || save_changed || switched.is_some() {
-        announce_route_change(state);
-      }
-
-      // A switch changes which control feeds the node, so push the newly
-      // active route's state unless the props above already did. Props that
-      // rode a DEFLECTED switch were applied to a now-inactive route; the
-      // active gate keeps them off the node.
-      if vol_changed && !state.routes[pos].active {
-        vol_changed  = false;
-        mute_changed = false;
-      }
-      if let Some(active_pos) = switched {
-        {
-          if !(active_pos == pos && vol_changed) {
-            emit_object_config(state, active_pos, true);
-          }
-          if !(active_pos == pos && mute_changed) {
-            emit_object_config(state, active_pos, false);
-          }
-        }
-      }
-
-      if vol_changed {
-        emit_object_config(state, pos, true);
-      }
-      if mute_changed {
-        emit_object_config(state, pos, false);
-      }
-
-      0
-    },
+    SPA_PARAM_Profile => set_profile_param(state, param),
+    SPA_PARAM_Route   => set_route_param(state, param),
     _ => -libc::ENOENT // unknown param id (ALSA convention)
   }
 }
@@ -1172,27 +1185,9 @@ fn probe_routes(pcm_devices: &[crate::sound::PcmDevice]) -> (Vec<RouteState>, Ve
   (routes, mixers)
 }
 
-unsafe extern "C" fn init(
-  _factory:  *const spa_handle_factory,
-  handle:    *mut   spa_handle,
-  info:      *const spa_dict,
-  support:   *const spa_support,
-  n_support: u32
-) -> c_int
-{
-  let log = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Log.as_ptr().cast()) as *mut spa_log;
-  let log = crate::spa::Log::wrap(log);
-
-  // the main loop and system drive the mixer poll timer; both are optional -
-  // without them external mixer changes just go unnoticed
-  let main_loop = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Loop  .as_ptr().cast()) as *mut spa_loop;
-  let system    = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_System.as_ptr().cast()) as *mut spa_system;
-  let main_loop = if main_loop.is_null() { None } else { Some(crate::spa::Loop  ::wrap(main_loop)) };
-  let system    = if system   .is_null() { None } else { Some(crate::spa::System::wrap(system)) };
-
-  let state = handle.cast::<State>().as_mut()
-    .expect("handle is not supposed to be null");
-
+// the init-dict device properties: the parent device name (for
+// SPA_KEY_DEVICE_NAME) and the pcm unit indexes this device aggregates
+unsafe fn parse_device_dict(info: *const spa_dict) -> (Option<String>, Vec<u32>) {
   let mut pcm_parent_device  = None;
   let mut pcm_device_indexes = vec![];
 
@@ -1216,20 +1211,12 @@ unsafe extern "C" fn init(
     });
   }
 
-  if pcm_device_indexes.is_empty() {
-    crate::error!(log, "{} should contain pcm device indexes", crate::keys::PCM_DEVICE_INDEXES);
-    return -libc::EINVAL;
-  }
+  (pcm_parent_device, pcm_device_indexes)
+}
 
-  let pcm_devices = crate::sound::list_pcm_devices(&pcm_device_indexes);
-
-  if pcm_devices.is_empty() {
-    crate::error!(log, "can't retrieve pcm device information");
-    return -libc::EINVAL;
-  }
-
-  let (routes, mixers) = probe_routes(&pcm_devices);
-
+// the device description shared by every aggregated pcm unit: the longest
+// common prefix of their descriptions, trimmed of a dangling " (" tail
+fn common_description(pcm_devices: &[crate::sound::PcmDevice]) -> String {
   let mut common_desc = pcm_devices[0].desc.clone();
   for pcm_device in &pcm_devices[1..] {
 
@@ -1249,6 +1236,103 @@ unsafe extern "C" fn init(
   while common_desc.ends_with(' ') || common_desc.ends_with('(') {
     common_desc.truncate(common_desc.len() - 1);
   }
+
+  common_desc
+}
+
+// arm the external-change watchers: the ~1 Hz mixer poll timer and the devd
+// socket (jack sense / recording-source flips). Both are best-effort - a
+// failure only costs noticing external changes - and only worth arming
+// when something is routed.
+unsafe fn arm_mixer_watch(state: &mut State) {
+  if state.routes.is_empty() {
+    return;
+  }
+
+  if let (Some(main_loop), Some(system)) = (&state.main_loop, &state.system) {
+    let fd = system.timerfd_create(libc::CLOCK_MONOTONIC, (SPA_FD_CLOEXEC | SPA_FD_NONBLOCK) as c_int);
+    if fd < 0 {
+      crate::warn!(state.log, "can't create the mixer poll timer; external volume changes won't be noticed");
+    }
+    if fd >= 0 {
+      let timerspec = itimerspec {
+        it_value:    timespec { tv_sec: 1, tv_nsec: 0 },
+        it_interval: timespec { tv_sec: 1, tv_nsec: 0 }
+      };
+      if system.timerfd_settime(fd, 0, &timerspec, std::ptr::null_mut()) < 0 {
+        crate::warn!(state.log, "can't arm the mixer poll timer");
+      }
+      state.timer_source.fd = fd;
+      if main_loop.add_source(&mut state.timer_source) >= 0 {
+        state.timer_added = true;
+      } else {
+        crate::warn!(state.log, "can't watch the mixer; external volume changes won't be noticed");
+        system.close(fd);
+        state.timer_source.fd = -1;
+      }
+    }
+  }
+
+  // devd's SND CONN notifications (jack sense, default-unit moves) nudge
+  // the same poll so kernel-side recording-source flips show up right
+  // away; losing devd only costs that immediacy (jails, minimal systems)
+  if let Some(main_loop) = &state.main_loop {
+    match crate::utils::DevdSocket::open() {
+      Ok(socket) => {
+        state.devd_source.fd = socket.fd();
+        state.devd_socket    = Some(socket);
+        if main_loop.add_source(&mut state.devd_source) >= 0 {
+          state.devd_added = true;
+        } else {
+          crate::warn!(state.log, "can't watch devd; jack events will wait for the mixer poll");
+          state.devd_socket    = None;
+          state.devd_source.fd = -1;
+        }
+      },
+      Err(err) => {
+        crate::info!(state.log, "no devd connection ({}); jack events will wait for the mixer poll", err);
+      }
+    }
+  }
+}
+
+unsafe extern "C" fn init(
+  _factory:  *const spa_handle_factory,
+  handle:    *mut   spa_handle,
+  info:      *const spa_dict,
+  support:   *const spa_support,
+  n_support: u32
+) -> c_int
+{
+  let log = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Log.as_ptr().cast()) as *mut spa_log;
+  let log = crate::spa::Log::wrap(log);
+
+  // the main loop and system drive the mixer poll timer; both are optional -
+  // without them external mixer changes just go unnoticed
+  let main_loop = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Loop  .as_ptr().cast()) as *mut spa_loop;
+  let system    = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_System.as_ptr().cast()) as *mut spa_system;
+  let main_loop = if main_loop.is_null() { None } else { Some(crate::spa::Loop  ::wrap(main_loop)) };
+  let system    = if system   .is_null() { None } else { Some(crate::spa::System::wrap(system)) };
+
+  let state = handle.cast::<State>().as_mut()
+    .expect("handle is not supposed to be null");
+
+  let (pcm_parent_device, pcm_device_indexes) = parse_device_dict(info);
+
+  if pcm_device_indexes.is_empty() {
+    crate::error!(log, "{} should contain pcm device indexes", crate::keys::PCM_DEVICE_INDEXES);
+    return -libc::EINVAL;
+  }
+
+  let pcm_devices = crate::sound::list_pcm_devices(&pcm_device_indexes);
+
+  if pcm_devices.is_empty() {
+    crate::error!(log, "can't retrieve pcm device information");
+    return -libc::EINVAL;
+  }
+
+  let (routes, mixers) = probe_routes(&pcm_devices);
+  let common_desc = common_description(&pcm_devices);
 
   std::ptr::write(state, State {
     handle: spa_handle {
@@ -1328,54 +1412,7 @@ unsafe extern "C" fn init(
 
   spa_hook_list_init(&mut state.hooks);
 
-  // ~1 Hz mixer poll; only worth arming when something is routed
-  if !state.routes.is_empty() {
-    if let (Some(main_loop), Some(system)) = (&state.main_loop, &state.system) {
-      let fd = system.timerfd_create(libc::CLOCK_MONOTONIC, (SPA_FD_CLOEXEC | SPA_FD_NONBLOCK) as c_int);
-      if fd < 0 {
-        crate::warn!(state.log, "can't create the mixer poll timer; external volume changes won't be noticed");
-      }
-      if fd >= 0 {
-        let timerspec = itimerspec {
-          it_value:    timespec { tv_sec: 1, tv_nsec: 0 },
-          it_interval: timespec { tv_sec: 1, tv_nsec: 0 }
-        };
-        if system.timerfd_settime(fd, 0, &timerspec, std::ptr::null_mut()) < 0 {
-          crate::warn!(state.log, "can't arm the mixer poll timer");
-        }
-        state.timer_source.fd = fd;
-        if main_loop.add_source(&mut state.timer_source) >= 0 {
-          state.timer_added = true;
-        } else {
-          crate::warn!(state.log, "can't watch the mixer; external volume changes won't be noticed");
-          system.close(fd);
-          state.timer_source.fd = -1;
-        }
-      }
-    }
-
-    // devd's SND CONN notifications (jack sense, default-unit moves) nudge
-    // the same poll so kernel-side recording-source flips show up right
-    // away; losing devd only costs that immediacy (jails, minimal systems)
-    if let Some(main_loop) = &state.main_loop {
-      match crate::utils::DevdSocket::open() {
-        Ok(socket) => {
-          state.devd_source.fd = socket.fd();
-          state.devd_socket    = Some(socket);
-          if main_loop.add_source(&mut state.devd_source) >= 0 {
-            state.devd_added = true;
-          } else {
-            crate::warn!(state.log, "can't watch devd; jack events will wait for the mixer poll");
-            state.devd_socket    = None;
-            state.devd_source.fd = -1;
-          }
-        },
-        Err(err) => {
-          crate::info!(state.log, "no devd connection ({}); jack events will wait for the mixer poll", err);
-        }
-      }
-    }
-  }
+  arm_mixer_watch(state);
 
   0
 }
