@@ -510,46 +510,49 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
         if port.dsp.is_closed() {
             // Suspend closed the device but the host restarted without a fresh
             // format; rebuild off-loop instead of tripping the dsp state asserts
-            port.resetup_pending = crate::node::queue_resetup(state_ptr, port_idx);
+            port.resetup_pending = unsafe { crate::node::queue_resetup(state_ptr, port_idx) };
             continue;
         }
 
-        if (*port.io).status == SPA_STATUS_HAVE_DATA as i32 {
+        if unsafe { (*port.io).status } == SPA_STATUS_HAVE_DATA as i32 {
             // a pending buffer the peer hasn't consumed yet: report HAVE_DATA, or
             // the adapter treats the cycle as empty (alsa-pcm-source.c does this)
             result |= SPA_STATUS_HAVE_DATA as i32;
             continue;
         }
-        if (*port.io).status != SPA_STATUS_OK as i32
-            && (*port.io).status != SPA_STATUS_NEED_DATA as i32
+        if unsafe { (*port.io).status } != SPA_STATUS_OK as i32
+            && unsafe { (*port.io).status } != SPA_STATUS_NEED_DATA as i32
         {
             continue;
         }
 
-        let buffer_id = if (*port.io).buffer_id == -1i32 as u32 {
+        let buffer_id = if unsafe { (*port.io).buffer_id } == -1i32 as u32 {
             // hand out the next never-used buffer; the host returns ids after that
             let idx = port.ext.active_buffers;
             port.ext.active_buffers += 1;
             idx as u32
         } else {
-            (*port.io).buffer_id
+            unsafe { (*port.io).buffer_id }
         };
 
         // buffer_id may be our fallback index; the validation is the shared
         // per-cycle gate (a source cycle just skips, no status to publish)
-        let Some(data_0) = crate::node::valid_data_block(port, buffer_id, &state.log) else {
+        let Some(data_0) = (unsafe { crate::node::valid_data_block(port, buffer_id, &state.log) })
+        else {
             continue;
         };
 
         // the raw block becomes a slice here: maxsize > 0 was just
         // validated, and the cycle owns the block until io publication
-        let cycle_data = std::slice::from_raw_parts_mut(
-            data_0.data.as_ptr().cast::<u8>(),
-            data_0.maxsize as usize,
-        );
+        let cycle_data = unsafe {
+            std::slice::from_raw_parts_mut(
+                data_0.data.as_ptr().cast::<u8>(),
+                data_0.maxsize as usize,
+            )
+        };
 
-        let matching =
-            state.following && !crate::utils::same_clock(state.position, &state.clock_name);
+        let matching = state.following
+            && !unsafe { crate::utils::same_clock(state.position, &state.clock_name) };
 
         let mut corr: f64 = 1.0; // DLL rate correction for the follower rate match
 
@@ -557,7 +560,7 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
         let mut period_in_bytes = 0u32;
         let mut graph_rate = 0u32;
         if !state.position.is_null() {
-            let driver_clock = (*state.position).clock;
+            let driver_clock = unsafe { (*state.position).clock };
             if driver_clock.target_rate.denom > 0 {
                 graph_rate = driver_clock.target_rate.denom;
                 period_in_bytes = crate::utils::device_period_bytes(
@@ -574,19 +577,19 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
             // rather than commit a fill target the current ring can't hold; if
             // even that fails (no main loop), keep running at the stale
             // geometry - degraded, but nothing stalls
-            port.resetup_pending = crate::node::queue_resetup(state_ptr, port_idx);
+            port.resetup_pending = unsafe { crate::node::queue_resetup(state_ptr, port_idx) };
             if port.resetup_pending {
                 continue;
             }
         }
 
         let freewheel = !state.position.is_null()
-            && (*state.position).clock.flags & SPA_IO_CLOCK_FLAG_FREEWHEEL != 0;
+            && unsafe { (*state.position).clock.flags } & SPA_IO_CLOCK_FLAG_FREEWHEEL != 0;
 
         // realtime resumed after freewheeling: the ring overflowed by design
-        // while reads were skipped, so re-prime explicitly for a known fill.
-        // (This used to lean on the overrun counter, which the gate below now
-        // deliberately ignores while the ring state is sane.)
+        // while reads were skipped, so re-prime explicitly for a known fill
+        // (the overrun gate below deliberately ignores the counter while the
+        // ring state is sane, so it cannot cover this)
         if port.ext.was_freewheeling && !freewheel {
             port.ext.primed = false;
         }
@@ -656,11 +659,15 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
         // rate matching coherent with the buffer we handed to the graph.
         if nbytes >= 0 && !port.rate_match.is_null() {
             if matching {
-                (*port.rate_match).flags |= SPA_IO_RATE_MATCH_FLAG_ACTIVE;
-                (*port.rate_match).rate = (1.0 / corr).clamp(0.99, 1.01);
+                unsafe {
+                    (*port.rate_match).flags |= SPA_IO_RATE_MATCH_FLAG_ACTIVE;
+                    (*port.rate_match).rate = (1.0 / corr).clamp(0.99, 1.01);
+                }
             } else {
-                (*port.rate_match).flags &= !SPA_IO_RATE_MATCH_FLAG_ACTIVE;
-                (*port.rate_match).rate = 1.0;
+                unsafe {
+                    (*port.rate_match).flags &= !SPA_IO_RATE_MATCH_FLAG_ACTIVE;
+                    (*port.rate_match).rate = 1.0;
+                }
             }
         }
 
@@ -686,22 +693,27 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
             #[cfg(debug_assertions)]
             if state.log.log_level() >= SPA_LOG_LEVEL_TRACE {
                 crate::trace!(state.log, "nbytes: {}", nbytes);
-                spa_debug_mem(0, data_0.data.as_ptr(), 16.min(nbytes) as usize);
+                unsafe { spa_debug_mem(0, data_0.data.as_ptr(), 16.min(nbytes) as usize) };
             }
 
-            let chunk = data_0.chunk.as_ptr();
-            (*chunk).offset = 0;
-            (*chunk).size = nbytes as u32;
-            (*chunk).stride = stride as i32;
-            (*chunk).flags = 0;
+            // chunk and io were validated non-null above for this cycle
+            unsafe {
+                let chunk = data_0.chunk.as_ptr();
+                (*chunk).offset = 0;
+                (*chunk).size = nbytes as u32;
+                (*chunk).stride = stride as i32;
+                (*chunk).flags = 0;
 
-            (*port.io).buffer_id = buffer_id;
-            (*port.io).status = SPA_STATUS_HAVE_DATA as i32;
+                (*port.io).buffer_id = buffer_id;
+                (*port.io).status = SPA_STATUS_HAVE_DATA as i32;
+            }
 
             result |= SPA_STATUS_HAVE_DATA as i32;
         } else {
-            (*port.io).buffer_id = buffer_id; // -1i32 as u32;
-            (*port.io).status = SPA_STATUS_OK as i32;
+            unsafe {
+                (*port.io).buffer_id = buffer_id; // -1i32 as u32;
+                (*port.io).status = SPA_STATUS_OK as i32;
+            }
         }
     }
 
@@ -730,7 +742,7 @@ impl Direction for SourceDir {
 
     fn ext_ready(_ext: &mut SourceExt) {}
 
-    unsafe fn build_node_param(
+    fn build_node_param(
         state: &mut State<SourceDir>,
         b: &mut libspa::pod::builder::Builder,
         id: u32,
@@ -766,13 +778,17 @@ impl Direction for SourceDir {
 
     // a NULL Props pod resets the props to their defaults and re-applies them
     unsafe fn reset_props(state: &mut State<SourceDir>) -> c_int {
-        let res = crate::node::store_and_rebuild(state, |state| {
-            state.oss_fragment = state.oss_fragment_default;
-        });
+        let res = unsafe {
+            crate::node::store_and_rebuild(state, |state| {
+                state.oss_fragment = state.oss_fragment_default;
+            })
+        };
         if res != 0 {
             return res;
         }
-        crate::node::handle_process_latency(state, crate::utils::process_latency_default());
+        unsafe {
+            crate::node::handle_process_latency(state, crate::utils::process_latency_default());
+        }
         0
     }
 
@@ -791,9 +807,11 @@ impl Direction for SourceDir {
                             let new_fragment = crate::node::normalize_fragment(*x as u32);
                             if new_fragment != state.oss_fragment {
                                 // unchanged echoes must not rebuild a running device
-                                let res = crate::node::apply_props_param(state, move |state| {
-                                    state.oss_fragment = new_fragment;
-                                });
+                                let res = unsafe {
+                                    crate::node::apply_props_param(state, move |state| {
+                                        state.oss_fragment = new_fragment;
+                                    })
+                                };
                                 if res != 0 {
                                     return res;
                                 }
@@ -808,7 +826,7 @@ impl Direction for SourceDir {
         0
     }
 
-    unsafe fn parse_config(
+    fn parse_config(
         state: &mut State<SourceDir>,
         raw: &spa_audio_info_raw,
     ) -> Result<PortConfig, c_int> {
@@ -888,9 +906,11 @@ impl Direction for SourceDir {
             tv_sec: 0,
             tv_nsec: 0,
         };
-        let err = state
-            .data_system
-            .clock_gettime(libc::CLOCK_MONOTONIC, &mut now);
+        let err = unsafe {
+            state
+                .data_system
+                .clock_gettime(libc::CLOCK_MONOTONIC, &mut now)
+        };
         assert!(err >= 0);
 
         state.next_time = (now.tv_sec * SPA_NSEC_PER_SEC as i64 + now.tv_nsec) as u64;
@@ -898,11 +918,11 @@ impl Direction for SourceDir {
         if state.started && !state.following && !state.position.is_null() {
             #[cfg(debug_assertions)]
             crate::trace!(state.log, "next time {}", state.next_time);
-            crate::node::set_timeout(state, state.next_time);
+            unsafe { crate::node::set_timeout(state, state.next_time) };
         } else {
             #[cfg(debug_assertions)]
             crate::trace!(state.log, "next time {}", 0);
-            crate::node::set_timeout(state, 0);
+            unsafe { crate::node::set_timeout(state, 0) };
         }
     }
 
@@ -930,7 +950,7 @@ impl Direction for SourceDir {
     }
 
     unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
-        process_ports(state)
+        unsafe { process_ports(state) }
     }
 }
 

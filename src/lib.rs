@@ -2,13 +2,10 @@
 // spa_log_topic_enum registration below; everything else is crate-internal,
 // and pub items would otherwise be exempt from dead_code analysis
 #![warn(unreachable_pub)]
-// unsafe_op_in_unsafe_fn (warn-by-default on edition 2024) is deliberately
-// allowed: for the remaining unsafe fns (FFI vtable entries, the raw-pointer
-// process paths) the whole body is the unsafe surface, and rustc's migration
-// wraps entire bodies in one block - indentation churn with no added
-// precision. Fns whose unsafe obligations are local already carry safe
-// signatures with narrow blocks.
-#![allow(unsafe_op_in_unsafe_fn)]
+// unsafe_op_in_unsafe_fn (warn-by-default on edition 2024) is honored: unsafe
+// fns wrap only their actual unsafe operations in narrow blocks, except for
+// short FFI trampolines and vtable-call wrappers whose whole body is the
+// unsafe surface.
 // mechanical-style clippy gates on top of the default set
 // (not unreadable_literal: the hex masks mirror sys/soundcard.h and grep
 // better without separators)
@@ -51,28 +48,31 @@ pub unsafe extern "C" fn spa_handle_factory_enum(
 ) -> c_int {
     assert!(!factory.is_null());
     assert!(!index.is_null());
-    match *index {
-        0 => {
-            *factory = &OSS_MONITOR_FACTORY;
-            *index += 1;
-            1
+    // non-null asserted above; the caller contract makes both valid and writable
+    unsafe {
+        match *index {
+            0 => {
+                *factory = &OSS_MONITOR_FACTORY;
+                *index += 1;
+                1
+            }
+            1 => {
+                *factory = &OSS_DEVICE_FACTORY;
+                *index += 1;
+                1
+            }
+            2 => {
+                *factory = &OSS_SINK_FACTORY;
+                *index += 1;
+                1
+            }
+            3 => {
+                *factory = &OSS_SOURCE_FACTORY;
+                *index += 1;
+                1
+            }
+            _ => 0,
         }
-        1 => {
-            *factory = &OSS_DEVICE_FACTORY;
-            *index += 1;
-            1
-        }
-        2 => {
-            *factory = &OSS_SINK_FACTORY;
-            *index += 1;
-            1
-        }
-        3 => {
-            *factory = &OSS_SOURCE_FACTORY;
-            *index += 1;
-            1
-        }
-        _ => 0,
     }
 }
 

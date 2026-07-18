@@ -108,7 +108,7 @@ unsafe fn rate_match_bytes(rate_match: *const spa_io_rate_match, stride: u32) ->
     if rate_match.is_null() {
         0
     } else {
-        (*rate_match).size.saturating_mul(stride)
+        unsafe { (*rate_match).size }.saturating_mul(stride)
     }
 }
 
@@ -693,10 +693,11 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
     // without touching the device. The io NEED_DATA + return HAVE_DATA pair
     // looks odd for a sink but matches alsa-pcm-sink.c:788-791; it is what
     // keeps the freewheel pump running.
-    if (*state.position).clock.flags & SPA_IO_CLOCK_FLAG_FREEWHEEL != 0 {
+    // position is non-null on the process path (checked by on_timeout/process)
+    if unsafe { (*state.position).clock.flags } & SPA_IO_CLOCK_FLAG_FREEWHEEL != 0 {
         for port in &mut state.ports {
             if !port.io.is_null() {
-                (*port.io).status = SPA_STATUS_NEED_DATA as i32;
+                unsafe { (*port.io).status = SPA_STATUS_NEED_DATA as i32 };
             }
         }
         return SPA_STATUS_HAVE_DATA as i32;
@@ -716,7 +717,7 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
 
         if port.resetup_pending {
             // the main thread is rebuilding the device; drop cycles until it lands
-            (*port.io).status = SPA_STATUS_NEED_DATA as i32;
+            unsafe { (*port.io).status = SPA_STATUS_NEED_DATA as i32 };
             result |= SPA_STATUS_NEED_DATA as i32;
             continue;
         }
@@ -724,41 +725,44 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
         if port.dsp.is_closed() {
             // Suspend closed the device but the host restarted without a fresh
             // format; rebuild off-loop instead of tripping the dsp state asserts
-            port.resetup_pending = crate::node::queue_resetup(state_ptr, port_idx);
-            (*port.io).status = SPA_STATUS_NEED_DATA as i32;
+            port.resetup_pending = unsafe { crate::node::queue_resetup(state_ptr, port_idx) };
+            unsafe { (*port.io).status = SPA_STATUS_NEED_DATA as i32 };
             result |= SPA_STATUS_NEED_DATA as i32;
             continue;
         }
 
-        if (*port.io).status != SPA_STATUS_HAVE_DATA as i32 {
+        if unsafe { (*port.io).status } != SPA_STATUS_HAVE_DATA as i32 {
             // no input this cycle (e.g. draining after stop); the clock (incl. the
             // draining delay) is published from on_timeout now, so just ask for data
-            (*port.io).status = SPA_STATUS_NEED_DATA as i32;
+            unsafe { (*port.io).status = SPA_STATUS_NEED_DATA as i32 };
             result |= SPA_STATUS_NEED_DATA as i32; // in the return too: the host prefetches only on this bit
             continue;
         }
 
-        let buffer_id = (*port.io).buffer_id;
-        let Some(data_0) = crate::node::valid_data_block(port, buffer_id, &state.log) else {
-            (*port.io).status = SPA_STATUS_NEED_DATA as i32;
+        let buffer_id = unsafe { (*port.io).buffer_id };
+        let Some(data_0) = (unsafe { crate::node::valid_data_block(port, buffer_id, &state.log) })
+        else {
+            unsafe { (*port.io).status = SPA_STATUS_NEED_DATA as i32 };
             result |= SPA_STATUS_NEED_DATA as i32; // return status, not just io, so the host refills
             continue;
         };
 
         // chunk non-null and maxsize > 0 guaranteed above
-        let offset = (*data_0.chunk.as_ptr()).offset % data_0.maxsize;
-        let size = (*data_0.chunk.as_ptr()).size.min(data_0.maxsize - offset);
+        let offset = unsafe { (*data_0.chunk.as_ptr()).offset } % data_0.maxsize;
+        let size = unsafe { (*data_0.chunk.as_ptr()).size }.min(data_0.maxsize - offset);
         // the raw block becomes a slice here: offset/size were just clamped
         // against maxsize, so the range is in bounds for the cycle
-        let cycle_data = std::slice::from_raw_parts(
-            data_0.data.as_ptr().cast::<u8>().add(offset as usize),
-            size as usize,
-        );
+        let cycle_data = unsafe {
+            std::slice::from_raw_parts(
+                data_0.data.as_ptr().cast::<u8>().add(offset as usize),
+                size as usize,
+            )
+        };
 
-        debug_assert_eq!((*data_0.chunk.as_ptr()).stride, stride as i32);
+        debug_assert_eq!(unsafe { (*data_0.chunk.as_ptr()).stride }, stride as i32);
 
         #[cfg(debug_assertions)]
-        if (*state.position).clock.flags & SPA_IO_CLOCK_FLAG_XRUN_RECOVER != 0 {
+        if unsafe { (*state.position).clock.flags } & SPA_IO_CLOCK_FLAG_XRUN_RECOVER != 0 {
             crate::warn!(
                 state.log,
                 "{}: SPA_IO_CLOCK_FLAG_XRUN_RECOVER @ {}",
@@ -770,16 +774,19 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
         #[cfg(debug_assertions)]
         if state.log.log_level() >= SPA_LOG_LEVEL_TRACE {
             crate::trace!(state.log, "offset: {}, chunk size: {}", offset, size);
-            spa_debug_mem(
-                0,
-                data_0.data.as_ptr().offset(offset as isize),
-                16.min(size) as usize,
-            );
+            // offset is in bounds for the block (clamped against maxsize above)
+            unsafe {
+                spa_debug_mem(
+                    0,
+                    data_0.data.as_ptr().offset(offset as isize),
+                    16.min(size) as usize,
+                );
+            }
         }
 
-        let driver_clock = (*state.position).clock;
-        let matching =
-            state.following && !crate::utils::same_clock(state.position, &state.clock_name);
+        let driver_clock = unsafe { (*state.position).clock };
+        let matching = state.following
+            && !unsafe { crate::utils::same_clock(state.position, &state.clock_name) };
 
         // the resampler can legitimately hand us a few frames over a quantum; warn
         // rather than debug_assert!, which would abort the process (panic across the
@@ -811,10 +818,10 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
             &state.log,
         ) {
             // the driver refused the trigger stop (dying fd): rebuild off-loop
-            port.resetup_pending = crate::node::queue_resetup(state_ptr, port_idx);
+            port.resetup_pending = unsafe { crate::node::queue_resetup(state_ptr, port_idx) };
             if port.resetup_pending {
                 port.was_matching = false; // the gap invalidates matching history
-                (*port.io).status = SPA_STATUS_NEED_DATA as i32;
+                unsafe { (*port.io).status = SPA_STATUS_NEED_DATA as i32 };
                 result |= SPA_STATUS_NEED_DATA as i32;
                 continue;
             }
@@ -878,11 +885,15 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
         port.was_matching = matching;
         if !port.rate_match.is_null() {
             if matching {
-                (*port.rate_match).flags |= SPA_IO_RATE_MATCH_FLAG_ACTIVE;
-                (*port.rate_match).rate = corr.clamp(0.99, 1.01);
+                unsafe {
+                    (*port.rate_match).flags |= SPA_IO_RATE_MATCH_FLAG_ACTIVE;
+                    (*port.rate_match).rate = corr.clamp(0.99, 1.01);
+                }
             } else {
-                (*port.rate_match).flags &= !SPA_IO_RATE_MATCH_FLAG_ACTIVE;
-                (*port.rate_match).rate = 1.0;
+                unsafe {
+                    (*port.rate_match).flags &= !SPA_IO_RATE_MATCH_FLAG_ACTIVE;
+                    (*port.rate_match).rate = 1.0;
+                }
             }
         }
 
@@ -902,7 +913,7 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
             }
         }
 
-        (*port.io).status = SPA_STATUS_NEED_DATA as i32;
+        unsafe { (*port.io).status = SPA_STATUS_NEED_DATA as i32 };
 
         // a sink has no output, so the return bit is NEED_DATA ("can accept input
         // next cycle"), matching the port io status, not HAVE_DATA.
@@ -941,7 +952,7 @@ impl Direction for SinkDir {
         ext.oss_delay_default = ext.oss_delay;
     }
 
-    unsafe fn build_node_param(
+    fn build_node_param(
         state: &mut State<SinkDir>,
         b: &mut libspa::pod::builder::Builder,
         id: u32,
@@ -988,14 +999,18 @@ impl Direction for SinkDir {
 
     // a NULL Props pod resets the props to their defaults and re-applies them
     unsafe fn reset_props(state: &mut State<SinkDir>) -> c_int {
-        let res = crate::node::store_and_rebuild(state, |state| {
-            state.ext.oss_delay = state.ext.oss_delay_default; // read by process()
-            state.oss_fragment = state.oss_fragment_default; // ditto (the prime path)
-        });
+        let res = unsafe {
+            crate::node::store_and_rebuild(state, |state| {
+                state.ext.oss_delay = state.ext.oss_delay_default; // read by process()
+                state.oss_fragment = state.oss_fragment_default; // ditto (the prime path)
+            })
+        };
         if res != 0 {
             return res;
         }
-        crate::node::handle_process_latency(state, crate::utils::process_latency_default());
+        unsafe {
+            crate::node::handle_process_latency(state, crate::utils::process_latency_default());
+        }
         0
     }
 
@@ -1013,9 +1028,11 @@ impl Direction for SinkDir {
                             let new_delay = (*x as u32).min(1024);
                             if new_delay != state.ext.oss_delay {
                                 // unchanged echoes must not rebuild a running device
-                                let res = crate::node::apply_props_param(state, move |state| {
-                                    state.ext.oss_delay = new_delay;
-                                });
+                                let res = unsafe {
+                                    crate::node::apply_props_param(state, move |state| {
+                                        state.ext.oss_delay = new_delay;
+                                    })
+                                };
                                 if res != 0 {
                                     return res;
                                 }
@@ -1028,9 +1045,11 @@ impl Direction for SinkDir {
                             // effective (rounded/clamped) value, not the raw request
                             let new_fragment = crate::node::normalize_fragment(*x as u32);
                             if new_fragment != state.oss_fragment {
-                                let res = crate::node::apply_props_param(state, move |state| {
-                                    state.oss_fragment = new_fragment;
-                                });
+                                let res = unsafe {
+                                    crate::node::apply_props_param(state, move |state| {
+                                        state.oss_fragment = new_fragment;
+                                    })
+                                };
                                 if res != 0 {
                                     return res;
                                 }
@@ -1045,7 +1064,7 @@ impl Direction for SinkDir {
         0
     }
 
-    unsafe fn parse_config(
+    fn parse_config(
         state: &mut State<SinkDir>,
         raw: &spa_audio_info_raw,
     ) -> Result<PortConfig, c_int> {
@@ -1128,11 +1147,11 @@ impl Direction for SinkDir {
             state.next_time = crate::utils::now_ns(&state.data_system);
             #[cfg(debug_assertions)]
             crate::trace!(state.log, "next time {}", state.next_time);
-            crate::node::set_timeout(state, state.next_time);
+            unsafe { crate::node::set_timeout(state, state.next_time) };
         } else {
             #[cfg(debug_assertions)]
             crate::trace!(state.log, "next time {}", 0);
-            crate::node::set_timeout(state, 0);
+            unsafe { crate::node::set_timeout(state, 0) };
         }
     }
 
@@ -1140,7 +1159,8 @@ impl Direction for SinkDir {
         #[cfg(debug_assertions)]
         eprintln!(
             "cycle: {}, delay: {} ms @ {}",
-            (*_state.position).clock.cycle,
+            // position is non-null on the process path (as in process_ports)
+            unsafe { (*_state.position).clock.cycle },
             _now.saturating_sub(_nsec) as f64 / 1000000.0,
             _now
         );
@@ -1167,7 +1187,7 @@ impl Direction for SinkDir {
     }
 
     unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
-        process_ports(state)
+        unsafe { process_ports(state) }
     }
 }
 

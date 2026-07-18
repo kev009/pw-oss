@@ -34,37 +34,39 @@ pub(crate) fn version_ok(version: u32, min: u32) -> bool {
 // plain list unlink fixes the cursor's neighbor pointers like any node's.
 // The former grab-next-first walk only survived self-removal.
 pub(crate) unsafe fn for_each_hook(head: *mut spa_hook_list, mut apply: impl FnMut(&spa_hook)) {
-    let list = std::ptr::addr_of_mut!((*head).list);
-    let mut cursor: spa_hook = std::mem::zeroed();
+    let list = unsafe { std::ptr::addr_of_mut!((*head).list) };
+    // all-zero is the C-struct cursor's valid initial state
+    let mut cursor: spa_hook = unsafe { std::mem::zeroed() };
     let cur = std::ptr::addr_of_mut!(cursor.link);
 
     // insert the cursor at the front
-    (*cur).prev = list;
-    (*cur).next = (*list).next;
-    (*(*list).next).prev = cur;
-    (*list).next = cur;
+    unsafe {
+        (*cur).prev = list;
+        (*cur).next = (*list).next;
+        (*(*list).next).prev = cur;
+        (*list).next = cur;
+    }
 
     loop {
-        let item = (*cur).next;
+        let item = unsafe { (*cur).next };
         if item == list {
             break;
         }
         // hop the cursor over the item: unlink, then relink after it
-        (*(*cur).prev).next = (*cur).next;
-        (*(*cur).next).prev = (*cur).prev;
-        (*cur).prev = item;
-        (*cur).next = (*item).next;
-        (*(*item).next).prev = cur;
-        (*item).next = cur;
+        unsafe {
+            (*(*cur).prev).next = (*cur).next;
+            (*(*cur).next).prev = (*cur).prev;
+            (*cur).prev = item;
+            (*cur).next = (*item).next;
+            (*(*item).next).prev = cur;
+            (*item).next = cur;
+        }
 
         // spa_hook's link is its first field, so the list node IS the hook.
         // Null funcs marks another iteration's cursor woven into this list
         // (a listener callback re-entering an emission path); skip it like
         // C's spa_callback_check does.
-        let hook = item
-            .cast::<spa_hook>()
-            .as_ref()
-            .expect("broken spa_hook_list");
+        let hook = unsafe { item.cast::<spa_hook>().as_ref() }.expect("broken spa_hook_list");
         if hook.cb.funcs.is_null() {
             continue;
         }
@@ -72,8 +74,10 @@ pub(crate) unsafe fn for_each_hook(head: *mut spa_hook_list, mut apply: impl FnM
     }
 
     // unlink the cursor
-    (*(*cur).prev).next = (*cur).next;
-    (*(*cur).next).prev = (*cur).prev;
+    unsafe {
+        (*(*cur).prev).next = (*cur).next;
+        (*(*cur).next).prev = (*cur).prev;
+    }
 }
 
 pub(crate) unsafe fn dev_emit_result(
@@ -83,24 +87,27 @@ pub(crate) unsafe fn dev_emit_result(
     type_: u32,
     result: &spa_result_device_params,
 ) {
-    for_each_hook(hooks, |entry| {
-        let f = entry
-            .cb
-            .funcs
-            .cast::<spa_device_events>()
-            .as_ref()
-            .expect("hook should be initialized");
-        assert!(version_ok(f.version, SPA_VERSION_DEVICE_EVENTS));
-        if let Some(result_fun) = f.result {
-            result_fun(
-                entry.cb.data,
-                seq,
-                res,
-                type_,
-                result as *const _ as *const c_void,
-            );
-        }
-    });
+    // one emission through the C listener vtables end to end
+    unsafe {
+        for_each_hook(hooks, |entry| {
+            let f = entry
+                .cb
+                .funcs
+                .cast::<spa_device_events>()
+                .as_ref()
+                .expect("hook should be initialized");
+            assert!(version_ok(f.version, SPA_VERSION_DEVICE_EVENTS));
+            if let Some(result_fun) = f.result {
+                result_fun(
+                    entry.cb.data,
+                    seq,
+                    res,
+                    type_,
+                    result as *const _ as *const c_void,
+                );
+            }
+        });
+    }
 }
 
 // Run spa_pod_filter with the output going into `out` through its own builder.
@@ -114,7 +121,7 @@ pub(crate) unsafe fn filter_pod(
 ) -> Option<*mut spa_pod> {
     let builder = libspa::pod::builder::Builder::new(out);
     let mut param: *mut spa_pod = std::ptr::null_mut();
-    if spa_pod_filter(builder.as_raw_ptr(), &mut param, src, filter) >= 0 {
+    if unsafe { spa_pod_filter(builder.as_raw_ptr(), &mut param, src, filter) } >= 0 {
         Some(param)
     } else {
         None
@@ -123,18 +130,21 @@ pub(crate) unsafe fn filter_pod(
 
 // sync() replies with an empty result carrying the sequence number
 pub(crate) unsafe fn node_emit_done(hooks: &mut spa_hook_list, seq: c_int) {
-    for_each_hook(hooks, |entry| {
-        let f = entry
-            .cb
-            .funcs
-            .cast::<spa_node_events>()
-            .as_ref()
-            .expect("hook should be initialized");
-        assert!(version_ok(f.version, SPA_VERSION_NODE_EVENTS));
-        if let Some(result_fun) = f.result {
-            result_fun(entry.cb.data, seq, 0, 0, std::ptr::null());
-        }
-    });
+    // one emission through the C listener vtables end to end
+    unsafe {
+        for_each_hook(hooks, |entry| {
+            let f = entry
+                .cb
+                .funcs
+                .cast::<spa_node_events>()
+                .as_ref()
+                .expect("hook should be initialized");
+            assert!(version_ok(f.version, SPA_VERSION_NODE_EVENTS));
+            if let Some(result_fun) = f.result {
+                result_fun(entry.cb.data, seq, 0, 0, std::ptr::null());
+            }
+        });
+    }
 }
 
 pub(crate) unsafe fn node_emit_result(
@@ -144,46 +154,52 @@ pub(crate) unsafe fn node_emit_result(
     type_: u32,
     result: &spa_result_node_params,
 ) {
-    for_each_hook(hooks, |entry| {
-        let f = entry
-            .cb
-            .funcs
-            .cast::<spa_node_events>()
-            .as_ref()
-            .expect("hook should be initialized");
-        assert!(version_ok(f.version, SPA_VERSION_NODE_EVENTS));
-        if let Some(result_fun) = f.result {
-            result_fun(
-                entry.cb.data,
-                seq,
-                res,
-                type_,
-                result as *const _ as *const c_void,
-            );
-        }
-    });
+    // one emission through the C listener vtables end to end
+    unsafe {
+        for_each_hook(hooks, |entry| {
+            let f = entry
+                .cb
+                .funcs
+                .cast::<spa_node_events>()
+                .as_ref()
+                .expect("hook should be initialized");
+            assert!(version_ok(f.version, SPA_VERSION_NODE_EVENTS));
+            if let Some(result_fun) = f.result {
+                result_fun(
+                    entry.cb.data,
+                    seq,
+                    res,
+                    type_,
+                    result as *const _ as *const c_void,
+                );
+            }
+        });
+    }
 }
 
 pub(crate) unsafe fn for_each_dict_item(dict: &spa_dict, mut apply: impl FnMut(&str, &str)) {
     if dict.n_items == 0 || dict.items.is_null() {
         return;
     }
-    for item in std::slice::from_raw_parts(dict.items, dict.n_items as usize) {
+    // items is non-null (checked above) and valid for n_items per the caller
+    for item in unsafe { std::slice::from_raw_parts(dict.items, dict.n_items as usize) } {
         if item.key.is_null() || item.value.is_null() {
             continue; // malformed host dict; skip rather than fault
         }
-        // host-supplied strings; don't abort on stray bytes
-        let key = CStr::from_ptr(item.key).to_string_lossy();
-        let value = CStr::from_ptr(item.value).to_string_lossy();
+        // host-supplied strings (null-checked above); don't abort on stray bytes
+        let key = unsafe { CStr::from_ptr(item.key) }.to_string_lossy();
+        let value = unsafe { CStr::from_ptr(item.value) }.to_string_lossy();
         apply(&key, &value);
     }
 }
 
 #[cfg(debug_assertions)]
 pub(crate) unsafe fn dump_spa_dict(dict: &spa_dict) {
-    for_each_dict_item(dict, |key, value| {
-        eprintln!("dict item: key = {key:?}, value = {value:?}");
-    });
+    unsafe {
+        for_each_dict_item(dict, |key, value| {
+            eprintln!("dict item: key = {key:?}, value = {value:?}");
+        });
+    }
 }
 
 pub(crate) enum DictionaryString {
@@ -570,16 +586,9 @@ pub(crate) struct Loop {
 
 impl Loop {
     pub(crate) unsafe fn wrap(loop_: *mut spa_loop) -> Self {
-        let loop_ = loop_
-            .cast::<spa_loop>()
-            .as_ref()
-            .expect("loop should be initialized");
-        let methods = loop_
-            .iface
-            .cb
-            .funcs
-            .cast::<spa_loop_methods>()
-            .as_ref()
+        let loop_ =
+            unsafe { loop_.cast::<spa_loop>().as_ref() }.expect("loop should be initialized");
+        let methods = unsafe { loop_.iface.cb.funcs.cast::<spa_loop_methods>().as_ref() }
             .expect("loop methods should be initialized");
         assert!(version_ok(methods.version, SPA_VERSION_LOOP_METHODS));
         Self { loop_, methods }
@@ -590,7 +599,7 @@ impl Loop {
             .methods
             .add_source
             .expect("add_source should be initialized");
-        spa_loop_add_source(self.loop_.iface.cb.data, source)
+        unsafe { spa_loop_add_source(self.loop_.iface.cb.data, source) }
     }
 
     // must be called from the loop thread (or through an invoke)
@@ -599,7 +608,7 @@ impl Loop {
             .methods
             .remove_source
             .expect("remove_source should be initialized");
-        spa_loop_remove_source(self.loop_.iface.cb.data, source)
+        unsafe { spa_loop_remove_source(self.loop_.iface.cb.data, source) }
     }
 
     pub(crate) unsafe fn invoke(
@@ -612,15 +621,17 @@ impl Loop {
         user_data: *mut c_void,
     ) -> c_int {
         let spa_loop_invoke = self.methods.invoke.expect("invoke should be initialized");
-        spa_loop_invoke(
-            self.loop_.iface.cb.data,
-            func,
-            seq,
-            data,
-            size,
-            block,
-            user_data,
-        )
+        unsafe {
+            spa_loop_invoke(
+                self.loop_.iface.cb.data,
+                func,
+                seq,
+                data,
+                size,
+                block,
+                user_data,
+            )
+        }
     }
 }
 
@@ -631,16 +642,9 @@ pub(crate) struct System {
 
 impl System {
     pub(crate) unsafe fn wrap(system: *mut spa_system) -> Self {
-        let system = system
-            .cast::<spa_system>()
-            .as_ref()
-            .expect("system should be initialized");
-        let methods = system
-            .iface
-            .cb
-            .funcs
-            .cast::<spa_system_methods>()
-            .as_ref()
+        let system =
+            unsafe { system.cast::<spa_system>().as_ref() }.expect("system should be initialized");
+        let methods = unsafe { system.iface.cb.funcs.cast::<spa_system_methods>().as_ref() }
             .expect("system methods should be initialized");
         assert!(version_ok(methods.version, SPA_VERSION_SYSTEM_METHODS));
         Self { system, methods }
@@ -648,7 +652,7 @@ impl System {
 
     pub(crate) unsafe fn close(&self, fd: c_int) -> c_int {
         let spa_system_close = self.methods.close.expect("close should be initialized");
-        spa_system_close(self.system.iface.cb.data, fd)
+        unsafe { spa_system_close(self.system.iface.cb.data, fd) }
     }
 
     pub(crate) unsafe fn clock_gettime(&self, clock_id: c_int, value: *mut timespec) -> c_int {
@@ -656,7 +660,7 @@ impl System {
             .methods
             .clock_gettime
             .expect("clock_gettime should be initialized");
-        spa_system_clock_gettime(self.system.iface.cb.data, clock_id, value)
+        unsafe { spa_system_clock_gettime(self.system.iface.cb.data, clock_id, value) }
     }
 
     pub(crate) unsafe fn timerfd_create(&self, clock_id: c_int, flags: c_int) -> c_int {
@@ -664,7 +668,7 @@ impl System {
             .methods
             .timerfd_create
             .expect("timerfd_create should be assigned");
-        spa_system_timerfd_create(self.system.iface.cb.data, clock_id, flags)
+        unsafe { spa_system_timerfd_create(self.system.iface.cb.data, clock_id, flags) }
     }
 
     pub(crate) unsafe fn timerfd_read(&self, fd: c_int, expirations: *mut u64) -> c_int {
@@ -672,7 +676,7 @@ impl System {
             .methods
             .timerfd_read
             .expect("timerfd_read should be initialized");
-        spa_system_timerfd_read(self.system.iface.cb.data, fd, expirations)
+        unsafe { spa_system_timerfd_read(self.system.iface.cb.data, fd, expirations) }
     }
 
     pub(crate) unsafe fn timerfd_settime(
@@ -686,7 +690,9 @@ impl System {
             .methods
             .timerfd_settime
             .expect("timerfd_settime should be initialized");
-        spa_system_timerfd_settime(self.system.iface.cb.data, fd, flags, new_value, old_value)
+        unsafe {
+            spa_system_timerfd_settime(self.system.iface.cb.data, fd, flags, new_value, old_value)
+        }
     }
 }
 
@@ -711,7 +717,7 @@ impl Log {
         let logger = std::ptr::NonNull::new(log).expect("log should be initialized");
         // the vtable pointer is read once here; the vtable fields are read
         // per call through the raw pointer
-        let funcs = (*log).iface.cb.funcs;
+        let funcs = unsafe { (*log).iface.cb.funcs };
         let methods = std::ptr::NonNull::new(funcs.cast::<spa_log_methods>().cast_mut())
             .expect("log methods should be initialized");
         // no minimum-version assert: version 0 (predating the logt slot) is

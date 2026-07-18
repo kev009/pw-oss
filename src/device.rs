@@ -98,7 +98,7 @@ unsafe fn emit_objects(
             let id = device.index * 2 + rec as u32;
 
             if !present {
-                obj_info_fun(data, id, std::ptr::null());
+                unsafe { obj_info_fun(data, id, std::ptr::null()) };
                 continue;
             }
 
@@ -148,7 +148,7 @@ unsafe fn emit_objects(
                 props: dict.raw(),
             };
 
-            obj_info_fun(data, id, &obj_info);
+            unsafe { obj_info_fun(data, id, &obj_info) };
         }
     }
 }
@@ -156,18 +156,21 @@ unsafe fn emit_objects(
 // re-emit dev_info to every listener (carrying whatever change_mask the caller
 // set, e.g. PARAMS), then clear the mask
 unsafe fn emit_device_info(state: &mut State) {
-    crate::spa::for_each_hook(&mut state.hooks, |entry| {
-        let f = entry
-            .cb
-            .funcs
-            .cast::<spa_device_events>()
-            .as_ref()
-            .expect("hook should be initialized");
-        assert!(crate::spa::version_ok(f.version, SPA_VERSION_DEVICE_EVENTS));
-        if let Some(info_fun) = f.info {
-            info_fun(entry.cb.data, state.dev_info.raw());
-        }
-    });
+    // one emission through the C listener vtables end to end
+    unsafe {
+        crate::spa::for_each_hook(&mut state.hooks, |entry| {
+            let f = entry
+                .cb
+                .funcs
+                .cast::<spa_device_events>()
+                .as_ref()
+                .expect("hook should be initialized");
+            assert!(crate::spa::version_ok(f.version, SPA_VERSION_DEVICE_EVENTS));
+            if let Some(info_fun) = f.info {
+                info_fun(entry.cb.data, state.dev_info.raw());
+            }
+        });
+    }
     let _ = state.dev_info.replace_change_mask(0);
 }
 
@@ -481,25 +484,28 @@ unsafe fn emit_object_config(state: &mut State, pos: usize, volume: bool) {
         return;
     }
 
-    crate::spa::for_each_hook(&mut state.hooks, |entry| {
-        let f = entry
-            .cb
-            .funcs
-            .cast::<spa_device_events>()
-            .as_ref()
-            .expect("hook should be initialized");
-        assert!(crate::spa::version_ok(f.version, SPA_VERSION_DEVICE_EVENTS));
-        if let Some(event_fun) = f.event {
-            event_fun(entry.cb.data, buffer.as_ptr() as *const spa_event);
-        }
-    });
+    // one emission through the C listener vtables end to end
+    unsafe {
+        crate::spa::for_each_hook(&mut state.hooks, |entry| {
+            let f = entry
+                .cb
+                .funcs
+                .cast::<spa_device_events>()
+                .as_ref()
+                .expect("hook should be initialized");
+            assert!(crate::spa::version_ok(f.version, SPA_VERSION_DEVICE_EVENTS));
+            if let Some(event_fun) = f.event {
+                event_fun(entry.cb.data, buffer.as_ptr() as *const spa_event);
+            }
+        });
+    }
 }
 
 // announce a Route change: flip the serial so consumers re-read the param
 unsafe fn announce_route_change(state: &mut State) {
     let _ = state.dev_info.replace_change_mask(0);
     state.dev_info.bump_param(SPA_PARAM_Route);
-    emit_device_info(state);
+    unsafe { emit_device_info(state) };
 }
 
 // The ~1 Hz external-change poll: on a modify_counter tick, value-diff the
@@ -643,31 +649,31 @@ unsafe fn poll_mixers(state: &mut State) {
         return;
     }
 
-    announce_route_change(state);
+    unsafe { announce_route_change(state) };
 
     for pos in switched {
         // the node's effective input volume is the new source's control now
         if state.routes[pos].control.is_some() {
-            emit_object_config(state, pos, true);
-            emit_object_config(state, pos, false);
+            unsafe {
+                emit_object_config(state, pos, true);
+                emit_object_config(state, pos, false);
+            }
         }
     }
 
     for (pos, vol_changed, mute_changed) in changed {
         if vol_changed {
-            emit_object_config(state, pos, true);
+            unsafe { emit_object_config(state, pos, true) };
         }
         if mute_changed {
-            emit_object_config(state, pos, false);
+            unsafe { emit_object_config(state, pos, false) };
         }
     }
 }
 
 unsafe extern "C" fn on_mixer_timeout(source: *mut spa_source) {
-    let state = (*source)
-        .data
-        .cast::<State>()
-        .as_mut()
+    // the source we registered in arm_mixer_watch; its data points at our State
+    let state = unsafe { (*source).data.cast::<State>().as_mut() }
         .expect("(*source).data is not supposed to be null");
 
     // drain the periodic timerfd or the level-triggered source spins the loop
@@ -675,11 +681,11 @@ unsafe extern "C" fn on_mixer_timeout(source: *mut spa_source) {
         return; // the source is only registered when the system interface exists
     };
     let mut expirations = 0;
-    if system.timerfd_read(state.timer_source.fd, &mut expirations) < 0 {
+    if unsafe { system.timerfd_read(state.timer_source.fd, &mut expirations) } < 0 {
         return;
     }
 
-    poll_mixers(state);
+    unsafe { poll_mixers(state) };
 }
 
 // devd "SND CONN" watcher. What the kernel actually emits (verified against
@@ -700,10 +706,8 @@ unsafe extern "C" fn on_mixer_timeout(source: *mut spa_source) {
 // (hdaa_autorecsrc_handler, hdaa.c:562) and pin mutes, so the one sound
 // reaction is nudging the mixer poll instead of waiting out the 1 Hz tick.
 unsafe extern "C" fn on_devd_event(source: *mut spa_source) {
-    let state = (*source)
-        .data
-        .cast::<State>()
-        .as_mut()
+    // the source we registered in arm_mixer_watch; its data points at our State
+    let state = unsafe { (*source).data.cast::<State>().as_mut() }
         .expect("(*source).data is not supposed to be null");
 
     let Some(devd_socket) = state.devd_socket.as_mut() else {
@@ -727,7 +731,7 @@ unsafe extern "C" fn on_devd_event(source: *mut spa_source) {
 
     if nudged {
         crate::debug!(state.log, "SND CONN event; re-polling the mixers");
-        poll_mixers(state);
+        unsafe { poll_mixers(state) };
     }
 
     if !alive {
@@ -738,7 +742,7 @@ unsafe extern "C" fn on_devd_event(source: *mut spa_source) {
             "devd connection lost; falling back to the mixer poll alone"
         );
         if let Some(main_loop) = &state.main_loop {
-            main_loop.remove_source(&mut state.devd_source);
+            unsafe { main_loop.remove_source(&mut state.devd_source) };
         }
         state.devd_socket = None;
         state.devd_added = false;
@@ -751,68 +755,71 @@ unsafe extern "C" fn add_listener(
     events: *const spa_device_events,
     data: *mut c_void,
 ) -> c_int {
-    let state = object
-        .cast::<State>()
-        .as_mut()
-        .expect("object is not supposed to be null");
+    let state =
+        unsafe { object.cast::<State>().as_mut() }.expect("object is not supposed to be null");
 
     let mut save = MaybeUninit::<spa_hook_list>::uninit();
-    spa_hook_list_isolate(
-        &mut state.hooks,
-        save.as_mut_ptr(),
-        listener,
-        events.cast(),
-        data,
-    );
+    unsafe {
+        spa_hook_list_isolate(
+            &mut state.hooks,
+            save.as_mut_ptr(),
+            listener,
+            events.cast(),
+            data,
+        );
+    }
 
-    crate::spa::for_each_hook(&mut state.hooks, |entry| {
-        let f =
-            entry.cb.funcs.cast::<spa_device_events>().as_ref().expect(
+    unsafe {
+        crate::spa::for_each_hook(&mut state.hooks, |entry| {
+            let f = entry.cb.funcs.cast::<spa_device_events>().as_ref().expect(
                 "we just assigned events to this very hook by calling spa_hook_list_isolate",
             );
 
-        assert!(crate::spa::version_ok(f.version, SPA_VERSION_DEVICE_EVENTS));
+            assert!(crate::spa::version_ok(f.version, SPA_VERSION_DEVICE_EVENTS));
 
-        if let Some(dev_info_fun) = f.info {
-            let old_mask = state
-                .dev_info
-                .replace_change_mask(crate::spa::SPA_DEVICE_CHANGE_MASK_ALL as u64);
-            dev_info_fun(entry.cb.data, state.dev_info.raw());
-            let _ = state.dev_info.replace_change_mask(old_mask);
-        }
+            if let Some(dev_info_fun) = f.info {
+                let old_mask = state
+                    .dev_info
+                    .replace_change_mask(crate::spa::SPA_DEVICE_CHANGE_MASK_ALL as u64);
+                dev_info_fun(entry.cb.data, state.dev_info.raw());
+                let _ = state.dev_info.replace_change_mask(old_mask);
+            }
 
-        emit_objects(
-            f,
-            entry.cb.data,
-            &state.pcm_devices,
-            &state.routes,
-            &state.description,
-            state.profile != 0,
-        );
-    });
+            emit_objects(
+                f,
+                entry.cb.data,
+                &state.pcm_devices,
+                &state.routes,
+                &state.description,
+                state.profile != 0,
+            );
+        });
+    }
 
-    spa_hook_list_join(&mut state.hooks, save.assume_init_mut());
+    // isolate above initialized `save`
+    unsafe { spa_hook_list_join(&mut state.hooks, save.assume_init_mut()) };
     0
 }
 
 unsafe extern "C" fn sync(object: *mut c_void, seq: c_int) -> c_int {
-    let state = object
-        .cast::<State>()
-        .as_mut()
-        .expect("object is not supposed to be null");
+    let state =
+        unsafe { object.cast::<State>().as_mut() }.expect("object is not supposed to be null");
 
-    crate::spa::for_each_hook(&mut state.hooks, |entry| {
-        let f = entry
-            .cb
-            .funcs
-            .cast::<spa_device_events>()
-            .as_ref()
-            .expect("hook should be initialized");
-        assert!(crate::spa::version_ok(f.version, SPA_VERSION_DEVICE_EVENTS));
-        if let Some(result_fun) = f.result {
-            result_fun(entry.cb.data, seq, 0, 0, std::ptr::null());
-        }
-    });
+    // one emission through the C listener vtables end to end
+    unsafe {
+        crate::spa::for_each_hook(&mut state.hooks, |entry| {
+            let f = entry
+                .cb
+                .funcs
+                .cast::<spa_device_events>()
+                .as_ref()
+                .expect("hook should be initialized");
+            assert!(crate::spa::version_ok(f.version, SPA_VERSION_DEVICE_EVENTS));
+            if let Some(result_fun) = f.result {
+                result_fun(entry.cb.data, seq, 0, 0, std::ptr::null());
+            }
+        });
+    }
 
     0
 }
@@ -825,10 +832,8 @@ unsafe extern "C" fn enum_params(
     max: u32,
     filter: *const spa_pod,
 ) -> c_int {
-    let state = object
-        .cast::<State>()
-        .as_mut()
-        .expect("object is not supposed to be null");
+    let state =
+        unsafe { object.cast::<State>().as_mut() }.expect("object is not supposed to be null");
 
     if max == 0 {
         return 0;
@@ -890,17 +895,20 @@ unsafe extern "C" fn enum_params(
             param: std::ptr::null_mut(),
         };
 
-        if let Some(param) =
+        // the built pod lives in `buffer`, distinct from the filter output
+        if let Some(param) = unsafe {
             crate::spa::filter_pod(&mut fbuffer, buffer.as_mut_ptr() as *mut spa_pod, filter)
-        {
+        } {
             result.param = param;
-            crate::spa::dev_emit_result(
-                &mut state.hooks,
-                seq,
-                0,
-                SPA_RESULT_TYPE_DEVICE_PARAMS,
-                &result,
-            );
+            unsafe {
+                crate::spa::dev_emit_result(
+                    &mut state.hooks,
+                    seq,
+                    0,
+                    SPA_RESULT_TYPE_DEVICE_PARAMS,
+                    &result,
+                );
+            }
             count += 1;
         }
 
@@ -983,7 +991,7 @@ unsafe fn set_profile_param(state: &mut State, param: *const spa_pod) -> c_int {
     if param.is_null() {
         index = Some(1);
     } else {
-        match crate::utils::deserialize_pod(param) {
+        match unsafe { crate::utils::deserialize_pod(param) } {
             Some(Value::Object(o)) if o.type_ == SPA_TYPE_OBJECT_ParamProfile => {
                 for p in o.properties {
                     #[allow(non_upper_case_globals)]
@@ -1041,34 +1049,36 @@ unsafe fn set_profile_param(state: &mut State, param: *const spa_pod) -> c_int {
 
         // add or remove the nodes, then re-announce the params tied to the
         // active profile (Route pods appear/vanish with it)
-        crate::spa::for_each_hook(&mut state.hooks, |entry| {
-            let f = entry
-                .cb
-                .funcs
-                .cast::<spa_device_events>()
-                .as_ref()
-                .expect("hook should be initialized");
-            assert!(crate::spa::version_ok(f.version, SPA_VERSION_DEVICE_EVENTS));
-            emit_objects(
-                f,
-                entry.cb.data,
-                &state.pcm_devices,
-                &state.routes,
-                &state.description,
-                index != 0,
-            );
-        });
+        unsafe {
+            crate::spa::for_each_hook(&mut state.hooks, |entry| {
+                let f = entry
+                    .cb
+                    .funcs
+                    .cast::<spa_device_events>()
+                    .as_ref()
+                    .expect("hook should be initialized");
+                assert!(crate::spa::version_ok(f.version, SPA_VERSION_DEVICE_EVENTS));
+                emit_objects(
+                    f,
+                    entry.cb.data,
+                    &state.pcm_devices,
+                    &state.routes,
+                    &state.description,
+                    index != 0,
+                );
+            });
+        }
 
         let _ = state.dev_info.replace_change_mask(0);
         state.dev_info.bump_param(SPA_PARAM_Profile);
         state.dev_info.bump_param(SPA_PARAM_EnumRoute);
         state.dev_info.bump_param(SPA_PARAM_Route);
-        emit_device_info(state);
+        unsafe { emit_device_info(state) };
     } else if profile_save_changed {
         // the save flag is part of the Profile readback; keep it fresh
         let _ = state.dev_info.replace_change_mask(0);
         state.dev_info.bump_param(SPA_PARAM_Profile);
-        emit_device_info(state);
+        unsafe { emit_device_info(state) };
     }
 
     0
@@ -1111,7 +1121,7 @@ unsafe fn set_route_param(state: &mut State, param: *const spa_pod) -> c_int {
         return -libc::EINVAL; // no routes exist under the Off profile
     }
 
-    let object = match crate::utils::deserialize_pod(param) {
+    let object = match unsafe { crate::utils::deserialize_pod(param) } {
         Some(Value::Object(o)) if o.type_ == SPA_TYPE_OBJECT_ParamRoute => o,
         _ => return -libc::EINVAL,
     };
@@ -1164,7 +1174,7 @@ unsafe fn set_route_param(state: &mut State, param: *const spa_pod) -> c_int {
                 );
                 // re-announce even so: the session manager applied the switch
                 // optimistically and must re-read what really happened
-                announce_route_change(state);
+                unsafe { announce_route_change(state) };
             }
         } else {
             crate::warn!(
@@ -1192,7 +1202,7 @@ unsafe fn set_route_param(state: &mut State, param: *const spa_pod) -> c_int {
     // bump only on an observable change: every spurious serial flip costs
     // the session manager a full param re-enumeration
     if vol_changed || mute_changed || save_changed || switched.is_some() {
-        announce_route_change(state);
+        unsafe { announce_route_change(state) };
     }
 
     // A switch changes which control feeds the node, so push the newly
@@ -1205,18 +1215,18 @@ unsafe fn set_route_param(state: &mut State, param: *const spa_pod) -> c_int {
     }
     if let Some(active_pos) = switched {
         if !(active_pos == pos && vol_changed) {
-            emit_object_config(state, active_pos, true);
+            unsafe { emit_object_config(state, active_pos, true) };
         }
         if !(active_pos == pos && mute_changed) {
-            emit_object_config(state, active_pos, false);
+            unsafe { emit_object_config(state, active_pos, false) };
         }
     }
 
     if vol_changed {
-        emit_object_config(state, pos, true);
+        unsafe { emit_object_config(state, pos, true) };
     }
     if mute_changed {
-        emit_object_config(state, pos, false);
+        unsafe { emit_object_config(state, pos, false) };
     }
 
     0
@@ -1228,15 +1238,13 @@ unsafe extern "C" fn set_param(
     _flags: u32,
     param: *const spa_pod,
 ) -> c_int {
-    let state = object
-        .cast::<State>()
-        .as_mut()
-        .expect("object is not supposed to be null");
+    let state =
+        unsafe { object.cast::<State>().as_mut() }.expect("object is not supposed to be null");
 
     #[allow(non_upper_case_globals)]
     match id {
-        SPA_PARAM_Profile => set_profile_param(state, param),
-        SPA_PARAM_Route => set_route_param(state, param),
+        SPA_PARAM_Profile => unsafe { set_profile_param(state, param) },
+        SPA_PARAM_Route => unsafe { set_route_param(state, param) },
         _ => -libc::ENOENT, // unknown param id (ALSA convention)
     }
 }
@@ -1254,13 +1262,12 @@ unsafe extern "C" fn get_interface(
     type_: *const c_char,
     interface: *mut *mut c_void,
 ) -> c_int {
-    let state = handle
-        .cast::<State>()
-        .as_mut()
-        .expect("handle is not supposed to be null");
+    let state =
+        unsafe { handle.cast::<State>().as_mut() }.expect("handle is not supposed to be null");
     assert!(!interface.is_null());
-    if spa_streq(type_, SPA_TYPE_INTERFACE_Device.as_ptr().cast()) {
-        *interface = &mut state.device as *mut _ as *mut c_void;
+    if unsafe { spa_streq(type_, SPA_TYPE_INTERFACE_Device.as_ptr().cast()) } {
+        // interface is non-null (asserted above) and writable per the contract
+        unsafe { *interface = &mut state.device as *mut _ as *mut c_void };
     } else {
         return -libc::ENOENT;
     }
@@ -1268,17 +1275,15 @@ unsafe extern "C" fn get_interface(
 }
 
 unsafe extern "C" fn clear(handle: *mut spa_handle) -> c_int {
-    let state = handle
-        .cast::<State>()
-        .as_mut()
-        .expect("handle is not supposed to be null");
+    let state =
+        unsafe { handle.cast::<State>().as_mut() }.expect("handle is not supposed to be null");
     // clear runs on the main loop's thread, so detach the poll source directly
     if state.timer_added {
         if let Some(main_loop) = &state.main_loop {
-            main_loop.remove_source(&mut state.timer_source);
+            unsafe { main_loop.remove_source(&mut state.timer_source) };
         }
         if let Some(system) = &state.system {
-            system.close(state.timer_source.fd);
+            unsafe { system.close(state.timer_source.fd) };
         }
         state.timer_source.fd = -1;
         state.timer_added = false;
@@ -1286,18 +1291,16 @@ unsafe extern "C" fn clear(handle: *mut spa_handle) -> c_int {
     // ditto for the devd watch; the socket fd closes with the DevdSocket drop
     if state.devd_added {
         if let Some(main_loop) = &state.main_loop {
-            main_loop.remove_source(&mut state.devd_source);
+            unsafe { main_loop.remove_source(&mut state.devd_source) };
         }
         state.devd_added = false;
     }
-    std::ptr::drop_in_place(state);
+    // the host frees the memory after clear; drop the fields exactly once here
+    unsafe { std::ptr::drop_in_place(state) };
     0
 }
 
-unsafe extern "C" fn get_size(
-    _factory: *const spa_handle_factory,
-    _params: *const spa_dict,
-) -> usize {
+extern "C" fn get_size(_factory: *const spa_handle_factory, _params: *const spa_dict) -> usize {
     std::mem::size_of::<State>()
 }
 
@@ -1472,23 +1475,27 @@ unsafe fn parse_device_dict(info: *const spa_dict) -> (Option<String>, Vec<u32>)
     let mut pcm_parent_device = None;
     let mut pcm_device_indexes = vec![];
 
-    if let Some(info) = info.as_ref() {
+    if let Some(info) = unsafe { info.as_ref() } {
         #[cfg(debug_assertions)]
-        crate::spa::dump_spa_dict(info);
+        unsafe {
+            crate::spa::dump_spa_dict(info);
+        }
 
-        crate::spa::for_each_dict_item(info, |key, value| match key {
-            crate::keys::PCM_PARENT_DEVICE => {
-                pcm_parent_device = Some(value.to_string());
-            }
-            crate::keys::PCM_DEVICE_INDEXES => {
-                for part in value.split(',') {
-                    if let Ok(index) = part.parse::<u32>() {
-                        pcm_device_indexes.push(index);
+        unsafe {
+            crate::spa::for_each_dict_item(info, |key, value| match key {
+                crate::keys::PCM_PARENT_DEVICE => {
+                    pcm_parent_device = Some(value.to_string());
+                }
+                crate::keys::PCM_DEVICE_INDEXES => {
+                    for part in value.split(',') {
+                        if let Ok(index) = part.parse::<u32>() {
+                            pcm_device_indexes.push(index);
+                        }
                     }
                 }
-            }
-            _ => (),
-        });
+                _ => (),
+            });
+        }
     }
 
     (pcm_parent_device, pcm_device_indexes)
@@ -1530,10 +1537,12 @@ unsafe fn arm_mixer_watch(state: &mut State) {
     }
 
     if let (Some(main_loop), Some(system)) = (&state.main_loop, &state.system) {
-        let fd = system.timerfd_create(
-            libc::CLOCK_MONOTONIC,
-            (SPA_FD_CLOEXEC | SPA_FD_NONBLOCK) as c_int,
-        );
+        let fd = unsafe {
+            system.timerfd_create(
+                libc::CLOCK_MONOTONIC,
+                (SPA_FD_CLOEXEC | SPA_FD_NONBLOCK) as c_int,
+            )
+        };
         if fd < 0 {
             crate::warn!(
                 state.log,
@@ -1551,18 +1560,18 @@ unsafe fn arm_mixer_watch(state: &mut State) {
                     tv_nsec: 0,
                 },
             };
-            if system.timerfd_settime(fd, 0, &timerspec, std::ptr::null_mut()) < 0 {
+            if unsafe { system.timerfd_settime(fd, 0, &timerspec, std::ptr::null_mut()) } < 0 {
                 crate::warn!(state.log, "can't arm the mixer poll timer");
             }
             state.timer_source.fd = fd;
-            if main_loop.add_source(&mut state.timer_source) >= 0 {
+            if unsafe { main_loop.add_source(&mut state.timer_source) } >= 0 {
                 state.timer_added = true;
             } else {
                 crate::warn!(
                     state.log,
                     "can't watch the mixer; external volume changes won't be noticed"
                 );
-                system.close(fd);
+                unsafe { system.close(fd) };
                 state.timer_source.fd = -1;
             }
         }
@@ -1576,7 +1585,7 @@ unsafe fn arm_mixer_watch(state: &mut State) {
             Ok(socket) => {
                 state.devd_source.fd = socket.fd();
                 state.devd_socket = Some(socket);
-                if main_loop.add_source(&mut state.devd_source) >= 0 {
+                if unsafe { main_loop.add_source(&mut state.devd_source) } >= 0 {
                     state.devd_added = true;
                 } else {
                     crate::warn!(
@@ -1605,36 +1614,40 @@ unsafe extern "C" fn init(
     support: *const spa_support,
     n_support: u32,
 ) -> c_int {
-    let log = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Log.as_ptr().cast())
-        as *mut spa_log;
-    let log = crate::spa::Log::wrap(log, std::ptr::NonNull::new(&raw mut OSS_DEVICE_TOPIC));
+    // the support array is the host's init contract: n_support valid entries
+    let log =
+        unsafe { spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Log.as_ptr().cast()) }
+            as *mut spa_log;
+    let log =
+        unsafe { crate::spa::Log::wrap(log, std::ptr::NonNull::new(&raw mut OSS_DEVICE_TOPIC)) };
 
     // the main loop and system drive the mixer poll timer; both are optional -
     // without them external mixer changes just go unnoticed
-    let main_loop = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Loop.as_ptr().cast())
-        as *mut spa_loop;
-    let system = spa_support_find(
-        support,
-        n_support,
-        SPA_TYPE_INTERFACE_System.as_ptr().cast(),
-    ) as *mut spa_system;
+    let main_loop =
+        unsafe { spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Loop.as_ptr().cast()) }
+            as *mut spa_loop;
+    let system = unsafe {
+        spa_support_find(
+            support,
+            n_support,
+            SPA_TYPE_INTERFACE_System.as_ptr().cast(),
+        )
+    } as *mut spa_system;
     let main_loop = if main_loop.is_null() {
         None
     } else {
-        Some(crate::spa::Loop::wrap(main_loop))
+        Some(unsafe { crate::spa::Loop::wrap(main_loop) })
     };
     let system = if system.is_null() {
         None
     } else {
-        Some(crate::spa::System::wrap(system))
+        Some(unsafe { crate::spa::System::wrap(system) })
     };
 
-    let state = handle
-        .cast::<State>()
-        .as_mut()
-        .expect("handle is not supposed to be null");
+    let state =
+        unsafe { handle.cast::<State>().as_mut() }.expect("handle is not supposed to be null");
 
-    let (pcm_parent_device, pcm_device_indexes) = parse_device_dict(info);
+    let (pcm_parent_device, pcm_device_indexes) = unsafe { parse_device_dict(info) };
 
     if pcm_device_indexes.is_empty() {
         crate::error!(
@@ -1655,72 +1668,76 @@ unsafe extern "C" fn init(
     let (routes, mixers) = probe_routes(&pcm_devices);
     let common_desc = common_description(&pcm_devices);
 
-    std::ptr::write(
-        state,
-        State {
-            handle: spa_handle {
-                version: SPA_VERSION_HANDLE,
-                get_interface: Some(get_interface),
-                clear: Some(clear),
-            },
+    // the host hands us uninitialized memory of get_size() bytes; write the
+    // whole State without dropping the garbage "old" value
+    unsafe {
+        std::ptr::write(
+            state,
+            State {
+                handle: spa_handle {
+                    version: SPA_VERSION_HANDLE,
+                    get_interface: Some(get_interface),
+                    clear: Some(clear),
+                },
 
-            device: spa_device {
-                iface: spa_interface {
-                    type_: SPA_TYPE_INTERFACE_Device.as_ptr().cast(),
-                    version: SPA_VERSION_DEVICE,
-                    cb: spa_callbacks {
-                        funcs: &DEVICE_IMPL as *const _ as *const c_void,
-                        data: state as *mut _ as *mut c_void,
+                device: spa_device {
+                    iface: spa_interface {
+                        type_: SPA_TYPE_INTERFACE_Device.as_ptr().cast(),
+                        version: SPA_VERSION_DEVICE,
+                        cb: spa_callbacks {
+                            funcs: &DEVICE_IMPL as *const _ as *const c_void,
+                            data: state as *mut _ as *mut c_void,
+                        },
                     },
                 },
-            },
 
-            dev_info: crate::spa::DeviceInfo::new(),
+                dev_info: crate::spa::DeviceInfo::new(),
 
-            hooks: spa_hook_list {
-                list: spa_list {
-                    next: std::ptr::null_mut(),
-                    prev: std::ptr::null_mut(),
+                hooks: spa_hook_list {
+                    list: spa_list {
+                        next: std::ptr::null_mut(),
+                        prev: std::ptr::null_mut(),
+                    },
                 },
+
+                pcm_devices,
+                description: common_desc,
+                profile: 1, // default on until a session manager decides otherwise
+                profile_save: false,
+
+                routes,
+                mixers,
+
+                main_loop,
+                system,
+
+                timer_source: spa_source {
+                    loop_: std::ptr::null_mut(),
+                    func: Some(on_mixer_timeout),
+                    data: state as *mut _ as *mut c_void,
+                    fd: -1,
+                    mask: SPA_IO_IN,
+                    rmask: 0,
+                    priv_: std::ptr::null_mut(),
+                },
+                timer_added: false,
+
+                devd_socket: None,
+                devd_source: spa_source {
+                    loop_: std::ptr::null_mut(),
+                    func: Some(on_devd_event),
+                    data: state as *mut _ as *mut c_void,
+                    fd: -1,
+                    mask: SPA_IO_IN,
+                    rmask: 0,
+                    priv_: std::ptr::null_mut(),
+                },
+                devd_added: false,
+
+                log,
             },
-
-            pcm_devices,
-            description: common_desc,
-            profile: 1, // default on until a session manager decides otherwise
-            profile_save: false,
-
-            routes,
-            mixers,
-
-            main_loop,
-            system,
-
-            timer_source: spa_source {
-                loop_: std::ptr::null_mut(),
-                func: Some(on_mixer_timeout),
-                data: state as *mut _ as *mut c_void,
-                fd: -1,
-                mask: SPA_IO_IN,
-                rmask: 0,
-                priv_: std::ptr::null_mut(),
-            },
-            timer_added: false,
-
-            devd_socket: None,
-            devd_source: spa_source {
-                loop_: std::ptr::null_mut(),
-                func: Some(on_devd_event),
-                data: state as *mut _ as *mut c_void,
-                fd: -1,
-                mask: SPA_IO_IN,
-                rmask: 0,
-                priv_: std::ptr::null_mut(),
-            },
-            devd_added: false,
-
-            log,
-        },
-    );
+        );
+    }
 
     state.dev_info.fix_pointers();
     state
@@ -1751,9 +1768,9 @@ unsafe extern "C" fn init(
         .dev_info
         .add_param(SPA_PARAM_Route, SPA_PARAM_INFO_READWRITE);
 
-    spa_hook_list_init(&mut state.hooks);
+    unsafe { spa_hook_list_init(&mut state.hooks) };
 
-    arm_mixer_watch(state);
+    unsafe { arm_mixer_watch(state) };
 
     0
 }
@@ -1769,13 +1786,16 @@ unsafe extern "C" fn enum_interface_info(
 ) -> c_int {
     assert!(!info.is_null());
     assert!(!index.is_null());
-    match *index {
-        0 => {
-            *info = &INTERFACE_INFO[0];
-            *index += 1;
-            1
+    // non-null asserted above; the caller contract makes both valid and writable
+    unsafe {
+        match *index {
+            0 => {
+                *info = &INTERFACE_INFO[0];
+                *index += 1;
+                1
+            }
+            _ => 0,
         }
-        _ => 0,
     }
 }
 

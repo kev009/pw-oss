@@ -57,40 +57,42 @@ unsafe extern "C" fn add_listener(
     events: *const spa_device_events,
     data: *mut c_void,
 ) -> c_int {
-    let state = object
-        .cast::<State>()
-        .as_mut()
-        .expect("object is not supposed to be null");
+    let state =
+        unsafe { object.cast::<State>().as_mut() }.expect("object is not supposed to be null");
 
     let mut save = MaybeUninit::<spa_hook_list>::uninit();
-    spa_hook_list_isolate(
-        &mut state.hooks,
-        save.as_mut_ptr(),
-        listener,
-        events.cast(),
-        data,
-    );
+    unsafe {
+        spa_hook_list_isolate(
+            &mut state.hooks,
+            save.as_mut_ptr(),
+            listener,
+            events.cast(),
+            data,
+        );
+    }
 
-    crate::spa::for_each_hook(&mut state.hooks, |entry| {
-        let f =
-            entry.cb.funcs.cast::<spa_device_events>().as_ref().expect(
+    unsafe {
+        crate::spa::for_each_hook(&mut state.hooks, |entry| {
+            let f = entry.cb.funcs.cast::<spa_device_events>().as_ref().expect(
                 "we just assigned events to this very hook by calling spa_hook_list_isolate",
             );
 
-        assert!(crate::spa::version_ok(f.version, SPA_VERSION_DEVICE_EVENTS));
+            assert!(crate::spa::version_ok(f.version, SPA_VERSION_DEVICE_EVENTS));
 
-        state.dev_info.change_mask = crate::spa::SPA_DEVICE_CHANGE_MASK_ALL as u64;
+            state.dev_info.change_mask = crate::spa::SPA_DEVICE_CHANGE_MASK_ALL as u64;
 
-        if let Some(dev_info_fun) = f.info {
-            dev_info_fun(entry.cb.data, &state.dev_info);
-        }
+            if let Some(dev_info_fun) = f.info {
+                dev_info_fun(entry.cb.data, &state.dev_info);
+            }
 
-        for (parent, indexes) in &state.pcm_indexes {
-            emit_dev_node(entry, f, parent, indexes);
-        }
-    });
+            for (parent, indexes) in &state.pcm_indexes {
+                emit_dev_node(entry, f, parent, indexes);
+            }
+        });
+    }
 
-    spa_hook_list_join(&mut state.hooks, save.assume_init_mut());
+    // isolate above initialized `save`
+    unsafe { spa_hook_list_join(&mut state.hooks, save.assume_init_mut()) };
     0
 }
 
@@ -107,15 +109,14 @@ unsafe extern "C" fn get_interface(
     type_: *const c_char,
     interface: *mut *mut c_void,
 ) -> c_int {
-    let state = handle
-        .cast::<State>()
-        .as_mut()
-        .expect("handle is not supposed to be null");
+    let state =
+        unsafe { handle.cast::<State>().as_mut() }.expect("handle is not supposed to be null");
 
     assert!(!interface.is_null());
 
-    if spa_streq(type_, SPA_TYPE_INTERFACE_Device.as_ptr().cast()) {
-        *interface = &mut state.device as *mut _ as *mut c_void;
+    if unsafe { spa_streq(type_, SPA_TYPE_INTERFACE_Device.as_ptr().cast()) } {
+        // interface is non-null (asserted above) and writable per the contract
+        unsafe { *interface = &mut state.device as *mut _ as *mut c_void };
     } else {
         return -libc::ENOENT;
     }
@@ -124,23 +125,19 @@ unsafe extern "C" fn get_interface(
 }
 
 unsafe extern "C" fn clear(handle: *mut spa_handle) -> c_int {
-    let state = handle
-        .cast::<State>()
-        .as_mut()
-        .expect("handle is not supposed to be null");
+    let state =
+        unsafe { handle.cast::<State>().as_mut() }.expect("handle is not supposed to be null");
     // clear runs on the main loop's thread, so detach the devd source directly;
     // the socket fd itself is closed by the DevdSocket drop below
     if state.devd_socket.is_some() {
-        state.main_loop.remove_source(&mut state.devd_source);
+        unsafe { state.main_loop.remove_source(&mut state.devd_source) };
     }
-    std::ptr::drop_in_place(state);
+    // the host frees the memory after clear; drop the fields exactly once here
+    unsafe { std::ptr::drop_in_place(state) };
     0
 }
 
-unsafe extern "C" fn get_size(
-    _factory: *const spa_handle_factory,
-    _params: *const spa_dict,
-) -> usize {
+extern "C" fn get_size(_factory: *const spa_handle_factory, _params: *const spa_dict) -> usize {
     std::mem::size_of::<State>()
 }
 
@@ -151,10 +148,8 @@ const DEV_INFO_PROPS: spa_dict = spa_dict {
 };
 
 unsafe extern "C" fn on_devd_event(source: *mut spa_source) {
-    let state = (*source)
-        .data
-        .cast::<State>()
-        .as_mut()
+    // the source we registered in init; its data points at our State
+    let state = unsafe { (*source).data.cast::<State>().as_mut() }
         .expect("(*source).data is not supposed to be null");
 
     let Some(devd_socket) = state.devd_socket.as_mut() else {
@@ -180,14 +175,14 @@ unsafe extern "C" fn on_devd_event(source: *mut spa_source) {
     });
 
     if resync {
-        resync_devices(state, &detached);
+        unsafe { resync_devices(state, &detached) };
     }
 
     if !alive {
         // devd restarted or dropped us; deregister or the level-triggered fd
         // spins the main loop forever. Hotplug stays off until pipewire restarts.
         crate::warn!(state.log, "devd connection lost; hotplug disabled");
-        state.main_loop.remove_source(&mut state.devd_source);
+        unsafe { state.main_loop.remove_source(&mut state.devd_source) };
         state.devd_socket = None;
     }
 }
@@ -218,16 +213,18 @@ unsafe fn resync_devices(state: &mut State, detached: &[String]) {
         if let Some(key) = key {
             if let Some(indexes) = state.pcm_indexes.remove(&key) {
                 crate::info!(state.log, "removing {} ({:?}) on detach", key, indexes);
-                crate::spa::for_each_hook(&mut state.hooks, |entry| {
-                    let f = entry
-                        .cb
-                        .funcs
-                        .cast::<spa_device_events>()
-                        .as_ref()
-                        .expect("callback should be initialized");
-                    assert!(crate::spa::version_ok(f.version, SPA_VERSION_DEVICE_EVENTS));
-                    remove_dev_node(entry, f, &indexes);
-                });
+                unsafe {
+                    crate::spa::for_each_hook(&mut state.hooks, |entry| {
+                        let f = entry
+                            .cb
+                            .funcs
+                            .cast::<spa_device_events>()
+                            .as_ref()
+                            .expect("callback should be initialized");
+                        assert!(crate::spa::version_ok(f.version, SPA_VERSION_DEVICE_EVENTS));
+                        remove_dev_node(entry, f, &indexes);
+                    });
+                }
             }
         }
     }
@@ -245,31 +242,35 @@ unsafe fn resync_devices(state: &mut State, detached: &[String]) {
     for (driver, old_indexes) in &old_map {
         if state.pcm_indexes.get(driver) != Some(old_indexes) {
             crate::info!(state.log, "removing {} ({:?})", driver, old_indexes);
-            crate::spa::for_each_hook(&mut state.hooks, |entry| {
-                let f = entry
-                    .cb
-                    .funcs
-                    .cast::<spa_device_events>()
-                    .as_ref()
-                    .expect("callback should be initialized");
-                assert!(crate::spa::version_ok(f.version, SPA_VERSION_DEVICE_EVENTS));
-                remove_dev_node(entry, f, old_indexes);
-            });
+            unsafe {
+                crate::spa::for_each_hook(&mut state.hooks, |entry| {
+                    let f = entry
+                        .cb
+                        .funcs
+                        .cast::<spa_device_events>()
+                        .as_ref()
+                        .expect("callback should be initialized");
+                    assert!(crate::spa::version_ok(f.version, SPA_VERSION_DEVICE_EVENTS));
+                    remove_dev_node(entry, f, old_indexes);
+                });
+            }
         }
     }
     for (driver, new_indexes) in &state.pcm_indexes {
         if old_map.get(driver) != Some(new_indexes) {
             crate::info!(state.log, "registering {} ({:?})", driver, new_indexes);
-            crate::spa::for_each_hook(&mut state.hooks, |entry| {
-                let f = entry
-                    .cb
-                    .funcs
-                    .cast::<spa_device_events>()
-                    .as_ref()
-                    .expect("callback should be initialized");
-                assert!(crate::spa::version_ok(f.version, SPA_VERSION_DEVICE_EVENTS));
-                emit_dev_node(entry, f, driver, new_indexes);
-            });
+            unsafe {
+                crate::spa::for_each_hook(&mut state.hooks, |entry| {
+                    let f = entry
+                        .cb
+                        .funcs
+                        .cast::<spa_device_events>()
+                        .as_ref()
+                        .expect("callback should be initialized");
+                    assert!(crate::spa::version_ok(f.version, SPA_VERSION_DEVICE_EVENTS));
+                    emit_dev_node(entry, f, driver, new_indexes);
+                });
+            }
         }
     }
 }
@@ -281,23 +282,24 @@ unsafe extern "C" fn init(
     support: *const spa_support,
     n_support: u32,
 ) -> c_int {
-    let log = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Log.as_ptr().cast())
-        as *mut spa_log;
-    let log = crate::spa::Log::wrap(log, std::ptr::NonNull::new(&raw mut OSS_MONITOR_TOPIC));
+    let log =
+        unsafe { spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Log.as_ptr().cast()) }
+            as *mut spa_log;
+    let log =
+        unsafe { crate::spa::Log::wrap(log, std::ptr::NonNull::new(&raw mut OSS_MONITOR_TOPIC)) };
 
-    let main_loop = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Loop.as_ptr().cast())
-        as *mut spa_loop;
+    let main_loop =
+        unsafe { spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Loop.as_ptr().cast()) }
+            as *mut spa_loop;
 
     if main_loop.is_null() {
         return -libc::EINVAL;
     }
 
-    let main_loop = crate::spa::Loop::wrap(main_loop);
+    let main_loop = unsafe { crate::spa::Loop::wrap(main_loop) };
 
-    let state = handle
-        .cast::<State>()
-        .as_mut()
-        .expect("handle is not supposed to be null");
+    let state =
+        unsafe { handle.cast::<State>().as_mut() }.expect("handle is not supposed to be null");
 
     let pcm_indexes = match crate::sound::read_sndstat() {
         Ok(indexes) => crate::sound::group_pcm_devices_by_parent(&indexes),
@@ -326,56 +328,60 @@ unsafe extern "C" fn init(
         priv_: std::ptr::null_mut(),
     };
 
-    std::ptr::write(
-        state,
-        State {
-            handle: spa_handle {
-                version: SPA_VERSION_HANDLE,
-                get_interface: Some(get_interface),
-                clear: Some(clear),
-            },
+    // the host hands us uninitialized memory of get_size() bytes; write the
+    // whole State without dropping the garbage "old" value
+    unsafe {
+        std::ptr::write(
+            state,
+            State {
+                handle: spa_handle {
+                    version: SPA_VERSION_HANDLE,
+                    get_interface: Some(get_interface),
+                    clear: Some(clear),
+                },
 
-            device: spa_device {
-                iface: spa_interface {
-                    type_: SPA_TYPE_INTERFACE_Device.as_ptr().cast(),
-                    version: SPA_VERSION_DEVICE,
-                    cb: spa_callbacks {
-                        funcs: &DEVICE_IMPL as *const _ as *const c_void,
-                        data: state as *mut _ as *mut c_void,
+                device: spa_device {
+                    iface: spa_interface {
+                        type_: SPA_TYPE_INTERFACE_Device.as_ptr().cast(),
+                        version: SPA_VERSION_DEVICE,
+                        cb: spa_callbacks {
+                            funcs: &DEVICE_IMPL as *const _ as *const c_void,
+                            data: state as *mut _ as *mut c_void,
+                        },
                     },
                 },
-            },
 
-            dev_info: spa_device_info {
-                version: SPA_VERSION_DEVICE_INFO,
-                change_mask: 0,
-                flags: 0,
-                props: &DEV_INFO_PROPS,
-                params: std::ptr::null_mut(),
-                n_params: 0,
-            },
-
-            hooks: spa_hook_list {
-                list: spa_list {
-                    next: std::ptr::null_mut(),
-                    prev: std::ptr::null_mut(),
+                dev_info: spa_device_info {
+                    version: SPA_VERSION_DEVICE_INFO,
+                    change_mask: 0,
+                    flags: 0,
+                    props: &DEV_INFO_PROPS,
+                    params: std::ptr::null_mut(),
+                    n_params: 0,
                 },
+
+                hooks: spa_hook_list {
+                    list: spa_list {
+                        next: std::ptr::null_mut(),
+                        prev: std::ptr::null_mut(),
+                    },
+                },
+
+                pcm_indexes,
+
+                main_loop,
+                devd_socket,
+                devd_source,
+
+                log,
             },
+        );
+    }
 
-            pcm_indexes,
-
-            main_loop,
-            devd_socket,
-            devd_source,
-
-            log,
-        },
-    );
-
-    spa_hook_list_init(&mut state.hooks);
+    unsafe { spa_hook_list_init(&mut state.hooks) };
 
     if state.devd_socket.is_some() {
-        let err = state.main_loop.add_source(&mut state.devd_source);
+        let err = unsafe { state.main_loop.add_source(&mut state.devd_source) };
         if err < 0 {
             // no hotplug then; enumeration still works
             crate::warn!(state.log, "can't watch devd: {}", err);
@@ -397,13 +403,16 @@ unsafe extern "C" fn enum_interface_info(
 ) -> c_int {
     assert!(!info.is_null());
     assert!(!index.is_null());
-    match *index {
-        0 => {
-            *info = &INTERFACE_INFO[0];
-            *index += 1;
-            1
+    // non-null asserted above; the caller contract makes both valid and writable
+    unsafe {
+        match *index {
+            0 => {
+                *info = &INTERFACE_INFO[0];
+                *index += 1;
+                1
+            }
+            _ => 0,
         }
-        _ => 0,
     }
 }
 

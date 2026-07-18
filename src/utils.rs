@@ -7,7 +7,7 @@ use std::os::raw::c_void;
 // for a size probe, `len` is in/out. Callers pass a `buf` valid for `len`
 // bytes (or null).
 unsafe fn sysctl_read(name: &CStr, buf: *mut c_void, len: &mut usize) -> Result<(), Errno> {
-    if sysctlbyname(name.as_ptr(), buf, len, std::ptr::null(), 0) == -1 {
+    if unsafe { sysctlbyname(name.as_ptr(), buf, len, std::ptr::null(), 0) } == -1 {
         return Err(Errno::last());
     }
     Ok(())
@@ -441,7 +441,15 @@ pub(crate) fn build_buffers_info(
 pub(crate) struct SendWrap<T>(T);
 unsafe impl<T> Send for SendWrap<T> {}
 impl<T> SendWrap<T> {
-    pub(crate) fn new(v: T) -> Self {
+    /// Allow `v` to cross onto the loop thread.
+    ///
+    /// # Safety
+    /// The caller asserts that this particular value stays valid and usable
+    /// from the loop thread for as long as it is used there. For host
+    /// pointers that is the SPA lifetime contract (the host keeps callback
+    /// tables, io areas and buffer arrays valid while they are set); the
+    /// blocking loop invoke is the serialization point.
+    pub(crate) unsafe fn new(v: T) -> Self {
         SendWrap(v)
     }
     pub(crate) fn into_inner(self) -> T {
@@ -473,29 +481,31 @@ pub(crate) unsafe fn block_on_loop<T, F: FnOnce(&mut T) + Send>(
         _size: usize,
         user_data: *mut std::os::raw::c_void,
     ) -> std::os::raw::c_int {
-        let ctx = user_data
-            .cast::<Ctx<T, F>>()
-            .as_mut()
+        // user_data is the &mut Ctx the blocking invoke below keeps alive
+        let ctx = unsafe { user_data.cast::<Ctx<T, F>>().as_mut() }
             .expect("user_data is not supposed to be null");
         let f = ctx.f.take().expect("the invoked function only runs once");
         let target = ctx.target;
         // a panic must not unwind into the C loop (that aborts the daemon)
         let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            f(target.as_mut().expect("target is not supposed to be null"));
+            // target validity is the caller's contract on block_on_loop
+            f(unsafe { target.as_mut() }.expect("target is not supposed to be null"));
         }));
         if ok.is_err() { -libc::ECANCELED } else { 0 }
     }
 
     // blocking, so `ctx` outlives the call
     let mut ctx = Ctx { target, f: Some(f) };
-    let err = loop_.invoke(
-        Some(trampoline::<T, F>),
-        0,
-        std::ptr::null(),
-        0,
-        true,
-        &mut ctx as *mut _ as *mut std::os::raw::c_void,
-    );
+    let err = unsafe {
+        loop_.invoke(
+            Some(trampoline::<T, F>),
+            0,
+            std::ptr::null(),
+            0,
+            true,
+            &mut ctx as *mut _ as *mut std::os::raw::c_void,
+        )
+    };
     err >= 0
 }
 
@@ -520,7 +530,7 @@ pub(crate) unsafe fn parse_latency_info(
     use libspa::pod::{Object, Value};
     use libspa::sys::*;
 
-    match crate::utils::deserialize_pod(param) {
+    match unsafe { crate::utils::deserialize_pod(param) } {
         Some(Value::Object(Object {
             type_, properties, ..
         })) if type_ == SPA_TYPE_OBJECT_ParamLatency => {
@@ -597,7 +607,7 @@ pub(crate) unsafe fn parse_process_latency_info(
     use libspa::pod::{Object, Value};
     use libspa::sys::*;
 
-    match crate::utils::deserialize_pod(param) {
+    match unsafe { crate::utils::deserialize_pod(param) } {
         Some(Value::Object(Object {
             type_, properties, ..
         })) if type_ == SPA_TYPE_OBJECT_ParamProcessLatency => {
@@ -777,8 +787,11 @@ pub(crate) unsafe fn set_clock_name(clock: *mut libspa::sys::spa_io_clock, name:
     }
     let bytes = name.to_bytes_with_nul();
     let n = bytes.len().min(63);
-    std::ptr::copy_nonoverlapping(bytes.as_ptr().cast(), (*clock).name.as_mut_ptr(), n);
-    (*clock).name[63] = 0;
+    // clock is null-checked above; n is capped to the 64-byte name field
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr().cast(), (*clock).name.as_mut_ptr(), n);
+        (*clock).name[63] = 0;
+    }
 }
 
 // does the driver's clock in `position` carry our clock name? (then we tick
@@ -791,7 +804,8 @@ pub(crate) unsafe fn same_clock(
     if position.is_null() {
         return false;
     }
-    let theirs = &(*position).clock.name;
+    // position is null-checked above
+    let theirs = unsafe { &(*position).clock.name };
     let ours = name.to_bytes();
     if ours.is_empty() || ours.len() >= theirs.len() || theirs[0] == 0 {
         return false;
@@ -850,7 +864,7 @@ pub(crate) unsafe fn deserialize_pod(
     param: *const libspa::sys::spa_pod,
 ) -> Option<libspa::pod::Value> {
     use libspa::pod::deserialize::PodDeserializer;
-    let bytes = libspa::pod::Pod::from_raw(param).as_bytes();
+    let bytes = unsafe { libspa::pod::Pod::from_raw(param).as_bytes() };
     std::panic::catch_unwind(|| PodDeserializer::deserialize_any_from(bytes).ok())
         .ok()
         .flatten()
@@ -882,10 +896,13 @@ pub(crate) unsafe fn invoke_on_loop<T, F: FnOnce(&mut T) + Send + 'static>(
         _size: usize,
         user_data: *mut std::os::raw::c_void,
     ) -> std::os::raw::c_int {
-        let ctx = Box::from_raw(user_data.cast::<Ctx<T, F>>());
+        // user_data is the Box::into_raw'd ctx below; the loop runs each
+        // queued item exactly once, so this is the sole owner
+        let ctx = unsafe { Box::from_raw(user_data.cast::<Ctx<T, F>>()) };
         let target = ctx.target;
         let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            (ctx.f)(target.as_mut().expect("target is not supposed to be null"));
+            // target validity is the caller's contract on invoke_on_loop
+            (ctx.f)(unsafe { target.as_mut() }.expect("target is not supposed to be null"));
         }));
         if ok.is_err() {
             eprintln!("freebsd-oss: panic in a queued main-loop task (swallowed)");
@@ -897,17 +914,20 @@ pub(crate) unsafe fn invoke_on_loop<T, F: FnOnce(&mut T) + Send + 'static>(
     }
 
     let ctx = Box::into_raw(Box::new(Ctx { target, f }));
-    let err = loop_.invoke(
-        Some(trampoline::<T, F>),
-        0,
-        std::ptr::null(),
-        0,
-        false,
-        ctx as *mut std::os::raw::c_void,
-    );
+    let err = unsafe {
+        loop_.invoke(
+            Some(trampoline::<T, F>),
+            0,
+            std::ptr::null(),
+            0,
+            false,
+            ctx as *mut std::os::raw::c_void,
+        )
+    };
     if err < 0 {
-        // a negative here uniquely means the item was never queued
-        drop(Box::from_raw(ctx));
+        // a negative here uniquely means the item was never queued (the
+        // trampoline never ran, so this is still the sole owner)
+        drop(unsafe { Box::from_raw(ctx) });
         return false;
     }
     true
