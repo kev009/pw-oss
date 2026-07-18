@@ -834,7 +834,7 @@ mod tests {
       assert_eq!(*widths.first().unwrap(), 2, "min {} max {}: {:?}", min, max, widths);
       assert_eq!(*widths.last().unwrap(),  2, "min {} max {}: {:?}", min, max, widths);
       assert!(widths.contains(&max), "native width lost: min {} max {}: {:?}", min, max, widths);
-      assert!(widths.iter().all(|w| (*w >= min && *w <= max)),
+      assert!(widths.iter().all(|w| *w >= min && *w <= max),
         "width out of range: min {} max {}: {:?}", min, max, widths);
       assert_eq!(widths.iter().filter(|w| **w == 2).count().min(2),
         if widths.len() == 1 { 1 } else { 2 });

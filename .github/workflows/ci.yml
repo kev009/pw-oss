@@ -1,7 +1,10 @@
 name: CI
 
+# pushes to master and all PRs; branch pushes get their run from the PR
+# event alone, not twice
 on:
   push:
+    branches: [master]
   pull_request:
 
 jobs:
@@ -24,3 +27,4 @@ jobs:
             export LIBCLANG_PATH=/usr/local/llvm19/lib
             cargo build --release
             cargo test
+            cargo clippy --all-targets -- -D warnings

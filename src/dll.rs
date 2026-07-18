@@ -176,7 +176,7 @@ mod tests {
     assert_eq!(BwAdapt::bw_cap(0, 2048), SPA_DLL_BW_MAX);
     assert_eq!(BwAdapt::bw_cap(16384, 16384), SPA_DLL_BW_MAX);
     let capped = BwAdapt::bw_cap(16384, 32768);
-    assert!(capped < SPA_DLL_BW_MAX && capped >= SPA_DLL_BW_MIN);
+    assert!((SPA_DLL_BW_MIN..SPA_DLL_BW_MAX).contains(&capped));
     assert_eq!(BwAdapt::bw_cap(1024, u32::MAX), SPA_DLL_BW_MIN);
   }
 

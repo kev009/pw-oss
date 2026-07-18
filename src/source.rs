@@ -818,7 +818,7 @@ mod tests {
 
         // a degenerate ring still pins the peak inside it
         let (_, peak3) = fill_targets(period, blocksize, period);
-        assert!(peak3 <= period.saturating_sub(blocksize).max(0));
+        assert!(peak3 <= period.saturating_sub(blocksize));
       }
     }
   }
