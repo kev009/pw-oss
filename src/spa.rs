@@ -3,32 +3,32 @@ use libspa::sys::*;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_void};
 
-pub const SPA_DEVICE_CHANGE_MASK_ALL: u32 =
+pub(crate) const SPA_DEVICE_CHANGE_MASK_ALL: u32 =
     SPA_DEVICE_CHANGE_MASK_FLAGS | SPA_DEVICE_CHANGE_MASK_PARAMS | SPA_DEVICE_CHANGE_MASK_PROPS;
 
-pub const SPA_DEVICE_OBJECT_CHANGE_MASK_ALL: u32 =
+pub(crate) const SPA_DEVICE_OBJECT_CHANGE_MASK_ALL: u32 =
     SPA_DEVICE_OBJECT_CHANGE_MASK_FLAGS | SPA_DEVICE_OBJECT_CHANGE_MASK_PROPS;
 
-pub const SPA_NODE_CHANGE_MASK_ALL: u32 =
+pub(crate) const SPA_NODE_CHANGE_MASK_ALL: u32 =
     SPA_NODE_CHANGE_MASK_FLAGS | SPA_NODE_CHANGE_MASK_PARAMS | SPA_NODE_CHANGE_MASK_PROPS;
 
-pub const SPA_PORT_CHANGE_MASK_ALL: u32 = SPA_PORT_CHANGE_MASK_FLAGS
+pub(crate) const SPA_PORT_CHANGE_MASK_ALL: u32 = SPA_PORT_CHANGE_MASK_FLAGS
     | SPA_PORT_CHANGE_MASK_PARAMS
     | SPA_PORT_CHANGE_MASK_PROPS
     | SPA_PORT_CHANGE_MASK_RATE;
 
 // spa/node/node.h:241; the libspa-sys bindings don't carry the set_param flags
-pub const SPA_NODE_PARAM_FLAG_NEAREST: u32 = 1 << 2;
+pub(crate) const SPA_NODE_PARAM_FLAG_NEAREST: u32 = 1 << 2;
 
 // The listener-vtable version gate. The SPA_VERSION_*_EVENTS constants are
 // currently 0, so a literal `version >= MIN` comparison trips clippy's
 // absurd_extreme_comparisons; routing MIN through a runtime parameter keeps
 // the check future-proof without module-wide allows.
-pub fn version_ok(version: u32, min: u32) -> bool {
+pub(crate) fn version_ok(version: u32, min: u32) -> bool {
     version >= min
 }
 
-pub unsafe fn for_each_hook(head: *mut spa_hook_list, mut apply: impl FnMut(&spa_hook)) {
+pub(crate) unsafe fn for_each_hook(head: *mut spa_hook_list, mut apply: impl FnMut(&spa_hook)) {
     let mut entry = (*head).list.next as *mut spa_hook;
     while (*entry).link != (*head).list {
         // grab next first: a listener may remove (and free) its own hook from
@@ -40,7 +40,7 @@ pub unsafe fn for_each_hook(head: *mut spa_hook_list, mut apply: impl FnMut(&spa
     }
 }
 
-pub unsafe fn dev_emit_result(
+pub(crate) unsafe fn dev_emit_result(
     hooks: &mut spa_hook_list,
     seq: c_int,
     res: c_int,
@@ -71,7 +71,7 @@ pub unsafe fn dev_emit_result(
 // The source pod must NOT live in `out`: the builder's overflow callback grows
 // the Vec by reallocating, which would move the source out from under the
 // filter mid-copy. Returns a pointer into `out`, valid until `out` changes.
-pub unsafe fn filter_pod(
+pub(crate) unsafe fn filter_pod(
     out: &mut Vec<u8>,
     src: *mut spa_pod,
     filter: *const spa_pod,
@@ -86,7 +86,7 @@ pub unsafe fn filter_pod(
 }
 
 // sync() replies with an empty result carrying the sequence number
-pub unsafe fn node_emit_done(hooks: &mut spa_hook_list, seq: c_int) {
+pub(crate) unsafe fn node_emit_done(hooks: &mut spa_hook_list, seq: c_int) {
     for_each_hook(hooks, |entry| {
         let f = entry
             .cb
@@ -101,7 +101,7 @@ pub unsafe fn node_emit_done(hooks: &mut spa_hook_list, seq: c_int) {
     });
 }
 
-pub unsafe fn node_emit_result(
+pub(crate) unsafe fn node_emit_result(
     hooks: &mut spa_hook_list,
     seq: c_int,
     res: c_int,
@@ -128,7 +128,7 @@ pub unsafe fn node_emit_result(
     });
 }
 
-pub unsafe fn for_each_dict_item(dict: &spa_dict, mut apply: impl FnMut(&str, &str)) {
+pub(crate) unsafe fn for_each_dict_item(dict: &spa_dict, mut apply: impl FnMut(&str, &str)) {
     if dict.n_items == 0 || dict.items.is_null() {
         return;
     }
@@ -144,13 +144,13 @@ pub unsafe fn for_each_dict_item(dict: &spa_dict, mut apply: impl FnMut(&str, &s
 }
 
 #[cfg(debug_assertions)]
-pub unsafe fn dump_spa_dict(dict: &spa_dict) {
+pub(crate) unsafe fn dump_spa_dict(dict: &spa_dict) {
     for_each_dict_item(dict, |key, value| {
         eprintln!("dict item: key = {:?}, value = {:?}", key, value);
     });
 }
 
-pub enum DictionaryString {
+pub(crate) enum DictionaryString {
     CString(CString),
     Ptr(*const c_char),
 }
@@ -176,14 +176,14 @@ impl From<*const u8> for DictionaryString {
 
 const MAX_ITEMS: u32 = 1024;
 
-pub struct Dictionary {
+pub(crate) struct Dictionary {
     dict: spa_dict,
     items: Vec<spa_dict_item>,
     strings: Vec<CString>,
 }
 
 impl Dictionary {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             dict: spa_dict {
                 flags: 0,
@@ -195,11 +195,11 @@ impl Dictionary {
         }
     }
 
-    pub fn fix_pointers(&mut self) {
+    pub(crate) fn fix_pointers(&mut self) {
         self.dict.items = self.items.as_ptr();
     }
 
-    pub unsafe fn raw(&self) -> *const spa_dict {
+    pub(crate) unsafe fn raw(&self) -> *const spa_dict {
         &self.dict as *const spa_dict
     }
 
@@ -207,12 +207,7 @@ impl Dictionary {
         &mut self.dict as *mut spa_dict
     }
 
-    /* currently unused
-    pub fn len(&self) -> u32 {
-      self.items.len() as u32
-    }*/
-
-    pub fn add_item<K: Into<DictionaryString>, V: Into<DictionaryString>>(
+    pub(crate) fn add_item<K: Into<DictionaryString>, V: Into<DictionaryString>>(
         &mut self,
         key: K,
         value: V,
@@ -254,14 +249,14 @@ impl Dictionary {
 
 const MAX_PARAMS: u32 = 16;
 
-pub struct DeviceInfo {
+pub(crate) struct DeviceInfo {
     info: spa_device_info,
     props: Dictionary,
     params: [spa_param_info; MAX_PARAMS as usize],
 }
 
 impl DeviceInfo {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             info: spa_device_info {
                 version: SPA_VERSION_DEVICE_INFO,
@@ -282,16 +277,16 @@ impl DeviceInfo {
         }
     }
 
-    pub fn fix_pointers(&mut self) {
+    pub(crate) fn fix_pointers(&mut self) {
         self.info.props = unsafe { self.props.raw() };
         self.info.params = self.params.as_mut_ptr();
     }
 
-    pub unsafe fn raw(&self) -> *const spa_device_info {
+    pub(crate) unsafe fn raw(&self) -> *const spa_device_info {
         &self.info as *const spa_device_info
     }
 
-    pub fn add_prop<K: Into<DictionaryString>, V: Into<DictionaryString>>(
+    pub(crate) fn add_prop<K: Into<DictionaryString>, V: Into<DictionaryString>>(
         &mut self,
         key: K,
         value: V,
@@ -300,7 +295,7 @@ impl DeviceInfo {
         self.info.change_mask |= SPA_DEVICE_CHANGE_MASK_PROPS as u64;
     }
 
-    pub fn add_param(&mut self, id: u32, flags: u32) {
+    pub(crate) fn add_param(&mut self, id: u32, flags: u32) {
         assert!(self.info.n_params < MAX_PARAMS);
         self.params[self.info.n_params as usize] = spa_param_info {
             id,
@@ -315,7 +310,7 @@ impl DeviceInfo {
 
     // flip a param's serial so consumers re-read it even when the read/write
     // flags didn't change
-    pub fn bump_param(&mut self, id: u32) {
+    pub(crate) fn bump_param(&mut self, id: u32) {
         for p in &mut self.params[0..self.info.n_params as usize] {
             if p.id == id {
                 p.flags ^= SPA_PARAM_INFO_SERIAL;
@@ -325,21 +320,21 @@ impl DeviceInfo {
         }
     }
 
-    pub fn replace_change_mask(&mut self, new_mask: u64) -> u64 {
+    pub(crate) fn replace_change_mask(&mut self, new_mask: u64) -> u64 {
         let old = self.info.change_mask;
         self.info.change_mask = new_mask;
         old
     }
 }
 
-pub struct NodeInfo {
+pub(crate) struct NodeInfo {
     info: spa_node_info,
     props: Dictionary,
     params: [spa_param_info; MAX_PARAMS as usize],
 }
 
 impl NodeInfo {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             info: spa_node_info {
                 max_input_ports: 0,
@@ -361,31 +356,31 @@ impl NodeInfo {
         }
     }
 
-    pub fn fix_pointers(&mut self) {
+    pub(crate) fn fix_pointers(&mut self) {
         self.info.props = unsafe { self.props.raw_mut() };
         self.info.params = self.params.as_mut_ptr();
     }
 
-    pub unsafe fn raw(&self) -> *const spa_node_info {
+    pub(crate) unsafe fn raw(&self) -> *const spa_node_info {
         &self.info as *const spa_node_info
     }
 
-    pub fn set_max_input_ports(&mut self, max_ports: u32) {
+    pub(crate) fn set_max_input_ports(&mut self, max_ports: u32) {
         self.info.max_input_ports = max_ports;
         self.info.change_mask |= SPA_NODE_CHANGE_MASK_FLAGS as u64; // does this field count as a flag?
     }
 
-    pub fn set_max_output_ports(&mut self, max_ports: u32) {
+    pub(crate) fn set_max_output_ports(&mut self, max_ports: u32) {
         self.info.max_output_ports = max_ports;
         self.info.change_mask |= SPA_NODE_CHANGE_MASK_FLAGS as u64; // does this field count as a flag?
     }
 
-    pub fn set_flags(&mut self, flags: u64) {
+    pub(crate) fn set_flags(&mut self, flags: u64) {
         self.info.flags = flags;
         self.info.change_mask |= SPA_NODE_CHANGE_MASK_FLAGS as u64;
     }
 
-    pub fn add_prop<K: Into<DictionaryString>, V: Into<DictionaryString>>(
+    pub(crate) fn add_prop<K: Into<DictionaryString>, V: Into<DictionaryString>>(
         &mut self,
         key: K,
         value: V,
@@ -394,7 +389,7 @@ impl NodeInfo {
         self.info.change_mask |= SPA_NODE_CHANGE_MASK_PROPS as u64;
     }
 
-    pub fn add_param(&mut self, id: u32, flags: u32) {
+    pub(crate) fn add_param(&mut self, id: u32, flags: u32) {
         assert!(self.info.n_params < MAX_PARAMS);
         self.params[self.info.n_params as usize] = spa_param_info {
             id,
@@ -409,7 +404,7 @@ impl NodeInfo {
 
     // flip a param's serial so consumers (the adapter compares flags, not user)
     // re-read it even when the read/write flags didn't change
-    pub fn bump_param(&mut self, id: u32) {
+    pub(crate) fn bump_param(&mut self, id: u32) {
         for p in &mut self.params[0..self.info.n_params as usize] {
             if p.id == id {
                 p.flags ^= SPA_PARAM_INFO_SERIAL;
@@ -419,21 +414,21 @@ impl NodeInfo {
         }
     }
 
-    pub fn replace_change_mask(&mut self, new_mask: u64) -> u64 {
+    pub(crate) fn replace_change_mask(&mut self, new_mask: u64) -> u64 {
         let old = self.info.change_mask;
         self.info.change_mask = new_mask;
         old
     }
 }
 
-pub struct PortInfo {
+pub(crate) struct PortInfo {
     info: spa_port_info,
     props: Dictionary,
     params: [spa_param_info; MAX_PARAMS as usize],
 }
 
 impl PortInfo {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             info: spa_port_info {
                 change_mask: 0,
@@ -454,21 +449,21 @@ impl PortInfo {
         }
     }
 
-    pub fn fix_pointers(&mut self) {
+    pub(crate) fn fix_pointers(&mut self) {
         self.info.props = unsafe { self.props.raw_mut() };
         self.info.params = self.params.as_mut_ptr();
     }
 
-    pub unsafe fn raw(&self) -> *const spa_port_info {
+    pub(crate) unsafe fn raw(&self) -> *const spa_port_info {
         &self.info as *const spa_port_info
     }
 
-    pub fn set_flags(&mut self, flags: u64) {
+    pub(crate) fn set_flags(&mut self, flags: u64) {
         self.info.flags = flags;
         self.info.change_mask |= SPA_PORT_CHANGE_MASK_FLAGS as u64;
     }
 
-    pub fn set_rate(&mut self, rate: spa_fraction) {
+    pub(crate) fn set_rate(&mut self, rate: spa_fraction) {
         self.info.rate = rate;
         self.info.change_mask |= SPA_PORT_CHANGE_MASK_RATE as u64;
     }
@@ -479,7 +474,7 @@ impl PortInfo {
       self.info.change_mask |= SPA_PORT_CHANGE_MASK_PROPS as u64;
     }*/
 
-    pub fn add_param(&mut self, id: u32, flags: u32) {
+    pub(crate) fn add_param(&mut self, id: u32, flags: u32) {
         assert!(self.info.n_params < MAX_PARAMS);
         self.params[self.info.n_params as usize] = spa_param_info {
             id,
@@ -495,7 +490,7 @@ impl PortInfo {
     // Change an advertised param's read/write flags. The host re-reads a param when
     // its flags change, so flipping Format WRITE<->READWRITE around a format
     // clear/set is what marks the port (re)negotiable.
-    pub fn set_param_flags(&mut self, id: u32, flags: u32) {
+    pub(crate) fn set_param_flags(&mut self, id: u32, flags: u32) {
         for p in &mut self.params[0..self.info.n_params as usize] {
             if p.id == id {
                 p.flags = flags;
@@ -507,7 +502,7 @@ impl PortInfo {
 
     // flip a param's serial so consumers (the adapter compares flags, not user)
     // re-read it even when the read/write flags didn't change
-    pub fn bump_param(&mut self, id: u32) {
+    pub(crate) fn bump_param(&mut self, id: u32) {
         for p in &mut self.params[0..self.info.n_params as usize] {
             if p.id == id {
                 p.flags ^= SPA_PARAM_INFO_SERIAL;
@@ -517,20 +512,20 @@ impl PortInfo {
         }
     }
 
-    pub fn replace_change_mask(&mut self, new_mask: u64) -> u64 {
+    pub(crate) fn replace_change_mask(&mut self, new_mask: u64) -> u64 {
         let old = self.info.change_mask;
         self.info.change_mask = new_mask;
         old
     }
 }
 
-pub struct Loop {
+pub(crate) struct Loop {
     loop_: &'static spa_loop, // not really 'static, but it should outlive our plugin anyway
     methods: &'static spa_loop_methods, // ditto
 }
 
 impl Loop {
-    pub unsafe fn wrap(loop_: *mut spa_loop) -> Self {
+    pub(crate) unsafe fn wrap(loop_: *mut spa_loop) -> Self {
         let loop_ = loop_
             .cast::<spa_loop>()
             .as_ref()
@@ -546,7 +541,7 @@ impl Loop {
         Self { loop_, methods }
     }
 
-    pub unsafe extern "C" fn add_source(&self, source: *mut spa_source) -> c_int {
+    pub(crate) unsafe extern "C" fn add_source(&self, source: *mut spa_source) -> c_int {
         let spa_loop_add_source = self
             .methods
             .add_source
@@ -555,7 +550,7 @@ impl Loop {
     }
 
     // must be called from the loop thread (or through an invoke)
-    pub unsafe extern "C" fn remove_source(&self, source: *mut spa_source) -> c_int {
+    pub(crate) unsafe extern "C" fn remove_source(&self, source: *mut spa_source) -> c_int {
         let spa_loop_remove_source = self
             .methods
             .remove_source
@@ -563,7 +558,7 @@ impl Loop {
         spa_loop_remove_source(self.loop_.iface.cb.data, source)
     }
 
-    pub unsafe extern "C" fn invoke(
+    pub(crate) unsafe extern "C" fn invoke(
         &self,
         func: spa_invoke_func_t,
         seq: u32,
@@ -585,13 +580,13 @@ impl Loop {
     }
 }
 
-pub struct System {
+pub(crate) struct System {
     system: &'static spa_system, // not really 'static, but it should outlive our plugin anyway
     methods: &'static spa_system_methods, // ditto
 }
 
 impl System {
-    pub unsafe fn wrap(system: *mut spa_system) -> Self {
+    pub(crate) unsafe fn wrap(system: *mut spa_system) -> Self {
         let system = system
             .cast::<spa_system>()
             .as_ref()
@@ -607,12 +602,16 @@ impl System {
         Self { system, methods }
     }
 
-    pub unsafe extern "C" fn close(&self, fd: c_int) -> c_int {
+    pub(crate) unsafe extern "C" fn close(&self, fd: c_int) -> c_int {
         let spa_system_close = self.methods.close.expect("close should be initialized");
         spa_system_close(self.system.iface.cb.data, fd)
     }
 
-    pub unsafe extern "C" fn clock_gettime(&self, clock_id: c_int, value: *mut timespec) -> c_int {
+    pub(crate) unsafe extern "C" fn clock_gettime(
+        &self,
+        clock_id: c_int,
+        value: *mut timespec,
+    ) -> c_int {
         let spa_system_clock_gettime = self
             .methods
             .clock_gettime
@@ -620,7 +619,7 @@ impl System {
         spa_system_clock_gettime(self.system.iface.cb.data, clock_id, value)
     }
 
-    pub unsafe extern "C" fn timerfd_create(&self, clock_id: c_int, flags: c_int) -> c_int {
+    pub(crate) unsafe extern "C" fn timerfd_create(&self, clock_id: c_int, flags: c_int) -> c_int {
         let spa_system_timerfd_create = self
             .methods
             .timerfd_create
@@ -628,7 +627,7 @@ impl System {
         spa_system_timerfd_create(self.system.iface.cb.data, clock_id, flags)
     }
 
-    pub unsafe extern "C" fn timerfd_read(&self, fd: c_int, expirations: *mut u64) -> c_int {
+    pub(crate) unsafe extern "C" fn timerfd_read(&self, fd: c_int, expirations: *mut u64) -> c_int {
         let spa_system_timerfd_read = self
             .methods
             .timerfd_read
@@ -636,7 +635,7 @@ impl System {
         spa_system_timerfd_read(self.system.iface.cb.data, fd, expirations)
     }
 
-    pub unsafe extern "C" fn timerfd_settime(
+    pub(crate) unsafe extern "C" fn timerfd_settime(
         &self,
         fd: c_int,
         flags: c_int,
@@ -651,7 +650,7 @@ impl System {
     }
 }
 
-pub struct Log {
+pub(crate) struct Log {
     // Raw pointers end to end, never long-lived references: the host logger
     // mutates the spa_log pointee (level) and the registered topic
     // (level/has_custom_level) at runtime, so holding a &'static over
@@ -665,7 +664,10 @@ pub struct Log {
 }
 
 impl Log {
-    pub unsafe fn wrap(log: *mut spa_log, topic: Option<std::ptr::NonNull<spa_log_topic>>) -> Self {
+    pub(crate) unsafe fn wrap(
+        log: *mut spa_log,
+        topic: Option<std::ptr::NonNull<spa_log_topic>>,
+    ) -> Self {
         let logger = std::ptr::NonNull::new(log).expect("log should be initialized");
         // the vtable pointer is read once here; the vtable fields are read
         // per call through the raw pointer
@@ -682,7 +684,7 @@ impl Log {
         }
     }
 
-    pub fn log_level(&self) -> spa_log_level {
+    pub(crate) fn log_level(&self) -> spa_log_level {
         use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
         // The host logger rewrites the registered topic's level (and the
         // logger's own level) from its own threads on runtime log-level
@@ -709,7 +711,7 @@ impl Log {
         unsafe { AtomicU32::from_ptr(&raw mut (*logger).level).load(Ordering::Relaxed) }
     }
 
-    pub fn log(&self, level: spa_log_level, file: &str, line: c_int, func: &str, msg: &str) {
+    pub(crate) fn log(&self, level: spa_log_level, file: &str, line: c_int, func: &str, msg: &str) {
         let file = CString::new(file).unwrap(); // ours, no interior NULs
         let func = CString::new(func).unwrap(); // ditto
 

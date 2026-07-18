@@ -1,3 +1,8 @@
+// the cdylib exports two symbols - spa_handle_factory_enum and the
+// spa_log_topic_enum registration below; everything else is crate-internal,
+// and pub items would otherwise be exempt from dead_code analysis
+#![warn(unreachable_pub)]
+
 use libspa::sys::spa_handle_factory;
 use std::os::raw::c_int;
 

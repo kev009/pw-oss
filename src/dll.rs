@@ -4,11 +4,11 @@
 /* SPDX-FileCopyrightText: Copyright © 2019 Wim Taymans */
 /* SPDX-License-Identifier: MIT */
 
-pub const SPA_DLL_BW_MAX: f64 = 0.128;
-pub const SPA_DLL_BW_MIN: f64 = 0.016;
+pub(crate) const SPA_DLL_BW_MAX: f64 = 0.128;
+pub(crate) const SPA_DLL_BW_MIN: f64 = 0.016;
 
 #[derive(Default)]
-pub struct SpaDLL {
+pub(crate) struct SpaDLL {
     bw: f64,
     z1: f64,
     z2: f64,
@@ -20,7 +20,7 @@ pub struct SpaDLL {
 
 impl SpaDLL {
     #[inline(always)]
-    pub fn init(&mut self) {
+    pub(crate) fn init(&mut self) {
         self.bw = 0.0;
         self.z1 = 0.0;
         self.z2 = 0.0;
@@ -33,7 +33,7 @@ impl SpaDLL {
     }
 
     #[inline(always)]
-    pub fn set_bw(&mut self, bw: f64, period: u32, rate: u32) {
+    pub(crate) fn set_bw(&mut self, bw: f64, period: u32, rate: u32) {
         let w = 2.0 * std::f64::consts::PI * bw * period as f64 / rate as f64;
         self.w0 = 1.0 - (-20.0 * w).exp();
         self.w1 = w * 1.5 / period as f64;
@@ -42,12 +42,12 @@ impl SpaDLL {
     }
 
     #[inline(always)]
-    pub fn bw(&self) -> f64 {
+    pub(crate) fn bw(&self) -> f64 {
         self.bw
     }
 
     #[inline(always)]
-    pub fn update(&mut self, err: f64) -> f64 {
+    pub(crate) fn update(&mut self, err: f64) -> f64 {
         self.z1 += self.w0 * (self.w1 * err - self.z1);
         self.z2 += self.w0 * (self.z1 - self.z2);
         self.z3 += self.w2 * self.z2;
@@ -57,7 +57,7 @@ impl SpaDLL {
 
 // ALSA's bandwidth floor for the adaptive scheme (alsa-pcm.c); well below the
 // classic SPA_DLL_BW_MIN - a quiet servo may relax that far
-pub const SPA_ALSA_DLL_BW_MIN: f64 = 0.001;
+pub(crate) const SPA_ALSA_DLL_BW_MIN: f64 = 0.001;
 
 const BW_PERIOD_NSEC: u64 = 3_000_000_000;
 
@@ -70,7 +70,7 @@ const BW_PERIOD_NSEC: u64 = 3_000_000_000;
 // capped by measurement granularity - a fragment wider than the period can't
 // support the full loop gain without wobbling the steered clock.
 #[derive(Default, Clone)]
-pub struct BwAdapt {
+pub(crate) struct BwAdapt {
     err_avg: f64,
     err_var: f64,
     base_time: u64,
@@ -84,7 +84,7 @@ pub struct BwAdapt {
 }
 
 impl BwAdapt {
-    pub fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         // the latched geometry survives: a relock (dll.init + reset) must
         // cold-start at the same committed geometry
         self.err_avg = 0.0;
@@ -93,7 +93,7 @@ impl BwAdapt {
     }
 
     // latch the committed geometry; update() no-ops until this ran (rate 0)
-    pub fn configure(&mut self, stride: u32, noise: u32, period: u32, rate: u32) {
+    pub(crate) fn configure(&mut self, stride: u32, noise: u32, period: u32, rate: u32) {
         self.stride = stride;
         self.noise = noise;
         self.period = period;
@@ -112,7 +112,7 @@ impl BwAdapt {
     // from configure(). Cold-starts the DLL at the granularity cap when
     // bw == 0 (i.e. after init()), making dll.init() + reset() the whole
     // relock idiom.
-    pub fn update(&mut self, dll: &mut SpaDLL, err: f64, now: u64) {
+    pub(crate) fn update(&mut self, dll: &mut SpaDLL, err: f64, now: u64) {
         let (stride, noise, period, rate) = (self.stride, self.noise, self.period, self.rate);
         if rate == 0 {
             return; // unconfigured; nothing to steer safely

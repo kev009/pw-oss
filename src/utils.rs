@@ -13,7 +13,7 @@ unsafe fn sysctl_read(name: &CStr, buf: *mut c_void, len: &mut usize) -> Result<
     Ok(())
 }
 
-pub enum SysctlName {
+pub(crate) enum SysctlName {
     CString(CString),
 }
 
@@ -29,18 +29,18 @@ impl From<String> for SysctlName {
     }
 }
 
-pub struct SysctlReader {
+pub(crate) struct SysctlReader {
     scratch_buffer: Vec<u8>,
 }
 
 impl SysctlReader {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             scratch_buffer: Vec::with_capacity(32),
         }
     }
 
-    pub fn read_string<T: Into<SysctlName>>(
+    pub(crate) fn read_string<T: Into<SysctlName>>(
         &mut self,
         name: T,
         max_len: usize,
@@ -71,7 +71,7 @@ impl SysctlReader {
         Ok(String::from_utf8_lossy(bytes).to_string())
     }
 
-    pub fn read_u32<T: Into<SysctlName>>(&mut self, name: T) -> Result<u32, Errno> {
+    pub(crate) fn read_u32<T: Into<SysctlName>>(&mut self, name: T) -> Result<u32, Errno> {
         let SysctlName::CString(name) = name.into();
         let mut value: u32 = 0;
         let mut len = std::mem::size_of::<u32>();
@@ -84,25 +84,25 @@ use std::os::fd::AsRawFd;
 use std::os::fd::RawFd;
 use uds::UnixSeqpacketConn;
 
-pub struct DevdSocket {
+pub(crate) struct DevdSocket {
     socket: UnixSeqpacketConn,
     buffer: Vec<u8>,
 }
 
 impl DevdSocket {
-    pub fn open() -> Result<Self, std::io::Error> {
+    pub(crate) fn open() -> Result<Self, std::io::Error> {
         let socket = UnixSeqpacketConn::connect("/var/run/devd.seqpacket.pipe")?;
         let buffer = [0; 8192 /* DEVCTL_MAXBUF */].to_vec();
         Ok(Self { socket, buffer })
     }
 
-    pub fn fd(&self) -> RawFd {
+    pub(crate) fn fd(&self) -> RawFd {
         self.socket.as_raw_fd()
     }
 
     // false when the connection is dead (EOF or error): the fd stays readable
     // forever then, and the caller must deregister it or the loop busy-spins
-    pub fn read_event(&mut self, mut apply: impl FnMut(&str)) -> bool {
+    pub(crate) fn read_event(&mut self, mut apply: impl FnMut(&str)) -> bool {
         match self.socket.recv(&mut self.buffer) {
             Ok(0) => false, // EOF: devd went away (e.g. service devd restart)
             Ok(len) => {
@@ -123,7 +123,7 @@ impl DevdSocket {
 // the rears, unlike WAV/ALSA
 // hand-formatted: one line per speaker pair keeps the interleave order legible
 #[rustfmt::skip]
-pub fn channel_positions(channels: u32) -> Option<&'static [u32]> {
+pub(crate) fn channel_positions(channels: u32) -> Option<&'static [u32]> {
     use libspa::sys::*;
     static C1: [u32; 1] = [SPA_AUDIO_CHANNEL_MONO];
     static C2: [u32; 2] = [SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR];
@@ -150,7 +150,7 @@ pub fn channel_positions(channels: u32) -> Option<&'static [u32]> {
 // sync with the per-direction parse_config/oss_format matches
 // (hand-formatted: one pair per line keeps the mapping scannable)
 #[rustfmt::skip]
-pub const FORMAT_MAP: [(u32, u32); 4] = [
+pub(crate) const FORMAT_MAP: [(u32, u32); 4] = [
     (crate::sound::AFMT_S32_LE, libspa::sys::SPA_AUDIO_FORMAT_S32_LE),
     (crate::sound::AFMT_S32_BE, libspa::sys::SPA_AUDIO_FORMAT_S32_BE),
     (crate::sound::AFMT_S16_LE, libspa::sys::SPA_AUDIO_FORMAT_S16_LE),
@@ -182,7 +182,7 @@ fn offered_formats(caps: &crate::sound::DspCaps) -> Vec<u32> {
 // (alsa-pcm.c:2364, :2388). Returns true when anything was adjusted; the
 // caller then returns 1 (alsa-pcm.c:2548) so the adapter re-reads our Format
 // param for the actual values (audioadapter.c:596).
-pub fn snap_raw_to_caps(
+pub(crate) fn snap_raw_to_caps(
     caps: &crate::sound::DspCaps,
     raw: &mut libspa::sys::spa_audio_info_raw,
 ) -> bool {
@@ -266,7 +266,7 @@ fn enum_format_widths(min_channels: u32, max_channels: u32) -> Vec<u32> {
 // One EnumFormat pod per offered channel width (enum_format_widths order),
 // positions from the kernel interleave. Returns false when `index` is past
 // the last result.
-pub unsafe fn build_enum_format_info(
+pub(crate) unsafe fn build_enum_format_info(
     b: &mut libspa::pod::builder::Builder,
     caps: &crate::sound::DspCaps,
     index: u32,
@@ -365,7 +365,7 @@ pub unsafe fn build_enum_format_info(
     Ok(true)
 }
 
-pub unsafe fn build_buffers_info(
+pub(crate) unsafe fn build_buffers_info(
     b: &mut libspa::pod::builder::Builder,
     stride: u32,
 ) -> Result<(), rustix::io::Errno> {
@@ -428,7 +428,7 @@ pub unsafe fn build_buffers_info(
 // the loop thread). The closure and target cross a thread boundary; callers
 // only capture raw pointers and plain data. Returns false when the invoke
 // failed or the closure panicked - the closure then may not have run.
-pub unsafe fn block_on_loop<T, F: FnOnce(&mut T)>(
+pub(crate) unsafe fn block_on_loop<T, F: FnOnce(&mut T)>(
     loop_: &crate::spa::Loop,
     target: *mut T,
     f: F,
@@ -476,7 +476,7 @@ pub unsafe fn block_on_loop<T, F: FnOnce(&mut T)>(
     err >= 0
 }
 
-pub fn latency_info_default(
+pub(crate) fn latency_info_default(
     direction: libspa::sys::spa_direction,
 ) -> libspa::sys::spa_latency_info {
     libspa::sys::spa_latency_info {
@@ -491,7 +491,7 @@ pub fn latency_info_default(
 }
 
 // spa_latency_parse is static inline C, so reimplemented here
-pub unsafe fn parse_latency_info(
+pub(crate) unsafe fn parse_latency_info(
     param: *const libspa::sys::spa_pod,
 ) -> Option<libspa::sys::spa_latency_info> {
     use libspa::pod::{Object, Value};
@@ -525,7 +525,7 @@ pub unsafe fn parse_latency_info(
 }
 
 // spa_latency_build is static inline C, so reimplemented here
-pub unsafe fn build_latency_info(
+pub(crate) unsafe fn build_latency_info(
     b: &mut libspa::pod::builder::Builder,
     info: &libspa::sys::spa_latency_info,
 ) -> Result<(), rustix::io::Errno> {
@@ -558,7 +558,7 @@ pub unsafe fn build_latency_info(
     Ok(())
 }
 
-pub fn process_latency_default() -> libspa::sys::spa_process_latency_info {
+pub(crate) fn process_latency_default() -> libspa::sys::spa_process_latency_info {
     libspa::sys::spa_process_latency_info {
         quantum: 0.0,
         rate: 0,
@@ -567,7 +567,7 @@ pub fn process_latency_default() -> libspa::sys::spa_process_latency_info {
 }
 
 // spa_process_latency_parse is static inline C, so reimplemented here
-pub unsafe fn parse_process_latency_info(
+pub(crate) unsafe fn parse_process_latency_info(
     param: *const libspa::sys::spa_pod,
 ) -> Option<libspa::sys::spa_process_latency_info> {
     use libspa::pod::{Object, Value};
@@ -597,7 +597,7 @@ pub unsafe fn parse_process_latency_info(
 }
 
 // spa_process_latency_build is static inline C, so reimplemented here
-pub unsafe fn build_process_latency_info(
+pub(crate) unsafe fn build_process_latency_info(
     b: &mut libspa::pod::builder::Builder,
     info: &libspa::sys::spa_process_latency_info,
 ) -> Result<(), rustix::io::Errno> {
@@ -624,7 +624,7 @@ pub unsafe fn build_process_latency_info(
 }
 
 // spa_process_latency_info_add is static inline C, so reimplemented here
-pub fn process_latency_info_add(
+pub(crate) fn process_latency_info_add(
     process: &libspa::sys::spa_process_latency_info,
     info: &mut libspa::sys::spa_latency_info,
 ) {
@@ -636,7 +636,7 @@ pub fn process_latency_info_add(
     info.max_ns += process.ns;
 }
 
-pub unsafe fn build_latency_offset_prop_info(
+pub(crate) unsafe fn build_latency_offset_prop_info(
     b: &mut libspa::pod::builder::Builder,
 ) -> Result<(), rustix::io::Errno> {
     use libspa::sys::*;
@@ -664,7 +664,7 @@ pub unsafe fn build_latency_offset_prop_info(
     Ok(())
 }
 
-pub unsafe fn build_latency_offset_props(
+pub(crate) unsafe fn build_latency_offset_props(
     b: &mut libspa::pod::builder::Builder,
     ns: i64,
     params: &[(&str, u32)],
@@ -697,7 +697,7 @@ pub unsafe fn build_latency_offset_props(
 
 // PropInfo for a custom u32 tunable carried in the Props params struct; the
 // advertised default is the CURRENT (effective) value, like the ALSA plugin
-pub unsafe fn build_params_prop_info(
+pub(crate) unsafe fn build_params_prop_info(
     b: &mut libspa::pod::builder::Builder,
     name: &str,
     description: &str,
@@ -734,7 +734,7 @@ pub unsafe fn build_params_prop_info(
 
 // identify our device clock (spa_io_clock.name) so consumers can tell whether
 // two nodes tick from the same hardware
-pub unsafe fn set_clock_name(clock: *mut libspa::sys::spa_io_clock, name: &std::ffi::CStr) {
+pub(crate) unsafe fn set_clock_name(clock: *mut libspa::sys::spa_io_clock, name: &std::ffi::CStr) {
     if clock.is_null() {
         return;
     }
@@ -747,7 +747,7 @@ pub unsafe fn set_clock_name(clock: *mut libspa::sys::spa_io_clock, name: &std::
 // does the driver's clock in `position` carry our clock name? (then we tick
 // from the same device and rate matching is pointless - ALSA does the same
 // clock-name comparison)
-pub unsafe fn same_clock(
+pub(crate) unsafe fn same_clock(
     position: *const libspa::sys::spa_io_position,
     name: &std::ffi::CStr,
 ) -> bool {
@@ -769,7 +769,7 @@ pub unsafe fn same_clock(
 
 // one graph cycle expressed in device bytes; the device rate can differ from
 // the graph rate (the adapter's resampler makes up the difference)
-pub fn device_period_bytes(
+pub(crate) fn device_period_bytes(
     target_duration: u64,
     device_rate: u32,
     graph_rate: u32,
@@ -787,7 +787,7 @@ pub fn device_period_bytes(
 // a nanosecond interval (hardware drain quantum, elapsed time) expressed in
 // device bytes; saturating and clamped - the inputs are device- or
 // clock-provided and an overflow here would abort the data loop
-pub fn ns_to_bytes(ns: u64, rate: u32, stride: u32) -> u32 {
+pub(crate) fn ns_to_bytes(ns: u64, rate: u32, stride: u32) -> u32 {
     ((ns as u128)
         .saturating_mul(rate as u128)
         .saturating_mul(stride as u128)
@@ -798,7 +798,7 @@ pub fn ns_to_bytes(ns: u64, rate: u32, stride: u32) -> u32 {
 // ns_to_bytes rounded up to a whole frame (the division floors: a 2048-byte
 // hardware quantum reads as 2047); a saturated conversion stays saturated at
 // the largest frame multiple instead of overflowing the round-up
-pub fn ns_to_frame_bytes(ns: u64, rate: u32, stride: u32) -> u32 {
+pub(crate) fn ns_to_frame_bytes(ns: u64, rate: u32, stride: u32) -> u32 {
     let stride = stride.max(1);
     ns_to_bytes(ns, rate, stride)
         .checked_next_multiple_of(stride)
@@ -809,7 +809,7 @@ pub fn ns_to_frame_bytes(ns: u64, rate: u32, stride: u32) -> u32 {
 // deserializer divides by a pod-declared child size (Choice pods) and
 // pre-allocates from declared lengths, so a hostile pod can panic it -
 // which must not unwind across our extern "C" boundaries.
-pub unsafe fn deserialize_pod(
+pub(crate) unsafe fn deserialize_pod(
     param: *const libspa::sys::spa_pod,
 ) -> Option<(&'static [u8], libspa::pod::Value)> {
     use libspa::pod::deserialize::PodDeserializer;
@@ -822,7 +822,7 @@ pub unsafe fn deserialize_pod(
 // Fire-and-forget: queue `f` to run once on the given loop (from any thread;
 // non-blocking, RT-safe on the caller side). The closure is boxed and freed
 // after it runs. Returns false when it could not even be queued.
-pub unsafe fn invoke_on_loop<T, F: FnOnce(&mut T)>(
+pub(crate) unsafe fn invoke_on_loop<T, F: FnOnce(&mut T)>(
     loop_: &crate::spa::Loop,
     target: *mut T,
     f: F,
@@ -873,13 +873,13 @@ pub unsafe fn invoke_on_loop<T, F: FnOnce(&mut T)>(
 
 // at most one message a second from a per-cycle warn site, with a count of
 // what went unsaid (ALSA uses spa_ratelimit for the same purpose)
-pub struct RateLimit {
+pub(crate) struct RateLimit {
     last: u64,
     suppressed: u32,
 }
 
 impl RateLimit {
-    pub const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             last: 0,
             suppressed: 0,
@@ -887,7 +887,7 @@ impl RateLimit {
     }
 
     // Some(previously suppressed count) when the caller may log now
-    pub fn check(&mut self, now: u64) -> Option<u32> {
+    pub(crate) fn check(&mut self, now: u64) -> Option<u32> {
         if now.saturating_sub(self.last) >= 1_000_000_000 {
             self.last = now;
             Some(std::mem::take(&mut self.suppressed))
@@ -898,7 +898,7 @@ impl RateLimit {
     }
 }
 
-pub fn now_ns(system: &crate::spa::System) -> u64 {
+pub(crate) fn now_ns(system: &crate::spa::System) -> u64 {
     let mut now = libspa::sys::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -909,7 +909,7 @@ pub fn now_ns(system: &crate::spa::System) -> u64 {
 }
 
 #[cfg(debug_assertions)]
-pub fn now_ns_libc() -> u64 {
+pub(crate) fn now_ns_libc() -> u64 {
     let mut now = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -919,7 +919,7 @@ pub fn now_ns_libc() -> u64 {
     (now.tv_sec * libspa::sys::SPA_NSEC_PER_SEC as i64 + now.tv_nsec) as u64
 }
 
-pub fn spa_command_to_str(body: &libspa::sys::spa_pod_object_body) -> &'static str {
+pub(crate) fn spa_command_to_str(body: &libspa::sys::spa_pod_object_body) -> &'static str {
     use libspa::sys::*;
     #[allow(non_upper_case_globals)]
     match (body.type_, body.id) {

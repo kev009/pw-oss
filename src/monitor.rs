@@ -407,7 +407,7 @@ unsafe extern "C" fn enum_interface_info(
     }
 }
 
-pub const OSS_MONITOR_FACTORY: spa_handle_factory = spa_handle_factory {
+pub(crate) const OSS_MONITOR_FACTORY: spa_handle_factory = spa_handle_factory {
     version: SPA_VERSION_HANDLE_FACTORY,
     name: c"freebsd-oss.monitor".as_ptr(),
     info: std::ptr::null(),

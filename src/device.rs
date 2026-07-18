@@ -1769,7 +1769,7 @@ const OSS_DEVICE_FACTORY_INFO: spa_dict = spa_dict {
     items: std::ptr::null(),
 };
 
-pub const OSS_DEVICE_FACTORY: spa_handle_factory = spa_handle_factory {
+pub(crate) const OSS_DEVICE_FACTORY: spa_handle_factory = spa_handle_factory {
     version: SPA_VERSION_HANDLE_FACTORY,
     name: c"freebsd-oss.device".as_ptr(),
     info: &OSS_DEVICE_FACTORY_INFO,

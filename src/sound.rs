@@ -4,10 +4,10 @@ use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_long, c_uint, c_ulong, c_void};
 
-pub const AFMT_S16_LE: u32 = 0x00000010;
-pub const AFMT_S16_BE: u32 = 0x00000020;
-pub const AFMT_S32_LE: u32 = 0x00001000;
-pub const AFMT_S32_BE: u32 = 0x00002000;
+pub(crate) const AFMT_S16_LE: u32 = 0x00000010;
+pub(crate) const AFMT_S16_BE: u32 = 0x00000020;
+pub(crate) const AFMT_S32_LE: u32 = 0x00001000;
+pub(crate) const AFMT_S32_BE: u32 = 0x00002000;
 
 const SNDCTL_DSP_SPEED: c_ulong =
     nix::request_code_readwrite!(b'P', 2, std::mem::size_of::<c_int>());
@@ -80,10 +80,10 @@ const PCM_ENABLE_INPUT: c_int = 0x00000001;
 const PCM_ENABLE_OUTPUT: c_int = 0x00000002;
 
 // sys/dev/sound/pcm/channel.h
-pub const CHN_2NDBUFMAXSIZE: usize = 131072;
+pub(crate) const CHN_2NDBUFMAXSIZE: usize = 131072;
 
 // every ring request keeps at least this byte budget, both directions
-pub const MIN_RING_BYTES: u32 = 65536;
+pub(crate) const MIN_RING_BYTES: u32 = 65536;
 
 // The kernel's per-channel soft-ring byte budget. Today the fixed
 // CHN_2NDBUFMAXSIZE; the pending hw.snd.secondary_buffer_max kernel change
@@ -91,7 +91,7 @@ pub const MIN_RING_BYTES: u32 = 65536;
 // Adapt HERE and every ring request, retune gate and advertised quantum cap
 // follows. Note the cap always wins over MIN_RING_BYTES at the use sites (a
 // future cap can undercut the floor).
-pub fn ring_byte_cap(_stride: u32, _rate: u32) -> u32 {
+pub(crate) fn ring_byte_cap(_stride: u32, _rate: u32) -> u32 {
     CHN_2NDBUFMAXSIZE as u32
 }
 
@@ -103,7 +103,7 @@ pub fn ring_byte_cap(_stride: u32, _rate: u32) -> u32 {
 // node.max-latency (node.rs publish_ring_quantum_cap): ring requests floor
 // on it so quantum changes retune in place instead of resizing the device.
 // graph_rate 0 (no position mapped yet) falls back to device frames.
-pub fn max_ring_period_bytes(stride: u32, device_rate: u32, graph_rate: u32) -> u32 {
+pub(crate) fn max_ring_period_bytes(stride: u32, device_rate: u32, graph_rate: u32) -> u32 {
     let stride = stride.max(1);
     let default_max = if graph_rate == 0 {
         2048u32.saturating_mul(stride)
@@ -128,7 +128,7 @@ pub fn max_ring_period_bytes(stride: u32, device_rate: u32, graph_rate: u32) -> 
 // published fraction itself is time-based (frames / device rate) and thus
 // correct at whatever rate the graph actually runs. None = the cap can't
 // bite below the default, nothing worth publishing.
-pub fn advertised_quantum_cap_frames(stride: u32, rate: u32) -> Option<u32> {
+pub(crate) fn advertised_quantum_cap_frames(stride: u32, rate: u32) -> Option<u32> {
     let stride = stride.max(1);
     let frames = ring_byte_cap(stride, rate) / stride / 4;
     if rate == 0 || frames as u64 * 44100 >= 2048 * rate as u64 {
@@ -168,7 +168,7 @@ enum DspState {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct DspCaps {
+pub(crate) struct DspCaps {
     pub formats: u32, // AFMT_* mask
     pub min_channels: u32,
     pub max_channels: u32,
@@ -181,7 +181,7 @@ pub struct DspCaps {
 
 impl DspCaps {
     // used when the device can't be probed (e.g. busy); conservative
-    pub fn fallback() -> Self {
+    pub(crate) fn fallback() -> Self {
         Self {
             formats: AFMT_S16_LE | AFMT_S16_BE | AFMT_S32_LE | AFMT_S32_BE,
             min_channels: 1,
@@ -197,7 +197,7 @@ impl DspCaps {
     // Lenient admission check for a host-requested format: rejects only clear
     // violations of the advertised caps (staleness is handled by the caller's
     // configure backstop). Rates within the feeder snap window pass.
-    pub fn admits(&self, oss_format: u32, channels: u32, rate: u32) -> bool {
+    pub(crate) fn admits(&self, oss_format: u32, channels: u32, rate: u32) -> bool {
         // format only matters where no feeder converts (bitperfect): a
         // non-native SETFMT there snaps and fails the strict grant check -
         // after the EBUSY retire already killed the working fd
@@ -234,7 +234,7 @@ const SNDSTIOC_GET_DEVS: c_ulong =
 
 // native per-direction device info from the sndstat(4) nvlist interface -
 // no dsp open, so an exclusive device's only channel stays unclaimed
-pub struct SndstatDspInfo {
+pub(crate) struct SndstatDspInfo {
     pub formats: u32,
     pub min_rate: u32,
     pub max_rate: u32,
@@ -312,7 +312,7 @@ fn sndstat_pcm_devices() -> Option<Vec<(u32, bool, bool)>> {
     Some(out)
 }
 
-pub fn sndstat_dsp_info(devnode: &str, play: bool) -> Option<SndstatDspInfo> {
+pub(crate) fn sndstat_dsp_info(devnode: &str, play: bool) -> Option<SndstatDspInfo> {
     let nvl = sndstat_snapshot()?;
     let root = nvl.root();
     for dev in root.nvlist_array(c"dsps") {
@@ -400,7 +400,7 @@ fn native_rates(path: &str, play: bool) -> Vec<u32> {
     rates
 }
 
-pub fn probe_caps(path: &str, play: bool) -> Option<DspCaps> {
+pub(crate) fn probe_caps(path: &str, play: bool) -> Option<DspCaps> {
     let native = sndstat_dsp_info(path.trim_start_matches("/dev/"), play);
 
     // An exclusive channel (bitperfect or vchans off) negotiates the native
@@ -593,7 +593,7 @@ fn get_error(fd: c_int) -> audio_errinfo {
     }
 }
 
-pub struct Dsp {
+pub(crate) struct Dsp {
     path: CString,
     pub hw_quantum_ns: u64, // the hardware drain quantum (sndstat); 0 = fragment-accurate
     fd: c_int,
@@ -604,7 +604,7 @@ pub struct Dsp {
 }
 
 impl Dsp {
-    pub fn new(path: &str) -> Self {
+    pub(crate) fn new(path: &str) -> Self {
         Self {
             path: CString::new(path).unwrap(),
             hw_quantum_ns: drain_quantum_ns(path, false),
@@ -616,27 +616,27 @@ impl Dsp {
         }
     }
 
-    pub fn is_closed(&self) -> bool {
+    pub(crate) fn is_closed(&self) -> bool {
         self.state == DspState::Closed
     }
 
-    pub fn path(&self) -> &str {
+    pub(crate) fn path(&self) -> &str {
         self.path.to_str().unwrap_or("") // constructed from &str; always valid
     }
 
     // on direct opens the hardware blocksize is per-session state; call after
     // configure so the snapshot reflects THIS session (see drain_quantum_ns)
-    pub fn refresh_hw_quantum(&mut self) {
+    pub(crate) fn refresh_hw_quantum(&mut self) {
         if let Ok(path) = self.path.to_str() {
             self.hw_quantum_ns = drain_quantum_ns(path, false);
         }
     }
 
-    pub fn is_running(&self) -> bool {
+    pub(crate) fn is_running(&self) -> bool {
         self.state == DspState::Running
     }
 
-    pub fn open(&mut self) -> Result<(), Errno> {
+    pub(crate) fn open(&mut self) -> Result<(), Errno> {
         assert_eq!(self.state, DspState::Closed);
 
         // O_RDONLY, not O_RDWR: on devices with asymmetric play/rec channel
@@ -653,7 +653,7 @@ impl Dsp {
         Ok(())
     }
 
-    pub fn close(&mut self) {
+    pub(crate) fn close(&mut self) {
         assert_ne!(self.state, DspState::Closed);
         unsafe { libc::close(self.fd) };
         self.fd = -1;
@@ -662,7 +662,7 @@ impl Dsp {
         self.skip = 0;
     }
 
-    pub fn configure(&mut self, format: u32, channels: u32, rate: u32) -> Result<(), Errno> {
+    pub(crate) fn configure(&mut self, format: u32, channels: u32, rate: u32) -> Result<(), Errno> {
         assert_eq!(self.state, DspState::Setup);
         // plain AFMT selector (no channel field), so this yields the sample width
         self.stride = afmt_frame_bytes(format)
@@ -682,7 +682,7 @@ impl Dsp {
     // mark survives a trigger suspend since chn_resetbuf doesn't touch it).
     // `fragment` is the normalized oss.fragment override (0 = the 1 KiB
     // default); either way the ring keeps the MIN_RING_BYTES budget.
-    pub fn set_small_fragments(&mut self, fragment: u32, ring: u32) {
+    pub(crate) fn set_small_fragments(&mut self, fragment: u32, ring: u32) {
         if self.state != DspState::Setup {
             return; // triggered channels can't retune; the next re-prime will
         }
@@ -713,7 +713,7 @@ impl Dsp {
     // and clears TRIGGERED, so the next prime retunes and poll() force-starts
     // the channel again (chn_poll ignores NOTRIGGER). false = driver refused;
     // the caller falls back to closing.
-    pub fn suspend(&mut self) -> bool {
+    pub(crate) fn suspend(&mut self) -> bool {
         if self.state != DspState::Running {
             return true; // nothing runs; already primable
         }
@@ -733,7 +733,7 @@ impl Dsp {
     /// returns short mid-frame (signals), the torn frame's tail is discarded on
     /// the next call and its consumed head hidden from this one - one frame
     /// dropped, alignment kept. Returns a frame-aligned count.
-    pub unsafe fn read(&mut self, buf: *mut c_void, count: size_t) -> ssize_t {
+    pub(crate) unsafe fn read(&mut self, buf: *mut c_void, count: size_t) -> ssize_t {
         if self.state == DspState::Setup {
             self.state = DspState::Running;
         }
@@ -762,7 +762,7 @@ impl Dsp {
         n
     }
 
-    pub fn ready_for_reading(&mut self, timeout_ms: usize) -> bool {
+    pub(crate) fn ready_for_reading(&mut self, timeout_ms: usize) -> bool {
         if self.state == DspState::Setup {
             self.state = DspState::Running;
         }
@@ -787,7 +787,7 @@ impl Dsp {
         n > 0 && (pfd.revents & libc::POLLIN) != 0
     }
 
-    pub fn ispace_in_bytes(&mut self) -> c_int {
+    pub(crate) fn ispace_in_bytes(&mut self) -> c_int {
         assert_eq!(self.state, DspState::Running);
         let mut info = std::mem::MaybeUninit::<audio_buf_info>::uninit();
         let err = unsafe { libc::ioctl(self.fd, SNDCTL_DSP_GETISPACE, info.as_mut_ptr()) };
@@ -802,7 +802,7 @@ impl Dsp {
     // needs all three and they come from the same struct (fragsize/fragstotal
     // are layout constants after SETFRAGMENT; only `bytes` moves). (0, 0, 0) =
     // ioctl failed (e.g. device unplugged mid-stream).
-    pub fn ispace_layout(&mut self) -> (u32, u32, u32) {
+    pub(crate) fn ispace_layout(&mut self) -> (u32, u32, u32) {
         assert_eq!(self.state, DspState::Running);
         let mut info = std::mem::MaybeUninit::<audio_buf_info>::uninit();
         if unsafe { libc::ioctl(self.fd, SNDCTL_DSP_GETISPACE, info.as_mut_ptr()) } == -1 {
@@ -816,7 +816,7 @@ impl Dsp {
         )
     }
 
-    pub fn overruns(&self) -> u32 {
+    pub(crate) fn overruns(&self) -> u32 {
         assert_eq!(self.state, DspState::Running);
         get_error(self.fd).rec_overruns.max(0) as u32
     }
@@ -857,7 +857,7 @@ fn afmt_frame_bytes(format: u32) -> u32 {
 // rate renegotiation converts cleanly; drivers with rate-proportional blocks
 // (fixed frame counts) read slightly large or small across rates, which only
 // shifts a floor. 0 = unknown, use the soft fragsize alone.
-pub fn drain_quantum_ns(devnode: &str, play: bool) -> u64 {
+pub(crate) fn drain_quantum_ns(devnode: &str, play: bool) -> u64 {
     let devnode = devnode.trim_start_matches("/dev/"); // sndstat devnodes are bare
     let want_dir = if play { 0x00020000u64 } else { 0x00010000 }; // PCM_CAP_OUTPUT/INPUT
     let mut quantum: u64 = 0;
@@ -889,7 +889,7 @@ pub fn drain_quantum_ns(devnode: &str, play: bool) -> u64 {
     quantum
 }
 
-pub struct DspWriter {
+pub(crate) struct DspWriter {
     pub path: String,
     pub hw_quantum_ns: u64, // the hardware drain quantum (sndstat); 0 = fragment-accurate
     fd: c_int,
@@ -904,7 +904,7 @@ pub struct DspWriter {
 static ZEROES: [u8; CHN_2NDBUFMAXSIZE] = [0u8; CHN_2NDBUFMAXSIZE];
 
 impl DspWriter {
-    pub fn new(path: &str) -> Self {
+    pub(crate) fn new(path: &str) -> Self {
         Self {
             path: path.to_string(),
             hw_quantum_ns: drain_quantum_ns(path, true), // main thread; nodes are built there
@@ -918,15 +918,15 @@ impl DspWriter {
         }
     }
 
-    pub fn is_closed(&self) -> bool {
+    pub(crate) fn is_closed(&self) -> bool {
         self.state == DspState::Closed
     }
 
-    pub fn is_running(&self) -> bool {
+    pub(crate) fn is_running(&self) -> bool {
         self.state == DspState::Running
     }
 
-    pub fn open(&mut self) -> Result<(), Errno> {
+    pub(crate) fn open(&mut self) -> Result<(), Errno> {
         assert_eq!(self.state, DspState::Closed);
         let path = CString::new(self.path.clone()).unwrap();
         let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
@@ -938,7 +938,7 @@ impl DspWriter {
         Ok(())
     }
 
-    pub fn close(&mut self) {
+    pub(crate) fn close(&mut self) {
         assert_ne!(self.state, DspState::Closed);
         // discard the queued buffer so close() doesn't block draining it
         unsafe {
@@ -957,7 +957,7 @@ impl DspWriter {
     // prime's SETFRAGMENT is legal again; write() arms the channel once real
     // data is buffered (write_zeroes only buffers, it never arms). false =
     // driver refused; the caller falls back to rebuilding.
-    pub fn suspend(&mut self) -> bool {
+    pub(crate) fn suspend(&mut self) -> bool {
         if self.state != DspState::Running {
             return true; // nothing runs; already primable
         }
@@ -983,7 +983,7 @@ impl DspWriter {
         }
     }
 
-    pub fn configure(&mut self, format: u32, channels: u32, rate: u32) -> Result<(), Errno> {
+    pub(crate) fn configure(&mut self, format: u32, channels: u32, rate: u32) -> Result<(), Errno> {
         assert_eq!(self.state, DspState::Setup);
         // plain AFMT selector (no channel field), so this yields the sample width
         self.stride = afmt_frame_bytes(format)
@@ -1002,7 +1002,7 @@ impl DspWriter {
     /// caller caches this value across period changes, and a fictitious
     /// capacity would gate quantum changes onto the in-place retune path
     /// forever with a fill target the real ring can't hold.
-    pub fn set_buffer_size(&mut self, len: u32, fragment: u32) -> u32 {
+    pub(crate) fn set_buffer_size(&mut self, len: u32, fragment: u32) -> u32 {
         assert_eq!(self.state, DspState::Setup);
         if fragment == 0 {
             // the fragment count field is 16 bits; an extreme oss.delay x quantum
@@ -1030,7 +1030,7 @@ impl DspWriter {
     /// a bounded retry; the ring drains continuously, so the few missing bytes
     /// fit within microseconds. Returns the frame-aligned byte count consumed
     /// from `buf` (callers drop only whole frames).
-    pub unsafe fn write(&mut self, buf: *const c_void, count: u32) -> ssize_t {
+    pub(crate) unsafe fn write(&mut self, buf: *const c_void, count: u32) -> ssize_t {
         if self.state == DspState::Setup {
             self.state = DspState::Running;
         }
@@ -1139,7 +1139,7 @@ impl DspWriter {
         nbytes
     }
 
-    pub fn write_zeroes(&mut self, mut count: u32) {
+    pub(crate) fn write_zeroes(&mut self, mut count: u32) {
         // even a zero-length prime must leave the writer Running: callers assume
         // the space/underrun ioctls are usable after priming
         if self.state == DspState::Setup {
@@ -1175,18 +1175,18 @@ impl DspWriter {
         }
     }
 
-    pub fn odelay(&self) -> u32 {
+    pub(crate) fn odelay(&self) -> u32 {
         assert_eq!(self.state, DspState::Running);
         odelay(self.fd).max(0) as u32
     }
 
     /// The fragment size the driver actually granted (may differ from what
     /// SETFRAGMENT asked for; some drivers force a fixed period).
-    pub fn blocksize(&self) -> u32 {
+    pub(crate) fn blocksize(&self) -> u32 {
         blocksize(self.fd).max(0) as u32
     }
 
-    pub fn underruns(&self) -> u32 {
+    pub(crate) fn underruns(&self) -> u32 {
         assert_eq!(self.state, DspState::Running);
         get_error(self.fd).play_underruns.max(0) as u32
     }
@@ -1200,7 +1200,7 @@ impl Drop for DspWriter {
     }
 }
 
-pub fn read_sndstat() -> Result<Vec<u32>, Errno> {
+pub(crate) fn read_sndstat() -> Result<Vec<u32>, Errno> {
     // sndstat's nvlist interface; the plugin assumes FreeBSD 14.4+
     sndstat_pcm_devices()
         .map(|devs| devs.into_iter().map(|(unit, _, _)| unit).collect())
@@ -1208,7 +1208,7 @@ pub fn read_sndstat() -> Result<Vec<u32>, Errno> {
 }
 
 #[derive(Debug)]
-pub struct PcmDevice {
+pub(crate) struct PcmDevice {
     pub index: u32,
     pub desc: String,
     pub location: String,
@@ -1216,7 +1216,7 @@ pub struct PcmDevice {
     pub rec: bool,
 }
 
-pub fn read_pcm_device_description(
+pub(crate) fn read_pcm_device_description(
     sysctl: &mut crate::utils::SysctlReader,
     index: u32,
 ) -> Option<String> {
@@ -1247,7 +1247,7 @@ pub fn read_pcm_device_description(
         .ok()
 }
 
-pub fn group_pcm_devices_by_parent(indexes: &[u32]) -> BTreeMap<String, Vec<u32>> {
+pub(crate) fn group_pcm_devices_by_parent(indexes: &[u32]) -> BTreeMap<String, Vec<u32>> {
     let mut sysctl = crate::utils::SysctlReader::new();
     let mut indexes_by_parent: BTreeMap<String, Vec<u32>> = BTreeMap::new();
     for index in indexes {
@@ -1259,7 +1259,7 @@ pub fn group_pcm_devices_by_parent(indexes: &[u32]) -> BTreeMap<String, Vec<u32>
     indexes_by_parent
 }
 
-pub fn list_pcm_devices(indexes: &[u32]) -> Vec<PcmDevice> {
+pub(crate) fn list_pcm_devices(indexes: &[u32]) -> Vec<PcmDevice> {
     let mut result = Vec::with_capacity(indexes.len());
     let mut sysctl = crate::utils::SysctlReader::new();
     // Direction support from the nvlist channel counts (vchans on or off);

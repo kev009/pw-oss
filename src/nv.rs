@@ -43,12 +43,12 @@ extern "C" {
 }
 
 // the owned root of an unpacked nvlist
-pub struct NvList {
+pub(crate) struct NvList {
     ptr: *mut c_void,
 }
 
 impl NvList {
-    pub fn unpack(buf: &[u8]) -> Option<Self> {
+    pub(crate) fn unpack(buf: &[u8]) -> Option<Self> {
         let ptr = unsafe { nvlist_unpack(buf.as_ptr().cast(), buf.len(), 0) };
         if ptr.is_null() {
             None
@@ -57,7 +57,7 @@ impl NvList {
         }
     }
 
-    pub fn root(&self) -> NvRef<'_> {
+    pub(crate) fn root(&self) -> NvRef<'_> {
         NvRef {
             ptr: self.ptr,
             _owner: std::marker::PhantomData,
@@ -73,13 +73,13 @@ impl Drop for NvList {
 
 // a borrowed (child) nvlist; lives as long as the owning NvList
 #[derive(Clone, Copy)]
-pub struct NvRef<'a> {
+pub(crate) struct NvRef<'a> {
     ptr: *const c_void,
     _owner: std::marker::PhantomData<&'a NvList>,
 }
 
 impl<'a> NvRef<'a> {
-    pub fn string(&self, name: &CStr) -> Option<&'a str> {
+    pub(crate) fn string(&self, name: &CStr) -> Option<&'a str> {
         unsafe {
             if !nvlist_exists_string(self.ptr, name.as_ptr()) {
                 return None;
@@ -90,7 +90,7 @@ impl<'a> NvRef<'a> {
         }
     }
 
-    pub fn number(&self, name: &CStr) -> Option<u64> {
+    pub(crate) fn number(&self, name: &CStr) -> Option<u64> {
         unsafe {
             if !nvlist_exists_number(self.ptr, name.as_ptr()) {
                 return None;
@@ -99,7 +99,7 @@ impl<'a> NvRef<'a> {
         }
     }
 
-    pub fn boolean(&self, name: &CStr) -> Option<bool> {
+    pub(crate) fn boolean(&self, name: &CStr) -> Option<bool> {
         unsafe {
             if !nvlist_exists_bool(self.ptr, name.as_ptr()) {
                 return None;
@@ -108,7 +108,7 @@ impl<'a> NvRef<'a> {
         }
     }
 
-    pub fn nvlist(&self, name: &CStr) -> Option<NvRef<'a>> {
+    pub(crate) fn nvlist(&self, name: &CStr) -> Option<NvRef<'a>> {
         unsafe {
             if !nvlist_exists_nvlist(self.ptr, name.as_ptr()) {
                 return None;
@@ -120,7 +120,7 @@ impl<'a> NvRef<'a> {
         }
     }
 
-    pub fn nvlist_array(&self, name: &CStr) -> Vec<NvRef<'a>> {
+    pub(crate) fn nvlist_array(&self, name: &CStr) -> Vec<NvRef<'a>> {
         unsafe {
             if !nvlist_exists_nvlist_array(self.ptr, name.as_ptr()) {
                 return vec![];

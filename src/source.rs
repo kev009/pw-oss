@@ -258,7 +258,7 @@ unsafe fn prime_capture(
 }
 
 #[derive(Debug, Clone)]
-pub struct PortConfig {
+pub(crate) struct PortConfig {
     pub format: libspa::param::audio::AudioFormat,
     pub rate: u32,
     pub channels: u32,
@@ -933,7 +933,7 @@ const OSS_SOURCE_FACTORY_INFO: spa_dict = spa_dict {
     items: std::ptr::null(),
 };
 
-pub const OSS_SOURCE_FACTORY: spa_handle_factory = spa_handle_factory {
+pub(crate) const OSS_SOURCE_FACTORY: spa_handle_factory = spa_handle_factory {
     version: SPA_VERSION_HANDLE_FACTORY,
     name: c"freebsd-oss.source".as_ptr(),
     info: &OSS_SOURCE_FACTORY_INFO,
