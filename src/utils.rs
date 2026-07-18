@@ -878,6 +878,12 @@ pub(crate) struct RateLimit {
     suppressed: u32,
 }
 
+impl Default for RateLimit {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RateLimit {
     pub(crate) const fn new() -> Self {
         Self {

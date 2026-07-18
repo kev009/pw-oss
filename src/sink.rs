@@ -37,6 +37,11 @@ pub(crate) struct SinkPortExt {
     pub target_delay: u32,   // OSS buffer fill target in bytes, clamped to the granted buffer
     pub buffer_size: u32,    // granted OSS playback ring capacity in bytes
     pub period_mismatch: u32, // consecutive cycles at a different period (debounce)
+    // the rebuild-pending arm of retune_period can run every cycle; its own
+    // limiter, because sharing port.warn_limit would let a persistent refusal
+    // consume the dropped-bytes/underrun warnings' emission slots and fold
+    // unrelated events into their suppressed counts
+    pub resetup_limit: crate::utils::RateLimit,
 }
 
 fn desired_delay(period: u32, oss_delay: u32) -> u32 {
@@ -276,8 +281,9 @@ fn retune_period(
         // period_mismatch stays >= 2 on purpose: if the caller can't queue the
         // rebuild (no main loop), the next cycle retries this retune
         // immediately instead of re-running the debounce - so this arm can run
-        // every cycle; rate-limit the log
-        if let Some(suppressed) = port.warn_limit.check(now) {
+        // every cycle; rate-limit the log (on its own limiter - see
+        // SinkPortExt::resetup_limit)
+        if let Some(suppressed) = port.ext.resetup_limit.check(now) {
             crate::info!(
                 log,
                 "{}: period {} -> {} bytes; re-setting up (+{} messages suppressed)",
@@ -762,15 +768,20 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
         // the resampler can legitimately hand us a few frames over a quantum; warn
         // rather than debug_assert!, which would abort the process (panic across the
         // extern "C" boundary). The write path below caps and drops the excess.
+        // (u64 math for the same reason: a garbage host duration must not
+        // overflow-panic the diagnostic that exists to report it)
         #[cfg(debug_assertions)]
-        if size > driver_clock.target_duration as u32 * stride {
-            crate::warn!(
-                state.log,
-                "{}: chunk size {} exceeds one quantum {}",
-                port.dsp.path,
-                size,
-                driver_clock.target_duration as u32 * stride
-            );
+        {
+            let quantum_bytes = driver_clock.target_duration.saturating_mul(stride as u64);
+            if size as u64 > quantum_bytes {
+                crate::warn!(
+                    state.log,
+                    "{}: chunk size {} exceeds one quantum {}",
+                    port.dsp.path,
+                    size,
+                    quantum_bytes
+                );
+            }
         }
 
         // one graph cycle in device bytes (see utils::device_period_bytes)
@@ -1046,6 +1057,15 @@ impl Direction for SinkDir {
     fn on_start_loop(state: &mut State<SinkDir>) {
         for port in &mut state.ports {
             port.ext.xrun_timestamp = 0;
+            // Start recomputes `following`, and a role flip that happened
+            // while stopped never went through on_role_flip (set_io only
+            // detects flips while started): relock the same way, so e.g. a
+            // paused follower promoted to driver can't start the timer servo
+            // on the follower's integrator state (the source's on_start_loop
+            // relocks for the same reason)
+            port.dll.init();
+            port.bw_adapt.reset();
+            port.was_matching = false;
         }
         state.ext.cur_timestamp = 0;
         state.ext.old_timestamp = 0;
@@ -1438,6 +1458,51 @@ mod tests {
         let out = drain(r);
         assert_eq!(out.len(), 5120);
         assert!(out.iter().all(|&b| b == 0));
+        unsafe { libc::close(r) };
+    }
+
+    // The in-place retune against a near-full ring: the gate math (granted >=
+    // target + write_max + blocksize post-snap) makes drops impossible when
+    // odelay reads true, but a vchan can under-read odelay and the snap then
+    // overfills - so the write path is the backstop and its drops must stay
+    // frame-aligned. Model the worst case directly: a ring with room for the
+    // whole snap (odelay reads 0 on a pipe, so the snap writes the full new
+    // target) but only half the cycle's data behind it.
+    #[test]
+    fn retune_snap_then_data_drops_whole_frames_on_a_near_full_ring() {
+        let (r, w) = pipe_pair(true, true);
+        let mut port = test_port(w, 4096, 2048);
+        port.dsp.write_zeroes(0); // a retuning channel is running
+        port.ext.buffer_size = 16384;
+        let log = crate::spa::Log::test_null();
+
+        // debounce cycle: no writes yet
+        assert!(!retune_period(&mut port, 4096, 8, 0, 0, &log));
+        assert!(drain(r).is_empty());
+
+        let capacity = fill_pipe(w);
+        free_space(r, 5120 + 1024);
+
+        // sustained: the retune commits and the snap fills to the new target
+        assert!(!retune_period(&mut port, 4096, 8, 0, 0, &log));
+        assert_eq!(port.setup_period, 4096);
+        assert_eq!(port.ext.target_delay, 5120);
+
+        // the cycle's data write against the 1024 bytes left: a frame-aligned
+        // short write, the tail dropped as whole frames
+        let data = pattern(2048, 3);
+        let n = port.dsp.write(&data);
+        assert_eq!(n, 1024);
+        assert_eq!(n % 8, 0);
+
+        let out = drain(r);
+        assert_eq!(out.len(), capacity); // filler + snap zeroes + data head
+        let tail = &out[out.len() - (5120 + 1024)..];
+        assert!(
+            tail[..5120].iter().all(|&b| b == 0),
+            "the snap must precede the data"
+        );
+        assert_eq!(&tail[5120..], &data[..1024]);
         unsafe { libc::close(r) };
     }
 
