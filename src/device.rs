@@ -76,19 +76,31 @@ fn oss_to_linear(l: u32) -> f32 {
 const ROUTE_CHANNELS: u32 = 2;
 const ROUTE_MAP: [u32; ROUTE_CHANNELS as usize] = [SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR];
 
-// emit (or, with present = false, retract) the node object for every pcm device
+// one object_info emission to every listener; its own list traversal, so a
+// listener freeing its hook mid-callback is never revisited (see for_each_hook)
+unsafe fn emit_object_info(
+    hooks: *mut spa_hook_list,
+    id: u32,
+    obj_info: *const spa_device_object_info,
+) {
+    unsafe {
+        crate::spa::emit_events(hooks, |f: &spa_device_events, data| {
+            if let Some(obj_info_fun) = f.object_info {
+                obj_info_fun(data, id, obj_info);
+            }
+        });
+    }
+}
+
+// emit (or, with present = false, retract) the node object for every pcm
+// device, one traversal per object (the C spa_device_emit_object_info shape)
 unsafe fn emit_objects(
-    f: &spa_device_events,
-    data: *mut c_void,
+    hooks: *mut spa_hook_list,
     pcm_devices: &[crate::sound::PcmDevice],
     routes: &[RouteState],
     description: &str,
     present: bool,
 ) {
-    let Some(obj_info_fun) = f.object_info else {
-        return;
-    };
-
     for device in pcm_devices {
         for (rec, enabled) in [(false, device.play), (true, device.rec)] {
             if !enabled {
@@ -98,7 +110,7 @@ unsafe fn emit_objects(
             let id = device.index * 2 + rec as u32;
 
             if !present {
-                unsafe { obj_info_fun(data, id, std::ptr::null()) };
+                unsafe { emit_object_info(hooks, id, std::ptr::null()) };
                 continue;
             }
 
@@ -148,7 +160,7 @@ unsafe fn emit_objects(
                 props: dict.raw(),
             };
 
-            unsafe { obj_info_fun(data, id, &obj_info) };
+            unsafe { emit_object_info(hooks, id, &obj_info) };
         }
     }
 }
@@ -158,16 +170,9 @@ unsafe fn emit_objects(
 unsafe fn emit_device_info(state: &mut State) {
     // one emission through the C listener vtables end to end
     unsafe {
-        crate::spa::for_each_hook(&mut state.hooks, |entry| {
-            let f = entry
-                .cb
-                .funcs
-                .cast::<spa_device_events>()
-                .as_ref()
-                .expect("hook should be initialized");
-            assert!(crate::spa::version_ok(f.version, SPA_VERSION_DEVICE_EVENTS));
+        crate::spa::emit_events(&mut state.hooks, |f: &spa_device_events, data| {
             if let Some(info_fun) = f.info {
-                info_fun(entry.cb.data, state.dev_info.raw());
+                info_fun(data, state.dev_info.raw());
             }
         });
     }
@@ -486,16 +491,9 @@ unsafe fn emit_object_config(state: &mut State, pos: usize, volume: bool) {
 
     // one emission through the C listener vtables end to end
     unsafe {
-        crate::spa::for_each_hook(&mut state.hooks, |entry| {
-            let f = entry
-                .cb
-                .funcs
-                .cast::<spa_device_events>()
-                .as_ref()
-                .expect("hook should be initialized");
-            assert!(crate::spa::version_ok(f.version, SPA_VERSION_DEVICE_EVENTS));
+        crate::spa::emit_events(&mut state.hooks, |f: &spa_device_events, data| {
             if let Some(event_fun) = f.event {
-                event_fun(entry.cb.data, buffer.as_ptr() as *const spa_event);
+                event_fun(data, buffer.as_ptr() as *const spa_event);
             }
         });
     }
@@ -769,31 +767,28 @@ unsafe extern "C" fn add_listener(
         );
     }
 
+    // The initial emissions only reach the newly added listener (the list is
+    // isolated). One method per traversal, mirroring C's spa_hook_list_call:
+    // a listener that removes and frees its hook from inside a callback must
+    // not be called (or have its hook read) again for the next method.
     unsafe {
-        crate::spa::for_each_hook(&mut state.hooks, |entry| {
-            let f = entry.cb.funcs.cast::<spa_device_events>().as_ref().expect(
-                "we just assigned events to this very hook by calling spa_hook_list_isolate",
-            );
-
-            assert!(crate::spa::version_ok(f.version, SPA_VERSION_DEVICE_EVENTS));
-
+        let old_mask = state
+            .dev_info
+            .replace_change_mask(crate::spa::SPA_DEVICE_CHANGE_MASK_ALL as u64);
+        crate::spa::emit_events(&mut state.hooks, |f: &spa_device_events, data| {
             if let Some(dev_info_fun) = f.info {
-                let old_mask = state
-                    .dev_info
-                    .replace_change_mask(crate::spa::SPA_DEVICE_CHANGE_MASK_ALL as u64);
-                dev_info_fun(entry.cb.data, state.dev_info.raw());
-                let _ = state.dev_info.replace_change_mask(old_mask);
+                dev_info_fun(data, state.dev_info.raw());
             }
-
-            emit_objects(
-                f,
-                entry.cb.data,
-                &state.pcm_devices,
-                &state.routes,
-                &state.description,
-                state.profile != 0,
-            );
         });
+        let _ = state.dev_info.replace_change_mask(old_mask);
+
+        emit_objects(
+            &mut state.hooks,
+            &state.pcm_devices,
+            &state.routes,
+            &state.description,
+            state.profile != 0,
+        );
     }
 
     // isolate above initialized `save`
@@ -807,16 +802,9 @@ unsafe extern "C" fn sync(object: *mut c_void, seq: c_int) -> c_int {
 
     // one emission through the C listener vtables end to end
     unsafe {
-        crate::spa::for_each_hook(&mut state.hooks, |entry| {
-            let f = entry
-                .cb
-                .funcs
-                .cast::<spa_device_events>()
-                .as_ref()
-                .expect("hook should be initialized");
-            assert!(crate::spa::version_ok(f.version, SPA_VERSION_DEVICE_EVENTS));
+        crate::spa::emit_events(&mut state.hooks, |f: &spa_device_events, data| {
             if let Some(result_fun) = f.result {
-                result_fun(entry.cb.data, seq, 0, 0, std::ptr::null());
+                result_fun(data, seq, 0, 0, std::ptr::null());
             }
         });
     }
@@ -1050,23 +1038,13 @@ unsafe fn set_profile_param(state: &mut State, param: *const spa_pod) -> c_int {
         // add or remove the nodes, then re-announce the params tied to the
         // active profile (Route pods appear/vanish with it)
         unsafe {
-            crate::spa::for_each_hook(&mut state.hooks, |entry| {
-                let f = entry
-                    .cb
-                    .funcs
-                    .cast::<spa_device_events>()
-                    .as_ref()
-                    .expect("hook should be initialized");
-                assert!(crate::spa::version_ok(f.version, SPA_VERSION_DEVICE_EVENTS));
-                emit_objects(
-                    f,
-                    entry.cb.data,
-                    &state.pcm_devices,
-                    &state.routes,
-                    &state.description,
-                    index != 0,
-                );
-            });
+            emit_objects(
+                &mut state.hooks,
+                &state.pcm_devices,
+                &state.routes,
+                &state.description,
+                index != 0,
+            );
         }
 
         let _ = state.dev_info.replace_change_mask(0);

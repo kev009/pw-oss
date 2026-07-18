@@ -20,7 +20,7 @@ struct State {
     log: crate::spa::Log,
 }
 
-fn emit_dev_node(hook: &spa_hook, events: &spa_device_events, driver: &str, indexes: &[u32]) {
+fn emit_dev_node(events: &spa_device_events, data: *mut c_void, driver: &str, indexes: &[u32]) {
     let indexes_str = indexes
         .iter()
         .map(|i| format!("{i}"))
@@ -41,13 +41,13 @@ fn emit_dev_node(hook: &spa_hook, events: &spa_device_events, driver: &str, inde
     };
 
     if let Some(obj_info_fun) = events.object_info {
-        unsafe { obj_info_fun(hook.cb.data, indexes[0], &obj_info) };
+        unsafe { obj_info_fun(data, indexes[0], &obj_info) };
     }
 }
 
-fn remove_dev_node(hook: &spa_hook, events: &spa_device_events, indexes: &[u32]) {
+fn remove_dev_node(events: &spa_device_events, data: *mut c_void, indexes: &[u32]) {
     if let Some(obj_info_fun) = events.object_info {
-        unsafe { obj_info_fun(hook.cb.data, indexes[0], std::ptr::null()) };
+        unsafe { obj_info_fun(data, indexes[0], std::ptr::null()) };
     }
 }
 
@@ -71,24 +71,23 @@ unsafe extern "C" fn add_listener(
         );
     }
 
+    // The initial emissions only reach the newly added listener (the list is
+    // isolated). One method per traversal, mirroring C's spa_hook_list_call:
+    // a listener that removes and frees its hook from inside a callback must
+    // not be called (or have its hook read) again for the next method.
     unsafe {
-        crate::spa::for_each_hook(&mut state.hooks, |entry| {
-            let f = entry.cb.funcs.cast::<spa_device_events>().as_ref().expect(
-                "we just assigned events to this very hook by calling spa_hook_list_isolate",
-            );
-
-            assert!(crate::spa::version_ok(f.version, SPA_VERSION_DEVICE_EVENTS));
-
-            state.dev_info.change_mask = crate::spa::SPA_DEVICE_CHANGE_MASK_ALL as u64;
-
+        state.dev_info.change_mask = crate::spa::SPA_DEVICE_CHANGE_MASK_ALL as u64;
+        crate::spa::emit_events(&mut state.hooks, |f: &spa_device_events, data| {
             if let Some(dev_info_fun) = f.info {
-                dev_info_fun(entry.cb.data, &state.dev_info);
-            }
-
-            for (parent, indexes) in &state.pcm_indexes {
-                emit_dev_node(entry, f, parent, indexes);
+                dev_info_fun(data, &state.dev_info);
             }
         });
+
+        for (parent, indexes) in &state.pcm_indexes {
+            crate::spa::emit_events(&mut state.hooks, |f: &spa_device_events, data| {
+                emit_dev_node(f, data, parent, indexes);
+            });
+        }
     }
 
     // isolate above initialized `save`
@@ -214,15 +213,8 @@ unsafe fn resync_devices(state: &mut State, detached: &[String]) {
             if let Some(indexes) = state.pcm_indexes.remove(&key) {
                 crate::info!(state.log, "removing {} ({:?}) on detach", key, indexes);
                 unsafe {
-                    crate::spa::for_each_hook(&mut state.hooks, |entry| {
-                        let f = entry
-                            .cb
-                            .funcs
-                            .cast::<spa_device_events>()
-                            .as_ref()
-                            .expect("callback should be initialized");
-                        assert!(crate::spa::version_ok(f.version, SPA_VERSION_DEVICE_EVENTS));
-                        remove_dev_node(entry, f, &indexes);
+                    crate::spa::emit_events(&mut state.hooks, |f: &spa_device_events, data| {
+                        remove_dev_node(f, data, &indexes);
                     });
                 }
             }
@@ -243,15 +235,8 @@ unsafe fn resync_devices(state: &mut State, detached: &[String]) {
         if state.pcm_indexes.get(driver) != Some(old_indexes) {
             crate::info!(state.log, "removing {} ({:?})", driver, old_indexes);
             unsafe {
-                crate::spa::for_each_hook(&mut state.hooks, |entry| {
-                    let f = entry
-                        .cb
-                        .funcs
-                        .cast::<spa_device_events>()
-                        .as_ref()
-                        .expect("callback should be initialized");
-                    assert!(crate::spa::version_ok(f.version, SPA_VERSION_DEVICE_EVENTS));
-                    remove_dev_node(entry, f, old_indexes);
+                crate::spa::emit_events(&mut state.hooks, |f: &spa_device_events, data| {
+                    remove_dev_node(f, data, old_indexes);
                 });
             }
         }
@@ -260,15 +245,8 @@ unsafe fn resync_devices(state: &mut State, detached: &[String]) {
         if old_map.get(driver) != Some(new_indexes) {
             crate::info!(state.log, "registering {} ({:?})", driver, new_indexes);
             unsafe {
-                crate::spa::for_each_hook(&mut state.hooks, |entry| {
-                    let f = entry
-                        .cb
-                        .funcs
-                        .cast::<spa_device_events>()
-                        .as_ref()
-                        .expect("callback should be initialized");
-                    assert!(crate::spa::version_ok(f.version, SPA_VERSION_DEVICE_EVENTS));
-                    emit_dev_node(entry, f, driver, new_indexes);
+                crate::spa::emit_events(&mut state.hooks, |f: &spa_device_events, data| {
+                    emit_dev_node(f, data, driver, new_indexes);
                 });
             }
         }

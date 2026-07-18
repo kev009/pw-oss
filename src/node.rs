@@ -342,31 +342,30 @@ unsafe extern "C" fn add_listener<D: Direction>(
         );
     }
 
-    // note that this only iterates over the newly added listener
+    // The initial emissions only reach the newly added listener (the list is
+    // isolated). One method per traversal, mirroring C's spa_hook_list_call:
+    // a listener that removes and frees its hook from inside a callback must
+    // not be called (or have its hook read) again for the next method.
     unsafe {
-        crate::spa::for_each_hook(&mut state.hooks, |entry| {
-            let f = entry.cb.funcs.cast::<spa_node_events>().as_ref().expect(
-                "we just assigned events to this very hook by calling spa_hook_list_isolate",
-            );
-
-            assert!(crate::spa::version_ok(f.version, SPA_VERSION_NODE_EVENTS));
-
+        let old_mask = state
+            .node_info
+            .replace_change_mask(crate::spa::SPA_NODE_CHANGE_MASK_ALL as u64);
+        crate::spa::emit_events(&mut state.hooks, |f: &spa_node_events, data| {
             if let Some(node_info_fun) = f.info {
-                let old_mask = state
-                    .node_info
-                    .replace_change_mask(crate::spa::SPA_NODE_CHANGE_MASK_ALL as u64);
-                node_info_fun(entry.cb.data, state.node_info.raw());
-                let _ = state.node_info.replace_change_mask(old_mask);
-            }
-
-            if let Some(port_info_fun) = f.port_info {
-                let old_mask = state
-                    .port_info
-                    .replace_change_mask(crate::spa::SPA_PORT_CHANGE_MASK_ALL as u64);
-                port_info_fun(entry.cb.data, D::DIRECTION, 0, state.port_info.raw());
-                let _ = state.port_info.replace_change_mask(old_mask);
+                node_info_fun(data, state.node_info.raw());
             }
         });
+        let _ = state.node_info.replace_change_mask(old_mask);
+
+        let old_mask = state
+            .port_info
+            .replace_change_mask(crate::spa::SPA_PORT_CHANGE_MASK_ALL as u64);
+        crate::spa::emit_events(&mut state.hooks, |f: &spa_node_events, data| {
+            if let Some(port_info_fun) = f.port_info {
+                port_info_fun(data, D::DIRECTION, 0, state.port_info.raw());
+            }
+        });
+        let _ = state.port_info.replace_change_mask(old_mask);
     }
 
     // isolate above initialized `save`
@@ -380,17 +379,9 @@ unsafe extern "C" fn add_listener<D: Direction>(
 pub(crate) unsafe fn emit_node_info<D: Direction>(state: &mut State<D>) {
     // one emission through the C listener vtables end to end
     unsafe {
-        crate::spa::for_each_hook(&mut state.hooks, |entry| {
-            let f = entry
-                .cb
-                .funcs
-                .cast::<spa_node_events>()
-                .as_ref()
-                .expect("hook should be initialized");
-            if crate::spa::version_ok(f.version, SPA_VERSION_NODE_EVENTS) {
-                if let Some(node_info_fun) = f.info {
-                    node_info_fun(entry.cb.data, state.node_info.raw());
-                }
+        crate::spa::emit_events(&mut state.hooks, |f: &spa_node_events, data| {
+            if let Some(node_info_fun) = f.info {
+                node_info_fun(data, state.node_info.raw());
             }
         });
     }
@@ -431,17 +422,9 @@ pub(crate) unsafe fn handle_process_latency<D: Direction>(
 pub(crate) unsafe fn emit_port_info<D: Direction>(state: &mut State<D>) {
     // one emission through the C listener vtables end to end
     unsafe {
-        crate::spa::for_each_hook(&mut state.hooks, |entry| {
-            let f = entry
-                .cb
-                .funcs
-                .cast::<spa_node_events>()
-                .as_ref()
-                .expect("hook should be initialized");
-            if crate::spa::version_ok(f.version, SPA_VERSION_NODE_EVENTS) {
-                if let Some(port_info_fun) = f.port_info {
-                    port_info_fun(entry.cb.data, D::DIRECTION, 0, state.port_info.raw());
-                }
+        crate::spa::emit_events(&mut state.hooks, |f: &spa_node_events, data| {
+            if let Some(port_info_fun) = f.port_info {
+                port_info_fun(data, D::DIRECTION, 0, state.port_info.raw());
             }
         });
     }

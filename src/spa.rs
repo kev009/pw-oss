@@ -33,7 +33,13 @@ pub(crate) fn version_ok(version: u32, min: u32) -> bool {
 // listener may remove any hook - its own, the next one, any other - and the
 // plain list unlink fixes the cursor's neighbor pointers like any node's.
 // The former grab-next-first walk only survived self-removal.
-pub(crate) unsafe fn for_each_hook(head: *mut spa_hook_list, mut apply: impl FnMut(&spa_hook)) {
+// The closure receives the hook's spa_callbacks BY VALUE (it is Copy), never
+// a reference into the hook: a callback that removes and frees its own hook
+// must not leave the closure holding a pointer into freed memory. For the
+// same reason callers emit ONE method per traversal (C's spa_hook_list_call
+// shape) - a second callback on the same hook after the first freed it would
+// still be a use-after-free even with the copied callbacks.
+pub(crate) unsafe fn for_each_hook(head: *mut spa_hook_list, mut apply: impl FnMut(spa_callbacks)) {
     let list = unsafe { std::ptr::addr_of_mut!((*head).list) };
     // all-zero is the C-struct cursor's valid initial state
     let mut cursor: spa_hook = unsafe { std::mem::zeroed() };
@@ -70,13 +76,66 @@ pub(crate) unsafe fn for_each_hook(head: *mut spa_hook_list, mut apply: impl FnM
         if hook.cb.funcs.is_null() {
             continue;
         }
-        apply(hook);
+        // copy the callbacks out before the callback can free the hook
+        apply(hook.cb);
     }
 
     // unlink the cursor
     unsafe {
         (*(*cur).prev).next = (*cur).next;
         (*(*cur).next).prev = (*cur).prev;
+    }
+}
+
+// A listener-events vtable an emission can be routed through: ties the
+// events struct to the minimum version we emit to.
+pub(crate) trait HookEvents {
+    const VERSION_MIN: u32;
+}
+
+impl HookEvents for spa_node_events {
+    const VERSION_MIN: u32 = SPA_VERSION_NODE_EVENTS;
+}
+
+impl HookEvents for spa_device_events {
+    const VERSION_MIN: u32 = SPA_VERSION_DEVICE_EVENTS;
+}
+
+// every SPA events vtable leads with `version: u32` (the spa_interface
+// convention, spa/utils/hook.h); emit_events' prefix read depends on it
+const _: () = assert!(
+    std::mem::offset_of!(spa_node_events, version) == 0
+        && std::mem::offset_of!(spa_device_events, version) == 0
+);
+
+// Emit ONE listener method to every hook in the list (see for_each_hook for
+// the one-method-per-traversal contract): each hook's funcs is viewed as the
+// typed events vtable and `call` receives it with the hook's data pointer.
+// The version prefix (offset 0, asserted above) is read alone FIRST: a
+// listener built against an older, shorter vtable must be rejected before
+// the full E - possibly larger in this build - is read out of the
+// listener's allocation. A too-old listener is skipped - soft, like C's
+// spa_callbacks_call version gate - never asserted on: these emissions
+// run under extern "C" callers, where a panic aborts the whole daemon.
+//
+// # Safety
+// `head` must point at an initialized hook list whose hooks carry E vtables
+// (the matching add_listener contract), valid for the whole traversal.
+pub(crate) unsafe fn emit_events<E: HookEvents>(
+    head: *mut spa_hook_list,
+    mut call: impl FnMut(&E, *mut c_void),
+) {
+    unsafe {
+        for_each_hook(head, |cb| {
+            // non-null: for_each_hook skips null-funcs entries (cursors)
+            assert!(
+                !cb.funcs.is_null(),
+                "hook funcs are non-null past for_each_hook"
+            );
+            if version_ok(cb.funcs.cast::<u32>().read(), E::VERSION_MIN) {
+                call(&*cb.funcs.cast::<E>(), cb.data);
+            }
+        });
     }
 }
 
@@ -89,22 +148,9 @@ pub(crate) unsafe fn dev_emit_result(
 ) {
     // one emission through the C listener vtables end to end
     unsafe {
-        for_each_hook(hooks, |entry| {
-            let f = entry
-                .cb
-                .funcs
-                .cast::<spa_device_events>()
-                .as_ref()
-                .expect("hook should be initialized");
-            assert!(version_ok(f.version, SPA_VERSION_DEVICE_EVENTS));
+        emit_events(hooks, |f: &spa_device_events, data| {
             if let Some(result_fun) = f.result {
-                result_fun(
-                    entry.cb.data,
-                    seq,
-                    res,
-                    type_,
-                    result as *const _ as *const c_void,
-                );
+                result_fun(data, seq, res, type_, result as *const _ as *const c_void);
             }
         });
     }
@@ -132,16 +178,9 @@ pub(crate) unsafe fn filter_pod(
 pub(crate) unsafe fn node_emit_done(hooks: &mut spa_hook_list, seq: c_int) {
     // one emission through the C listener vtables end to end
     unsafe {
-        for_each_hook(hooks, |entry| {
-            let f = entry
-                .cb
-                .funcs
-                .cast::<spa_node_events>()
-                .as_ref()
-                .expect("hook should be initialized");
-            assert!(version_ok(f.version, SPA_VERSION_NODE_EVENTS));
+        emit_events(hooks, |f: &spa_node_events, data| {
             if let Some(result_fun) = f.result {
-                result_fun(entry.cb.data, seq, 0, 0, std::ptr::null());
+                result_fun(data, seq, 0, 0, std::ptr::null());
             }
         });
     }
@@ -156,22 +195,9 @@ pub(crate) unsafe fn node_emit_result(
 ) {
     // one emission through the C listener vtables end to end
     unsafe {
-        for_each_hook(hooks, |entry| {
-            let f = entry
-                .cb
-                .funcs
-                .cast::<spa_node_events>()
-                .as_ref()
-                .expect("hook should be initialized");
-            assert!(version_ok(f.version, SPA_VERSION_NODE_EVENTS));
+        emit_events(hooks, |f: &spa_node_events, data| {
             if let Some(result_fun) = f.result {
-                result_fun(
-                    entry.cb.data,
-                    seq,
-                    res,
-                    type_,
-                    result as *const _ as *const c_void,
-                );
+                result_fun(data, seq, res, type_, result as *const _ as *const c_void);
             }
         });
     }
@@ -919,14 +945,36 @@ mod tests {
         let h1 = std::ptr::addr_of_mut!(*hooks[1]);
         let mut seen = Vec::new();
         unsafe {
-            for_each_hook(&mut *head, |h| {
-                seen.push(h.cb.data as usize);
-                if h.cb.data as usize == 0 {
+            for_each_hook(&mut *head, |cb| {
+                seen.push(cb.data as usize);
+                if cb.data as usize == 0 {
                     unlink(&mut *h1); // hook 0's callback frees hook 1
                 }
             });
         }
         assert_eq!(seen, [0, 2]);
+    }
+
+    // the per-method-traversal contract behind the add_listener emitters: a
+    // callback that removes its own hook during one traversal is not visited
+    // by the next one (so freeing the hook mid-callback stays sound)
+    #[test]
+    fn self_removal_hides_the_hook_from_later_traversals() {
+        let (mut head, mut hooks) = hook_list(2);
+        let h0 = std::ptr::addr_of_mut!(*hooks[0]);
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        unsafe {
+            for_each_hook(&mut *head, |cb| {
+                first.push(cb.data as usize);
+                if cb.data as usize == 0 {
+                    unlink(&mut *h0); // hook 0's callback removes hook 0
+                }
+            });
+            for_each_hook(&mut *head, |cb| second.push(cb.data as usize));
+        }
+        assert_eq!(first, [0, 1]);
+        assert_eq!(second, [1]);
     }
 
     // a callback re-entering an emission path iterates the same list; the
@@ -938,10 +986,10 @@ mod tests {
         let mut outer = Vec::new();
         let mut inner = Vec::new();
         unsafe {
-            for_each_hook(head_ptr, |h| {
-                outer.push(h.cb.data as usize);
-                if h.cb.data as usize == 0 {
-                    for_each_hook(head_ptr, |ih| inner.push(ih.cb.data as usize));
+            for_each_hook(head_ptr, |cb| {
+                outer.push(cb.data as usize);
+                if cb.data as usize == 0 {
+                    for_each_hook(head_ptr, |icb| inner.push(icb.data as usize));
                 }
             });
         }
