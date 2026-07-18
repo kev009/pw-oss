@@ -103,6 +103,121 @@ fn commit_geometry(port: &mut crate::node::Port<SourceDir>, period: u32, blocksi
   port.bw_adapt.reset(); // cold-starts at the granularity cap next servo cycle
 }
 
+// The retune phase. A period change re-tunes the servo: the fill target and
+// catch-up peak derive from the period, and stale ones steer the servo to
+// the OLD quantum's latency forever (ALSA compensates the error by the
+// threshold delta, we relock fast instead). The ring IS SETFRAGMENT-sized
+// (at prime), so the retune stays in place only while the grant still holds
+// the new period's geometry (ring_required); a smaller ring suspends the
+// channel so the prime phase re-applies the fragment layout at the new size
+// in this very cycle. Returns true when the driver refused the trigger stop
+// (dying fd) and only a main-thread rebuild remains.
+fn retune_period(port: &mut crate::node::Port<SourceDir>, period_in_bytes: u32, log: &crate::spa::Log) -> bool {
+  if !port.ext.primed || port.setup_period == 0 || period_in_bytes == 0 || period_in_bytes == port.setup_period {
+    port.ext.period_mismatch = 0;
+    return false;
+  }
+  // debounce (as the sink): a single-cycle flip usually means a
+  // renegotiation is in flight; read at the old geometry for one cycle
+  // rather than relock the servo on every flip of a storm
+  port.ext.period_mismatch += 1;
+  if port.ext.period_mismatch < 2 {
+    return false;
+  }
+  port.ext.period_mismatch = 0;
+  // cached blocksize: the triggered channel refuses SETFRAGMENT and the
+  // hw cadence is per-session, so the grant can't have changed since
+  // prime (the sink reuses its cache for the same reason)
+  let blocksize = port.setup_blocksize;
+  if port.ext.ring_size >= ring_required(period_in_bytes, blocksize) {
+    commit_geometry(port, period_in_bytes, blocksize);
+    false
+  } else if port.dsp.suspend() {
+    // re-enter priming IN THIS CYCLE: it re-applies the fragment layout at
+    // the new size, discards the backlog, hands the graph one period of
+    // silence and relocks (commit_geometry at prime) - the cost the overrun
+    // recovery already pays, and one cycle cheaper than a close/reopen
+    crate::info!(log, "capture period {} -> {} bytes exceeds the ring ({}); re-priming",
+      port.setup_period, period_in_bytes, port.ext.ring_size);
+    port.ext.primed = false;
+    false
+  } else {
+    true
+  }
+}
+
+// The prime phase - the capture analogue of the sink's zero priming: trigger
+// the device, discard any backlog so the fill level starts out known, and
+// hand the graph one period of silence while the ring fills. Don't wait for
+// real data: an empty first cycle reads as a missed deadline to the graph.
+// Re-apply the fragment layout while the channel is in setup (legal after a
+// trigger suspend too, so live oss.fragment changes reach a suspended
+// source). Returns the cycle's byte count (the period of silence).
+unsafe fn prime_capture(port: &mut crate::node::Port<SourceDir>, period_in_bytes: u32, graph_rate: u32,
+                        oss_fragment: u32, data: *mut std::os::raw::c_void, maxsize: u32,
+                        log: &crate::spa::Log) -> isize {
+  // copies, not a borrow (the geometry commit below needs &mut port); the
+  // gate in process_ports guarantees a negotiated config here
+  let (stride, rate) = {
+    let config = port.config.as_ref().unwrap();
+    (config.stride.max(1), config.rate)
+  };
+  // The capture fragment is capped at the period: queued readings move in
+  // fragment steps, and a fragment far above the period makes the servo
+  // target unreachable - the error pegs at the clamp and the integrator
+  // ramps. The ring scales with the period so large quanta keep some
+  // overrun slack.
+  if !port.dsp.is_running() {
+    let m    = period_in_bytes.max(1024);
+    let cap  = 1u32 << (31 - m.leading_zeros());
+    let frag = if oss_fragment == 0 { 1024 } else { oss_fragment.min(cap) };
+    port.dsp.set_small_fragments(frag, ring_request(period_in_bytes,
+      crate::sound::max_ring_period_bytes(stride, rate, graph_rate),
+      crate::sound::ring_byte_cap(stride, rate)));
+  }
+  let ready = port.dsp.ready_for_reading(0);
+  // one GETISPACE serves the backlog, the granted fragment and the ring
+  // total: they come from the same struct, and the layout fields are
+  // final now that ready_for_reading has triggered the channel. The
+  // ACTUAL grant, not the request - the kernel clamps the ring silently,
+  // and the fill geometry must fit reality.
+  let (backlog, fragsize, ring) = port.dsp.ispace_layout();
+  if ready {
+    let mut backlog = backlog;
+    while backlog > 0 {
+      // whole frames only: GETISPACE is byte-granular and can sit
+      // mid-frame; an unaligned read would tear every later sample
+      let chunk = (backlog.min(maxsize) / stride) * stride;
+      if chunk == 0 {
+        break; // a sub-frame tail; it completes into a frame later
+      }
+      let n = port.dsp.read(data, chunk as usize);
+      if n <= 0 {
+        break;
+      }
+      backlog -= n as u32;
+    }
+  }
+  port.ext.primed    = true;
+  port.ext.ring_size = ring;
+  // the measurement/arrival quantum is the granted fragment or the
+  // hardware cadence sndstat reports, whichever is coarser (see the
+  // sink); data arrives in these lumps regardless of the soft fragment
+  let chunk = crate::utils::ns_to_frame_bytes(port.dsp.hw_quantum_ns, rate, stride);
+  commit_geometry(port, period_in_bytes, fragsize.max(chunk));
+  port.ext.pinned_cycles = 0;
+  if port.ext.ring_size > 0 && port.ext.ring_size < ring_required(period_in_bytes, port.setup_blocksize) {
+    crate::warn!(log, "granted OSS capture ring ({}) is smaller than the fill geometry needs ({}); \
+      audio will glitch. Lower the PipeWire quantum; we set the fragment size \
+      explicitly, so hw.snd.latency has no effect",
+      port.ext.ring_size, ring_required(period_in_bytes, port.setup_blocksize));
+  }
+
+  let len = period_in_bytes.min(maxsize);
+  std::ptr::write_bytes(data.cast::<u8>(), 0, len as usize);
+  len as isize
+}
+
 #[derive(Debug, Clone)]
 pub struct PortConfig {
   pub format:    libspa::param::audio::AudioFormat,
@@ -136,6 +251,149 @@ impl crate::node::ConfigOps for PortConfig {
   fn format_raw(&self) -> u32  { self.format.0 }
   fn flags(&self) -> u32       { self.flags }
   fn positions(&self) -> &[u32] { &self.positions }
+}
+
+// The follower-servo phase, matching a foreign clock: the DLL serves rate
+// matching only (when driving, the servo runs in on_timeout where the clock
+// is published; a same-device follower has nothing to correct). `queued` is
+// the pre-read fill the caller measured this cycle. Returns the rate
+// correction.
+fn capture_servo(port: &mut crate::node::Port<SourceDir>, queued: u32, now: u64,
+                 stride: u32, rate: u32) -> f64 {
+  let mut corr: f64 = 1.0;
+  if !port.was_matching {
+    // matching just engaged; relock rather than apply stale state
+    port.dll.init();
+    port.bw_adapt.reset();
+  }
+  // capture error is inverted vs the sink: a slow device queues less
+  let err_raw = port.ext.target_fill as f64 - queued as f64;
+  // the healthy swing is half an arrival either side of target; a
+  // snap threshold below that resets the DLL on every arrival
+  let snap = port.setup_period.max(port.setup_blocksize / 2 + port.setup_period / 2);
+  if err_raw.abs() > snap as f64 {
+    // fill snap (see the sink): a level error past one period would
+    // wind the integrator against the +/-1% clamp; the bounded read
+    // drains genuine backlog, so just relock here
+    port.dll.init();
+    port.bw_adapt.reset();
+  } else {
+    let max_err = (port.setup_period as f64 / 2.0).max(256.0 * stride as f64);
+    let err = err_raw.clamp(-max_err, max_err);
+    corr = port.dll.update(err);
+    port.bw_adapt.update(&mut port.dll, err, stride, port.setup_blocksize,
+      now, port.setup_period, rate * stride);
+  }
+
+  #[cfg(debug_assertions)]
+  eprintln!("capture: corr = {}, err = {}", corr, err_raw);
+
+  corr
+}
+
+// The read-tail phase. Bounded read: one period, plus only the backlog
+// beyond the healthy peak (genuine catch-up). Draining everything each
+// cycle turns consumer backpressure into a permanent extra period of
+// latency (an oversized chunk holds io.status HAVE_DATA, we skip the device
+// next cycle, it queues 2 periods, repeat) and pollutes the servo error. If
+// the device is late, keep the graph timeline stable: read only queued
+// bytes from the blocking fd and zero-pad the rest of the period instead of
+// returning an empty or short cycle.
+unsafe fn bounded_read(port: &mut crate::node::Port<SourceDir>, queued: u32,
+                       data: *mut std::os::raw::c_void, maxsize: u32, stride: u32,
+                       log: &crate::spa::Log) -> isize {
+  let want = if port.setup_period != 0 {
+    // catch-up beyond the healthy peak (fill_targets: target plus slack,
+    // capped by the granted ring so a fill at the ceiling is drainable);
+    // the servo handles the rest without a pegged error, and a threshold
+    // under the arrival peak would drag the fill below target on every
+    // arrival
+    port.setup_period.saturating_add(queued.saturating_sub(port.ext.read_peak))
+  } else {
+    queued
+  };
+  // floored to whole frames: `queued` is byte-granular and can sit
+  // mid-frame; an unaligned read would start the next buffer mid-sample
+  let ispace = (want.min(queued).min(maxsize) / stride) * stride;
+  #[cfg(debug_assertions)]
+  crate::trace!(log, "ispace: {}", ispace);
+  #[cfg(not(debug_assertions))]
+  let _ = log;
+  let nread = if ispace > 0 {
+    port.dsp.read(data, ispace as usize).max(0) as u32
+  } else {
+    0
+  };
+  let period = port.setup_period.min(maxsize);
+  let out = if period > 0 { nread.max(period) } else { nread };
+  if out > nread {
+    std::ptr::write_bytes(data.cast::<u8>().add(nread as usize), 0, (out - nread) as usize);
+  }
+  out as isize
+}
+
+// The overrun phase. A rec overrun means chn_rdfeed found the soft ring
+// full at interrupt time and DISPOSED the hardware lump UPSTREAM of us -
+// our queued fill is intact and already bounded by the ring, so the counter
+// alone is not corrupted state (the sink learned the same about vchan
+// underrun accounting). Re-priming on every tick amplified a 4 ms kernel
+// drop into a 20+ ms skip (backlog discard, a period of silence, a DLL
+// relock whose overshoot re-tripped the ceiling at a ~1.3 s cadence).
+// Recovery is only warranted when the ring stays PINNED at the ceiling
+// across consecutive cycles - i.e. the catch-up read can't drain it
+// (consumer stall, graph buffer smaller than the backlog, wedged reads).
+// The freewheel branch never triggers the device (it may still be in
+// setup), and while freewheeling the ring overruns by design - the exit
+// edge re-primes, so don't flood the counter meanwhile.
+unsafe fn detect_overrun(port: &mut crate::node::Port<SourceDir>, freewheel: bool,
+                         pre_read_fill: Option<u32>, data_system: &crate::spa::System,
+                         callbacks: &spa_callbacks, log: &crate::spa::Log) {
+  let overrun_count = if port.dsp.is_running() && !freewheel { port.dsp.overruns() } else { 0 };
+  if overrun_count == 0 {
+    port.ext.pinned_cycles = 0;
+    return;
+  }
+  // pinned = pre-read fill within one arrival of the ring end; with an
+  // unknown ring treat every tick as pinned (can't gate what we can't
+  // measure). A cycle without a pre-read sample (prime/freewheel) just
+  // cleared the ring, so the state is fresh by construction.
+  let pinned = match (pre_read_fill, port.ext.ring_size) {
+    (Some(fill), ring) if ring > 0 => fill > ring.saturating_sub(port.setup_blocksize),
+    (Some(_), _) => true,
+    (None, _)    => false
+  };
+  port.ext.pinned_cycles = if pinned { port.ext.pinned_cycles + 1 } else { 0 };
+  if port.ext.pinned_cycles >= PINNED_CYCLE_LIMIT {
+    port.ext.pinned_cycles = 0;
+    let now = crate::utils::now_ns(data_system);
+    if let Some(suppressed) = port.warn_limit.check(now) {
+      crate::warn!(log, "OSS reported {:3} overruns @ {} with the ring pinned; re-priming (+{} warnings suppressed)",
+        overrun_count, now, suppressed);
+    }
+    // report the EVENT to the host (pw-top's xrun counter) only for real
+    // recovery; the length isn't known, so pass 0 delay
+    let node_callbacks = callbacks.funcs.cast::<spa_node_callbacks>().as_ref();
+    if let Some(xrun_fun) = node_callbacks.and_then(|c| c.xrun) {
+      xrun_fun(callbacks.data, now / 1000, 0, std::ptr::null_mut());
+    }
+
+    // recover like the sink's underrun path: re-enter priming next cycle,
+    // which drains the backlog and relocks the DLL - otherwise the
+    // un-drained backlog becomes permanent capture latency while the
+    // integrator winds up against an error the reads can't remove.
+    // Trigger-suspend first so the re-prime's SETFRAGMENT can also
+    // RESIZE the ring: a pinned ring may be one the current quantum
+    // outgrew, and a Running channel silently skips the layout
+    // re-application (a refused suspend just re-primes at the old size).
+    let _ = port.dsp.suspend();
+    port.ext.primed = false;
+    port.bw_adapt.reset();
+    port.dll.init();
+  } else {
+    // suppressed counts stay diagnosable (see the sink's underrun gate)
+    crate::debug!(log, "{} overrun counts ignored (kernel disposed upstream; fill {:?} of ring {})",
+      overrun_count, pre_read_fill, port.ext.ring_size);
+  }
 }
 
 // Run the servo before the clock is published so every field below belongs
@@ -285,50 +543,16 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
       }
     }
 
-    // A period change re-tunes the servo: the fill target and catch-up peak
-    // derive from the period, and stale ones steer the servo to the OLD
-    // quantum's latency forever (ALSA compensates the error by the threshold
-    // delta, we relock fast instead). The ring IS SETFRAGMENT-sized (at
-    // prime), so the retune stays in place only while the grant still holds
-    // the new period's geometry (ring_required); a smaller ring suspends the
-    // channel so the prime branch below re-applies the fragment layout at
-    // the new size in this very cycle.
-    if port.ext.primed && port.setup_period != 0 && period_in_bytes != 0 && period_in_bytes != port.setup_period {
-      // debounce (as the sink): a single-cycle flip usually means a
-      // renegotiation is in flight; read at the old geometry for one cycle
-      // rather than relock the servo on every flip of a storm
-      port.ext.period_mismatch += 1;
-      if port.ext.period_mismatch >= 2 {
-        port.ext.period_mismatch = 0;
-        // cached blocksize: the triggered channel refuses SETFRAGMENT and the
-        // hw cadence is per-session, so the grant can't have changed since
-        // prime (the sink reuses its cache for the same reason)
-        let blocksize = port.setup_blocksize;
-        if port.ext.ring_size >= ring_required(period_in_bytes, blocksize) {
-          commit_geometry(port, period_in_bytes, blocksize);
-        } else if port.dsp.suspend() {
-          // re-enter priming below IN THIS CYCLE: it re-applies the fragment
-          // layout at the new size, discards the backlog, hands the graph one
-          // period of silence and relocks (commit_geometry at prime) - the
-          // cost the overrun recovery already pays, and one cycle cheaper
-          // than a close/reopen
-          crate::info!(state.log, "capture period {} -> {} bytes exceeds the ring ({}); re-priming",
-            port.setup_period, period_in_bytes, port.ext.ring_size);
-          port.ext.primed = false;
-        } else {
-          // the driver refused the trigger stop (dying fd): rebuild off-loop
-          // rather than commit a fill target the current ring can't hold; if
-          // even that fails (no main loop), keep running at the stale
-          // geometry - degraded, but nothing stalls
-          port.resetup_pending = state.main_loop.as_ref().is_some_and(|main_loop|
-            crate::utils::invoke_on_loop(main_loop, state_ptr, move |state| crate::node::resetup_task(state, port_idx)));
-          if port.resetup_pending {
-            continue;
-          }
-        }
+    if retune_period(port, period_in_bytes, &state.log) {
+      // the driver refused the trigger stop (dying fd): rebuild off-loop
+      // rather than commit a fill target the current ring can't hold; if
+      // even that fails (no main loop), keep running at the stale
+      // geometry - degraded, but nothing stalls
+      port.resetup_pending = state.main_loop.as_ref().is_some_and(|main_loop|
+        crate::utils::invoke_on_loop(main_loop, state_ptr, move |state| crate::node::resetup_task(state, port_idx)));
+      if port.resetup_pending {
+        continue;
       }
-    } else {
-      port.ext.period_mismatch = 0;
     }
 
     let freewheel = !state.position.is_null() &&
@@ -356,66 +580,8 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
       std::ptr::write_bytes(data_0.data.cast::<u8>(), 0, len as usize);
       len as isize
     } else if !port.ext.primed && period_in_bytes > 0 {
-      // Capture analogue of the sink's zero priming: trigger the device,
-      // discard any backlog so the fill level starts out known, and hand the
-      // graph one period of silence while the ring fills. Don't wait for real
-      // data: an empty first cycle reads as a missed deadline to the graph.
-      // Re-apply the fragment layout while the channel is in setup (legal
-      // after a trigger suspend too, so live oss.fragment changes reach a
-      // suspended source). The capture fragment is capped at the period:
-      // queued readings move in fragment steps, and a fragment far above
-      // the period makes the servo target unreachable - the error pegs at
-      // the clamp and the integrator ramps. The ring scales with the
-      // period so large quanta keep some overrun slack.
-      if !port.dsp.is_running() {
-        let m    = period_in_bytes.max(1024);
-        let cap  = 1u32 << (31 - m.leading_zeros());
-        let frag = if state.oss_fragment == 0 { 1024 } else { state.oss_fragment.min(cap) };
-        port.dsp.set_small_fragments(frag, ring_request(period_in_bytes,
-          crate::sound::max_ring_period_bytes(stride, rate, graph_rate),
-          crate::sound::ring_byte_cap(stride, rate)));
-      }
-      let ready = port.dsp.ready_for_reading(0);
-      // one GETISPACE serves the backlog, the granted fragment and the ring
-      // total: they come from the same struct, and the layout fields are
-      // final now that ready_for_reading has triggered the channel. The
-      // ACTUAL grant, not the request - the kernel clamps the ring silently,
-      // and the fill geometry must fit reality.
-      let (backlog, fragsize, ring) = port.dsp.ispace_layout();
-      if ready {
-        let mut backlog = backlog;
-        while backlog > 0 {
-          // whole frames only: GETISPACE is byte-granular and can sit
-          // mid-frame; an unaligned read would tear every later sample
-          let chunk = (backlog.min(data_0.maxsize) / stride) * stride;
-          if chunk == 0 {
-            break; // a sub-frame tail; it completes into a frame later
-          }
-          let n = port.dsp.read(data_0.data, chunk as usize);
-          if n <= 0 {
-            break;
-          }
-          backlog -= n as u32;
-        }
-      }
-      port.ext.primed    = true;
-      port.ext.ring_size = ring;
-      // the measurement/arrival quantum is the granted fragment or the
-      // hardware cadence sndstat reports, whichever is coarser (see the
-      // sink); data arrives in these lumps regardless of the soft fragment
-      let chunk = crate::utils::ns_to_frame_bytes(port.dsp.hw_quantum_ns, rate, stride);
-      commit_geometry(port, period_in_bytes, fragsize.max(chunk));
-      port.ext.pinned_cycles = 0;
-      if port.ext.ring_size > 0 && port.ext.ring_size < ring_required(period_in_bytes, port.setup_blocksize) {
-        crate::warn!(state.log, "granted OSS capture ring ({}) is smaller than the fill geometry needs ({}); \
-          audio will glitch. Lower the PipeWire quantum; we set the fragment size \
-          explicitly, so hw.snd.latency has no effect",
-          port.ext.ring_size, ring_required(period_in_bytes, port.setup_blocksize));
-      }
-
-      let len = period_in_bytes.min(data_0.maxsize);
-      std::ptr::write_bytes(data_0.data.cast::<u8>(), 0, len as usize);
-      len as isize
+      prime_capture(port, period_in_bytes, graph_rate, state.oss_fragment,
+        data_0.data, data_0.maxsize, &state.log)
     } else if !port.dsp.is_running() {
       // un-primed and no usable position yet (the prime branch needs a
       // period): the device is still in setup, where the space ioctls assert
@@ -425,81 +591,20 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
       // is one full fragment, which can exceed a small graph period - every
       // read (and the servo error) would then be biased by a fragment. The
       // priming pass already triggered the channel; GETISPACE doesn't need
-      // the trigger. If the device is late, keep the graph timeline stable:
-      // read only queued bytes from the blocking fd and zero-pad the rest of
-      // the period instead of returning an empty or short cycle.
+      // the trigger.
       let queued = port.dsp.ispace_in_bytes().max(0) as u32;
       pre_read_fill = Some(queued);
       if queued == 0 {
         crate::debug!(state.log, "capture: empty cycle (no data queued at wakeup)");
       }
 
-      // when driving, the servo runs in on_timeout where the clock is
-      // published; here the DLL only serves rate matching as a follower on a
-      // foreign clock (a same-device follower has nothing to correct). A
-      // debounce hold cycle runs at stale geometry - don't feed its
+      // A debounce hold cycle runs at stale geometry - don't feed its
       // transitional error to the DLL (the sink gates the same way).
       if matching && period_in_bytes > 0 && port.setup_period != 0 && port.ext.period_mismatch == 0 {
-        let now = crate::utils::now_ns(&state.data_system);
-        if !port.was_matching {
-          // matching just engaged; relock rather than apply stale state
-          port.dll.init();
-          port.bw_adapt.reset();
-        }
-        // capture error is inverted vs the sink: a slow device queues less
-        let err_raw = port.ext.target_fill as f64 - queued as f64;
-        // the healthy swing is half an arrival either side of target; a
-        // snap threshold below that resets the DLL on every arrival
-        let snap = port.setup_period.max(port.setup_blocksize / 2 + port.setup_period / 2);
-        if err_raw.abs() > snap as f64 {
-          // fill snap (see the sink): a level error past one period would
-          // wind the integrator against the +/-1% clamp; the bounded read
-          // above drains genuine backlog, so just relock here
-          port.dll.init();
-          port.bw_adapt.reset();
-        } else {
-          let max_err = (port.setup_period as f64 / 2.0).max(256.0 * stride as f64);
-          let err = err_raw.clamp(-max_err, max_err);
-          corr = port.dll.update(err);
-          port.bw_adapt.update(&mut port.dll, err, stride, port.setup_blocksize,
-            now, port.setup_period, rate * stride);
-        }
-
-        #[cfg(debug_assertions)]
-        eprintln!("capture: corr = {}, err = {}", corr, err_raw);
+        corr = capture_servo(port, queued, crate::utils::now_ns(&state.data_system), stride, rate);
       }
 
-      // Bounded read: one period, plus only the backlog beyond two periods
-      // (genuine catch-up). Draining everything each cycle turns consumer
-      // backpressure into a permanent extra period of latency (an oversized
-      // chunk holds io.status HAVE_DATA, we skip the device next cycle, it
-      // queues 2 periods, repeat) and pollutes the servo error.
-      let want = if port.setup_period != 0 {
-        // catch-up beyond the healthy peak (fill_targets: target plus slack,
-        // capped by the granted ring so a fill at the ceiling is drainable);
-        // the servo handles the rest without a pegged error, and a threshold
-        // under the arrival peak would drag the fill below target on every
-        // arrival
-        port.setup_period.saturating_add(queued.saturating_sub(port.ext.read_peak))
-      } else {
-        queued
-      };
-      // floored to whole frames: `queued` is byte-granular and can sit
-      // mid-frame; an unaligned read would start the next buffer mid-sample
-      let ispace = (want.min(queued).min(data_0.maxsize) / stride) * stride;
-      #[cfg(debug_assertions)]
-      crate::trace!(state.log, "ispace: {}", ispace);
-      let nread = if ispace > 0 {
-        port.dsp.read(data_0.data, ispace as usize).max(0) as u32
-      } else {
-        0
-      };
-      let period = port.setup_period.min(data_0.maxsize);
-      let out = if period > 0 { nread.max(period) } else { nread };
-      if out > nread {
-        std::ptr::write_bytes(data_0.data.cast::<u8>().add(nread as usize), 0, (out - nread) as usize);
-      }
-      out as isize
+      bounded_read(port, queued, data_0.data, data_0.maxsize, stride, &state.log)
     };
 
     // Rate-match only as a follower on a foreign clock: when driving, the
@@ -519,65 +624,7 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
       }
     }
 
-    // A rec overrun means chn_rdfeed found the soft ring full at interrupt
-    // time and DISPOSED the hardware lump UPSTREAM of us - our queued fill
-    // is intact and already bounded by the ring, so the counter alone is not
-    // corrupted state (the sink learned the same about vchan underrun
-    // accounting). Re-priming on every tick amplified a 4 ms kernel drop
-    // into a 20+ ms skip (backlog discard, a period of silence, a DLL
-    // relock whose overshoot re-tripped the ceiling at a ~1.3 s cadence).
-    // Recovery is only warranted when the ring stays PINNED at the ceiling
-    // across consecutive cycles - i.e. the catch-up read can't drain it
-    // (consumer stall, graph buffer smaller than the backlog, wedged reads).
-    // The freewheel branch never triggers the device (it may still be in
-    // setup), and while freewheeling the ring overruns by design - the exit
-    // edge above re-primes, so don't flood the counter meanwhile.
-    let overrun_count = if port.dsp.is_running() && !freewheel { port.dsp.overruns() } else { 0 };
-    if overrun_count > 0 {
-      // pinned = pre-read fill within one arrival of the ring end; with an
-      // unknown ring treat every tick as pinned (can't gate what we can't
-      // measure). A cycle without a pre-read sample (prime/freewheel) just
-      // cleared the ring, so the state is fresh by construction.
-      let pinned = match (pre_read_fill, port.ext.ring_size) {
-        (Some(fill), ring) if ring > 0 => fill > ring.saturating_sub(port.setup_blocksize),
-        (Some(_), _) => true,
-        (None, _)    => false
-      };
-      port.ext.pinned_cycles = if pinned { port.ext.pinned_cycles + 1 } else { 0 };
-      if port.ext.pinned_cycles >= PINNED_CYCLE_LIMIT {
-        port.ext.pinned_cycles = 0;
-        let now = crate::utils::now_ns(&state.data_system);
-        if let Some(suppressed) = port.warn_limit.check(now) {
-          crate::warn!(state.log, "OSS reported {:3} overruns @ {} with the ring pinned; re-priming (+{} warnings suppressed)",
-            overrun_count, now, suppressed);
-        }
-        // report the EVENT to the host (pw-top's xrun counter) only for real
-        // recovery; the length isn't known, so pass 0 delay
-        let node_callbacks = state.callbacks.funcs.cast::<spa_node_callbacks>().as_ref();
-        if let Some(xrun_fun) = node_callbacks.and_then(|c| c.xrun) {
-          xrun_fun(state.callbacks.data, now / 1000, 0, std::ptr::null_mut());
-        }
-
-        // recover like the sink's underrun path: re-enter priming next cycle,
-        // which drains the backlog and relocks the DLL - otherwise the
-        // un-drained backlog becomes permanent capture latency while the
-        // integrator winds up against an error the reads can't remove.
-        // Trigger-suspend first so the re-prime's SETFRAGMENT can also
-        // RESIZE the ring: a pinned ring may be one the current quantum
-        // outgrew, and a Running channel silently skips the layout
-        // re-application (a refused suspend just re-primes at the old size).
-        let _ = port.dsp.suspend();
-        port.ext.primed = false;
-        port.bw_adapt.reset();
-        port.dll.init();
-      } else {
-        // suppressed counts stay diagnosable (see the sink's underrun gate)
-        crate::debug!(state.log, "{} overrun counts ignored (kernel disposed upstream; fill {:?} of ring {})",
-          overrun_count, pre_read_fill, port.ext.ring_size);
-      }
-    } else {
-      port.ext.pinned_cycles = 0;
-    }
+    detect_overrun(port, freewheel, pre_read_fill, &state.data_system, &state.callbacks, &state.log);
 
     if nbytes != -1 {
       #[cfg(debug_assertions)]
