@@ -168,10 +168,18 @@ impl From<String> for DictionaryString {
     }
 }
 
-impl From<*const u8> for DictionaryString {
-    fn from(p: *const u8) -> Self {
-        DictionaryString::Ptr(p.cast())
+impl From<&'static CStr> for DictionaryString {
+    fn from(c: &'static CStr) -> Self {
+        // NUL-terminated and 'static by construction, so the raw pointer
+        // stays valid for the dictionary's lifetime
+        DictionaryString::Ptr(c.as_ptr())
     }
+}
+
+// bindgen renders the SPA key constants as NUL-terminated byte arrays; view
+// one as the &'static CStr it is
+pub(crate) fn key(k: &'static [u8]) -> &'static CStr {
+    CStr::from_bytes_with_nul(k).expect("bindgen keys are NUL-terminated")
 }
 
 const MAX_ITEMS: u32 = 1024;

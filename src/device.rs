@@ -105,17 +105,20 @@ unsafe fn emit_objects(
             let mut dict = crate::spa::Dictionary::new();
 
             dict.add_item(
-                SPA_KEY_NODE_NAME.as_ptr(),
+                crate::spa::key(SPA_KEY_NODE_NAME),
                 format!("pcm{}.{}", device.index, if rec { "rec" } else { "play" }),
             );
 
             if device.desc == description && !device.location.is_empty() {
                 dict.add_item(
-                    SPA_KEY_NODE_DESCRIPTION.as_ptr(),
+                    crate::spa::key(SPA_KEY_NODE_DESCRIPTION),
                     format!("{} @ {}", device.desc, device.location),
                 );
             } else {
-                dict.add_item(SPA_KEY_NODE_DESCRIPTION.as_ptr(), device.desc.as_str());
+                dict.add_item(
+                    crate::spa::key(SPA_KEY_NODE_DESCRIPTION),
+                    device.desc.as_str(),
+                );
             }
 
             dict.add_item(
@@ -981,7 +984,7 @@ unsafe fn set_profile_param(state: &mut State, param: *const spa_pod) -> c_int {
         index = Some(1);
     } else {
         match crate::utils::deserialize_pod(param) {
-            Some((_, Value::Object(o))) if o.type_ == SPA_TYPE_OBJECT_ParamProfile => {
+            Some(Value::Object(o)) if o.type_ == SPA_TYPE_OBJECT_ParamProfile => {
                 for p in o.properties {
                     #[allow(non_upper_case_globals)]
                     match (p.key, p.value) {
@@ -1109,7 +1112,7 @@ unsafe fn set_route_param(state: &mut State, param: *const spa_pod) -> c_int {
     }
 
     let object = match crate::utils::deserialize_pod(param) {
-        Some((_, Value::Object(o))) if o.type_ == SPA_TYPE_OBJECT_ParamRoute => o,
+        Some(Value::Object(o)) if o.type_ == SPA_TYPE_OBJECT_ParamRoute => o,
         _ => return -libc::EINVAL,
     };
 
@@ -1722,17 +1725,17 @@ unsafe extern "C" fn init(
     state.dev_info.fix_pointers();
     state
         .dev_info
-        .add_prop(SPA_KEY_DEVICE_API.as_ptr(), "freebsd-oss");
+        .add_prop(crate::spa::key(SPA_KEY_DEVICE_API), "freebsd-oss");
     state
         .dev_info
-        .add_prop(SPA_KEY_MEDIA_CLASS.as_ptr(), "Audio/Device");
+        .add_prop(crate::spa::key(SPA_KEY_MEDIA_CLASS), "Audio/Device");
     if let Some(pcm_parent_device) = pcm_parent_device {
         state
             .dev_info
-            .add_prop(SPA_KEY_DEVICE_NAME.as_ptr(), pcm_parent_device);
+            .add_prop(crate::spa::key(SPA_KEY_DEVICE_NAME), pcm_parent_device);
     }
     state.dev_info.add_prop(
-        SPA_KEY_DEVICE_DESCRIPTION.as_ptr(),
+        crate::spa::key(SPA_KEY_DEVICE_DESCRIPTION),
         state.description.as_str(),
     );
     state

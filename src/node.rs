@@ -554,12 +554,9 @@ unsafe extern "C" fn set_param<D: Direction>(
                 return res;
             }
             match crate::utils::deserialize_pod(param) {
-                Some((
-                    _,
-                    Value::Object(Object {
-                        type_, properties, ..
-                    }),
-                )) if type_ == SPA_TYPE_OBJECT_Props => {
+                Some(Value::Object(Object {
+                    type_, properties, ..
+                })) if type_ == SPA_TYPE_OBJECT_Props => {
                     for property in properties {
                         match property.key {
                             // there is no way adapter is actually supposed to pass all those properties (or parameters?) to us,
@@ -1717,9 +1714,21 @@ unsafe extern "C" fn port_set_io<D: Direction>(
     port_id: u32,
     id: u32,
     data: *mut c_void,
-    _size: usize,
+    size: usize,
 ) -> c_int {
     if direction != D::DIRECTION || (port_id as usize) >= MAX_PORTS {
+        return -libc::EINVAL;
+    }
+
+    #[allow(non_upper_case_globals)]
+    let min_size = match id {
+        SPA_IO_Buffers => std::mem::size_of::<spa_io_buffers>(),
+        SPA_IO_RateMatch => std::mem::size_of::<spa_io_rate_match>(),
+        _ => return -libc::ENOENT,
+    };
+    // NULL/0 clears the area; only a non-empty-but-short one is an error
+    // (process derefs the full struct, as set_io guards for clock/position)
+    if !data.is_null() && size < min_size {
         return -libc::EINVAL;
     }
 
@@ -1727,12 +1736,6 @@ unsafe extern "C" fn port_set_io<D: Direction>(
         .cast::<State<D>>()
         .as_mut()
         .expect("object is not supposed to be null");
-
-    #[allow(non_upper_case_globals)]
-    match id {
-        SPA_IO_Buffers | SPA_IO_RateMatch => (),
-        _ => return -libc::ENOENT,
-    }
 
     // these pointers are dereferenced by process() on the data loop
     let state: *mut State<D> = state;
@@ -1859,10 +1862,10 @@ unsafe fn publish_static_info<D: Direction>(state: &mut State<D>) {
 
     state
         .node_info
-        .add_prop(SPA_KEY_MEDIA_CLASS.as_ptr(), D::MEDIA_CLASS);
+        .add_prop(crate::spa::key(SPA_KEY_MEDIA_CLASS), D::MEDIA_CLASS);
     state
         .node_info
-        .add_prop(SPA_KEY_NODE_DRIVER.as_ptr(), "true");
+        .add_prop(crate::spa::key(SPA_KEY_NODE_DRIVER), "true");
 
     // no EnumPortConfig/PortConfig: dead surface on a follower, see the note
     // above build_port_format_info

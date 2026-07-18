@@ -505,12 +505,9 @@ pub(crate) unsafe fn parse_latency_info(
     use libspa::sys::*;
 
     match crate::utils::deserialize_pod(param) {
-        Some((
-            _,
-            Value::Object(Object {
-                type_, properties, ..
-            }),
-        )) if type_ == SPA_TYPE_OBJECT_ParamLatency => {
+        Some(Value::Object(Object {
+            type_, properties, ..
+        })) if type_ == SPA_TYPE_OBJECT_ParamLatency => {
             let mut info = latency_info_default(SPA_DIRECTION_INPUT);
             for p in properties {
                 #[allow(non_upper_case_globals)]
@@ -585,12 +582,9 @@ pub(crate) unsafe fn parse_process_latency_info(
     use libspa::sys::*;
 
     match crate::utils::deserialize_pod(param) {
-        Some((
-            _,
-            Value::Object(Object {
-                type_, properties, ..
-            }),
-        )) if type_ == SPA_TYPE_OBJECT_ParamProcessLatency => {
+        Some(Value::Object(Object {
+            type_, properties, ..
+        })) if type_ == SPA_TYPE_OBJECT_ParamProcessLatency => {
             let mut info = process_latency_default();
             for p in properties {
                 #[allow(non_upper_case_globals)]
@@ -838,12 +832,15 @@ pub(crate) fn ns_to_frame_bytes(ns: u64, rate: u32, stride: u32) -> u32 {
 // which must not unwind across our extern "C" boundaries.
 pub(crate) unsafe fn deserialize_pod(
     param: *const libspa::sys::spa_pod,
-) -> Option<(&'static [u8], libspa::pod::Value)> {
+) -> Option<libspa::pod::Value> {
     use libspa::pod::deserialize::PodDeserializer;
     let bytes = libspa::pod::Pod::from_raw(param).as_bytes();
     std::panic::catch_unwind(|| PodDeserializer::deserialize_any_from(bytes).ok())
         .ok()
         .flatten()
+        // the parse remainder rode a lifetime fabricated from the raw pod;
+        // every caller wants only the owned Value
+        .map(|(_, value)| value)
 }
 
 // Fire-and-forget: queue `f` to run once on the given loop (from any thread;
