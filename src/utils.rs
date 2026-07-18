@@ -214,12 +214,32 @@ pub fn snap_raw_to_caps(caps: &crate::sound::DspCaps, raw: &mut libspa::sys::spa
   changed
 }
 
-// One EnumFormat pod per offered channel width, positions from the kernel
-// interleave. When 2ch is in range it is listed first (host default) and last
-// (pulse-server falls back to the last EnumFormat map when Format is gone;
-// HW routes always report 2ch volume, so a last width of 1/max would thrash
-// cvolume.channels). That can mean two entries for stereo. Returns false when
-// `index` is past the last result.
+// The offered channel widths, in EnumFormat order: standard widths in range,
+// then the native max if missing (AUX for non-std), with 2 pinned first (host
+// default) and last (pulse-server falls back to the LAST EnumFormat map when
+// Format is gone; HW routes always report 2ch volume, so a last width of
+// 1/max would thrash cvolume.channels). That can mean two entries for stereo.
+fn enum_format_widths(min_channels: u32, max_channels: u32) -> Vec<u32> {
+  let mut counts = [2u32, 4, 6, 8, 1].iter().copied()
+    .filter(|c| *c >= min_channels && *c <= max_channels)
+    .collect::<Vec<_>>();
+  if !counts.contains(&max_channels) {
+    counts.push(max_channels);
+  }
+  // pin 2 first and last; no-op when already only [2]
+  if min_channels <= 2 && max_channels >= 2 {
+    counts.retain(|c| *c != 2);
+    counts.insert(0, 2);
+    if counts.last() != Some(&2) {
+      counts.push(2);
+    }
+  }
+  counts
+}
+
+// One EnumFormat pod per offered channel width (enum_format_widths order),
+// positions from the kernel interleave. Returns false when `index` is past
+// the last result.
 pub unsafe fn build_enum_format_info(b: &mut libspa::pod::builder::Builder, caps: &crate::sound::DspCaps, index: u32) -> Result<bool, rustix::io::Errno> {
 
   use libspa::sys::*;
@@ -230,22 +250,7 @@ pub unsafe fn build_enum_format_info(b: &mut libspa::pod::builder::Builder, caps
     return Ok(false);
   }
 
-  // standard widths in range, then native max if missing (AUX for non-std)
-  let mut counts = [2u32, 4, 6, 8, 1].iter().copied()
-    .filter(|c| *c >= caps.min_channels && *c <= caps.max_channels)
-    .collect::<Vec<_>>();
-  if !counts.contains(&caps.max_channels) {
-    counts.push(caps.max_channels);
-  }
-  // pin 2 first and last (see fn doc); no-op when already only [2]
-  if caps.min_channels <= 2 && caps.max_channels >= 2 {
-    counts.retain(|c| *c != 2);
-    counts.insert(0, 2);
-    if counts.last() != Some(&2) {
-      counts.push(2);
-    }
-  }
-
+  let counts = enum_format_widths(caps.min_channels, caps.max_channels);
   let Some(&channels) = counts.get(index as usize) else {
     return Ok(false);
   };
@@ -799,5 +804,71 @@ pub fn spa_command_to_str(body: &libspa::sys::spa_pod_object_body) -> &'static s
     (SPA_TYPE_COMMAND_Node, SPA_NODE_COMMAND_ParamEnd)   => "SPA_NODE_COMMAND_ParamEnd",
     (SPA_TYPE_COMMAND_Node, _)                           => "SPA_NODE_COMMAND_???",
     _ => "???"
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{device_period_bytes, enum_format_widths, ns_to_bytes, ns_to_frame_bytes};
+
+  #[test]
+  fn frame_bytes_round_up_and_stay_saturated() {
+    // the floored hardware quantum comes back up to a whole frame
+    assert_eq!(ns_to_frame_bytes(5_333_333, 48000, 8), 2048);
+    assert_eq!(ns_to_frame_bytes(0, 48000, 8), 0);
+    // a saturated conversion must not overflow the round-up (debug builds
+    // would abort the data loop; release would wrap the chunk to zero) -
+    // it stays pinned at the largest frame multiple
+    assert_eq!(ns_to_frame_bytes(u64::MAX, u32::MAX, 8), u32::MAX - u32::MAX % 8);
+    assert_eq!(ns_to_frame_bytes(u64::MAX, u32::MAX, 1), u32::MAX);
+  }
+
+  // the 9875023 invariant: pulse falls back to the LAST EnumFormat map when
+  // Format is gone, and HW route volume is always 2ch - so whenever the
+  // device can do stereo, the list must open with it (host default) and end
+  // with it (fallback), or cvolume.channels flips and pops the volume OSD
+  #[test]
+  fn stereo_pins_both_ends_of_enum_format() {
+    for (min, max) in [(1u32, 2u32), (2, 2), (1, 8), (2, 8), (1, 10), (2, 32)] {
+      let widths = enum_format_widths(min, max);
+      assert_eq!(*widths.first().unwrap(), 2, "min {} max {}: {:?}", min, max, widths);
+      assert_eq!(*widths.last().unwrap(),  2, "min {} max {}: {:?}", min, max, widths);
+      assert!(widths.contains(&max), "native width lost: min {} max {}: {:?}", min, max, widths);
+      assert!(widths.iter().all(|w| (*w >= min && *w <= max)),
+        "width out of range: min {} max {}: {:?}", min, max, widths);
+      assert_eq!(widths.iter().filter(|w| **w == 2).count().min(2),
+        if widths.len() == 1 { 1 } else { 2 });
+    }
+    // concrete shapes: this machine's HDMI 8ch and a 10ch USB mixer
+    assert_eq!(enum_format_widths(2, 8), [2, 4, 6, 8, 2]);
+    assert_eq!(enum_format_widths(1, 10), [2, 4, 6, 8, 1, 10, 2]);
+    assert_eq!(enum_format_widths(2, 2), [2]);
+    // no stereo support: no pinning, the native width still leads/closes
+    assert_eq!(enum_format_widths(1, 1), [1]);
+    assert_eq!(enum_format_widths(4, 8), [4, 6, 8]);
+    assert_eq!(enum_format_widths(3, 3), [3]);
+  }
+
+  #[test]
+  fn ns_to_bytes_floors() {
+    // the production hw-quantum shape: 256 frames @ 48k S32 stereo is
+    // 5333333 ns, which floors to 2047 - call sites round back up to the
+    // stride and rely on this direction; a rounding change here silently
+    // shifts every geometry derived from it
+    assert_eq!(ns_to_bytes(5_333_333, 48000, 8), 2047);
+    assert_eq!(ns_to_bytes(5_333_334, 48000, 8), 2048);
+    assert_eq!(ns_to_bytes(0, 48000, 8), 0);
+    assert_eq!(ns_to_bytes(1_000_000_000, 48000, 8), 384_000);
+    // saturates instead of wrapping
+    assert_eq!(ns_to_bytes(u64::MAX, u32::MAX, u32::MAX), u32::MAX);
+  }
+
+  #[test]
+  fn device_period_scales_with_rate_ratio() {
+    assert_eq!(device_period_bytes(2048, 48000, 48000, 8), 16384);
+    assert_eq!(device_period_bytes(2048, 96000, 48000, 8), 32768);
+    assert_eq!(device_period_bytes(2048, 44100, 48000, 8), 15048); // floors
+    assert_eq!(device_period_bytes(2048, 48000, 0, 8), 0);
+    assert_eq!(device_period_bytes(u64::MAX, u32::MAX, 1, u32::MAX), u32::MAX);
   }
 }

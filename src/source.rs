@@ -791,3 +791,45 @@ pub const OSS_SOURCE_FACTORY: spa_handle_factory = spa_handle_factory {
   init:                Some(crate::node::init::<SourceDir>),
   enum_interface_info: Some(crate::node::enum_interface_info)
 };
+
+#[cfg(test)]
+mod tests {
+  use super::{fill_targets, ring_request, ring_required};
+
+  #[test]
+  fn fill_targets_track_arrival_granularity() {
+    for period in [1024u32, 4096, 16384, 65536] {
+      for blocksize in [512u32, 1024, 2047, 2048, 16384, 65536] {
+        // unbounded: target sits half an arrival over one period, peak half
+        // an arrival plus half a period over that
+        let (target, peak) = fill_targets(period, blocksize, 0);
+        assert_eq!(target, period + blocksize / 2);
+        assert_eq!(peak, target + blocksize / 2 + period / 2);
+
+        // an adequate ring keeps a catch-up band (one arrival above target)
+        // and one arrival of top headroom - the read never goes dead
+        let ring = ring_required(period, blocksize);
+        let (target2, peak2) = fill_targets(period, blocksize, ring);
+        assert_eq!(target2, target);
+        assert!(peak2 >= target + blocksize,
+          "catch-up band lost: peak {} < target {} + arrival {} (ring {})", peak2, target, blocksize, ring);
+        assert!(peak2 <= ring - blocksize,
+          "undrainable: peak {} past ring {} - arrival {}", peak2, ring, blocksize);
+
+        // a degenerate ring still pins the peak inside it
+        let (_, peak3) = fill_targets(period, blocksize, period);
+        assert!(peak3 <= period.saturating_sub(blocksize).max(0));
+      }
+    }
+  }
+
+  #[test]
+  fn ring_request_floors_and_caps() {
+    // four periods of the largest negotiable quantum, floored at the byte
+    // budget, and the kernel cap always wins
+    assert_eq!(ring_request(1024, 16384, 1 << 20), 16384 * 4);
+    assert_eq!(ring_request(32768, 16384, 1 << 20), 32768 * 4);
+    assert!(ring_request(64, 64, 1 << 20) >= crate::sound::MIN_RING_BYTES);
+    assert_eq!(ring_request(65536, 65536, 4096), 4096);
+  }
+}

@@ -894,3 +894,70 @@ pub const OSS_SINK_FACTORY: spa_handle_factory = spa_handle_factory {
   init:                Some(crate::node::init::<SinkDir>),
   enum_interface_info: Some(crate::node::enum_interface_info)
 };
+
+#[cfg(test)]
+mod tests {
+  use super::{buffer_request, buffer_required, desired_delay, fill_floor, target_delay};
+
+  #[test]
+  fn target_matches_live_geometry() {
+    // the production log shape: granted 65536, blocksize 2048, period 16384
+    // -> target delay 20480 (fill_floor binds: period + period/4)
+    assert_eq!(target_delay(65536, 16384, 2048, 16384, 0), (20480, false));
+    // a fragment wider than the jitter margin takes over the floor
+    assert_eq!(fill_floor(16384, 8192), 16384 + 8192);
+  }
+
+  // "buffer_required() and target_delay() must derive this identically": any
+  // grant that passes the retune gate (buffer_size >= required) must yield a
+  // fill target at or above the floor (no starvation) with a full write plus
+  // one fragment of wander of headroom above it (no short-write drops)
+  #[test]
+  fn granted_at_required_never_starves_or_drops() {
+    for period in [1024u32, 4096, 16384, 65536] {
+      for blocksize in [512u32, 1024, 2047, 2048, 16384, 65536] {
+        for write_max in [period, period * 2, period * 4] {
+          for oss_delay in [0u32, 4, 32, 1024] {
+            let desired  = desired_delay(period, oss_delay);
+            let required = buffer_required(period, desired, blocksize, write_max);
+            for granted in [required, required + 1, required.saturating_mul(2)] {
+              let (target, _) = target_delay(granted, period, blocksize, write_max, desired);
+              assert!(target >= fill_floor(period, blocksize),
+                "starved: target {} < floor {} (granted {}, period {}, blocksize {}, write_max {}, desired {})",
+                target, fill_floor(period, blocksize), granted, period, blocksize, write_max, desired);
+              assert!(target.saturating_add(write_max).saturating_add(blocksize) <= granted,
+                "will drop: target {} + write_max {} + blocksize {} > granted {} (period {}, desired {})",
+                target, write_max, blocksize, granted, period, desired);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  #[test]
+  fn small_grant_is_best_effort_half() {
+    // under two quanta there is no workable geometry; half the ring, and the
+    // caller warns
+    assert_eq!(target_delay(8192, 16384, 1024, 16384, 0), (4096, false));
+  }
+
+  #[test]
+  fn oversized_delay_is_capped_and_reported() {
+    // oss.delay pushing past the ceiling: clamped to it, flagged for the log
+    let (target, capped) = target_delay(65536, 4096, 1024, 4096, u32::MAX);
+    assert_eq!(target, 65536 - 4096 - 1024);
+    assert!(capped);
+  }
+
+  #[test]
+  fn request_covers_the_largest_negotiable_quantum() {
+    // the prime-time request holds the stable floor so later period changes
+    // retune in place; the kernel cap always wins
+    let cap = crate::sound::ring_byte_cap(8, 48000);
+    let req = buffer_request(4096, 16384, cap, 0, 2048, 4096, 4);
+    assert!(req >= buffer_required(16384, desired_delay(16384, 4), 2048, 16384));
+    assert!(req >= crate::sound::MIN_RING_BYTES.min(cap));
+    assert!(req <= cap);
+  }
+}
