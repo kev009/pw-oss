@@ -89,7 +89,8 @@ pub(crate) unsafe fn for_each_hook(head: *mut spa_hook_list, mut apply: impl FnM
 
 // A listener-events vtable an emission can be routed through: ties the
 // events struct to the minimum version we emit to.
-pub(crate) trait HookEvents {
+// Copy so emissions can hand closures the vtable by value (see emit_events).
+pub(crate) trait HookEvents: Copy {
     const VERSION_MIN: u32;
 }
 
@@ -110,10 +111,12 @@ const _: () = assert!(
 
 // Emit ONE listener method to every hook in the list (see for_each_hook for
 // the one-method-per-traversal contract): each hook's funcs is viewed as the
-// typed events vtable and `call` receives it with the hook's data pointer.
+// typed events vtable and `call` receives a COPY of it with the hook's data
+// pointer, so the closure never holds a borrow into the listener-owned
+// vtable while it calls out (a callback could otherwise invalidate it).
 // The version prefix (offset 0, asserted above) is read alone FIRST: a
 // listener built against an older, shorter vtable must be rejected before
-// the full E - possibly larger in this build - is read out of the
+// the full E - possibly larger in this build - is copied out of the
 // listener's allocation. A too-old listener is skipped - soft, like C's
 // spa_callbacks_call version gate - never asserted on: these emissions
 // run under extern "C" callers, where a panic aborts the whole daemon.
@@ -123,7 +126,7 @@ const _: () = assert!(
 // (the matching add_listener contract), valid for the whole traversal.
 pub(crate) unsafe fn emit_events<E: HookEvents>(
     head: *mut spa_hook_list,
-    mut call: impl FnMut(&E, *mut c_void),
+    mut call: impl FnMut(E, *mut c_void),
 ) {
     unsafe {
         for_each_hook(head, |cb| {
@@ -133,7 +136,7 @@ pub(crate) unsafe fn emit_events<E: HookEvents>(
                 "hook funcs are non-null past for_each_hook"
             );
             if version_ok(cb.funcs.cast::<u32>().read(), E::VERSION_MIN) {
-                call(&*cb.funcs.cast::<E>(), cb.data);
+                call(cb.funcs.cast::<E>().read(), cb.data);
             }
         });
     }
@@ -148,7 +151,7 @@ pub(crate) unsafe fn dev_emit_result(
 ) {
     // one emission through the C listener vtables end to end
     unsafe {
-        emit_events(hooks, |f: &spa_device_events, data| {
+        emit_events(hooks, |f: spa_device_events, data| {
             if let Some(result_fun) = f.result {
                 result_fun(data, seq, res, type_, result as *const _ as *const c_void);
             }
@@ -187,12 +190,19 @@ impl<T> IoArea<T> {
         self.ptr.is_null()
     }
 
-    // run `f` on the live area; None while cleared. &self on purpose: the
-    // pointee is host-shared either way, and callers hold &mut elsewhere
-    // (ports iteration) while touching disjoint areas.
-    pub(crate) fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> Option<R> {
+    // Run `f` on the live area; None while cleared. &mut self so two live
+    // &mut T over one area cannot coexist through safe calls (with &self a
+    // nested with() would alias); no call site nests today, this keeps it
+    // that way by construction.
+    pub(crate) fn with<R>(&mut self, f: impl FnOnce(&mut T) -> R) -> Option<R> {
         // sound per set()'s contract (validity and serialization)
         unsafe { self.ptr.as_mut() }.map(f)
+    }
+
+    // read-only view of the live area; None while cleared
+    pub(crate) fn with_ref<R>(&self, f: impl FnOnce(&T) -> R) -> Option<R> {
+        // sound per set()'s contract (validity and serialization)
+        unsafe { self.ptr.as_ref() }.map(f)
     }
 }
 
@@ -271,7 +281,7 @@ pub(crate) unsafe fn enum_params_loop<S>(
 pub(crate) unsafe fn node_emit_done(hooks: &mut spa_hook_list, seq: c_int) {
     // one emission through the C listener vtables end to end
     unsafe {
-        emit_events(hooks, |f: &spa_node_events, data| {
+        emit_events(hooks, |f: spa_node_events, data| {
             if let Some(result_fun) = f.result {
                 result_fun(data, seq, 0, 0, std::ptr::null());
             }
@@ -288,7 +298,7 @@ pub(crate) unsafe fn node_emit_result(
 ) {
     // one emission through the C listener vtables end to end
     unsafe {
-        emit_events(hooks, |f: &spa_node_events, data| {
+        emit_events(hooks, |f: spa_node_events, data| {
             if let Some(result_fun) = f.result {
                 result_fun(data, seq, res, type_, result as *const _ as *const c_void);
             }

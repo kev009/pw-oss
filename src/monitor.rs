@@ -20,7 +20,7 @@ struct State {
     log: crate::spa::Log,
 }
 
-fn emit_dev_node(events: &spa_device_events, data: *mut c_void, driver: &str, indexes: &[u32]) {
+fn emit_dev_node(events: spa_device_events, data: *mut c_void, driver: &str, indexes: &[u32]) {
     let indexes_str = indexes
         .iter()
         .map(|i| format!("{i}"))
@@ -45,7 +45,7 @@ fn emit_dev_node(events: &spa_device_events, data: *mut c_void, driver: &str, in
     }
 }
 
-fn remove_dev_node(events: &spa_device_events, data: *mut c_void, indexes: &[u32]) {
+fn remove_dev_node(events: spa_device_events, data: *mut c_void, indexes: &[u32]) {
     if let Some(obj_info_fun) = events.object_info {
         unsafe { obj_info_fun(data, indexes[0], std::ptr::null()) };
     }
@@ -77,14 +77,14 @@ unsafe extern "C" fn add_listener(
     // not be called (or have its hook read) again for the next method.
     unsafe {
         state.dev_info.change_mask = crate::spa::SPA_DEVICE_CHANGE_MASK_ALL as u64;
-        crate::spa::emit_events(&mut state.hooks, |f: &spa_device_events, data| {
+        crate::spa::emit_events(&mut state.hooks, |f: spa_device_events, data| {
             if let Some(dev_info_fun) = f.info {
                 dev_info_fun(data, &state.dev_info);
             }
         });
 
         for (parent, indexes) in &state.pcm_indexes {
-            crate::spa::emit_events(&mut state.hooks, |f: &spa_device_events, data| {
+            crate::spa::emit_events(&mut state.hooks, |f: spa_device_events, data| {
                 emit_dev_node(f, data, parent, indexes);
             });
         }
@@ -213,7 +213,7 @@ unsafe fn resync_devices(state: &mut State, detached: &[String]) {
             if let Some(indexes) = state.pcm_indexes.remove(&key) {
                 crate::info!(state.log, "removing {} ({:?}) on detach", key, indexes);
                 unsafe {
-                    crate::spa::emit_events(&mut state.hooks, |f: &spa_device_events, data| {
+                    crate::spa::emit_events(&mut state.hooks, |f: spa_device_events, data| {
                         remove_dev_node(f, data, &indexes);
                     });
                 }
@@ -235,7 +235,7 @@ unsafe fn resync_devices(state: &mut State, detached: &[String]) {
         if state.pcm_indexes.get(driver) != Some(old_indexes) {
             crate::info!(state.log, "removing {} ({:?})", driver, old_indexes);
             unsafe {
-                crate::spa::emit_events(&mut state.hooks, |f: &spa_device_events, data| {
+                crate::spa::emit_events(&mut state.hooks, |f: spa_device_events, data| {
                     remove_dev_node(f, data, old_indexes);
                 });
             }
@@ -245,7 +245,7 @@ unsafe fn resync_devices(state: &mut State, detached: &[String]) {
         if old_map.get(driver) != Some(new_indexes) {
             crate::info!(state.log, "registering {} ({:?})", driver, new_indexes);
             unsafe {
-                crate::spa::emit_events(&mut state.hooks, |f: &spa_device_events, data| {
+                crate::spa::emit_events(&mut state.hooks, |f: spa_device_events, data| {
                     emit_dev_node(f, data, driver, new_indexes);
                 });
             }

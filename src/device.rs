@@ -84,7 +84,7 @@ unsafe fn emit_object_info(
     obj_info: *const spa_device_object_info,
 ) {
     unsafe {
-        crate::spa::emit_events(hooks, |f: &spa_device_events, data| {
+        crate::spa::emit_events(hooks, |f: spa_device_events, data| {
             if let Some(obj_info_fun) = f.object_info {
                 obj_info_fun(data, id, obj_info);
             }
@@ -170,7 +170,7 @@ unsafe fn emit_objects(
 unsafe fn emit_device_info(state: &mut State) {
     // one emission through the C listener vtables end to end
     unsafe {
-        crate::spa::emit_events(&mut state.hooks, |f: &spa_device_events, data| {
+        crate::spa::emit_events(&mut state.hooks, |f: spa_device_events, data| {
             if let Some(info_fun) = f.info {
                 info_fun(data, state.dev_info.raw());
             }
@@ -456,7 +456,7 @@ unsafe fn emit_object_config(state: &mut State, pos: usize, volume: bool) {
 
     // one emission through the C listener vtables end to end
     unsafe {
-        crate::spa::emit_events(&mut state.hooks, |f: &spa_device_events, data| {
+        crate::spa::emit_events(&mut state.hooks, |f: spa_device_events, data| {
             if let Some(event_fun) = f.event {
                 event_fun(data, buffer.as_ptr() as *const spa_event);
             }
@@ -740,7 +740,7 @@ unsafe extern "C" fn add_listener(
         let old_mask = state
             .dev_info
             .replace_change_mask(crate::spa::SPA_DEVICE_CHANGE_MASK_ALL as u64);
-        crate::spa::emit_events(&mut state.hooks, |f: &spa_device_events, data| {
+        crate::spa::emit_events(&mut state.hooks, |f: spa_device_events, data| {
             if let Some(dev_info_fun) = f.info {
                 dev_info_fun(data, state.dev_info.raw());
             }
@@ -767,7 +767,7 @@ unsafe extern "C" fn sync(object: *mut c_void, seq: c_int) -> c_int {
 
     // one emission through the C listener vtables end to end
     unsafe {
-        crate::spa::emit_events(&mut state.hooks, |f: &spa_device_events, data| {
+        crate::spa::emit_events(&mut state.hooks, |f: spa_device_events, data| {
             if let Some(result_fun) = f.result {
                 result_fun(data, seq, 0, 0, std::ptr::null());
             }

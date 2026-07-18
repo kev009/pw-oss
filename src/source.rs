@@ -522,7 +522,7 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
         // one period in device bytes (0 while position is absent)
         let mut period_in_bytes = 0u32;
         let mut graph_rate = 0u32;
-        if let Some(driver_clock) = state.position.with(|p| p.clock) {
+        if let Some(driver_clock) = state.position.with_ref(|p| p.clock) {
             if driver_clock.target_rate.denom > 0 {
                 graph_rate = driver_clock.target_rate.denom;
                 period_in_bytes = crate::utils::device_period_bytes(
@@ -545,8 +545,9 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
             }
         }
 
-        let freewheel =
-            state.position.with(|p| p.clock.flags).unwrap_or(0) & SPA_IO_CLOCK_FLAG_FREEWHEEL != 0;
+        let freewheel = state.position.with_ref(|p| p.clock.flags).unwrap_or(0)
+            & SPA_IO_CLOCK_FLAG_FREEWHEEL
+            != 0;
 
         // realtime resumed after freewheeling: the ring overflowed by design
         // while reads were skipped, so re-prime explicitly for a known fill

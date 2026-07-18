@@ -220,8 +220,8 @@ pub(crate) struct State<D: Direction> {
 
 impl<D: Direction> State<D> {
     fn node_is_follower(&self) -> bool {
-        let driver = self.position.with(|p| p.clock.id);
-        let ours = self.clock.with(|c| c.id);
+        let driver = self.position.with_ref(|p| p.clock.id);
+        let ours = self.clock.with_ref(|c| c.id);
         matches!((driver, ours), (Some(d), Some(o)) if d != o)
     }
 }
@@ -348,7 +348,7 @@ unsafe extern "C" fn add_listener<D: Direction>(
         let old_mask = state
             .node_info
             .replace_change_mask(crate::spa::SPA_NODE_CHANGE_MASK_ALL as u64);
-        crate::spa::emit_events(&mut state.hooks, |f: &spa_node_events, data| {
+        crate::spa::emit_events(&mut state.hooks, |f: spa_node_events, data| {
             if let Some(node_info_fun) = f.info {
                 node_info_fun(data, state.node_info.raw());
             }
@@ -358,7 +358,7 @@ unsafe extern "C" fn add_listener<D: Direction>(
         let old_mask = state
             .port_info
             .replace_change_mask(crate::spa::SPA_PORT_CHANGE_MASK_ALL as u64);
-        crate::spa::emit_events(&mut state.hooks, |f: &spa_node_events, data| {
+        crate::spa::emit_events(&mut state.hooks, |f: spa_node_events, data| {
             if let Some(port_info_fun) = f.port_info {
                 port_info_fun(data, D::DIRECTION, 0, state.port_info.raw());
             }
@@ -377,7 +377,7 @@ unsafe extern "C" fn add_listener<D: Direction>(
 pub(crate) unsafe fn emit_node_info<D: Direction>(state: &mut State<D>) {
     // one emission through the C listener vtables end to end
     unsafe {
-        crate::spa::emit_events(&mut state.hooks, |f: &spa_node_events, data| {
+        crate::spa::emit_events(&mut state.hooks, |f: spa_node_events, data| {
             if let Some(node_info_fun) = f.info {
                 node_info_fun(data, state.node_info.raw());
             }
@@ -420,7 +420,7 @@ pub(crate) unsafe fn handle_process_latency<D: Direction>(
 pub(crate) unsafe fn emit_port_info<D: Direction>(state: &mut State<D>) {
     // one emission through the C listener vtables end to end
     unsafe {
-        crate::spa::emit_events(&mut state.hooks, |f: &spa_node_events, data| {
+        crate::spa::emit_events(&mut state.hooks, |f: spa_node_events, data| {
             if let Some(port_info_fun) = f.port_info {
                 port_info_fun(data, D::DIRECTION, 0, state.port_info.raw());
             }
@@ -621,7 +621,7 @@ unsafe fn timeout_servo<D: Direction>(state: &mut State<D>, nsec: u64, rate: u32
         let fill = D::servo_fill(port);
         // device frames scale to the graph rate; the resampler queue is already
         // graph-side (audioconvert reports it unscaled, like ALSA adds it)
-        let resamp = port.rate_match.with(|rm| rm.delay as i64).unwrap_or(0);
+        let resamp = port.rate_match.with_ref(|rm| rm.delay as i64).unwrap_or(0);
         delay = (fill as i64 / stride as i64) * rate as i64 / device_rate as i64 + resamp;
 
         if D::servo_hold(port) {
@@ -724,7 +724,7 @@ unsafe extern "C" fn on_timeout<D: Direction>(source: *mut spa_source) {
     // position and clock were null-checked above and stay set for the cycle
     let (duration, rate) = state
         .position
-        .with(|p| (p.clock.target_duration, p.clock.target_rate.denom))
+        .with_ref(|p| (p.clock.target_duration, p.clock.target_rate.denom))
         .unwrap_or((0, 0));
     if duration == 0 || rate == 0 {
         // malformed position: idle-tick, and advance next_time so the deadline
