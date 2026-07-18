@@ -1,6 +1,17 @@
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
+use std::os::raw::c_void;
 use libc::sysctlbyname;
 use nix::errno::Errno;
+
+// the shared read-only sysctlbyname shape (no new value): `buf` may be null
+// for a size probe, `len` is in/out. Callers pass a `buf` valid for `len`
+// bytes (or null).
+unsafe fn sysctl_read(name: &CStr, buf: *mut c_void, len: &mut usize) -> Result<(), Errno> {
+  if sysctlbyname(name.as_ptr(), buf, len, std::ptr::null(), 0) == -1 {
+    return Err(Errno::last());
+  }
+  Ok(())
+}
 
 pub enum SysctlName {
   CString(CString)
@@ -37,9 +48,7 @@ impl SysctlReader {
     let SysctlName::CString(name) = name.into();
 
     let mut len = 0;
-    if unsafe { sysctlbyname(name.as_ptr(), std::ptr::null_mut(), &mut len, std::ptr::null(), 0) } == -1 {
-      return Err(Errno::last())
-    }
+    unsafe { sysctl_read(&name, std::ptr::null_mut(), &mut len) }?;
 
     if len > max_len {
       return Err(Errno::ENOMEM);
@@ -50,9 +59,7 @@ impl SysctlReader {
     }
 
     self.scratch_buffer.resize(len, 0);
-    if unsafe { sysctlbyname(name.as_ptr(), self.scratch_buffer.as_mut_ptr().cast(), &mut len, std::ptr::null(), 0) } == -1 {
-      return Err(Errno::last());
-    }
+    unsafe { sysctl_read(&name, self.scratch_buffer.as_mut_ptr().cast(), &mut len) }?;
 
     // classic string sysctls (e.g. kern.ostype) count the terminating NUL
     // in the returned length; device-tree ones don't - trim either way, or
@@ -68,9 +75,7 @@ impl SysctlReader {
     let SysctlName::CString(name) = name.into();
     let mut value: u32 = 0;
     let mut len = std::mem::size_of::<u32>();
-    if unsafe { sysctlbyname(name.as_ptr(), (&mut value as *mut u32).cast(), &mut len, std::ptr::null(), 0) } == -1 {
-      return Err(Errno::last());
-    }
+    unsafe { sysctl_read(&name, (&mut value as *mut u32).cast(), &mut len) }?;
     Ok(value)
   }
 }

@@ -65,8 +65,6 @@ struct oss_audioinfo {
 // sys/dev/sound/pcm/matrix.h: SETCHANNELS requests are clamped to this
 const SND_CHN_MAX: c_int = 8;
 
-// currently unused
-#[allow(dead_code)]
 const PCM_ENABLE_INPUT:  c_int = 0x00000001;
 const PCM_ENABLE_OUTPUT: c_int = 0x00000002;
 

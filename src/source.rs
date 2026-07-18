@@ -300,8 +300,7 @@ fn capture_servo(port: &mut crate::node::Port<SourceDir>, queued: u32, now: u64,
 // bytes from the blocking fd and zero-pad the rest of the period instead of
 // returning an empty or short cycle.
 unsafe fn bounded_read(port: &mut crate::node::Port<SourceDir>, queued: u32,
-                       data: *mut std::os::raw::c_void, maxsize: u32, stride: u32,
-                       log: &crate::spa::Log) -> isize {
+                       data: *mut std::os::raw::c_void, maxsize: u32, stride: u32) -> isize {
   let want = if port.setup_period != 0 {
     // catch-up beyond the healthy peak (fill_targets: target plus slack,
     // capped by the granted ring so a fill at the ceiling is drainable);
@@ -315,10 +314,6 @@ unsafe fn bounded_read(port: &mut crate::node::Port<SourceDir>, queued: u32,
   // floored to whole frames: `queued` is byte-granular and can sit
   // mid-frame; an unaligned read would start the next buffer mid-sample
   let ispace = (want.min(queued).min(maxsize) / stride) * stride;
-  #[cfg(debug_assertions)]
-  crate::trace!(log, "ispace: {}", ispace);
-  #[cfg(not(debug_assertions))]
-  let _ = log;
   let nread = if ispace > 0 {
     port.dsp.read(data, ispace as usize).max(0) as u32
   } else {
@@ -604,7 +599,7 @@ unsafe fn process_ports(state: &mut State<SourceDir>) -> c_int {
         corr = capture_servo(port, queued, crate::utils::now_ns(&state.data_system), stride, rate);
       }
 
-      bounded_read(port, queued, data_0.data, data_0.maxsize, stride, &state.log)
+      bounded_read(port, queued, data_0.data, data_0.maxsize, stride)
     };
 
     // Rate-match only as a follower on a foreign clock: when driving, the
@@ -868,19 +863,18 @@ mod tests {
   fn bounded_read_caps_catchup_and_pads_late_cycles() {
     let (r, w) = pipe_pair(false, false);
     let mut port = test_port(r, 1024, 2048);
-    let log = crate::spa::Log::test_null();
     let mut buf = vec![0xaau8; 8192];
 
     // backlog past the peak: one period plus the excess is drained, no more
     let s = pattern(4096, 4);
     assert_eq!(unsafe { libc::write(w, s.as_ptr().cast(), 4096) }, 4096);
-    let n = unsafe { bounded_read(&mut port, 4096, buf.as_mut_ptr().cast(), 8192, 8, &log) };
+    let n = unsafe { bounded_read(&mut port, 4096, buf.as_mut_ptr().cast(), 8192, 8) };
     assert_eq!(n, 1024 + (4096 - 2048));
     assert_eq!(&buf[..n as usize], &s[..n as usize]);
 
     // late cycle: nothing queued, so nothing is read from the blocking fd
     // and the graph still gets a whole period of silence
-    let n = unsafe { bounded_read(&mut port, 0, buf.as_mut_ptr().cast(), 8192, 8, &log) };
+    let n = unsafe { bounded_read(&mut port, 0, buf.as_mut_ptr().cast(), 8192, 8) };
     assert_eq!(n, 1024);
     assert!(buf[..1024].iter().all(|&b| b == 0));
     unsafe { libc::close(w) };

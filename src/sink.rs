@@ -416,7 +416,7 @@ unsafe fn detect_underrun(port: &mut crate::node::Port<SinkDir>, period_in_bytes
 // unwritten (the skip-buffer hold). Returns the cycle's write result
 // (`size` when held).
 unsafe fn recover_or_hold(port: &mut crate::node::Port<SinkDir>, clock_nsec: u64, clock_flags: u32,
-                          data: *const std::os::raw::c_void, size: u32, log: &crate::spa::Log) -> isize {
+                          data: *const std::os::raw::c_void, size: u32) -> isize {
   if clock_nsec > port.ext.xrun_timestamp && clock_flags & SPA_IO_CLOCK_FLAG_XRUN_RECOVER == 0 {
     port.ext.xrun_timestamp = 0;
 
@@ -429,16 +429,14 @@ unsafe fn recover_or_hold(port: &mut crate::node::Port<SinkDir>, clock_nsec: u64
     let refill = port.ext.target_delay.saturating_sub(odelay);
 
     #[cfg(debug_assertions)]
-    crate::warn!(log, "{}: re-priming with {} zeroes (odelay {})", port.dsp.path, refill, odelay);
-    #[cfg(not(debug_assertions))]
-    let _ = log;
+    eprintln!("{}: re-priming with {} zeroes (odelay {})", port.dsp.path, refill, odelay);
 
     port.dsp.write_zeroes(refill);
     // write `size`, not the period: only `size` bytes at the offset are owned
     port.dsp.write(data, size)
   } else {
     #[cfg(debug_assertions)]
-    crate::warn!(log, "{}: skipping buffer @ {}", port.dsp.path, clock_nsec);
+    eprintln!("{}: skipping buffer @ {}", port.dsp.path, clock_nsec);
 
     size as isize
   }
@@ -715,7 +713,7 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
     let mut corr: f64 = 1.0; // DLL rate correction, published as clock.rate_diff below
     let nbytes = if port.ext.xrun_timestamp != 0 {
       recover_or_hold(port, driver_clock.nsec, driver_clock.flags,
-        data_0.data.offset(offset as isize), size, &state.log)
+        data_0.data.offset(offset as isize), size)
     } else {
       let mut skip_write = false;
       if matching && port.setup_period != 0 && port.ext.period_mismatch == 0 {
@@ -1067,8 +1065,7 @@ mod tests {
     free_space(r, 4096 + 1024);
 
     let data = pattern(2048, 1);
-    let log  = crate::spa::Log::test_null();
-    let n = unsafe { recover_or_hold(&mut port, 2_000, 0, data.as_ptr().cast(), 2048, &log) };
+    let n = unsafe { recover_or_hold(&mut port, 2_000, 0, data.as_ptr().cast(), 2048) };
 
     // the hold cleared and the overfull ring dropped the tail: only the
     // frames that fit after the re-prime were consumed
@@ -1093,22 +1090,21 @@ mod tests {
     port.ext.xrun_timestamp = 5_000;
 
     let data = pattern(2048, 2);
-    let log  = crate::spa::Log::test_null();
 
     // same-cycle clock: not past the event yet
-    let n = unsafe { recover_or_hold(&mut port, 5_000, 0, data.as_ptr().cast(), 2048, &log) };
+    let n = unsafe { recover_or_hold(&mut port, 5_000, 0, data.as_ptr().cast(), 2048) };
     assert_eq!(n, 2048);
     assert_eq!(port.ext.xrun_timestamp, 5_000);
     assert!(drain(r).is_empty(), "a held buffer must not reach the device");
 
     // past the event, but the host flags its own xrun recovery: still held
-    let n = unsafe { recover_or_hold(&mut port, 6_000, SPA_IO_CLOCK_FLAG_XRUN_RECOVER, data.as_ptr().cast(), 2048, &log) };
+    let n = unsafe { recover_or_hold(&mut port, 6_000, SPA_IO_CLOCK_FLAG_XRUN_RECOVER, data.as_ptr().cast(), 2048) };
     assert_eq!(n, 2048);
     assert_eq!(port.ext.xrun_timestamp, 5_000);
     assert!(drain(r).is_empty());
 
     // past the event with no host recovery: re-primes and writes
-    let n = unsafe { recover_or_hold(&mut port, 6_000, 0, data.as_ptr().cast(), 2048, &log) };
+    let n = unsafe { recover_or_hold(&mut port, 6_000, 0, data.as_ptr().cast(), 2048) };
     assert_eq!(n, 2048);
     assert_eq!(port.ext.xrun_timestamp, 0);
     let out = drain(r);
