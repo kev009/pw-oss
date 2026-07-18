@@ -1,0 +1,4 @@
+# rustfmt flag-day (2-space hand style -> default rustfmt); keep git blame
+# useful with: git config blame.ignoreRevsFile .git-blame-ignore-revs
+# (GitHub applies this file automatically)
+9f4738406ead9f784542c23a7a23ae8a67302ba0
