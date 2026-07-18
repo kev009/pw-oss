@@ -694,9 +694,15 @@ unsafe extern "C" fn on_timeout<D: Direction>(source: *mut spa_source) {
         return; // ios cleared while the timer was armed; skip the cycle
     }
 
-    // a failed clock read parks the timer (one-shot; only set_timeout re-arms)
-    // instead of aborting the data loop
+    // A failed clock read must not abort the data loop, but a bare return
+    // would park the one-shot timer until the next external transition
+    // (only set_timeout re-arms it): retry on a RELATIVE ~10 ms one-shot.
+    // next_time deliberately does not advance - it re-anchors only from a
+    // successful read (the stall resync below); an absolute re-arm computed
+    // from a stale deadline would fire immediately and busy-spin the loop
+    // until the synthetic deadline caught up with wall time.
     let Some(now) = crate::utils::try_now_ns(&state.data_system) else {
+        unsafe { set_timeout_rel(state, SPA_NSEC_PER_SEC as u64 / 100) };
         return;
     };
 
@@ -764,33 +770,56 @@ unsafe extern "C" fn on_timeout<D: Direction>(source: *mut spa_source) {
 
 // Data loop only. Arm the wakeup timer from now when this node drives the
 // graph (started, not following, position present); park it otherwise. A
-// failed clock read parks too - process()/on_timeout degrade the same way -
-// rather than aborting the data loop (the sink's former copy assert!()ed).
+// failed clock read must not park a node that wants to run (nothing but
+// another external transition would ever re-arm it): retry on a relative
+// ~10 ms one-shot without touching next_time - it re-anchors only from a
+// successful read (here or on_timeout's stall resync; an absolute arm from
+// a stale next_time would busy-spin) - and let on_timeout take over from
+// there; nothing aborts the data loop (the sink's former copy assert!()ed).
 pub(crate) unsafe fn update_timers<D: Direction>(state: &mut State<D>) {
     #[cfg(debug_assertions)]
     crate::trace!(state.log, "update_timers");
 
-    let next = if state.started && !state.following && !state.position.is_null() {
-        crate::utils::try_now_ns(&state.data_system).unwrap_or(0)
-    } else {
-        0
-    };
-    if next != 0 {
-        state.next_time = next;
+    if !(state.started && !state.following && !state.position.is_null()) {
+        unsafe { set_timeout(state, 0) }; // park
+        return;
     }
-    #[cfg(debug_assertions)]
-    crate::trace!(state.log, "next time {}", next);
-    unsafe { set_timeout(state, next) };
+    match crate::utils::try_now_ns(&state.data_system) {
+        Some(now) => {
+            state.next_time = now;
+            #[cfg(debug_assertions)]
+            crate::trace!(state.log, "next time {}", now);
+            unsafe { set_timeout(state, now) }; // immediate fire from a fresh anchor
+        }
+        None => unsafe { set_timeout_rel(state, SPA_NSEC_PER_SEC as u64 / 100) },
+    }
 }
 
 pub(crate) unsafe fn set_timeout<D: Direction>(state: &mut State<D>, next_time: u64) {
     #[cfg(debug_assertions)]
     crate::trace!(state.log, "set_timeout {}", next_time);
 
+    // absolute one-shot on the loop clock; 0 disarms (parks)
+    unsafe { arm_timer(state, next_time, SPA_FD_TIMER_ABSTIME as i32) };
+}
+
+// Relative one-shot: the clock-read failure paths' retry. They have no
+// trustworthy "now" to anchor an absolute deadline on, and an absolute arm
+// from a stale next_time fires immediately - a busy-spin for as long as the
+// clock keeps failing. `delay_ns` must be nonzero (zero would disarm).
+pub(crate) unsafe fn set_timeout_rel<D: Direction>(state: &mut State<D>, delay_ns: u64) {
+    #[cfg(debug_assertions)]
+    crate::trace!(state.log, "set_timeout_rel {}", delay_ns);
+
+    debug_assert!(delay_ns > 0);
+    unsafe { arm_timer(state, delay_ns, 0) };
+}
+
+unsafe fn arm_timer<D: Direction>(state: &mut State<D>, value_ns: u64, flags: i32) {
     let timerspec = itimerspec {
         it_value: timespec {
-            tv_sec: (next_time / SPA_NSEC_PER_SEC as u64) as i64,
-            tv_nsec: (next_time % SPA_NSEC_PER_SEC as u64) as i64,
+            tv_sec: (value_ns / SPA_NSEC_PER_SEC as u64) as i64,
+            tv_nsec: (value_ns % SPA_NSEC_PER_SEC as u64) as i64,
         },
         it_interval: timespec {
             tv_sec: 0,
@@ -801,7 +830,7 @@ pub(crate) unsafe fn set_timeout<D: Direction>(state: &mut State<D>, next_time: 
     unsafe {
         state.data_system.timerfd_settime(
             state.timer_source.fd,
-            SPA_FD_TIMER_ABSTIME as i32,
+            flags,
             &timerspec,
             std::ptr::null_mut(),
         );
