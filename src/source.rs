@@ -341,7 +341,7 @@ fn follower_servo(
     }
 
     #[cfg(debug_assertions)]
-    eprintln!("capture: corr = {}, err = {}", corr, err_raw);
+    eprintln!("capture: corr = {corr}, err = {err_raw}");
 
     corr
 }
@@ -749,7 +749,7 @@ impl Direction for SourceDir {
             .unwrap(),
             (SPA_PARAM_Props, _) => return ParamBuild::Exhausted,
             (SPA_PARAM_ProcessLatency, 0) => {
-                crate::utils::build_process_latency_info(b, &state.process_latency).unwrap()
+                crate::utils::build_process_latency_info(b, &state.process_latency).unwrap();
             }
             (SPA_PARAM_ProcessLatency, _) => return ParamBuild::Exhausted,
             _ => return ParamBuild::Unknown,
@@ -785,7 +785,7 @@ impl Direction for SourceDir {
                             if new_fragment != state.oss_fragment {
                                 // unchanged echoes must not rebuild a running device
                                 let res = crate::node::apply_props_param(state, move |state| {
-                                    state.oss_fragment = new_fragment
+                                    state.oss_fragment = new_fragment;
                                 });
                                 if res != 0 {
                                     return res;
@@ -1028,18 +1028,11 @@ mod tests {
                 assert_eq!(target2, target);
                 assert!(
                     peak2 >= target + blocksize,
-                    "catch-up band lost: peak {} < target {} + arrival {} (ring {})",
-                    peak2,
-                    target,
-                    blocksize,
-                    ring
+                    "catch-up band lost: peak {peak2} < target {target} + arrival {blocksize} (ring {ring})"
                 );
                 assert!(
                     peak2 <= ring - blocksize,
-                    "undrainable: peak {} past ring {} - arrival {}",
-                    peak2,
-                    ring,
-                    blocksize
+                    "undrainable: peak {peak2} past ring {ring} - arrival {blocksize}"
                 );
 
                 // a degenerate ring still pins the peak inside it

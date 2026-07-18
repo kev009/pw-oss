@@ -973,7 +973,7 @@ impl Direction for SinkDir {
             .unwrap(),
             (SPA_PARAM_Props, _) => return ParamBuild::Exhausted,
             (SPA_PARAM_ProcessLatency, 0) => {
-                crate::utils::build_process_latency_info(b, &state.process_latency).unwrap()
+                crate::utils::build_process_latency_info(b, &state.process_latency).unwrap();
             }
             (SPA_PARAM_ProcessLatency, _) => return ParamBuild::Exhausted,
             _ => return ParamBuild::Unknown,
@@ -1009,7 +1009,7 @@ impl Direction for SinkDir {
                             if new_delay != state.ext.oss_delay {
                                 // unchanged echoes must not rebuild a running device
                                 let res = crate::node::apply_props_param(state, move |state| {
-                                    state.ext.oss_delay = new_delay
+                                    state.ext.oss_delay = new_delay;
                                 });
                                 if res != 0 {
                                     return res;
@@ -1024,7 +1024,7 @@ impl Direction for SinkDir {
                             let new_fragment = crate::node::normalize_fragment(*x as u32);
                             if new_fragment != state.oss_fragment {
                                 let res = crate::node::apply_props_param(state, move |state| {
-                                    state.oss_fragment = new_fragment
+                                    state.oss_fragment = new_fragment;
                                 });
                                 if res != 0 {
                                     return res;
@@ -1256,8 +1256,7 @@ mod tests {
                 "starved: target {} < floor {} (granted {}, period {}, blocksize {}, write_max {}, desired {})",
                 target, fill_floor(period, blocksize), granted, period, blocksize, write_max, desired);
                             assert!(target.saturating_add(write_max).saturating_add(blocksize) <= granted,
-                "will drop: target {} + write_max {} + blocksize {} > granted {} (period {}, desired {})",
-                target, write_max, blocksize, granted, period, desired);
+                "will drop: target {target} + write_max {write_max} + blocksize {blocksize} > granted {granted} (period {period}, desired {desired})");
                         }
                     }
                 }

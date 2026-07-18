@@ -1221,11 +1221,11 @@ pub(crate) fn read_pcm_device_description(
     index: u32,
 ) -> Option<String> {
     let parent = sysctl
-        .read_string(format!("dev.pcm.{}.%parent", index), 1024)
+        .read_string(format!("dev.pcm.{index}.%parent"), 1024)
         .ok()?; // the device can detach mid-enumeration
     if let Some(str) = parent.strip_prefix("uaudio") {
         if let Ok(idx) = str.parse::<u32>() {
-            if let Ok(desc) = sysctl.read_string(format!("dev.uaudio.{}.%desc", idx), 1024) {
+            if let Ok(desc) = sysctl.read_string(format!("dev.uaudio.{idx}.%desc"), 1024) {
                 // let's get rid of ", class %d/%d, rev %x.%02x/%x.%02x, addr %d" suffix
                 static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
                 let re = RE.get_or_init(|| {
@@ -1243,7 +1243,7 @@ pub(crate) fn read_pcm_device_description(
     }
 
     sysctl
-        .read_string(format!("dev.pcm.{}.%desc", index), 1024)
+        .read_string(format!("dev.pcm.{index}.%desc"), 1024)
         .ok()
 }
 
@@ -1251,7 +1251,7 @@ pub(crate) fn group_pcm_devices_by_parent(indexes: &[u32]) -> BTreeMap<String, V
     let mut sysctl = crate::utils::SysctlReader::new();
     let mut indexes_by_parent: BTreeMap<String, Vec<u32>> = BTreeMap::new();
     for index in indexes {
-        if let Ok(parent) = sysctl.read_string(format!("dev.pcm.{}.%parent", index), 1024) {
+        if let Ok(parent) = sysctl.read_string(format!("dev.pcm.{index}.%parent"), 1024) {
             let values = indexes_by_parent.entry(parent).or_default();
             values.push(*index);
         }
@@ -1269,7 +1269,7 @@ pub(crate) fn list_pcm_devices(indexes: &[u32]) -> Vec<PcmDevice> {
 
     for index in indexes {
         if let Some(desc) = read_pcm_device_description(&mut sysctl, *index) {
-            if let Ok(location) = sysctl.read_string(format!("dev.pcm.{}.%location", index), 1024) {
+            if let Ok(location) = sysctl.read_string(format!("dev.pcm.{index}.%location"), 1024) {
                 let from_nv = chans.as_ref().and_then(|c| {
                     c.iter()
                         .find(|(unit, _, _)| unit == index)
@@ -1277,7 +1277,7 @@ pub(crate) fn list_pcm_devices(indexes: &[u32]) -> Vec<PcmDevice> {
                 });
                 let (play, rec) = match from_nv {
                     Some(dirs) => dirs,
-                    None => match sysctl.read_u32(format!("dev.pcm.{}.mode", index)) {
+                    None => match sysctl.read_u32(format!("dev.pcm.{index}.mode")) {
                         Ok(mode) => (mode & 2 != 0, mode & 4 != 0),
                         Err(_) => (false, false),
                     },
@@ -1435,7 +1435,7 @@ mod tests {
     #[test]
     fn drain_quantum_probe() {
         for unit in [0u32, 1, 6] {
-            let node = format!("/dev/dsp{}", unit); // the production string shape
+            let node = format!("/dev/dsp{unit}"); // the production string shape
             println!(
                 "{}: play {} ns, rec {} ns",
                 node,

@@ -38,7 +38,7 @@ impl DeviceOps for crate::sound::Dsp {
         crate::sound::Dsp::is_running(self)
     }
     fn close(&mut self) {
-        crate::sound::Dsp::close(self)
+        crate::sound::Dsp::close(self);
     }
     fn suspend(&mut self) -> bool {
         crate::sound::Dsp::suspend(self)
@@ -59,7 +59,7 @@ impl DeviceOps for crate::sound::DspWriter {
         crate::sound::DspWriter::is_running(self)
     }
     fn close(&mut self) {
-        crate::sound::DspWriter::close(self)
+        crate::sound::DspWriter::close(self);
     }
     fn suspend(&mut self) -> bool {
         crate::sound::DspWriter::suspend(self)
@@ -564,14 +564,14 @@ unsafe extern "C" fn set_param<D: Direction>(
                         match property.key {
                             // there is no way adapter is actually supposed to pass all those properties (or parameters?) to us,
                             // it's probably a bug
-                            SPA_PROP_volume => (),         // fuck it
-                            SPA_PROP_mute => (),           // ditto
+                            SPA_PROP_volume => (), // softvol-handled by the adapter
+                            SPA_PROP_mute => (),   // ditto
                             SPA_PROP_channelVolumes => (), // ditto
-                            SPA_PROP_channelMap => (),     // ditto
-                            SPA_PROP_monitorMute => (),    // ditto
+                            SPA_PROP_channelMap => (), // ditto
+                            SPA_PROP_monitorMute => (), // ditto
                             SPA_PROP_monitorVolumes => (), // ditto
-                            SPA_PROP_softMute => (),       // ditto
-                            SPA_PROP_softVolumes => (),    // ditto
+                            SPA_PROP_softMute => (), // ditto
+                            SPA_PROP_softVolumes => (), // ditto
                             SPA_PROP_latencyOffsetNsec => {
                                 if let Value::Long(ns) = property.value {
                                     let mut info = state.process_latency;
@@ -1061,7 +1061,7 @@ unsafe extern "C" fn port_enum_params<D: Direction>(
             (SPA_PARAM_Buffers, 0) => {
                 match state.ports[port_id as usize].config.as_ref() {
                     Some(cfg) => {
-                        crate::utils::build_buffers_info(&mut builder, cfg.stride()).unwrap()
+                        crate::utils::build_buffers_info(&mut builder, cfg.stride()).unwrap();
                     }
                     None => return -libc::ENOENT, // format not negotiated yet
                 }
@@ -1074,7 +1074,7 @@ unsafe extern "C" fn port_enum_params<D: Direction>(
                 if info.direction == D::DIRECTION {
                     crate::utils::process_latency_info_add(&state.process_latency, &mut info);
                 }
-                crate::utils::build_latency_info(&mut builder, &info).unwrap()
+                crate::utils::build_latency_info(&mut builder, &info).unwrap();
             }
             (SPA_PARAM_Latency, _) => return 0,
             _ => return -libc::ENOENT, // unknown param id (ALSA convention)
@@ -1502,7 +1502,7 @@ unsafe fn publish_ring_quantum_cap<D: Direction>(state: &mut State<D>, port_idx:
     let _ = state.node_info.replace_change_mask(0);
     state
         .node_info
-        .add_prop("node.max-latency", format!("{}/{}", frames, rate));
+        .add_prop("node.max-latency", format!("{frames}/{rate}"));
     emit_node_info(state);
 }
 
@@ -1534,7 +1534,7 @@ pub(crate) unsafe fn queue_resetup<D: Direction>(
 ) -> bool {
     (*state_ptr).main_loop.as_ref().is_some_and(|main_loop| {
         crate::utils::invoke_on_loop(main_loop, state_ptr, move |state| {
-            resetup_task(state, port_idx)
+            resetup_task(state, port_idx);
         })
     })
 }

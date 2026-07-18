@@ -66,7 +66,7 @@ pub(crate) struct Mixer {
 impl Mixer {
     // None when the pcm device has no mixer (ENOENT) or it can't be queried
     pub(crate) fn open(unit: u32) -> Option<Self> {
-        let path = CString::new(format!("/dev/mixer{}", unit)).ok()?;
+        let path = CString::new(format!("/dev/mixer{unit}")).ok()?;
         let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
         if fd == -1 {
             return None;

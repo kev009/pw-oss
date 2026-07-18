@@ -23,7 +23,7 @@ struct State {
 fn emit_dev_node(hook: &spa_hook, events: &spa_device_events, driver: &str, indexes: &[u32]) {
     let indexes_str = indexes
         .iter()
-        .map(|i| format!("{}", i))
+        .map(|i| format!("{i}"))
         .collect::<Vec<_>>()
         .join(",");
 
@@ -37,7 +37,7 @@ fn emit_dev_node(hook: &spa_hook, events: &spa_device_events, driver: &str, inde
         factory_name: c"freebsd-oss.device".as_ptr(),
         change_mask: crate::spa::SPA_DEVICE_OBJECT_CHANGE_MASK_ALL as u64,
         flags: 0,
-        props: unsafe { dict.raw() },
+        props: dict.raw(),
     };
 
     if let Some(obj_info_fun) = events.object_info {

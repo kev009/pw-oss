@@ -146,7 +146,7 @@ pub(crate) unsafe fn for_each_dict_item(dict: &spa_dict, mut apply: impl FnMut(&
 #[cfg(debug_assertions)]
 pub(crate) unsafe fn dump_spa_dict(dict: &spa_dict) {
     for_each_dict_item(dict, |key, value| {
-        eprintln!("dict item: key = {:?}, value = {:?}", key, value);
+        eprintln!("dict item: key = {key:?}, value = {value:?}");
     });
 }
 
@@ -199,11 +199,11 @@ impl Dictionary {
         self.dict.items = self.items.as_ptr();
     }
 
-    pub(crate) unsafe fn raw(&self) -> *const spa_dict {
+    pub(crate) fn raw(&self) -> *const spa_dict {
         &self.dict as *const spa_dict
     }
 
-    unsafe fn raw_mut(&mut self) -> *mut spa_dict {
+    fn raw_mut(&mut self) -> *mut spa_dict {
         &mut self.dict as *mut spa_dict
     }
 
@@ -278,11 +278,11 @@ impl DeviceInfo {
     }
 
     pub(crate) fn fix_pointers(&mut self) {
-        self.info.props = unsafe { self.props.raw() };
+        self.info.props = self.props.raw();
         self.info.params = self.params.as_mut_ptr();
     }
 
-    pub(crate) unsafe fn raw(&self) -> *const spa_device_info {
+    pub(crate) fn raw(&self) -> *const spa_device_info {
         &self.info as *const spa_device_info
     }
 
@@ -357,11 +357,11 @@ impl NodeInfo {
     }
 
     pub(crate) fn fix_pointers(&mut self) {
-        self.info.props = unsafe { self.props.raw_mut() };
+        self.info.props = self.props.raw_mut();
         self.info.params = self.params.as_mut_ptr();
     }
 
-    pub(crate) unsafe fn raw(&self) -> *const spa_node_info {
+    pub(crate) fn raw(&self) -> *const spa_node_info {
         &self.info as *const spa_node_info
     }
 
@@ -450,11 +450,11 @@ impl PortInfo {
     }
 
     pub(crate) fn fix_pointers(&mut self) {
-        self.info.props = unsafe { self.props.raw_mut() };
+        self.info.props = self.props.raw_mut();
         self.info.params = self.params.as_mut_ptr();
     }
 
-    pub(crate) unsafe fn raw(&self) -> *const spa_port_info {
+    pub(crate) fn raw(&self) -> *const spa_port_info {
         &self.info as *const spa_port_info
     }
 
@@ -541,7 +541,7 @@ impl Loop {
         Self { loop_, methods }
     }
 
-    pub(crate) unsafe extern "C" fn add_source(&self, source: *mut spa_source) -> c_int {
+    pub(crate) unsafe fn add_source(&self, source: *mut spa_source) -> c_int {
         let spa_loop_add_source = self
             .methods
             .add_source
@@ -550,7 +550,7 @@ impl Loop {
     }
 
     // must be called from the loop thread (or through an invoke)
-    pub(crate) unsafe extern "C" fn remove_source(&self, source: *mut spa_source) -> c_int {
+    pub(crate) unsafe fn remove_source(&self, source: *mut spa_source) -> c_int {
         let spa_loop_remove_source = self
             .methods
             .remove_source
@@ -558,7 +558,7 @@ impl Loop {
         spa_loop_remove_source(self.loop_.iface.cb.data, source)
     }
 
-    pub(crate) unsafe extern "C" fn invoke(
+    pub(crate) unsafe fn invoke(
         &self,
         func: spa_invoke_func_t,
         seq: u32,
@@ -602,16 +602,12 @@ impl System {
         Self { system, methods }
     }
 
-    pub(crate) unsafe extern "C" fn close(&self, fd: c_int) -> c_int {
+    pub(crate) unsafe fn close(&self, fd: c_int) -> c_int {
         let spa_system_close = self.methods.close.expect("close should be initialized");
         spa_system_close(self.system.iface.cb.data, fd)
     }
 
-    pub(crate) unsafe extern "C" fn clock_gettime(
-        &self,
-        clock_id: c_int,
-        value: *mut timespec,
-    ) -> c_int {
+    pub(crate) unsafe fn clock_gettime(&self, clock_id: c_int, value: *mut timespec) -> c_int {
         let spa_system_clock_gettime = self
             .methods
             .clock_gettime
@@ -619,7 +615,7 @@ impl System {
         spa_system_clock_gettime(self.system.iface.cb.data, clock_id, value)
     }
 
-    pub(crate) unsafe extern "C" fn timerfd_create(&self, clock_id: c_int, flags: c_int) -> c_int {
+    pub(crate) unsafe fn timerfd_create(&self, clock_id: c_int, flags: c_int) -> c_int {
         let spa_system_timerfd_create = self
             .methods
             .timerfd_create
@@ -627,7 +623,7 @@ impl System {
         spa_system_timerfd_create(self.system.iface.cb.data, clock_id, flags)
     }
 
-    pub(crate) unsafe extern "C" fn timerfd_read(&self, fd: c_int, expirations: *mut u64) -> c_int {
+    pub(crate) unsafe fn timerfd_read(&self, fd: c_int, expirations: *mut u64) -> c_int {
         let spa_system_timerfd_read = self
             .methods
             .timerfd_read
@@ -635,7 +631,7 @@ impl System {
         spa_system_timerfd_read(self.system.iface.cb.data, fd, expirations)
     }
 
-    pub(crate) unsafe extern "C" fn timerfd_settime(
+    pub(crate) unsafe fn timerfd_settime(
         &self,
         fd: c_int,
         flags: c_int,
@@ -783,7 +779,7 @@ macro_rules! log {
         if $log.log_level() >= $log_level {
             let file = file!();
             let line = line!();
-            let func = ""; //TODO: add something there?
+            let func = ""; // no cheap function-name source; file:line suffices
             $log.log($log_level, file, line as c_int, func, &format!($($arg)*));
         }
     };

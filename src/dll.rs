@@ -184,12 +184,12 @@ mod tests {
         for _ in 0..5000 {
             let corr = dll.update(err);
             assert!(corr.is_finite());
-            assert!(err.abs() < 1e5, "servo diverged: err {}", err);
+            assert!(err.abs() < 1e5, "servo diverged: err {err}");
             first_corr.get_or_insert(corr);
             err -= (1.0 - corr) * period as f64;
         }
         assert!(first_corr.unwrap() < 1.0);
-        assert!(err.abs() < 1.0, "servo failed to converge: err {}", err);
+        assert!(err.abs() < 1.0, "servo failed to converge: err {err}");
     }
 
     #[test]

@@ -2,6 +2,16 @@
 // spa_log_topic_enum registration below; everything else is crate-internal,
 // and pub items would otherwise be exempt from dead_code analysis
 #![warn(unreachable_pub)]
+// unsafe_op_in_unsafe_fn is deliberately NOT warned: for the remaining
+// unsafe fns (FFI vtable entries, the raw-pointer process paths) the whole
+// body is the unsafe surface, and rustc's migration wraps entire bodies in
+// one block - indentation churn with no added precision. Fns whose unsafe
+// obligations are local already carry safe signatures with narrow blocks.
+// mechanical-style clippy gates on top of the default set
+// (not unreadable_literal: the hex masks mirror sys/soundcard.h and grep
+// better without separators)
+#![warn(clippy::uninlined_format_args)]
+#![warn(clippy::semicolon_if_nothing_returned)]
 
 use libspa::sys::spa_handle_factory;
 use std::os::raw::c_int;

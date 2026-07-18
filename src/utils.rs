@@ -13,19 +13,18 @@ unsafe fn sysctl_read(name: &CStr, buf: *mut c_void, len: &mut usize) -> Result<
     Ok(())
 }
 
-pub(crate) enum SysctlName {
-    CString(CString),
-}
+// a NUL-terminated sysctl name
+pub(crate) struct SysctlName(CString);
 
 impl From<&str> for SysctlName {
     fn from(str: &str) -> Self {
-        SysctlName::CString(CString::new(str).unwrap())
+        SysctlName(CString::new(str).unwrap())
     }
 }
 
 impl From<String> for SysctlName {
     fn from(str: String) -> Self {
-        SysctlName::CString(CString::new(str).unwrap())
+        SysctlName(CString::new(str).unwrap())
     }
 }
 
@@ -45,7 +44,7 @@ impl SysctlReader {
         name: T,
         max_len: usize,
     ) -> Result<String, Errno> {
-        let SysctlName::CString(name) = name.into();
+        let SysctlName(name) = name.into();
 
         let mut len = 0;
         unsafe { sysctl_read(&name, std::ptr::null_mut(), &mut len) }?;
@@ -72,7 +71,7 @@ impl SysctlReader {
     }
 
     pub(crate) fn read_u32<T: Into<SysctlName>>(&mut self, name: T) -> Result<u32, Errno> {
-        let SysctlName::CString(name) = name.into();
+        let SysctlName(name) = name.into();
         let mut value: u32 = 0;
         let mut len = std::mem::size_of::<u32>();
         unsafe { sysctl_read(&name, (&mut value as *mut u32).cast(), &mut len) }?;
@@ -266,161 +265,169 @@ fn enum_format_widths(min_channels: u32, max_channels: u32) -> Vec<u32> {
 // One EnumFormat pod per offered channel width (enum_format_widths order),
 // positions from the kernel interleave. Returns false when `index` is past
 // the last result.
-pub(crate) unsafe fn build_enum_format_info(
+pub(crate) fn build_enum_format_info(
     b: &mut libspa::pod::builder::Builder,
     caps: &crate::sound::DspCaps,
     index: u32,
 ) -> Result<bool, rustix::io::Errno> {
-    use libspa::sys::*;
+    // SAFETY: the frame pushes/pops below act on locally-owned frames in
+    // strict LIFO order; the pod bytes land in the caller-owned builder
+    unsafe {
+        use libspa::sys::*;
 
-    // formats supported by both us and the device, best first
-    let formats = offered_formats(caps);
-    if formats.is_empty() {
-        return Ok(false);
-    }
-
-    let counts = enum_format_widths(caps.min_channels, caps.max_channels);
-    let Some(&channels) = counts.get(index as usize) else {
-        return Ok(false);
-    };
-
-    let mut outer = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
-    let mut inner = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
-
-    b.push_object(&mut outer, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat)?;
-
-    b.add_prop(SPA_FORMAT_mediaType, 0)?;
-    b.add_id(libspa::utils::Id(SPA_MEDIA_TYPE_audio))?;
-
-    b.add_prop(SPA_FORMAT_mediaSubtype, 0)?;
-    b.add_id(libspa::utils::Id(SPA_MEDIA_SUBTYPE_raw))?;
-
-    b.add_prop(SPA_FORMAT_AUDIO_format, 0)?;
-    if formats.len() == 1 {
-        b.add_id(libspa::utils::Id(formats[0]))?;
-    } else {
-        b.push_choice(&mut inner, SPA_CHOICE_Enum, 0)?;
-        for fmt in &formats {
-            b.add_id(libspa::utils::Id(*fmt))?;
+        // formats supported by both us and the device, best first
+        let formats = offered_formats(caps);
+        if formats.is_empty() {
+            return Ok(false);
         }
-        b.pop(inner.assume_init_mut());
-    }
 
-    b.add_prop(SPA_FORMAT_AUDIO_rate, 0)?;
-    if caps.rates.len() > 1 {
-        // discrete native rates (exclusive devices); a range would admit
-        // in-between rates the hardware can't run (see sound::native_rates)
-        let target = caps.preferred_rate.unwrap_or(48000);
-        let default = *caps
-            .rates
-            .iter()
-            .min_by_key(|r| r.abs_diff(target))
-            .unwrap();
-        b.push_choice(&mut inner, SPA_CHOICE_Enum, 0)?;
-        b.add_int(default as i32)?;
-        for rate in &caps.rates {
-            b.add_int(*rate as i32)?;
+        let counts = enum_format_widths(caps.min_channels, caps.max_channels);
+        let Some(&channels) = counts.get(index as usize) else {
+            return Ok(false);
+        };
+
+        let mut outer = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
+        let mut inner = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
+
+        b.push_object(&mut outer, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat)?;
+
+        b.add_prop(SPA_FORMAT_mediaType, 0)?;
+        b.add_id(libspa::utils::Id(SPA_MEDIA_TYPE_audio))?;
+
+        b.add_prop(SPA_FORMAT_mediaSubtype, 0)?;
+        b.add_id(libspa::utils::Id(SPA_MEDIA_SUBTYPE_raw))?;
+
+        b.add_prop(SPA_FORMAT_AUDIO_format, 0)?;
+        if formats.len() == 1 {
+            b.add_id(libspa::utils::Id(formats[0]))?;
+        } else {
+            b.push_choice(&mut inner, SPA_CHOICE_Enum, 0)?;
+            for fmt in &formats {
+                b.add_id(libspa::utils::Id(*fmt))?;
+            }
+            b.pop(inner.assume_init_mut());
         }
-        b.pop(inner.assume_init_mut());
-    } else if let [rate] = caps.rates[..] {
-        b.add_int(rate as i32)?;
-    } else if caps.min_rate == caps.max_rate {
-        b.add_int(caps.min_rate as i32)?;
-    } else {
-        b.push_choice(&mut inner, SPA_CHOICE_Range, 0)?;
-        b.add_int(
-            caps.preferred_rate
-                .unwrap_or(48000)
-                .clamp(caps.min_rate, caps.max_rate) as i32,
+
+        b.add_prop(SPA_FORMAT_AUDIO_rate, 0)?;
+        if caps.rates.len() > 1 {
+            // discrete native rates (exclusive devices); a range would admit
+            // in-between rates the hardware can't run (see sound::native_rates)
+            let target = caps.preferred_rate.unwrap_or(48000);
+            let default = *caps
+                .rates
+                .iter()
+                .min_by_key(|r| r.abs_diff(target))
+                .unwrap();
+            b.push_choice(&mut inner, SPA_CHOICE_Enum, 0)?;
+            b.add_int(default as i32)?;
+            for rate in &caps.rates {
+                b.add_int(*rate as i32)?;
+            }
+            b.pop(inner.assume_init_mut());
+        } else if let [rate] = caps.rates[..] {
+            b.add_int(rate as i32)?;
+        } else if caps.min_rate == caps.max_rate {
+            b.add_int(caps.min_rate as i32)?;
+        } else {
+            b.push_choice(&mut inner, SPA_CHOICE_Range, 0)?;
+            b.add_int(
+                caps.preferred_rate
+                    .unwrap_or(48000)
+                    .clamp(caps.min_rate, caps.max_rate) as i32,
+            )?;
+            b.add_int(caps.min_rate as i32)?;
+            b.add_int(caps.max_rate as i32)?;
+            b.pop(inner.assume_init_mut());
+        }
+
+        b.add_prop(SPA_FORMAT_AUDIO_channels, 0)?;
+        b.add_int(channels as i32)?;
+
+        let aux_positions;
+        let positions: &[u32] = match channel_positions(channels) {
+            Some(positions) => positions,
+            None => {
+                aux_positions = (0..channels)
+                    .map(|i| SPA_AUDIO_CHANNEL_AUX0 + i)
+                    .collect::<Vec<u32>>();
+                &aux_positions
+            }
+        };
+
+        b.add_prop(SPA_FORMAT_AUDIO_position, 0)?;
+        b.add_array(
+            std::mem::size_of::<u32>() as u32,
+            SPA_TYPE_Id,
+            positions.len() as u32,
+            positions.as_ptr().cast(),
         )?;
-        b.add_int(caps.min_rate as i32)?;
-        b.add_int(caps.max_rate as i32)?;
-        b.pop(inner.assume_init_mut());
+
+        b.pop(outer.assume_init_mut());
+
+        Ok(true)
     }
-
-    b.add_prop(SPA_FORMAT_AUDIO_channels, 0)?;
-    b.add_int(channels as i32)?;
-
-    let aux_positions;
-    let positions: &[u32] = match channel_positions(channels) {
-        Some(positions) => positions,
-        None => {
-            aux_positions = (0..channels)
-                .map(|i| SPA_AUDIO_CHANNEL_AUX0 + i)
-                .collect::<Vec<u32>>();
-            &aux_positions
-        }
-    };
-
-    b.add_prop(SPA_FORMAT_AUDIO_position, 0)?;
-    b.add_array(
-        std::mem::size_of::<u32>() as u32,
-        SPA_TYPE_Id,
-        positions.len() as u32,
-        positions.as_ptr().cast(),
-    )?;
-
-    b.pop(outer.assume_init_mut());
-
-    Ok(true)
 }
 
-pub(crate) unsafe fn build_buffers_info(
+pub(crate) fn build_buffers_info(
     b: &mut libspa::pod::builder::Builder,
     stride: u32,
 ) -> Result<(), rustix::io::Errno> {
-    use libspa::sys::*;
+    // SAFETY: the frame pushes/pops below act on locally-owned frames in
+    // strict LIFO order; the pod bytes land in the caller-owned builder
+    unsafe {
+        use libspa::sys::*;
 
-    // The point here is dataType = MemPtr: process() maps the buffer memory
-    // directly, so a MemFd/DmaBuf block would be unusable.
-    //
-    // Capacity floors at two graph periods (2048 frames at the 1024-frame
-    // reference quantum). The capture catch-up read (source.rs) drains a device
-    // ring excursion by handing the graph MORE than one period in a cycle; a
-    // one-period buffer clamps that read back to a period, so the ring stays
-    // pinned at its ceiling and the kernel overruns every late cycle. Two
-    // periods of *capacity* cost no latency - we still deliver one period per
-    // cycle - it only widens the container so the drain can happen. The adapter
-    // sizes the buffer to the graph quantum and clamps up to this floor, so the
-    // headroom is present at the common quanta (a quantum coarser than the floor
-    // needs the ring-quantum cap in node.rs to stay glitch-free anyway).
-    let floor = 2048 * stride;
-    let max = 16384 * stride;
+        // The point here is dataType = MemPtr: process() maps the buffer memory
+        // directly, so a MemFd/DmaBuf block would be unusable.
+        //
+        // Capacity floors at two graph periods (2048 frames at the 1024-frame
+        // reference quantum). The capture catch-up read (source.rs) drains a device
+        // ring excursion by handing the graph MORE than one period in a cycle; a
+        // one-period buffer clamps that read back to a period, so the ring stays
+        // pinned at its ceiling and the kernel overruns every late cycle. Two
+        // periods of *capacity* cost no latency - we still deliver one period per
+        // cycle - it only widens the container so the drain can happen. The adapter
+        // sizes the buffer to the graph quantum and clamps up to this floor, so the
+        // headroom is present at the common quanta (a quantum coarser than the floor
+        // needs the ring-quantum cap in node.rs to stay glitch-free anyway).
+        let floor = 2048 * stride;
+        let max = 16384 * stride;
 
-    let mut obj = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
-    let mut choice = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
+        let mut obj = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
+        let mut choice = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
 
-    b.push_object(&mut obj, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers)?;
+        b.push_object(&mut obj, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers)?;
 
-    b.add_prop(SPA_PARAM_BUFFERS_buffers, 0)?;
-    b.push_choice(&mut choice, SPA_CHOICE_Range, 0)?;
-    b.add_int(2)?;
-    b.add_int(1)?;
-    b.add_int(32)?; // default, min, max
-    b.pop(choice.assume_init_mut());
+        b.add_prop(SPA_PARAM_BUFFERS_buffers, 0)?;
+        b.push_choice(&mut choice, SPA_CHOICE_Range, 0)?;
+        b.add_int(2)?;
+        b.add_int(1)?;
+        b.add_int(32)?; // default, min, max
+        b.pop(choice.assume_init_mut());
 
-    b.add_prop(SPA_PARAM_BUFFERS_blocks, 0)?;
-    b.add_int(1)?;
+        b.add_prop(SPA_PARAM_BUFFERS_blocks, 0)?;
+        b.add_int(1)?;
 
-    b.add_prop(SPA_PARAM_BUFFERS_size, 0)?;
-    b.push_choice(&mut choice, SPA_CHOICE_Range, 0)?;
-    b.add_int(floor as i32)?;
-    b.add_int(floor as i32)?;
-    b.add_int(max as i32)?; // default, min, max
-    b.pop(choice.assume_init_mut());
+        b.add_prop(SPA_PARAM_BUFFERS_size, 0)?;
+        b.push_choice(&mut choice, SPA_CHOICE_Range, 0)?;
+        b.add_int(floor as i32)?;
+        b.add_int(floor as i32)?;
+        b.add_int(max as i32)?; // default, min, max
+        b.pop(choice.assume_init_mut());
 
-    b.add_prop(SPA_PARAM_BUFFERS_stride, 0)?;
-    b.add_int(stride as i32)?;
+        b.add_prop(SPA_PARAM_BUFFERS_stride, 0)?;
+        b.add_int(stride as i32)?;
 
-    b.add_prop(SPA_PARAM_BUFFERS_align, 0)?;
-    b.add_int(16)?;
+        b.add_prop(SPA_PARAM_BUFFERS_align, 0)?;
+        b.add_int(16)?;
 
-    b.add_prop(SPA_PARAM_BUFFERS_dataType, 0)?;
-    b.add_int(1i32 << SPA_DATA_MemPtr)?;
+        b.add_prop(SPA_PARAM_BUFFERS_dataType, 0)?;
+        b.add_int(1i32 << SPA_DATA_MemPtr)?;
 
-    b.pop(obj.assume_init_mut());
+        b.pop(obj.assume_init_mut());
 
-    Ok(())
+        Ok(())
+    }
 }
 
 // Run `f` on the data loop and wait for it; serializes main-thread
@@ -525,37 +532,41 @@ pub(crate) unsafe fn parse_latency_info(
 }
 
 // spa_latency_build is static inline C, so reimplemented here
-pub(crate) unsafe fn build_latency_info(
+pub(crate) fn build_latency_info(
     b: &mut libspa::pod::builder::Builder,
     info: &libspa::sys::spa_latency_info,
 ) -> Result<(), rustix::io::Errno> {
-    use libspa::sys::*;
+    // SAFETY: the frame pushes/pops below act on locally-owned frames in
+    // strict LIFO order; the pod bytes land in the caller-owned builder
+    unsafe {
+        use libspa::sys::*;
 
-    let mut frame = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
+        let mut frame = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
 
-    b.push_object(&mut frame, SPA_TYPE_OBJECT_ParamLatency, SPA_PARAM_Latency)?;
+        b.push_object(&mut frame, SPA_TYPE_OBJECT_ParamLatency, SPA_PARAM_Latency)?;
 
-    b.add_prop(SPA_PARAM_LATENCY_direction, 0)?;
-    b.add_id(libspa::utils::Id(info.direction))?;
+        b.add_prop(SPA_PARAM_LATENCY_direction, 0)?;
+        b.add_id(libspa::utils::Id(info.direction))?;
 
-    b.add_prop(SPA_PARAM_LATENCY_minQuantum, 0)?;
-    b.add_float(info.min_quantum)?;
-    b.add_prop(SPA_PARAM_LATENCY_maxQuantum, 0)?;
-    b.add_float(info.max_quantum)?;
+        b.add_prop(SPA_PARAM_LATENCY_minQuantum, 0)?;
+        b.add_float(info.min_quantum)?;
+        b.add_prop(SPA_PARAM_LATENCY_maxQuantum, 0)?;
+        b.add_float(info.max_quantum)?;
 
-    b.add_prop(SPA_PARAM_LATENCY_minRate, 0)?;
-    b.add_int(info.min_rate)?;
-    b.add_prop(SPA_PARAM_LATENCY_maxRate, 0)?;
-    b.add_int(info.max_rate)?;
+        b.add_prop(SPA_PARAM_LATENCY_minRate, 0)?;
+        b.add_int(info.min_rate)?;
+        b.add_prop(SPA_PARAM_LATENCY_maxRate, 0)?;
+        b.add_int(info.max_rate)?;
 
-    b.add_prop(SPA_PARAM_LATENCY_minNs, 0)?;
-    b.add_long(info.min_ns)?;
-    b.add_prop(SPA_PARAM_LATENCY_maxNs, 0)?;
-    b.add_long(info.max_ns)?;
+        b.add_prop(SPA_PARAM_LATENCY_minNs, 0)?;
+        b.add_long(info.min_ns)?;
+        b.add_prop(SPA_PARAM_LATENCY_maxNs, 0)?;
+        b.add_long(info.max_ns)?;
 
-    b.pop(frame.assume_init_mut());
+        b.pop(frame.assume_init_mut());
 
-    Ok(())
+        Ok(())
+    }
 }
 
 pub(crate) fn process_latency_default() -> libspa::sys::spa_process_latency_info {
@@ -597,30 +608,34 @@ pub(crate) unsafe fn parse_process_latency_info(
 }
 
 // spa_process_latency_build is static inline C, so reimplemented here
-pub(crate) unsafe fn build_process_latency_info(
+pub(crate) fn build_process_latency_info(
     b: &mut libspa::pod::builder::Builder,
     info: &libspa::sys::spa_process_latency_info,
 ) -> Result<(), rustix::io::Errno> {
-    use libspa::sys::*;
+    // SAFETY: the frame pushes/pops below act on locally-owned frames in
+    // strict LIFO order; the pod bytes land in the caller-owned builder
+    unsafe {
+        use libspa::sys::*;
 
-    let mut frame = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
+        let mut frame = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
 
-    b.push_object(
-        &mut frame,
-        SPA_TYPE_OBJECT_ParamProcessLatency,
-        SPA_PARAM_ProcessLatency,
-    )?;
+        b.push_object(
+            &mut frame,
+            SPA_TYPE_OBJECT_ParamProcessLatency,
+            SPA_PARAM_ProcessLatency,
+        )?;
 
-    b.add_prop(SPA_PARAM_PROCESS_LATENCY_quantum, 0)?;
-    b.add_float(info.quantum)?;
-    b.add_prop(SPA_PARAM_PROCESS_LATENCY_rate, 0)?;
-    b.add_int(info.rate)?;
-    b.add_prop(SPA_PARAM_PROCESS_LATENCY_ns, 0)?;
-    b.add_long(info.ns)?;
+        b.add_prop(SPA_PARAM_PROCESS_LATENCY_quantum, 0)?;
+        b.add_float(info.quantum)?;
+        b.add_prop(SPA_PARAM_PROCESS_LATENCY_rate, 0)?;
+        b.add_int(info.rate)?;
+        b.add_prop(SPA_PARAM_PROCESS_LATENCY_ns, 0)?;
+        b.add_long(info.ns)?;
 
-    b.pop(frame.assume_init_mut());
+        b.pop(frame.assume_init_mut());
 
-    Ok(())
+        Ok(())
+    }
 }
 
 // spa_process_latency_info_add is static inline C, so reimplemented here
@@ -636,100 +651,112 @@ pub(crate) fn process_latency_info_add(
     info.max_ns += process.ns;
 }
 
-pub(crate) unsafe fn build_latency_offset_prop_info(
+pub(crate) fn build_latency_offset_prop_info(
     b: &mut libspa::pod::builder::Builder,
 ) -> Result<(), rustix::io::Errno> {
-    use libspa::sys::*;
+    // SAFETY: the frame pushes/pops below act on locally-owned frames in
+    // strict LIFO order; the pod bytes land in the caller-owned builder
+    unsafe {
+        use libspa::sys::*;
 
-    let mut outer = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
-    let mut inner = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
+        let mut outer = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
+        let mut inner = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
 
-    b.push_object(&mut outer, SPA_TYPE_OBJECT_PropInfo, SPA_PARAM_PropInfo)?;
+        b.push_object(&mut outer, SPA_TYPE_OBJECT_PropInfo, SPA_PARAM_PropInfo)?;
 
-    b.add_prop(SPA_PROP_INFO_id, 0)?;
-    b.add_id(libspa::utils::Id(SPA_PROP_latencyOffsetNsec))?;
+        b.add_prop(SPA_PROP_INFO_id, 0)?;
+        b.add_id(libspa::utils::Id(SPA_PROP_latencyOffsetNsec))?;
 
-    b.add_prop(SPA_PROP_INFO_description, 0)?;
-    b.add_string("Latency offset (ns)")?;
+        b.add_prop(SPA_PROP_INFO_description, 0)?;
+        b.add_string("Latency offset (ns)")?;
 
-    b.add_prop(SPA_PROP_INFO_type, 0)?;
-    b.push_choice(&mut inner, SPA_CHOICE_Range, 0)?;
-    b.add_long(0)?;
-    b.add_long(0)?;
-    b.add_long(2 * SPA_NSEC_PER_SEC as i64)?;
-    b.pop(inner.assume_init_mut());
+        b.add_prop(SPA_PROP_INFO_type, 0)?;
+        b.push_choice(&mut inner, SPA_CHOICE_Range, 0)?;
+        b.add_long(0)?;
+        b.add_long(0)?;
+        b.add_long(2 * SPA_NSEC_PER_SEC as i64)?;
+        b.pop(inner.assume_init_mut());
 
-    b.pop(outer.assume_init_mut());
+        b.pop(outer.assume_init_mut());
 
-    Ok(())
+        Ok(())
+    }
 }
 
-pub(crate) unsafe fn build_latency_offset_props(
+pub(crate) fn build_latency_offset_props(
     b: &mut libspa::pod::builder::Builder,
     ns: i64,
     params: &[(&str, u32)],
 ) -> Result<(), rustix::io::Errno> {
-    use libspa::sys::*;
+    // SAFETY: the frame pushes/pops below act on locally-owned frames in
+    // strict LIFO order; the pod bytes land in the caller-owned builder
+    unsafe {
+        use libspa::sys::*;
 
-    let mut frame = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
+        let mut frame = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
 
-    b.push_object(&mut frame, SPA_TYPE_OBJECT_Props, SPA_PARAM_Props)?;
+        b.push_object(&mut frame, SPA_TYPE_OBJECT_Props, SPA_PARAM_Props)?;
 
-    b.add_prop(SPA_PROP_latencyOffsetNsec, 0)?;
-    b.add_long(ns)?;
+        b.add_prop(SPA_PROP_latencyOffsetNsec, 0)?;
+        b.add_long(ns)?;
 
-    // custom key/value props (oss.delay, oss.fragment) ride in the params struct
-    if !params.is_empty() {
-        let mut inner = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
-        b.add_prop(SPA_PROP_params, 0)?;
-        b.push_struct(&mut inner)?;
-        for (key, value) in params {
-            b.add_string(key)?;
-            b.add_int(*value as i32)?;
+        // custom key/value props (oss.delay, oss.fragment) ride in the params struct
+        if !params.is_empty() {
+            let mut inner = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
+            b.add_prop(SPA_PROP_params, 0)?;
+            b.push_struct(&mut inner)?;
+            for (key, value) in params {
+                b.add_string(key)?;
+                b.add_int(*value as i32)?;
+            }
+            b.pop(inner.assume_init_mut());
         }
-        b.pop(inner.assume_init_mut());
+
+        b.pop(frame.assume_init_mut());
+
+        Ok(())
     }
-
-    b.pop(frame.assume_init_mut());
-
-    Ok(())
 }
 
 // PropInfo for a custom u32 tunable carried in the Props params struct; the
 // advertised default is the CURRENT (effective) value, like the ALSA plugin
-pub(crate) unsafe fn build_params_prop_info(
+pub(crate) fn build_params_prop_info(
     b: &mut libspa::pod::builder::Builder,
     name: &str,
     description: &str,
     current: u32,
     max: u32,
 ) -> Result<(), rustix::io::Errno> {
-    use libspa::sys::*;
+    // SAFETY: the frame pushes/pops below act on locally-owned frames in
+    // strict LIFO order; the pod bytes land in the caller-owned builder
+    unsafe {
+        use libspa::sys::*;
 
-    let mut outer = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
-    let mut inner = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
+        let mut outer = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
+        let mut inner = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
 
-    b.push_object(&mut outer, SPA_TYPE_OBJECT_PropInfo, SPA_PARAM_PropInfo)?;
+        b.push_object(&mut outer, SPA_TYPE_OBJECT_PropInfo, SPA_PARAM_PropInfo)?;
 
-    b.add_prop(SPA_PROP_INFO_name, 0)?;
-    b.add_string(name)?;
+        b.add_prop(SPA_PROP_INFO_name, 0)?;
+        b.add_string(name)?;
 
-    b.add_prop(SPA_PROP_INFO_description, 0)?;
-    b.add_string(description)?;
+        b.add_prop(SPA_PROP_INFO_description, 0)?;
+        b.add_string(description)?;
 
-    b.add_prop(SPA_PROP_INFO_type, 0)?;
-    b.push_choice(&mut inner, SPA_CHOICE_Range, 0)?;
-    b.add_int(current as i32)?;
-    b.add_int(0)?;
-    b.add_int(max as i32)?;
-    b.pop(inner.assume_init_mut());
+        b.add_prop(SPA_PROP_INFO_type, 0)?;
+        b.push_choice(&mut inner, SPA_CHOICE_Range, 0)?;
+        b.add_int(current as i32)?;
+        b.add_int(0)?;
+        b.add_int(max as i32)?;
+        b.pop(inner.assume_init_mut());
 
-    b.add_prop(SPA_PROP_INFO_params, 0)?;
-    b.add_bool(true)?; // settable through the Props params struct
+        b.add_prop(SPA_PROP_INFO_params, 0)?;
+        b.add_bool(true)?; // settable through the Props params struct
 
-    b.pop(outer.assume_init_mut());
+        b.pop(outer.assume_init_mut());
 
-    Ok(())
+        Ok(())
+    }
 }
 
 // identify our device clock (spa_io_clock.name) so consumers can tell whether
@@ -963,32 +990,20 @@ mod tests {
             assert_eq!(
                 *widths.first().unwrap(),
                 2,
-                "min {} max {}: {:?}",
-                min,
-                max,
-                widths
+                "min {min} max {max}: {widths:?}"
             );
             assert_eq!(
                 *widths.last().unwrap(),
                 2,
-                "min {} max {}: {:?}",
-                min,
-                max,
-                widths
+                "min {min} max {max}: {widths:?}"
             );
             assert!(
                 widths.contains(&max),
-                "native width lost: min {} max {}: {:?}",
-                min,
-                max,
-                widths
+                "native width lost: min {min} max {max}: {widths:?}"
             );
             assert!(
                 widths.iter().all(|w| *w >= min && *w <= max),
-                "width out of range: min {} max {}: {:?}",
-                min,
-                max,
-                widths
+                "width out of range: min {min} max {max}: {widths:?}"
             );
             assert_eq!(
                 widths.iter().filter(|w| **w == 2).count().min(2),
