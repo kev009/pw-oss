@@ -483,6 +483,21 @@ fn prime_playback(
 // the host once, not per held cycle.
 // `underrun_count` is the counter the caller read this cycle (nonzero, or
 // this isn't called); measured outside so tests can drive the gate.
+// the "genuinely low at wakeup" threshold: a period, capped by the healthy
+// sawtooth floor (target minus one fragment). A late cycle finds a
+// legitimately lower fill (the device kept draining, `drained` bytes over
+// the lateness), so the threshold tracks the expected healthy fill at THIS
+// moment; the floor keeps a true empty ring (a real underrun reads 0 until
+// we write) detectable at any lateness.
+fn underrun_low(target_delay: u32, blocksize: u32, period_in_bytes: u32, drained: u32) -> u32 {
+    let low = period_in_bytes
+        .min(target_delay.saturating_sub(blocksize))
+        .max(period_in_bytes / 4);
+    let wander = (period_in_bytes / 4).max(blocksize);
+    low.min(target_delay.saturating_sub(drained).saturating_sub(wander))
+        .max(period_in_bytes / 16)
+}
+
 fn detect_underrun(
     port: &mut crate::node::Port<SinkDir>,
     period_in_bytes: u32,
@@ -495,26 +510,16 @@ fn detect_underrun(
     let Some((stride, cfg_rate)) = port.stride_rate() else {
         return;
     };
-    // (cached blocksize: the channel can't be retuned while triggered,
-    // and the gate must not cost ioctls on healthy cycles)
-    let low = period_in_bytes
-        .min(port.ext.target_delay.saturating_sub(port.setup_blocksize))
-        .max(period_in_bytes / 4);
-    // A late cycle finds a legitimately lower fill (the device kept
-    // draining), so the threshold tracks the expected healthy fill at
-    // THIS moment; the floor keeps a true empty ring (a real underrun
-    // reads 0 until we write) detectable at any lateness.
+    // cached blocksize: the channel can't be retuned while triggered, and
+    // the gate must not cost ioctls on healthy cycles
     let elapsed = cur_timestamp.saturating_sub(clock_nsec);
     let drained = crate::utils::ns_to_bytes(elapsed, cfg_rate, stride);
-    let wander = (period_in_bytes / 4).max(port.setup_blocksize);
-    let low = low
-        .min(
-            port.ext
-                .target_delay
-                .saturating_sub(drained)
-                .saturating_sub(wander),
-        )
-        .max(period_in_bytes / 16);
+    let low = underrun_low(
+        port.ext.target_delay,
+        port.setup_blocksize,
+        period_in_bytes,
+        drained,
+    );
     let odelay_now = port.dsp.odelay();
     if odelay_now < low {
         if let Some(suppressed) = port.warn_limit.check(cur_timestamp) {
@@ -1358,6 +1363,24 @@ mod tests {
         assert!(out[..4096].iter().all(|&b| b == 0));
         assert_eq!(&out[4096..], &data[..]);
         unsafe { libc::close(r) };
+    }
+
+    // the "genuinely low" threshold behind the underrun gate: healthy
+    // sawtooth fills sit above it, lateness lowers it by what drained, and
+    // the floor keeps a truly empty ring detectable at any lateness
+    #[test]
+    fn underrun_threshold_tracks_lateness() {
+        use super::underrun_low;
+        // on-time wakeup, roomy target: one period binds
+        assert_eq!(underrun_low(20480, 2048, 16384, 0), 16384);
+        // a healthy sawtooth fill (target minus a fragment) is NOT low
+        assert!(20480 - 2048 >= underrun_low(20480, 2048, 16384, 0));
+        // a fragment wider than the period caps at the sawtooth floor
+        assert_eq!(underrun_low(20480, 18432, 16384, 0), 20480 - 18432);
+        // lateness lowers the threshold by what drained (plus wander)...
+        assert_eq!(underrun_low(20480, 2048, 16384, 8192), 20480 - 8192 - 4096);
+        // ...but a truly empty ring stays detectable at any lateness
+        assert_eq!(underrun_low(20480, 2048, 16384, 1 << 30), 16384 / 16);
     }
 
     // the underrun gate arms the recovery hold once per event: the driver
