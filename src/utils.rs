@@ -430,12 +430,32 @@ pub(crate) fn build_buffers_info(
     }
 }
 
+// Marks a captured value as allowed to cross onto the loop thread inside an
+// invoke closure. For host pointers (io areas, the callback table, buffer
+// arrays) whose validity the SPA contract ties to the node's lifetime rather
+// than to a Rust Send impl; the loop invoke is the serialization point.
+// The field is private on purpose: closures capture fields precisely, so a
+// public .0 (or a destructuring pattern of it) would be captured
+// field-by-field, skipping the wrapper's Send; into_inner takes self whole,
+// forcing whole-value capture.
+pub(crate) struct SendWrap<T>(T);
+unsafe impl<T> Send for SendWrap<T> {}
+impl<T> SendWrap<T> {
+    pub(crate) fn new(v: T) -> Self {
+        SendWrap(v)
+    }
+    pub(crate) fn into_inner(self) -> T {
+        self.0
+    }
+}
+
 // Run `f` on the data loop and wait for it; serializes main-thread
 // reconfiguration against process()/on_timeout() (runs inline when already on
 // the loop thread). The closure and target cross a thread boundary; callers
-// only capture raw pointers and plain data. Returns false when the invoke
-// failed or the closure panicked - the closure then may not have run.
-pub(crate) unsafe fn block_on_loop<T, F: FnOnce(&mut T)>(
+// only capture raw pointers and plain data (F: Send; the blocking call keeps
+// stack borrows sound, so no 'static is needed). Returns false when the
+// invoke failed or the closure panicked - the closure then may not have run.
+pub(crate) unsafe fn block_on_loop<T, F: FnOnce(&mut T) + Send>(
     loop_: &crate::spa::Loop,
     target: *mut T,
     f: F,
@@ -445,7 +465,7 @@ pub(crate) unsafe fn block_on_loop<T, F: FnOnce(&mut T)>(
         f: Option<F>,
     }
 
-    unsafe extern "C" fn trampoline<T, F: FnOnce(&mut T)>(
+    unsafe extern "C" fn trampoline<T, F: FnOnce(&mut T) + Send>(
         _loop: *mut libspa::sys::spa_loop,
         _async: bool,
         _seq: u32,
@@ -846,7 +866,9 @@ pub(crate) unsafe fn deserialize_pod(
 // Fire-and-forget: queue `f` to run once on the given loop (from any thread;
 // non-blocking, RT-safe on the caller side). The closure is boxed and freed
 // after it runs. Returns false when it could not even be queued.
-pub(crate) unsafe fn invoke_on_loop<T, F: FnOnce(&mut T)>(
+// F: Send + 'static - the boxed closure crosses to the loop thread and runs
+// after this call returns, so captured stack borrows would dangle
+pub(crate) unsafe fn invoke_on_loop<T, F: FnOnce(&mut T) + Send + 'static>(
     loop_: &crate::spa::Loop,
     target: *mut T,
     f: F,
@@ -856,7 +878,7 @@ pub(crate) unsafe fn invoke_on_loop<T, F: FnOnce(&mut T)>(
         f: F,
     }
 
-    unsafe extern "C" fn trampoline<T, F: FnOnce(&mut T)>(
+    unsafe extern "C" fn trampoline<T, F: FnOnce(&mut T) + Send + 'static>(
         _loop: *mut libspa::sys::spa_loop,
         _async: bool,
         _seq: u32,

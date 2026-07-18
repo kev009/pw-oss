@@ -97,8 +97,9 @@ pub(crate) trait Direction: Sized + 'static {
     /// historical prefix of the unknown-command warning ("oss-source: " there)
     const CMD_WARN_PREFIX: &'static str;
 
-    type Device: DeviceOps;
-    type Config: ConfigOps;
+    // Send: both cross onto the data loop through install_device's swap
+    type Device: DeviceOps + Send;
+    type Config: ConfigOps + Send;
     type Ext: Default; // direction-specific State fields
     type PortExt: Default; // direction-specific Port fields
 
@@ -445,8 +446,13 @@ unsafe extern "C" fn set_callbacks<D: Direction>(
 ) -> c_int {
     let state: *mut State<D> = object.cast();
     assert!(!state.is_null());
-    // read by on_timeout/process on the data loop
-    if !crate::utils::block_on_loop(&(*state).data_loop, state, |state| {
+    // read by on_timeout/process on the data loop; the host keeps the
+    // callback table alive for the node's lifetime (SendWrap blesses it)
+    let callbacks = crate::utils::SendWrap::new(callbacks);
+    let data = crate::utils::SendWrap::new(data);
+    if !crate::utils::block_on_loop(&(*state).data_loop, state, move |state| {
+        let callbacks = callbacks.into_inner();
+        let data = data.into_inner();
         state.callbacks.funcs = callbacks as *const c_void;
         state.callbacks.data = data;
     }) {
@@ -815,8 +821,11 @@ unsafe extern "C" fn set_io<D: Direction>(
         return -libc::EINVAL;
     }
 
-    // clock/position are read on the data loop; apply the change there
-    let applied = crate::utils::block_on_loop(&(*state).data_loop, state, |state| {
+    // clock/position are read on the data loop; apply the change there (the
+    // host keeps the io areas valid while set; SendWrap blesses the pointer)
+    let data = crate::utils::SendWrap::new(data);
+    let applied = crate::utils::block_on_loop(&(*state).data_loop, state, move |state| {
+        let data = data.into_inner();
         let was_armed = !state.clock.is_null() && !state.position.is_null();
 
         #[allow(non_upper_case_globals)]
@@ -1356,7 +1365,7 @@ pub(crate) fn normalize_fragment(v: u32) -> u32 {
 // from this (main) thread so the next cycle re-primes with the new layout.
 pub(crate) unsafe fn store_and_rebuild<D: Direction>(
     state: &mut State<D>,
-    store: impl FnOnce(&mut State<D>),
+    store: impl FnOnce(&mut State<D>) + Send,
 ) -> c_int {
     let mut running = [false; MAX_PORTS];
     let applied = {
@@ -1392,7 +1401,7 @@ pub(crate) unsafe fn store_and_rebuild<D: Direction>(
 // store_and_rebuild; shared by the sink's and source's set_props_params
 pub(crate) unsafe fn apply_props_param<D: Direction>(
     state: &mut State<D>,
-    store: impl FnOnce(&mut State<D>),
+    store: impl FnOnce(&mut State<D>) + Send,
 ) -> c_int {
     let _ = state.node_info.replace_change_mask(0);
     state.node_info.bump_param(SPA_PARAM_Props);
@@ -1695,11 +1704,13 @@ unsafe extern "C" fn port_use_buffers<D: Direction>(
         vec![]
     };
 
-    // process() walks this vec on the data loop; swap it there
+    // process() walks this vec on the data loop; swap it there (host buffer
+    // pointers, valid until the next use_buffers call; SendWrap blesses them)
     let port_idx = port_id as usize;
+    let new_buffers = crate::utils::SendWrap::new(new_buffers);
     let state_ptr: *mut State<D> = state;
     if !crate::utils::block_on_loop(&(*state_ptr).data_loop, state_ptr, move |state| {
-        state.ports[port_idx].buffers = new_buffers;
+        state.ports[port_idx].buffers = new_buffers.into_inner();
         D::on_buffers_swapped(state, port_idx);
     }) {
         return -libc::EIO; // keeping stale host buffer pointers would be a UAF
@@ -1737,9 +1748,12 @@ unsafe extern "C" fn port_set_io<D: Direction>(
         .as_mut()
         .expect("object is not supposed to be null");
 
-    // these pointers are dereferenced by process() on the data loop
+    // these pointers are dereferenced by process() on the data loop (the
+    // host keeps the io areas valid while set; SendWrap blesses the pointer)
+    let data = crate::utils::SendWrap::new(data);
     let state: *mut State<D> = state;
-    let applied = crate::utils::block_on_loop(&(*state).data_loop, state, |state| {
+    let applied = crate::utils::block_on_loop(&(*state).data_loop, state, move |state| {
+        let data = data.into_inner();
         #[allow(non_upper_case_globals)]
         match id {
             SPA_IO_Buffers => state.ports[port_id as usize].io = data.cast(), // null clears
