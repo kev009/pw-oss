@@ -1009,7 +1009,7 @@ impl DspWriter {
     /// caller caches this value across period changes, and a fictitious
     /// capacity would gate quantum changes onto the in-place retune path
     /// forever with a fill target the real ring can't hold.
-    pub(crate) fn set_buffer_size(&mut self, len: u32, fragment: u32) -> u32 {
+    pub(crate) fn set_buffer_size(&self, len: u32, fragment: u32) -> u32 {
         assert_eq!(self.state, DspState::Setup);
         if fragment == 0 {
             // the fragment count field is 16 bits; an extreme oss.delay x quantum

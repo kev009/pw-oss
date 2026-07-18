@@ -855,22 +855,25 @@ unsafe extern "C" fn enum_params(
                 build_profile_info(&mut builder, SPA_PARAM_EnumProfile, index, state, false)
                     .unwrap();
             }
-            (SPA_PARAM_EnumProfile, _) => return 0,
             (SPA_PARAM_Profile, 0) => {
                 build_profile_info(&mut builder, SPA_PARAM_Profile, state.profile, state, true)
                     .unwrap();
             }
-            (SPA_PARAM_Profile, _) => return 0,
             (SPA_PARAM_EnumRoute, i) if (i as usize) < state.routes.len() => {
                 build_route_info(&mut builder, SPA_PARAM_EnumRoute, state, i as usize, false)
                     .unwrap();
             }
-            (SPA_PARAM_EnumRoute, _) => return 0,
             // no Route pods while Off is active: there is nothing routed
             (SPA_PARAM_Route, i) if state.profile != 0 && (i as usize) < state.routes.len() => {
                 build_route_info(&mut builder, SPA_PARAM_Route, state, i as usize, true).unwrap();
             }
-            (SPA_PARAM_Route, _) => return 0,
+            // a known id whose indices are exhausted ends the enumeration
+            (
+                SPA_PARAM_EnumProfile | SPA_PARAM_Profile | SPA_PARAM_EnumRoute | SPA_PARAM_Route,
+                _,
+            ) => {
+                return 0;
+            }
             _ => return -libc::ENOENT,
         };
 

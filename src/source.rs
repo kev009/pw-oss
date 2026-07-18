@@ -722,18 +722,18 @@ impl Direction for SourceDir {
                 16384,
             )
             .unwrap(),
-            (SPA_PARAM_PropInfo, _) => return ParamBuild::Exhausted,
             (SPA_PARAM_Props, 0) => crate::utils::build_latency_offset_props(
                 b,
                 state.process_latency.ns,
                 &[(crate::keys::OSS_FRAGMENT, state.oss_fragment)],
             )
             .unwrap(),
-            (SPA_PARAM_Props, _) => return ParamBuild::Exhausted,
             (SPA_PARAM_ProcessLatency, 0) => {
                 crate::utils::build_process_latency_info(b, &state.process_latency).unwrap();
             }
-            (SPA_PARAM_ProcessLatency, _) => return ParamBuild::Exhausted,
+            (SPA_PARAM_PropInfo | SPA_PARAM_Props | SPA_PARAM_ProcessLatency, _) => {
+                return ParamBuild::Exhausted;
+            }
             _ => return ParamBuild::Unknown,
         };
         ParamBuild::Built

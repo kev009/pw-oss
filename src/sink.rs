@@ -950,7 +950,6 @@ impl Direction for SinkDir {
                 16384,
             )
             .unwrap(),
-            (SPA_PARAM_PropInfo, _) => return ParamBuild::Exhausted,
             (SPA_PARAM_Props, 0) => crate::utils::build_latency_offset_props(
                 b,
                 state.process_latency.ns,
@@ -960,11 +959,12 @@ impl Direction for SinkDir {
                 ],
             )
             .unwrap(),
-            (SPA_PARAM_Props, _) => return ParamBuild::Exhausted,
             (SPA_PARAM_ProcessLatency, 0) => {
                 crate::utils::build_process_latency_info(b, &state.process_latency).unwrap();
             }
-            (SPA_PARAM_ProcessLatency, _) => return ParamBuild::Exhausted,
+            (SPA_PARAM_PropInfo | SPA_PARAM_Props | SPA_PARAM_ProcessLatency, _) => {
+                return ParamBuild::Exhausted;
+            }
             _ => return ParamBuild::Unknown,
         };
         ParamBuild::Built
@@ -1075,15 +1075,16 @@ impl Direction for SinkDir {
         }
     }
 
-    unsafe fn debug_cycle(_state: &State<SinkDir>, _now: u64, _nsec: u64) {
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "cycle: {}, delay: {} ms @ {}",
-            // position is non-null on the process path (as in process_ports)
-            _state.position.with(|p| p.clock.cycle).unwrap_or(0),
-            _now.saturating_sub(_nsec) as f64 / 1000000.0,
-            _now
-        );
+    unsafe fn debug_cycle(state: &State<SinkDir>, now: u64, nsec: u64) {
+        if cfg!(debug_assertions) {
+            eprintln!(
+                "cycle: {}, delay: {} ms @ {}",
+                // position is non-null on the process path (as in process_ports)
+                state.position.with(|p| p.clock.cycle).unwrap_or(0),
+                now.saturating_sub(nsec) as f64 / 1000000.0,
+                now
+            );
+        }
     }
 
     fn servo_ready(_port: &crate::node::Port<SinkDir>) -> bool {

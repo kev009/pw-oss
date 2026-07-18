@@ -562,14 +562,15 @@ unsafe extern "C" fn set_param<D: Direction>(
                         match property.key {
                             // there is no way adapter is actually supposed to pass all those properties (or parameters?) to us,
                             // it's probably a bug
-                            SPA_PROP_volume => (), // softvol-handled by the adapter
-                            SPA_PROP_mute => (),   // ditto
-                            SPA_PROP_channelVolumes => (), // ditto
-                            SPA_PROP_channelMap => (), // ditto
-                            SPA_PROP_monitorMute => (), // ditto
-                            SPA_PROP_monitorVolumes => (), // ditto
-                            SPA_PROP_softMute => (), // ditto
-                            SPA_PROP_softVolumes => (), // ditto
+                            // softvol-handled by the adapter
+                            SPA_PROP_volume
+                            | SPA_PROP_mute
+                            | SPA_PROP_channelVolumes
+                            | SPA_PROP_channelMap
+                            | SPA_PROP_monitorMute
+                            | SPA_PROP_monitorVolumes
+                            | SPA_PROP_softMute
+                            | SPA_PROP_softVolumes => (),
                             SPA_PROP_latencyOffsetNsec => {
                                 if let Value::Long(ns) = property.value {
                                     let mut info = state.process_latency;
@@ -1140,7 +1141,6 @@ unsafe extern "C" fn port_enum_params<D: Direction>(
                     None => return -libc::ENOENT, // no format negotiated yet
                 }
             }
-            (SPA_PARAM_Format, _) => return 0,
             (SPA_PARAM_Buffers, 0) => {
                 match state.ports[port_id as usize].config.as_ref() {
                     Some(cfg) => {
@@ -1149,7 +1149,6 @@ unsafe extern "C" fn port_enum_params<D: Direction>(
                     None => return -libc::ENOENT, // format not negotiated yet
                 }
             }
-            (SPA_PARAM_Buffers, _) => return 0,
             (SPA_PARAM_Latency, 0 | 1) => {
                 let mut info = state.latency[index as usize];
                 // the process latency shifts what we report toward the peer (upstream
@@ -1159,7 +1158,8 @@ unsafe extern "C" fn port_enum_params<D: Direction>(
                 }
                 crate::utils::build_latency_info(&mut builder, &info).unwrap();
             }
-            (SPA_PARAM_Latency, _) => return 0,
+            // a known id whose indices are exhausted ends the enumeration
+            (SPA_PARAM_Format | SPA_PARAM_Buffers | SPA_PARAM_Latency, _) => return 0,
             _ => return -libc::ENOENT, // unknown param id (ALSA convention)
         };
 
@@ -1198,7 +1198,7 @@ unsafe extern "C" fn port_enum_params<D: Direction>(
 // port_set_param(Format): validate the raw format against the format map and
 // build the shared config (the stride falls out of the map's bytes/sample)
 fn parse_config<D: Direction>(
-    state: &mut State<D>,
+    state: &State<D>,
     raw: &spa_audio_info_raw,
 ) -> Result<PortConfig, c_int> {
     let format = libspa::param::audio::AudioFormat(raw.format);
@@ -1753,7 +1753,7 @@ pub(crate) unsafe fn resetup_task<D: Direction>(state: &mut State<D>, port_idx: 
 // are independent acquires and can diverge, breaking every serialization
 // invariant here. Detect it and refuse to process rather than corrupt; the
 // remedy is pinning node.loop.name for this node.
-fn check_loop_identity<D: Direction>(state: &mut State<D>) -> bool {
+fn check_loop_identity<D: Direction>(state: &State<D>) -> bool {
     use std::sync::atomic::Ordering;
     let tid = unsafe { libc::pthread_self() } as usize;
     // The expected id is SEEDED from a closure run on the data loop at init,

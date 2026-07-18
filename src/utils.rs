@@ -70,7 +70,7 @@ impl SysctlReader {
         Ok(String::from_utf8_lossy(bytes).to_string())
     }
 
-    pub(crate) fn read_u32<T: Into<SysctlName>>(&mut self, name: T) -> Result<u32, Errno> {
+    pub(crate) fn read_u32<T: Into<SysctlName>>(&self, name: T) -> Result<u32, Errno> {
         let SysctlName(name) = name.into();
         let mut value: u32 = 0;
         let mut len = std::mem::size_of::<u32>();

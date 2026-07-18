@@ -11,6 +11,9 @@
 // better without separators)
 #![warn(clippy::uninlined_format_args)]
 #![warn(clippy::semicolon_if_nothing_returned)]
+#![warn(clippy::match_same_arms)]
+#![warn(clippy::needless_pass_by_ref_mut)]
+#![warn(clippy::used_underscore_binding)]
 
 use libspa::sys::spa_handle_factory;
 use std::os::raw::c_int;
