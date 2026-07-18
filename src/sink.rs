@@ -1260,7 +1260,9 @@ pub(crate) static mut OSS_SINK_TOPIC: spa_log_topic = spa_log_topic {
 #[cfg(test)]
 mod tests {
     use super::{buffer_request, buffer_required, desired_delay, fill_floor, target_delay};
-    use super::{follower_servo, level_correct, recover_or_hold, SinkDir, SinkPortExt};
+    use super::{
+        follower_servo, level_correct, recover_or_hold, retune_period, SinkDir, SinkPortExt,
+    };
     use crate::sound::test_util::{drain, fill_pipe, free_space, pattern, pipe_pair};
     use libspa::sys::SPA_IO_CLOCK_FLAG_XRUN_RECOVER;
 
@@ -1472,6 +1474,51 @@ mod tests {
         let out = drain(r);
         assert_eq!(out.len(), 4096 - 1024);
         assert!(out.iter().all(|&b| b == 0));
+        unsafe { libc::close(r) };
+    }
+
+    // the in-place retune: a sustained period change with enough ring
+    // headroom recommits the geometry and snaps the fill to the new target
+    #[test]
+    fn retune_recommits_in_place_and_snaps_the_fill() {
+        let (r, w) = pipe_pair(true, true);
+        let mut port = test_port(w, 4096, 2048);
+        port.dsp.write_zeroes(0); // a retuning channel is running
+        port.ext.buffer_size = 16384;
+        let log = crate::spa::Log::test_null();
+
+        // one flip is debounced: write at the old geometry for a cycle
+        assert!(!unsafe { retune_period(&mut port, 4096, 8, 0, std::ptr::null(), &log) });
+        assert_eq!(port.setup_period, 2048);
+        assert!(drain(r).is_empty());
+
+        // sustained: retune in place and fill to the new target (odelay
+        // reads 0 on a pipe, so the snap writes the whole target)
+        assert!(!unsafe { retune_period(&mut port, 4096, 8, 0, std::ptr::null(), &log) });
+        assert_eq!(port.setup_period, 4096);
+        assert_eq!(port.ext.target_delay, 5120); // fill_floor(4096, 1024) binds
+        assert_eq!(port.ext.period_mismatch, 0);
+        let out = drain(r);
+        assert_eq!(out.len(), 5120);
+        assert!(out.iter().all(|&b| b == 0));
+        unsafe { libc::close(r) };
+    }
+
+    // a ring too small for the new period wants a trigger suspend; the pipe
+    // refuses the ioctl (the dying-fd model), so retune asks for a rebuild
+    // and keeps the debounce counter armed for an immediate retry
+    #[test]
+    fn retune_requests_rebuild_when_the_suspend_is_refused() {
+        let (r, w) = pipe_pair(true, true);
+        let mut port = test_port(w, 4096, 2048);
+        port.dsp.write_zeroes(0);
+        let log = crate::spa::Log::test_null();
+
+        assert!(!unsafe { retune_period(&mut port, 4096, 8, 0, std::ptr::null(), &log) });
+        assert!(unsafe { retune_period(&mut port, 4096, 8, 0, std::ptr::null(), &log) });
+        assert_eq!(port.setup_period, 2048); // untouched; the rebuild replaces the device
+        assert!(port.ext.period_mismatch >= 2);
+        assert!(drain(r).is_empty());
         unsafe { libc::close(r) };
     }
 

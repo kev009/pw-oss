@@ -1029,7 +1029,8 @@ pub(crate) static mut OSS_SOURCE_TOPIC: spa_log_topic = spa_log_topic {
 #[cfg(test)]
 mod tests {
     use super::{
-        bounded_read, fill_targets, ring_request, ring_required, SourceDir, SourcePortExt,
+        bounded_read, fill_targets, follower_servo, retune_period, ring_request, ring_required,
+        SourceDir, SourcePortExt,
     };
     use crate::sound::test_util::{pattern, pipe_pair};
 
@@ -1120,6 +1121,66 @@ mod tests {
                 assert!(peak3 <= period.saturating_sub(blocksize));
             }
         }
+    }
+
+    // the in-place retune: enough ring for the new period recommits the
+    // fill geometry without touching the device
+    #[test]
+    fn retune_recommits_in_place() {
+        let (r, w) = pipe_pair(false, false);
+        let mut port = test_port(r, 1024, 0);
+        port.ext.primed = true;
+        port.ext.ring_size = 8192;
+        let log = crate::spa::Log::test_null();
+
+        assert!(!retune_period(&mut port, 2048, &log)); // debounced
+        assert_eq!(port.setup_period, 1024);
+        assert!(!retune_period(&mut port, 2048, &log)); // sustained: retune
+        assert_eq!(port.setup_period, 2048);
+        assert_eq!(port.ext.target_fill, 2048 + 512); // period + half an arrival
+        assert_eq!(port.ext.read_peak, 4096);
+        assert!(port.ext.primed);
+        unsafe { libc::close(w) };
+    }
+
+    // a ring the new period outgrew wants a trigger suspend; the pipe
+    // refuses the ioctl (the dying-fd model), so retune asks for a rebuild
+    #[test]
+    fn retune_requests_rebuild_when_the_suspend_is_refused() {
+        let (r, w) = pipe_pair(false, false);
+        let mut port = test_port(r, 1024, 0);
+        port.ext.primed = true;
+        port.ext.ring_size = 1024;
+        // a read transitions the device to running, so suspend really issues
+        // the (failing) SETTRIGGER instead of short-circuiting from setup
+        let s = pattern(8, 5);
+        assert_eq!(unsafe { libc::write(w, s.as_ptr().cast(), 8) }, 8);
+        let mut buf = [0u8; 8];
+        assert_eq!(unsafe { port.dsp.read(buf.as_mut_ptr().cast(), 8) }, 8);
+        let log = crate::spa::Log::test_null();
+
+        assert!(!retune_period(&mut port, 2048, &log));
+        assert!(retune_period(&mut port, 2048, &log));
+        assert!(port.ext.primed); // not re-primed; the rebuild replaces the device
+        assert_eq!(port.setup_period, 1024);
+        unsafe { libc::close(w) };
+    }
+
+    // the follower servo: in-band errors feed the DLL, a level error past
+    // the snap threshold (period.max(blocksize/2 + period/2)) relocks
+    // instead of winding the integrator
+    #[test]
+    fn follower_servo_locks_in_band_and_relocks_on_snap() {
+        let (r, w) = pipe_pair(false, false);
+        let mut port = test_port(r, 1024, 0);
+        port.ext.target_fill = 2560;
+
+        let corr = follower_servo(&mut port, 2560 + 1500, 0, 8, 48000);
+        assert_eq!(corr, 1.0); // snapped: relock only
+
+        let corr = follower_servo(&mut port, 2560 - 512, 0, 8, 48000);
+        assert!((0.9..=1.1).contains(&corr)); // in-band: the DLL absorbs it
+        unsafe { libc::close(w) };
     }
 
     #[test]

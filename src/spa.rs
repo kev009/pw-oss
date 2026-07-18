@@ -757,6 +757,24 @@ impl Log {
     }
 }
 
+// a Log that never emits (level NONE, methods never reached): phase-function
+// tests need a Log without a live host logger. Safe because the log! macros
+// gate every method call on log_level(), which reads NONE here.
+#[cfg(test)]
+impl Log {
+    pub(crate) fn test_null() -> Self {
+        Self {
+            logger: std::ptr::NonNull::from(Box::leak(Box::new(unsafe {
+                std::mem::zeroed::<spa_log>()
+            }))),
+            methods: std::ptr::NonNull::from(Box::leak(Box::new(unsafe {
+                std::mem::zeroed::<spa_log_methods>()
+            }))),
+            topic: None,
+        }
+    }
+}
+
 #[macro_export]
 macro_rules! log {
     ($log:expr, $log_level:expr, $($arg:tt)*) => {
