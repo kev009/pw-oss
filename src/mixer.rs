@@ -13,7 +13,7 @@
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_uint, c_ulong};
 
-use crate::utils::{ioctl_int, ioctl_read};
+use crate::utils::{LibcFd, ioctl_int, ioctl_read};
 
 pub(crate) const SOUND_MIXER_VOLUME: c_uint = 0;
 pub(crate) const SOUND_MIXER_PCM: c_uint = 4;
@@ -63,7 +63,7 @@ const SOUND_MIXER_INFO: c_ulong =
     nix::request_code_read!(b'M', 101, std::mem::size_of::<MixerInfo>());
 
 pub(crate) struct Mixer {
-    fd: c_int,
+    fd: LibcFd,
     devmask: u32,
     recmask: u32,
 }
@@ -72,10 +72,7 @@ impl Mixer {
     // None when the pcm device has no mixer (ENOENT) or it can't be queried
     pub(crate) fn open(unit: u32) -> Option<Self> {
         let path = CString::new(format!("/dev/mixer{unit}")).ok()?;
-        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
-        if fd == -1 {
-            return None;
-        }
+        let fd = LibcFd::open(&path, libc::O_RDWR)?;
         let mut mixer = Self {
             fd,
             devmask: 0,
@@ -93,11 +90,11 @@ impl Mixer {
     }
 
     fn read_int(&self, dev: c_uint) -> Option<c_int> {
-        ioctl_int(self.fd, read_req(dev), 0)
+        ioctl_int(self.fd.raw(), read_req(dev), 0)
     }
 
     fn write_int(&self, dev: c_uint, value: c_int) -> bool {
-        ioctl_int(self.fd, write_req(dev), value).is_some()
+        ioctl_int(self.fd.raw(), write_req(dev), value).is_some()
     }
 
     fn has(&self, dev: c_uint) -> bool {
@@ -199,13 +196,7 @@ impl Mixer {
     // for level writes while muted (mixer_set stores level_muted and returns
     // early), so callers must value-diff and treat the counter as a hint.
     pub(crate) fn modify_counter(&self) -> Option<c_int> {
-        unsafe { ioctl_read::<MixerInfo>(self.fd, SOUND_MIXER_INFO) }
+        unsafe { ioctl_read::<MixerInfo>(self.fd.raw(), SOUND_MIXER_INFO) }
             .map(|info| info.modify_counter)
-    }
-}
-
-impl Drop for Mixer {
-    fn drop(&mut self) {
-        unsafe { libc::close(self.fd) };
     }
 }

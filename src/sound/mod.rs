@@ -559,7 +559,7 @@ fn get_error(fd: c_int) -> audio_errinfo {
 pub(crate) struct Dsp {
     path: CString,
     pub hw_quantum_ns: u64, // the hardware drain quantum (sndstat); 0 = fragment-accurate
-    fd: c_int,
+    fd: Option<LibcFd>,
     state: DspState,
     needs_trigger: bool, // trigger-suspended: NOTRIGGER must be cleared on restart
     stride: u32,         // negotiated frame bytes; reads must consume whole frames
@@ -571,7 +571,7 @@ impl Dsp {
         Self {
             path: CString::new(path).unwrap(),
             hw_quantum_ns: drain_quantum_ns(path, false),
-            fd: -1,
+            fd: None,
             state: DspState::Closed,
             needs_trigger: false,
             stride: 1,
@@ -599,18 +599,22 @@ impl Dsp {
         self.state == DspState::Running
     }
 
+    fn raw_fd(&self) -> c_int {
+        self.fd
+            .as_ref()
+            .expect("an active DSP state owns its descriptor")
+            .raw()
+    }
+
     pub(crate) fn open(&mut self) -> Result<(), Errno> {
         assert_eq!(self.state, DspState::Closed);
 
         // O_RDONLY, not O_RDWR: on devices with asymmetric play/rec channel
         // counts (e.g. RODECaster) the kernel won't take per-direction counts on
         // one fd (shkhln/pw-oss#3)
-        let fd = unsafe { libc::open(self.path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-        if fd == -1 {
-            return Err(Errno::last());
-        }
+        let fd = LibcFd::open(&self.path, libc::O_RDONLY).ok_or_else(Errno::last)?;
 
-        self.fd = fd;
+        self.fd = Some(fd);
         self.state = DspState::Setup;
 
         Ok(())
@@ -618,8 +622,11 @@ impl Dsp {
 
     pub(crate) fn close(&mut self) {
         assert_ne!(self.state, DspState::Closed);
-        unsafe { libc::close(self.fd) };
-        self.fd = -1;
+        drop(
+            self.fd
+                .take()
+                .expect("an active DSP state owns its descriptor"),
+        );
         self.state = DspState::Closed;
         self.needs_trigger = false;
         self.skip = 0;
@@ -631,9 +638,9 @@ impl Dsp {
         self.stride = afmt_frame_bytes(format)
             .max(1)
             .saturating_mul(channels.max(1));
-        set_value(self.fd, SNDCTL_DSP_SETFMT, format, 0)?;
-        set_value(self.fd, SNDCTL_DSP_CHANNELS, channels, 0)?;
-        set_value(self.fd, SNDCTL_DSP_SPEED, rate, feeder_rate_round())
+        set_value(self.raw_fd(), SNDCTL_DSP_SETFMT, format, 0)?;
+        set_value(self.raw_fd(), SNDCTL_DSP_CHANNELS, channels, 0)?;
+        set_value(self.raw_fd(), SNDCTL_DSP_SPEED, rate, feeder_rate_round())
     }
 
     // Size the capture ring into small fragments and make poll byte-accurate.
@@ -653,7 +660,7 @@ impl Dsp {
         // clamp panics if a future rate-dependent cap undercuts MIN_RING_BYTES)
         let ring = ring.max(MIN_RING_BYTES).min(CHN_2NDBUFMAXSIZE as u32);
         if fragment == 0 {
-            set_fragment(self.fd, (ring >> 10).min(u16::MAX as u32) as u16, 10);
+            set_fragment(self.raw_fd(), (ring >> 10).min(u16::MAX as u32) as u16, 10);
         // 1 KiB fragments
         } else {
             // fragment is a power of two in [64, 16384] (node.rs
@@ -662,13 +669,13 @@ impl Dsp {
             // the kernel minimum of 2 (dsp.c:1256)
             let count = (ring >> fragment.trailing_zeros()).max(2u32);
             set_fragment(
-                self.fd,
+                self.raw_fd(),
                 count.min(u16::MAX as u32) as u16,
                 fragment.trailing_zeros() as u16,
             );
         }
         // best-effort: without it, poll readiness is merely fragment-coarse
-        let _ = ioctl_int(self.fd, SNDCTL_DSP_LOW_WATER, 1);
+        let _ = ioctl_int(self.raw_fd(), SNDCTL_DSP_LOW_WATER, 1);
     }
 
     // Stop the channel but keep the fd: SETTRIGGER(0) aborts, resets the ring
@@ -679,7 +686,7 @@ impl Dsp {
         if self.state != DspState::Running {
             return true; // nothing runs; already primable
         }
-        if !set_trigger(self.fd, 0) {
+        if !set_trigger(self.raw_fd(), 0) {
             return false;
         }
         self.state = DspState::Setup;
@@ -704,7 +711,7 @@ impl Dsp {
             let mut scratch = [0u8; 64];
             let n = unsafe {
                 libc::read(
-                    self.fd,
+                    self.raw_fd(),
                     scratch.as_mut_ptr().cast(),
                     (self.skip as usize).min(scratch.len()),
                 )
@@ -714,7 +721,7 @@ impl Dsp {
             }
             self.skip -= n as u32;
         }
-        let n = unsafe { libc::read(self.fd, buf.as_mut_ptr().cast(), buf.len()) };
+        let n = unsafe { libc::read(self.raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
         if n <= 0 {
             return n;
         }
@@ -737,7 +744,7 @@ impl Dsp {
         // (1024) fds, which a busy daemon can reach; poll also triggers the
         // capture channel just like select/read do (dsp_poll -> chn_poll)
         let mut pfd = libc::pollfd {
-            fd: self.fd,
+            fd: self.raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         };
@@ -746,14 +753,14 @@ impl Dsp {
         // set, which would keep the channel from ever auto-restarting; clear it
         if self.needs_trigger {
             self.needs_trigger = false;
-            let _ = set_trigger(self.fd, PCM_ENABLE_INPUT);
+            let _ = set_trigger(self.raw_fd(), PCM_ENABLE_INPUT);
         }
         n > 0 && (pfd.revents & libc::POLLIN) != 0
     }
 
     pub(crate) fn ispace_in_bytes(&mut self) -> c_int {
         assert_eq!(self.state, DspState::Running);
-        unsafe { ioctl_read::<audio_buf_info>(self.fd, SNDCTL_DSP_GETISPACE) }
+        unsafe { ioctl_read::<audio_buf_info>(self.raw_fd(), SNDCTL_DSP_GETISPACE) }
             .map_or(0, |info| info.bytes)
     }
 
@@ -763,7 +770,8 @@ impl Dsp {
     // ioctl failed (e.g. device unplugged mid-stream).
     pub(crate) fn ispace_layout(&mut self) -> (u32, u32, u32) {
         assert_eq!(self.state, DspState::Running);
-        let Some(info) = (unsafe { ioctl_read::<audio_buf_info>(self.fd, SNDCTL_DSP_GETISPACE) })
+        let Some(info) =
+            (unsafe { ioctl_read::<audio_buf_info>(self.raw_fd(), SNDCTL_DSP_GETISPACE) })
         else {
             return (0, 0, 0);
         };
@@ -776,7 +784,7 @@ impl Dsp {
 
     pub(crate) fn overruns(&self) -> u32 {
         assert_eq!(self.state, DspState::Running);
-        get_error(self.fd).rec_overruns.max(0) as u32
+        get_error(self.raw_fd()).rec_overruns.max(0) as u32
     }
 }
 
@@ -850,7 +858,7 @@ pub(crate) fn drain_quantum_ns(devnode: &str, play: bool) -> u64 {
 pub(crate) struct DspWriter {
     pub path: String,
     pub hw_quantum_ns: u64, // the hardware drain quantum (sndstat); 0 = fragment-accurate
-    fd: c_int,
+    fd: Option<LibcFd>,
     state: DspState,
     needs_trigger: bool, // trigger-suspended: writes buffer until armed
     stride: u32,         // negotiated frame bytes; the byte stream must stay frame-aligned
@@ -866,7 +874,7 @@ impl DspWriter {
         Self {
             path: path.to_string(),
             hw_quantum_ns: drain_quantum_ns(path, true), // main thread; nodes are built there
-            fd: -1,
+            fd: None,
             state: DspState::Closed,
             needs_trigger: false,
             stride: 1,
@@ -884,19 +892,18 @@ impl DspWriter {
         self.state == DspState::Running
     }
 
+    fn raw_fd(&self) -> c_int {
+        self.fd
+            .as_ref()
+            .expect("an active DSP writer state owns its descriptor")
+            .raw()
+    }
+
     pub(crate) fn open(&mut self) -> Result<(), Errno> {
         assert_eq!(self.state, DspState::Closed);
         let path = CString::new(self.path.clone()).unwrap();
-        let fd = unsafe {
-            libc::open(
-                path.as_ptr(),
-                libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
-            )
-        };
-        if fd == -1 {
-            return Err(Errno::last());
-        }
-        self.fd = fd;
+        let fd = LibcFd::open(&path, libc::O_WRONLY | libc::O_NONBLOCK).ok_or_else(Errno::last)?;
+        self.fd = Some(fd);
         self.state = DspState::Setup;
         Ok(())
     }
@@ -905,10 +912,13 @@ impl DspWriter {
         assert_ne!(self.state, DspState::Closed);
         // discard the queued buffer so close() doesn't block draining it
         unsafe {
-            libc::ioctl(self.fd, SNDCTL_DSP_HALT);
+            libc::ioctl(self.raw_fd(), SNDCTL_DSP_HALT);
         }
-        unsafe { libc::close(self.fd) };
-        self.fd = -1;
+        drop(
+            self.fd
+                .take()
+                .expect("an active DSP writer state owns its descriptor"),
+        );
         self.state = DspState::Closed;
         self.needs_trigger = false;
         self.frame_off = 0;
@@ -924,7 +934,7 @@ impl DspWriter {
         if self.state != DspState::Running {
             return true; // nothing runs; already primable
         }
-        if !set_trigger(self.fd, 0) {
+        if !set_trigger(self.raw_fd(), 0) {
             return false;
         }
         self.state = DspState::Setup;
@@ -937,7 +947,7 @@ impl DspWriter {
     fn arm(&mut self) {
         if self.needs_trigger {
             self.needs_trigger = false;
-            if !set_trigger(self.fd, PCM_ENABLE_OUTPUT) {
+            if !set_trigger(self.raw_fd(), PCM_ENABLE_OUTPUT) {
                 eprintln!(
                     "{}: SETTRIGGER(OUTPUT) failed after a trigger suspend",
                     self.path
@@ -952,9 +962,9 @@ impl DspWriter {
         self.stride = afmt_frame_bytes(format)
             .max(1)
             .saturating_mul(channels.max(1));
-        set_value(self.fd, SNDCTL_DSP_SETFMT, format, 0)?;
-        set_value(self.fd, SNDCTL_DSP_CHANNELS, channels, 0)?;
-        set_value(self.fd, SNDCTL_DSP_SPEED, rate, feeder_rate_round())
+        set_value(self.raw_fd(), SNDCTL_DSP_SETFMT, format, 0)?;
+        set_value(self.raw_fd(), SNDCTL_DSP_CHANNELS, channels, 0)?;
+        set_value(self.raw_fd(), SNDCTL_DSP_SPEED, rate, feeder_rate_round())
     }
 
     /// Request a `len`-byte output buffer and return the size the device granted.
@@ -970,7 +980,11 @@ impl DspWriter {
         if fragment == 0 {
             // the fragment count field is 16 bits; an extreme oss.delay x quantum
             // request must clamp, not truncate
-            set_fragment(self.fd, len.div_ceil(1024).min(u16::MAX as u32) as u16, 10);
+            set_fragment(
+                self.raw_fd(),
+                len.div_ceil(1024).min(u16::MAX as u32) as u16,
+                10,
+            );
         } else {
             // fragment is a power of two in [64, 16384] (node.rs
             // normalize_fragment), keeping the selector inside the kernel's
@@ -979,10 +993,14 @@ impl DspWriter {
             let count = len
                 .div_ceil(fragment)
                 .clamp(2, CHN_2NDBUFMAXSIZE as u32 / fragment);
-            set_fragment(self.fd, count as u16, fragment.trailing_zeros() as u16);
+            set_fragment(
+                self.raw_fd(),
+                count as u16,
+                fragment.trailing_zeros() as u16,
+            );
         }
         // nothing's written yet, so GETOSPACE reports the granted buffer size
-        ospace_in_bytes(self.fd).max(0) as u32
+        ospace_in_bytes(self.raw_fd()).max(0) as u32
     }
 
     /// Write `count` bytes, keeping the device byte stream frame-aligned. The
@@ -1073,11 +1091,11 @@ impl DspWriter {
         assert_eq!(self.state, DspState::Running);
 
         #[cfg(debug_assertions)]
-        let space = ospace_in_bytes(self.fd) as usize;
+        let space = ospace_in_bytes(self.raw_fd()) as usize;
         #[cfg(debug_assertions)]
-        let delay = odelay(self.fd);
+        let delay = odelay(self.raw_fd());
 
-        let nbytes = unsafe { libc::write(self.fd, buf.as_ptr().cast(), count as size_t) };
+        let nbytes = unsafe { libc::write(self.raw_fd(), buf.as_ptr().cast(), count as size_t) };
         if nbytes > 0 {
             // frame phase of the stream: every accepted byte counts, whoever wrote it
             self.frame_off = (self.frame_off + nbytes as u32) % self.stride.max(1);
@@ -1086,8 +1104,8 @@ impl DspWriter {
         #[cfg(debug_assertions)]
         {
             let now = crate::utils::now_ns_libc();
-            let space_after = ospace_in_bytes(self.fd) as usize;
-            let delay_after = odelay(self.fd);
+            let space_after = ospace_in_bytes(self.raw_fd()) as usize;
+            let delay_after = odelay(self.raw_fd());
             eprintln!(
                 "{}: {:9} @ {}, count = {:5}, ospace = {:5} -> {:5}, odelay = {:5} -> {:5}",
                 self.path,
@@ -1143,18 +1161,18 @@ impl DspWriter {
 
     pub(crate) fn odelay(&self) -> u32 {
         assert_eq!(self.state, DspState::Running);
-        odelay(self.fd).max(0) as u32
+        odelay(self.raw_fd()).max(0) as u32
     }
 
     /// The fragment size the driver actually granted (may differ from what
     /// SETFRAGMENT asked for; some drivers force a fixed period).
     pub(crate) fn blocksize(&self) -> u32 {
-        blocksize(self.fd).max(0) as u32
+        blocksize(self.raw_fd()).max(0) as u32
     }
 
     pub(crate) fn underruns(&self) -> u32 {
         assert_eq!(self.state, DspState::Running);
-        get_error(self.fd).play_underruns.max(0) as u32
+        get_error(self.raw_fd()).play_underruns.max(0) as u32
     }
 }
 
@@ -1273,7 +1291,8 @@ impl DspWriter {
         Self {
             path: "test-fd".to_string(),
             hw_quantum_ns: 0,
-            fd,
+            // The test constructor takes ownership of this pipe endpoint.
+            fd: Some(unsafe { LibcFd::from_raw(fd) }),
             state: DspState::Setup,
             needs_trigger: false,
             stride,
@@ -1290,7 +1309,8 @@ impl Dsp {
         Self {
             path: CString::new("test-fd").unwrap(),
             hw_quantum_ns: 0,
-            fd,
+            // The test constructor takes ownership of this pipe endpoint.
+            fd: Some(unsafe { LibcFd::from_raw(fd) }),
             state: DspState::Setup,
             needs_trigger: false,
             stride,

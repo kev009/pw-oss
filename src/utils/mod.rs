@@ -3,13 +3,23 @@ use nix::errno::Errno;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_int, c_ulong, c_void};
 
-/// An fd returned by `libc::open` and closed with `libc::close`.
+/// An owned libc descriptor closed with `libc::close`.
 pub(crate) struct LibcFd(c_int);
 
 impl LibcFd {
     pub(crate) fn open(path: &CStr, flags: c_int) -> Option<Self> {
         let fd = unsafe { libc::open(path.as_ptr(), flags | libc::O_CLOEXEC) };
         (fd != -1).then(|| Self(fd))
+    }
+
+    /// Take ownership of an existing descriptor.
+    ///
+    /// # Safety
+    /// `fd` must be open and exclusively transferred to the returned owner.
+    #[cfg(test)]
+    pub(crate) unsafe fn from_raw(fd: c_int) -> Self {
+        assert!(fd >= 0);
+        Self(fd)
     }
 
     pub(crate) fn raw(&self) -> c_int {
