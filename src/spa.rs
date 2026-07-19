@@ -3,6 +3,10 @@ use libspa::sys::*;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_void};
 
+mod notifications;
+
+pub(crate) use notifications::{LocalDispatchGuard, LocalNotificationQueue};
+
 pub(crate) const SPA_DEVICE_CHANGE_MASK_ALL: u32 =
     SPA_DEVICE_CHANGE_MASK_FLAGS | SPA_DEVICE_CHANGE_MASK_PARAMS | SPA_DEVICE_CHANGE_MASK_PROPS;
 

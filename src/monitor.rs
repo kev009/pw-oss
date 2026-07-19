@@ -6,7 +6,7 @@ use std::vec::Vec;
 
 struct MonitorEvents {
     hooks: crate::spa::ListenerList<spa_device_events>,
-    pending: std::cell::RefCell<PendingMonitorNotifications>,
+    pending: crate::spa::LocalNotificationQueue<MonitorNotification>,
 }
 
 enum MonitorObjectEvent {
@@ -25,29 +25,11 @@ enum MonitorNotification {
     ActivateListeners(std::rc::Rc<crate::spa::ListenerList<spa_device_events>>),
 }
 
-struct PendingMonitorNotifications {
-    queue: std::collections::VecDeque<MonitorNotification>,
-    dispatching: bool,
-}
-
-struct MonitorDispatchGuard<'a> {
-    pending: &'a std::cell::RefCell<PendingMonitorNotifications>,
-}
-
-impl Drop for MonitorDispatchGuard<'_> {
-    fn drop(&mut self) {
-        self.pending.borrow_mut().dispatching = false;
-    }
-}
-
 impl MonitorEvents {
     fn new() -> Self {
         Self {
             hooks: crate::spa::ListenerList::new(),
-            pending: std::cell::RefCell::new(PendingMonitorNotifications {
-                queue: std::collections::VecDeque::new(),
-                dispatching: false,
-            }),
+            pending: crate::spa::LocalNotificationQueue::new(),
         }
     }
 
@@ -138,46 +120,22 @@ impl MonitorEvents {
         data: *mut c_void,
         initial: impl FnOnce(&crate::spa::ListenerList<spa_device_events>) -> R,
     ) -> R {
-        let deferred = {
-            let mut pending = self.pending.borrow_mut();
-            if pending.dispatching || !pending.queue.is_empty() {
-                let hooks = std::rc::Rc::new(crate::spa::ListenerList::new());
-                pending
-                    .queue
-                    .push_back(MonitorNotification::ActivateListeners(hooks.clone()));
-                Some(hooks)
-            } else {
-                None
-            }
-        };
+        let deferred = self.pending.defer_when_busy(|| {
+            let hooks = std::rc::Rc::new(crate::spa::ListenerList::new());
+            (MonitorNotification::ActivateListeners(hooks.clone()), hooks)
+        });
         let hooks = deferred.as_deref().unwrap_or(&self.hooks);
         unsafe { hooks.with_isolated_listener(listener, events, data, || initial(hooks)) }
     }
 
-    fn begin_dispatch(&self) -> Option<MonitorDispatchGuard<'_>> {
-        let mut pending = self.pending.borrow_mut();
-        if pending.dispatching {
-            None
-        } else {
-            pending.dispatching = true;
-            drop(pending);
-            Some(MonitorDispatchGuard {
-                pending: &self.pending,
-            })
-        }
+    fn begin_dispatch(&self) -> Option<crate::spa::LocalDispatchGuard<'_, MonitorNotification>> {
+        self.pending.begin_dispatch()
     }
 
     // SAFETY: no State reference may be live; only the begin_dispatch owner
     // calls this, and the RefCell borrow ends before listener dispatch.
-    unsafe fn drain(&self, _guard: MonitorDispatchGuard<'_>) {
-        loop {
-            let notification = {
-                let mut pending = self.pending.borrow_mut();
-                match pending.queue.pop_front() {
-                    Some(notification) => notification,
-                    None => return,
-                }
-            };
+    unsafe fn drain(&self, guard: crate::spa::LocalDispatchGuard<'_, MonitorNotification>) {
+        self.pending.drain(guard, |notification| {
             match notification {
                 MonitorNotification::Object(event) => unsafe {
                     self.emit_object(&event);
@@ -187,18 +145,22 @@ impl MonitorEvents {
                     unsafe { self.hooks.append_from(&hooks) };
                 }
             }
-        }
+        });
     }
 
     // SAFETY: no associated State reference may be live.
     unsafe fn dispatch_all(&self, notifications: Vec<MonitorObjectEvent>) {
-        self.pending
-            .borrow_mut()
-            .queue
-            .extend(notifications.into_iter().map(MonitorNotification::Object));
-        if let Some(guard) = self.begin_dispatch() {
-            unsafe { self.drain(guard) };
-        }
+        self.pending.dispatch_all(
+            notifications.into_iter().map(MonitorNotification::Object),
+            |notification| match notification {
+                MonitorNotification::Object(event) => unsafe {
+                    self.emit_object(&event);
+                },
+                MonitorNotification::ActivateListeners(hooks) => {
+                    unsafe { self.hooks.append_from(&hooks) };
+                }
+            },
+        );
     }
 }
 
