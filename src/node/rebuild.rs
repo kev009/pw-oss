@@ -266,6 +266,7 @@ pub(in crate::node) fn queue_main_event<D: Direction>(
 // one (superseded by install/release/Suspend) is retired to the worker for
 // closing. Returns whether the cycle must skip the port (rebuild still
 // in flight, or this cycle consumed a non-install outcome).
+#[inline]
 pub(crate) fn poll_rebuild<D: Direction>(state: &mut DataState<D>, port_idx: usize) -> bool {
     if state.rebuild_takeover {
         return true;
@@ -273,6 +274,21 @@ pub(crate) fn poll_rebuild<D: Direction>(state: &mut DataState<D>, port_idx: usi
     if !flush_deferred_work(state) {
         return true;
     }
+    // The completion slot is empty on virtually every audio cycle. Check it
+    // with a plain load so the steady-state path does not issue a locked CAS.
+    // A concurrent deposit missed here is consumed next cycle, just as when
+    // take_swap loses its CAS to a writer holding SLOT_BUSY.
+    if !state.shared.swap_ready() {
+        return state.ports[port_idx].rebuild_pending;
+    }
+    poll_rebuild_completion(state, port_idx)
+}
+
+// Keep the large owned completion variants and their drop paths out of the
+// ordinary audio-cycle frame.
+#[cold]
+#[inline(never)]
+fn poll_rebuild_completion<D: Direction>(state: &mut DataState<D>, port_idx: usize) -> bool {
     let Some(swap) = state.shared.take_swap() else {
         return state.ports[port_idx].rebuild_pending;
     };

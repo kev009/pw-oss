@@ -239,6 +239,7 @@ fn rebuild_work_slot_returns_ownership_when_full_or_stopped() {
 #[test]
 fn rebuild_mailbox_delivers_replaces_and_discards() {
     let shared: NodeShared<SinkDir> = NodeShared::new();
+    assert!(!shared.swap_ready());
     assert!(shared.take_swap().is_none());
 
     shared.deposit(DeviceSwap {
@@ -253,9 +254,11 @@ fn rebuild_mailbox_delivers_replaces_and_discards() {
             placeholder: crate::oss::DspWriter::new("/nonexistent/dsp"),
         },
     });
+    assert!(shared.swap_ready());
     let swap = shared.take_swap().expect("a deposited swap");
     assert_eq!(swap.generation, 4, "the newer deposit wins");
     assert!(matches!(swap.outcome, SwapOutcome::Failed { .. }));
+    assert!(!shared.swap_ready());
     assert!(shared.take_swap().is_none(), "take is one-shot");
 
     shared.deposit(DeviceSwap {
@@ -264,6 +267,7 @@ fn rebuild_mailbox_delivers_replaces_and_discards() {
         outcome: SwapOutcome::Aborted,
     });
     shared.discard_swap();
+    assert!(!shared.swap_ready());
     assert!(shared.take_swap().is_none(), "discard voids the slot");
 }
 

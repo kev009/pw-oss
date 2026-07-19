@@ -117,6 +117,15 @@ impl<D: Direction> NodeShared<D> {
         drop(prev);
     }
 
+    // Data-loop fast-path hint. An empty or BUSY observation may become FULL
+    // immediately afterward; deferring that completion until the next cycle
+    // is already part of the non-blocking mailbox contract. The successful
+    // CAS in take_swap remains the Acquire operation that publishes the
+    // payload.
+    pub(in crate::node) fn swap_ready(&self) -> bool {
+        self.slot_state.load(std::sync::atomic::Ordering::Relaxed) == SLOT_FULL
+    }
+
     // Data loop (single consumer): the completion, if one arrived. Never
     // waits: a writer mid-deposit just reads as "nothing yet".
     pub(in crate::node) fn take_swap(&self) -> Option<DeviceSwap<D>> {
