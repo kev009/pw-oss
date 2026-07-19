@@ -2,29 +2,32 @@ use super::*;
 
 // Route properties accepted from set_param. Unknown properties are ignored
 // because session managers may include adapter-owned values such as
-// softVolumes. Mute is applied before channelVolumes, and the last duplicate
-// property wins.
+// softVolumes. Retaining pod order preserves the caller's mixer-write order,
+// including duplicate properties and partial hardware failures.
 #[derive(Debug, Default, PartialEq)]
-pub(super) struct RouteProps {
-    pub(super) mute: Option<bool>,
-    pub(super) channel_volumes: Option<Vec<f32>>, // non-empty (decode drops empty arrays)
+pub(super) struct RouteProps(pub(super) Vec<RouteProp>);
+
+#[derive(Debug, PartialEq)]
+pub(super) enum RouteProp {
+    Mute(bool),
+    ChannelVolumes(Vec<f32>),
 }
 
 fn decode_route_props(object: libspa::pod::Object) -> RouteProps {
     use libspa::pod::{Value, ValueArray};
 
-    let mut props = RouteProps::default();
+    let mut props = Vec::new();
     for p in object.properties {
         #[allow(non_upper_case_globals)]
         match (p.key, p.value) {
-            (SPA_PROP_mute, Value::Bool(mute)) => props.mute = Some(mute),
+            (SPA_PROP_mute, Value::Bool(mute)) => props.push(RouteProp::Mute(mute)),
             (SPA_PROP_channelVolumes, Value::ValueArray(ValueArray::Float(v))) if !v.is_empty() => {
-                props.channel_volumes = Some(v);
+                props.push(RouteProp::ChannelVolumes(v));
             }
             _ => (),
         }
     }
-    props
+    RouteProps(props)
 }
 
 // Apply route properties to the hardware and cached state.
@@ -43,41 +46,44 @@ fn apply_route_props(
     // emit_object_config pushes them into the node's softVolumes
     let control = state.routes[pos].control;
 
-    if let Some(mute) = props.mute {
-        if mute != state.routes[pos].mute {
-            let applied = match control {
-                Some(c) => state.mixers[mi].mixer.set_muted(c, mute),
-                None => true, // soft route: the shadow is the state
-            };
-            if applied {
-                state.routes[pos].mute = mute;
-                *mute_changed = true;
+    for prop in props.0 {
+        match prop {
+            RouteProp::Mute(mute) => {
+                if mute != state.routes[pos].mute {
+                    let applied = match control {
+                        Some(c) => state.mixers[mi].mixer.set_muted(c, mute),
+                        None => true, // soft route: the shadow is the state
+                    };
+                    if applied {
+                        state.routes[pos].mute = mute;
+                        *mute_changed = true;
+                    }
+                }
             }
-        }
-    }
-
-    if let Some(v) = props.channel_volumes {
-        // non-empty per decode_route_props; the indexing below relies on it
-        assert!(!v.is_empty(), "decode admits only non-empty volume arrays");
-        // any width is accepted: mixer channel i reads v[i % n], so a mono
-        // request fans out and a wider-than-stereo one folds down
-        // log what the session manager actually sent; misapplied volumes
-        // are hard to attribute after the fact (PIPEWIRE_DEBUG="spa.oss.*:4")
-        crate::debug!(
-            state.log,
-            "route {} channelVolumes {:?}",
-            state.routes[pos].name,
-            v
-        );
-        let levels = (linear_to_oss(v[0]), linear_to_oss(v[1 % v.len()]));
-        if levels != state.routes[pos].levels {
-            let applied = match control {
-                Some(c) => state.mixers[mi].mixer.set_level(c, levels.0, levels.1),
-                None => true,
-            };
-            if applied {
-                state.routes[pos].levels = levels;
-                *vol_changed = true;
+            RouteProp::ChannelVolumes(v) => {
+                let Some(&left) = v.first() else {
+                    continue;
+                };
+                let right = v.get(1).copied().unwrap_or(left);
+                // any width is accepted: the mixer uses the first two values,
+                // with a mono request fanned out to both channels
+                crate::debug!(
+                    state.log,
+                    "route {} channelVolumes {:?}",
+                    state.routes[pos].name,
+                    v
+                );
+                let levels = (linear_to_oss(left), linear_to_oss(right));
+                if levels != state.routes[pos].levels {
+                    let applied = match control {
+                        Some(c) => state.mixers[mi].mixer.set_level(c, levels.0, levels.1),
+                        None => true,
+                    };
+                    if applied {
+                        state.routes[pos].levels = levels;
+                        *vol_changed = true;
+                    }
+                }
             }
         }
     }

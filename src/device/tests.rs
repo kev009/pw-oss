@@ -551,11 +551,11 @@ fn route_requests_decode_with_typed_props() {
                     type_: SPA_TYPE_OBJECT_Props,
                     id: SPA_PARAM_Route,
                     properties: vec![
-                        prop(SPA_PROP_mute, Value::Bool(true)),
                         prop(
                             SPA_PROP_channelVolumes,
                             Value::ValueArray(ValueArray::Float(vec![0.5, 0.25])),
                         ),
+                        prop(SPA_PROP_mute, Value::Bool(true)),
                         // ignored at decode: softVolumes ride along
                         prop(
                             SPA_PROP_softVolumes,
@@ -570,13 +570,13 @@ fn route_requests_decode_with_typed_props() {
             name: Some("oss-output".into()),
             device: 2,
             save: true,
-            props: Some(super::RouteProps {
-                mute: Some(true),
-                channel_volumes: Some(vec![0.5, 0.25]),
-            }),
+            props: Some(super::RouteProps(vec![
+                super::RouteProp::ChannelVolumes(vec![0.5, 0.25]),
+                super::RouteProp::Mute(true),
+            ])),
         })
     );
-    // an empty volume array is dropped (the apply indexes v[0])
+    // an empty volume array is dropped before it can become a mixer write
     assert_eq!(
         super::decode_route_request(pod(vec![
             prop(SPA_PARAM_ROUTE_device, Value::Int(2)),

@@ -7,7 +7,8 @@ use params::set_param;
 
 #[cfg(test)]
 use params::{
-    ProfileRequest, RouteProps, RouteRequest, decode_profile_request, decode_route_request,
+    ProfileRequest, RouteProp, RouteProps, RouteRequest, decode_profile_request,
+    decode_route_request,
 };
 
 // One hardware route per (pcm device, direction) that has a usable mixer
