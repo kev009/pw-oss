@@ -226,15 +226,21 @@ pub(crate) fn channel_positions(channels: u32) -> Option<&'static [u32]> {
 }
 
 // (OSS AFMT, SPA audio format, bytes per sample) triples we can produce,
-// best first; the single source of truth for the format surface - EnumFormat,
-// the negotiation snap and the per-config stride all derive from it
+// ordered by preference: wide integer, float, 3-byte 24-bit, 16-bit, then U8.
+// This is the single source of truth for EnumFormat, negotiation snapping and
+// per-config stride.
 // (hand-formatted: one triple per line keeps the mapping scannable)
 #[rustfmt::skip]
-pub(crate) const FORMAT_MAP: [(u32, u32, u32); 4] = [
+pub(crate) const FORMAT_MAP: [(u32, u32, u32); 9] = [
     (crate::sound::AFMT_S32_LE, libspa::sys::SPA_AUDIO_FORMAT_S32_LE, 4),
     (crate::sound::AFMT_S32_BE, libspa::sys::SPA_AUDIO_FORMAT_S32_BE, 4),
+    (crate::sound::AFMT_F32_LE, libspa::sys::SPA_AUDIO_FORMAT_F32_LE, 4),
+    (crate::sound::AFMT_F32_BE, libspa::sys::SPA_AUDIO_FORMAT_F32_BE, 4),
+    (crate::sound::AFMT_S24_LE, libspa::sys::SPA_AUDIO_FORMAT_S24_LE, 3),
+    (crate::sound::AFMT_S24_BE, libspa::sys::SPA_AUDIO_FORMAT_S24_BE, 3),
     (crate::sound::AFMT_S16_LE, libspa::sys::SPA_AUDIO_FORMAT_S16_LE, 2),
-    (crate::sound::AFMT_S16_BE, libspa::sys::SPA_AUDIO_FORMAT_S16_BE, 2)
+    (crate::sound::AFMT_S16_BE, libspa::sys::SPA_AUDIO_FORMAT_S16_BE, 2),
+    (crate::sound::AFMT_U8,     libspa::sys::SPA_AUDIO_FORMAT_U8,     1)
 ];
 
 // the (OSS AFMT, bytes per sample) behind a SPA audio format; None for

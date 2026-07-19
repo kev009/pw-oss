@@ -6,10 +6,15 @@ use std::os::raw::{c_char, c_int, c_long, c_uint, c_ulong, c_void};
 
 use crate::utils::{LibcFd, ioctl_int, ioctl_read, ioctl_value, ioctl_zeroed};
 
+pub(crate) const AFMT_U8: u32 = 0x00000008;
 pub(crate) const AFMT_S16_LE: u32 = 0x00000010;
 pub(crate) const AFMT_S16_BE: u32 = 0x00000020;
 pub(crate) const AFMT_S32_LE: u32 = 0x00001000;
 pub(crate) const AFMT_S32_BE: u32 = 0x00002000;
+pub(crate) const AFMT_S24_LE: u32 = 0x00010000;
+pub(crate) const AFMT_S24_BE: u32 = 0x00020000;
+pub(crate) const AFMT_F32_LE: u32 = 0x10000000;
+pub(crate) const AFMT_F32_BE: u32 = 0x20000000;
 
 const SNDCTL_DSP_SPEED: c_ulong =
     nix::request_code_readwrite!(b'P', 2, std::mem::size_of::<c_int>());
@@ -190,10 +195,19 @@ pub(crate) struct DspCaps {
 }
 
 impl DspCaps {
-    // used when the device can't be probed (e.g. busy); conservative
+    // Used when the device can't be probed (e.g. busy): conservative geometry
+    // plus the PCM formats available through the FreeBSD feeder.
     pub(crate) fn fallback() -> Self {
         Self {
-            formats: AFMT_S16_LE | AFMT_S16_BE | AFMT_S32_LE | AFMT_S32_BE,
+            formats: AFMT_U8
+                | AFMT_S16_LE
+                | AFMT_S16_BE
+                | AFMT_S24_LE
+                | AFMT_S24_BE
+                | AFMT_S32_LE
+                | AFMT_S32_BE
+                | AFMT_F32_LE
+                | AFMT_F32_BE,
             min_channels: 1,
             max_channels: 2,
             min_rate: 8000,
@@ -800,16 +814,21 @@ impl Drop for Dsp {
 // the AFMT_CHANNEL field, sound.h:344); approximate widths are fine - the
 // quantum this feeds is a floor, and overstating errs toward more margin
 fn afmt_frame_bytes(format: u32) -> u32 {
-    let width: u32 = if format & (AFMT_S32_LE | AFMT_S32_BE | 0x0000c000 | 0x30000000) != 0 {
-        4 // S32/U32/F32
-    } else if format & 0x000f0000 != 0 {
-        // AFMT_S24/U24
-        3
-    } else if format & (AFMT_S16_LE | AFMT_S16_BE | 0x00000180) != 0 {
-        2
-    } else {
-        1
-    };
+    const AFMT_U16_MASK: u32 = 0x00000180;
+    const AFMT_U24_MASK: u32 = 0x000c0000;
+    const AFMT_U32_MASK: u32 = 0x0000c000;
+
+    let width: u32 =
+        if format & (AFMT_S32_LE | AFMT_S32_BE | AFMT_F32_LE | AFMT_F32_BE | AFMT_U32_MASK) != 0 {
+            4 // S32/U32/F32
+        } else if format & (AFMT_S24_LE | AFMT_S24_BE | AFMT_U24_MASK) != 0 {
+            // 3-byte S24/U24
+            3
+        } else if format & (AFMT_S16_LE | AFMT_S16_BE | AFMT_U16_MASK) != 0 {
+            2
+        } else {
+            1
+        };
     let channels = ((format & 0x07f00000) >> 20).max(1); // AFMT_CHANNEL (sound.h:344)
     width * channels
 }

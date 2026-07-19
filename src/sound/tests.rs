@@ -26,6 +26,26 @@ fn advertised_quantum_cap() {
 }
 
 #[test]
+fn pcm_format_widths_cover_u8_float_and_three_byte_24() {
+    const STEREO: u32 = 2 << 20;
+
+    assert_eq!(super::afmt_frame_bytes(super::AFMT_U8), 1);
+    assert_eq!(super::afmt_frame_bytes(super::AFMT_U8 | STEREO), 2);
+    assert_eq!(super::afmt_frame_bytes(super::AFMT_S24_LE), 3);
+    assert_eq!(super::afmt_frame_bytes(super::AFMT_S24_BE | STEREO), 6);
+    assert_eq!(super::afmt_frame_bytes(super::AFMT_F32_LE), 4);
+    assert_eq!(super::afmt_frame_bytes(super::AFMT_F32_BE | STEREO), 8);
+}
+
+#[test]
+fn fallback_formats_cover_the_supported_surface() {
+    let mapped = crate::utils::FORMAT_MAP
+        .iter()
+        .fold(0, |formats, (oss, _, _)| formats | oss);
+    assert_eq!(super::DspCaps::fallback().formats, mapped);
+}
+
+#[test]
 fn drain_quantum_probe() {
     for unit in [0u32, 1, 6] {
         let node = format!("/dev/dsp{unit}"); // the production string shape
