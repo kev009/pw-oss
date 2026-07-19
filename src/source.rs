@@ -455,13 +455,13 @@ fn try_open_configure(
 fn process_ports(state: &mut DataState<SourceDir>) -> c_int {
     let mut result = SPA_STATUS_OK as i32;
 
-    // indexed (not iter_mut) so the resetup arms below can end the &mut port
+    // indexed (not iter_mut) so the rebuild arms below can end the &mut port
     // borrow, borrow the whole State, and re-borrow the port
     for port_idx in 0..state.ports.len() {
         // Consume any completed background rebuild before the cycle reads the
         // port (it may swap in a fresh device or clear the config); a rebuild
         // still in flight skips the cycle.
-        if crate::node::poll_resetup(state, port_idx) {
+        if crate::node::poll_rebuild(state, port_idx) {
             continue;
         }
         let port = &mut state.ports[port_idx];
@@ -476,9 +476,9 @@ fn process_ports(state: &mut DataState<SourceDir>) -> c_int {
         if port.dsp.is_closed() {
             // Suspend closed the device but the host restarted without a fresh
             // format; rebuild off-loop instead of tripping the dsp state
-            // asserts (the &mut port borrow ends here: queue_resetup snapshots
+            // asserts (the &mut port borrow ends here: queue_rebuild snapshots
             // an owned request and owns the pending claim)
-            crate::node::queue_resetup(state, port_idx);
+            crate::node::queue_rebuild(state, port_idx);
             continue;
         }
 
@@ -548,9 +548,9 @@ fn process_ports(state: &mut DataState<SourceDir>) -> c_int {
             // rather than commit a fill target the current ring can't hold; if
             // even that fails (no main loop), keep running at the stale
             // geometry - degraded, but nothing stalls
-            // (the &mut port borrow ends here: queue_resetup snapshots an
+            // (the &mut port borrow ends here: queue_rebuild snapshots an
             // owned request and owns the pending claim)
-            let pending = crate::node::queue_resetup(state, port_idx);
+            let pending = crate::node::queue_rebuild(state, port_idx);
             if pending {
                 continue;
             }
@@ -889,7 +889,7 @@ mod tests {
             setup_period: period,
             bw_adapt: Default::default(),
             setup_blocksize: 1024,
-            resetup_pending: false,
+            rebuild_pending: false,
             generation: 0,
             was_matching: false,
             warn_limit: crate::utils::RateLimit::new(),

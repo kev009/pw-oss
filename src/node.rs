@@ -9,7 +9,36 @@ use std::os::raw::{c_char, c_int, c_void};
 
 use libspa::sys::*;
 
+mod events;
+mod rebuild;
+
+use events::NodeEvents;
+use rebuild::{
+    MainEvent, NodeShared, RebuildWork, RebuildWorkSlot, RebuildWorker, install_device,
+    queue_main_event, release_rebuild_takeover,
+};
+pub(crate) use rebuild::{
+    apply_props_param, normalize_fragment, poll_rebuild, queue_rebuild, store_and_rebuild,
+};
+
+#[cfg(test)]
+use rebuild::{
+    DepositOnUnwind, DeviceSwap, RebuildRequest, SwapOutcome, WORK_BUSY, WORK_CLOSED,
+    WorkSubmission, rebuild_request_is_current, rebuild_task,
+};
+
 pub(crate) const MAX_PORTS: usize = 1;
+
+trait MutexExt<T> {
+    fn lock_unpoisoned(&self) -> std::sync::MutexGuard<'_, T>;
+}
+
+impl<T> MutexExt<T> for std::sync::Mutex<T> {
+    fn lock_unpoisoned(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
 
 // the shared surface of sound::Dsp/sound::DspWriter used by the generic core;
 // the direction-specific ops (write/odelay vs read/ispace) stay on the
@@ -185,295 +214,6 @@ pub(crate) trait Direction: Sized + 'static {
     };
 }
 
-struct EventInfo {
-    node: crate::spa::NodeInfo,
-    port: crate::spa::PortInfo,
-}
-
-enum NodeNotification {
-    Node(Box<crate::spa::NodeInfo>),
-    Port(Box<crate::spa::PortInfo>),
-    Done(c_int),
-    ActivateListeners(std::sync::Arc<crate::spa::ListenerList<spa_node_events>>),
-}
-
-struct PendingNodeNotifications {
-    queue: std::collections::VecDeque<NodeNotification>,
-    dispatching: bool,
-}
-
-// Main-loop-owned listener and info state. The Arc gives queued messages a
-// lifetime-safe endpoint without exposing State across loops. Info mutation
-// is locked only on the main loop; callbacks run after the lock is released,
-// against owned snapshots, so listener reentry cannot alias or invalidate the
-// live payload. The hook list itself follows SPA's main-loop serialization.
-struct NodeEvents<D: Direction> {
-    hooks: crate::spa::ListenerList<spa_node_events>,
-    info: std::sync::Mutex<EventInfo>,
-    pending: std::sync::Mutex<PendingNodeNotifications>,
-    // Changes only when the advertised Format/Buffers state is published.
-    // Deferred FormatLost messages carry the value they observed so a newer
-    // successful format publication cannot be overwritten by a stale task.
-    format_publication_epoch: std::sync::atomic::AtomicU64,
-    _direction: std::marker::PhantomData<fn() -> D>,
-}
-
-struct NodeDispatchClaim<'a, D: Direction>(&'a NodeEvents<D>);
-
-impl<D: Direction> Drop for NodeDispatchClaim<'_, D> {
-    fn drop(&mut self) {
-        self.0
-            .pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .dispatching = false;
-    }
-}
-
-// SAFETY: NodeEvents' safe methods serialize info through the mutex and never
-// expose it. Listener-list access is confined to those methods and the SPA
-// add-listener entry point, all of which the host calls on the main loop.
-// Cross-loop users hold only Weak/Arc handles and queue an owned MainEvent
-// back to that loop; they never traverse the list themselves.
-unsafe impl<D: Direction> Send for NodeEvents<D> {}
-unsafe impl<D: Direction> Sync for NodeEvents<D> {}
-
-impl<D: Direction> NodeEvents<D> {
-    fn new() -> Self {
-        Self {
-            hooks: crate::spa::ListenerList::new(),
-            info: std::sync::Mutex::new(EventInfo {
-                node: crate::spa::NodeInfo::new(),
-                port: crate::spa::PortInfo::new(),
-            }),
-            pending: std::sync::Mutex::new(PendingNodeNotifications {
-                queue: std::collections::VecDeque::new(),
-                dispatching: false,
-            }),
-            format_publication_epoch: std::sync::atomic::AtomicU64::new(0),
-            _direction: std::marker::PhantomData,
-        }
-    }
-
-    fn with_info<R>(
-        &self,
-        apply: impl FnOnce(&mut crate::spa::NodeInfo, &mut crate::spa::PortInfo) -> R,
-    ) -> R {
-        let mut info = self
-            .info
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let EventInfo { node, port } = &mut *info;
-        apply(node, port)
-    }
-
-    fn with_node_info<R>(&self, apply: impl FnOnce(&mut crate::spa::NodeInfo) -> R) -> R {
-        self.with_info(|node, _port| apply(node))
-    }
-
-    fn with_port_info<R>(&self, apply: impl FnOnce(&mut crate::spa::PortInfo) -> R) -> R {
-        self.with_info(|_node, port| apply(port))
-    }
-
-    fn initial_snapshots(&self) -> (Box<crate::spa::NodeInfo>, Box<crate::spa::PortInfo>) {
-        self.with_info(|node, port| {
-            let mut node = node.snapshot();
-            let mut port = port.snapshot();
-            let _ = node.replace_change_mask(crate::spa::SPA_NODE_CHANGE_MASK_ALL as u64);
-            let _ = port.replace_change_mask(crate::spa::SPA_PORT_CHANGE_MASK_ALL as u64);
-            (node, port)
-        })
-    }
-
-    fn queue_node_info(&self) {
-        let snapshot = self.with_node_info(|info| {
-            let snapshot = info.snapshot();
-            let _ = info.replace_change_mask(0);
-            snapshot
-        });
-        self.pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .queue
-            .push_back(NodeNotification::Node(snapshot));
-    }
-
-    fn queue_port_info(&self) {
-        let snapshot = self.with_port_info(|info| {
-            let snapshot = info.snapshot();
-            let _ = info.replace_change_mask(0);
-            snapshot
-        });
-        self.pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .queue
-            .push_back(NodeNotification::Port(snapshot));
-    }
-
-    fn format_publication_epoch(&self) -> u64 {
-        self.format_publication_epoch
-            .load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    fn advance_format_publication_epoch(&self) {
-        self.format_publication_epoch
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    }
-
-    // Register immediately on the active list when no older FIFO work exists.
-    // Otherwise enqueue an activation barrier before the synchronous initial
-    // callbacks: older notifications stay ahead of the new listener, while
-    // anything those callbacks queue lands after it.
-    unsafe fn with_new_listener<R>(
-        &self,
-        listener: *mut spa_hook,
-        events: *const spa_node_events,
-        data: *mut c_void,
-        initial: impl FnOnce(&crate::spa::ListenerList<spa_node_events>) -> R,
-    ) -> R {
-        let deferred = {
-            let mut pending = self
-                .pending
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if pending.dispatching || !pending.queue.is_empty() {
-                // Arc is intentional even though ListenerList itself remains
-                // main-loop-only: NodeEvents has cross-loop Arc handles, while
-                // this atomic owner keeps a reentrantly drained cohort alive
-                // through its synchronous initial callback.
-                #[allow(clippy::arc_with_non_send_sync)]
-                let hooks = std::sync::Arc::new(crate::spa::ListenerList::new());
-                pending
-                    .queue
-                    .push_back(NodeNotification::ActivateListeners(hooks.clone()));
-                Some(hooks)
-            } else {
-                None
-            }
-        };
-        let hooks = deferred.as_deref().unwrap_or(&self.hooks);
-        unsafe { hooks.with_isolated_listener(listener, events, data, || initial(hooks)) }
-    }
-
-    // SAFETY: no reference into the associated State may be live. Listener
-    // code may re-enter any node method and create a new mutable State borrow.
-    unsafe fn dispatch(&self, notification: &NodeNotification) {
-        match notification {
-            NodeNotification::Node(snapshot) => self.hooks.emit(|f, data| {
-                if let Some(info) = f.info {
-                    // through the C listener vtable (add_listener contract)
-                    unsafe { info(data, snapshot.raw()) };
-                }
-            }),
-            NodeNotification::Port(snapshot) => self.hooks.emit(|f, data| {
-                if let Some(info) = f.port_info {
-                    // through the C listener vtable (add_listener contract)
-                    unsafe { info(data, D::DIRECTION, 0, snapshot.raw()) };
-                }
-            }),
-            NodeNotification::Done(seq) => self.hooks.emit(|f, data| {
-                if let Some(result) = f.result {
-                    unsafe { result(data, *seq, 0, 0, std::ptr::null()) };
-                }
-            }),
-            NodeNotification::ActivateListeners(hooks) => {
-                // SAFETY: drain processes barriers between listener
-                // traversals; the isolated batch finished its initial
-                // callbacks before it was eligible to reach this point.
-                unsafe { self.hooks.append_from(hooks) };
-            }
-        }
-    }
-
-    // Claim the endpoint's dispatch turn. A reentrant producer appends to the
-    // same FIFO and returns; the outer owner completes its current transaction
-    // before draining the nested one.
-    fn begin_dispatch(&self) -> Option<NodeDispatchClaim<'_, D>> {
-        let mut pending = self
-            .pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if pending.dispatching {
-            None
-        } else {
-            pending.dispatching = true;
-            Some(NodeDispatchClaim(self))
-        }
-    }
-
-    // Called only by the owner returned from begin_dispatch(), after the
-    // surrounding State borrow has ended. Pop one notification at a time so
-    // the mutex is never held across arbitrary listener code.
-    // SAFETY: as dispatch(); callers must end their State phase first.
-    unsafe fn drain(&self, _claim: &NodeDispatchClaim<'_, D>) {
-        loop {
-            let notification = {
-                let mut pending = self
-                    .pending
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                match pending.queue.pop_front() {
-                    Some(notification) => notification,
-                    None => return,
-                }
-            };
-            unsafe { self.dispatch(&notification) };
-        }
-    }
-
-    // SAFETY: no associated State reference may be live. Reentrant flushes
-    // only enqueue; the outer drain preserves FIFO transaction ordering.
-    unsafe fn flush(&self) {
-        if let Some(claim) = self.begin_dispatch() {
-            unsafe { self.drain(&claim) };
-        }
-    }
-
-    fn record_format_lost(&self) {
-        self.with_port_info(|info| {
-            let _ = info.replace_change_mask(0);
-            info.set_param_flags(SPA_PARAM_Format, SPA_PARAM_INFO_WRITE);
-            info.set_param_flags(SPA_PARAM_Buffers, 0);
-            // This serial flip is what audioadapter reacts to: an EnumFormat
-            // flags change sets recheck_format and starts renegotiation.
-            info.bump_param(SPA_PARAM_EnumFormat);
-        });
-        self.queue_port_info();
-    }
-
-    fn record_current_format_lost(&self) {
-        self.record_format_lost();
-        // Retire duplicate deferred losses before the queued snapshot is
-        // flushed and listeners can re-enter.
-        self.advance_format_publication_epoch();
-    }
-
-    // SAFETY: no State reference may be live during listener dispatch.
-    unsafe fn emit_format_lost_now(&self, expected_epoch: u64) {
-        if self.format_publication_epoch() != expected_epoch {
-            return;
-        }
-        self.record_current_format_lost();
-        unsafe { self.flush() };
-    }
-
-    // SAFETY: no associated State reference may be live.
-    unsafe fn emit_done(&self, seq: c_int) {
-        self.pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .queue
-            .push_back(NodeNotification::Done(seq));
-        unsafe { self.flush() };
-    }
-
-    // SAFETY: no associated State reference may be live.
-    unsafe fn emit_result(&self, seq: c_int, result: &spa_result_node_params) {
-        crate::spa::node_emit_result(&self.hooks, seq, 0, SPA_RESULT_TYPE_NODE_PARAMS, result);
-    }
-}
-
 #[repr(C)]
 // The pinned FFI shell. Runtime entry points project only one disjoint field
 // from its raw pointer; they never create a reference to this whole object.
@@ -509,7 +249,7 @@ pub(crate) struct MainState<D: Direction> {
     // Owns the only thread that may execute an asynchronous device
     // open/configure/close. DataState holds only its bounded submission
     // endpoint; clear stops and joins this worker before State is dropped.
-    resetup_worker: ResetupWorker<D>,
+    rebuild_worker: RebuildWorker<D>,
     pub ring_cap_published: bool,
     pub ext: D::MainExt,
 }
@@ -528,18 +268,18 @@ pub(crate) struct DataState<D: Direction> {
     pub callbacks: NodeCallbacks,
     pub ports: [Port<D>; MAX_PORTS],
     pub oss_fragment: u32, // normalized fragment size in bytes (0 = automatic); read by the prime paths
-    // the Arc'd rendezvous with the owned resetup worker and
+    // the Arc'd rendezvous with the owned rebuild worker and
     // clear(); outlives the FFI shell by construction (see NodeShared)
     pub shared: std::sync::Arc<NodeShared<D>>,
     // The data loop is the sole producer. A device-bearing command that
     // finds the worker slot occupied stays here and is retried before any
     // further completion is consumed; it is never dropped on the RT path.
-    resetup_work: std::sync::Arc<ResetupWorkSlot<D>>,
-    deferred_work: Option<ResetupWork<D>>,
+    rebuild_work: std::sync::Arc<RebuildWorkSlot<D>>,
+    deferred_work: Option<RebuildWork<D>>,
     // Main-thread synchronous installs take this data-loop lease before
     // waiting for the worker. While set, process neither consumes a
     // completion nor submits new work.
-    resetup_takeover: bool,
+    rebuild_takeover: bool,
     events: std::sync::Arc<NodeEvents<D>>,
     // Data-loop-owned: process_ports records endpoint work here, and generic
     // process() extracts it before ending its DataState phase. Delivery happens
@@ -607,11 +347,11 @@ pub(crate) struct Port<D: Direction> {
     pub setup_period: u32, // device bytes per graph cycle the stream/servo was set up for
     pub bw_adapt: crate::dll::BwAdapt, // variance-adaptive bandwidth (ALSA scheme)
     pub setup_blocksize: u32, // device fragment size (measurement quantization)
-    // A main-loop device rebuild is in flight; skip cycles until poll_resetup
+    // A main-loop device rebuild is in flight; skip cycles until poll_rebuild
     // consumes its completion. Data-loop-owned: set when the order is queued,
     // cleared when the completion swap is consumed (or by the install/suspend
     // swap closures, which also run on this loop) - no other thread touches it.
-    pub resetup_pending: bool,
+    pub rebuild_pending: bool,
     // Data-loop-owned rebuild fence. Increment it whenever the port's device
     // or configuration changes. A completion applies only when its snapshot
     // still matches; wrapping is safe because the fence uses equality only.
@@ -1157,7 +897,7 @@ fn timeout_servo<D: Direction>(state: &mut DataState<D>, nsec: u64, rate: u32) -
         let device_rate = device_rate.max(1);
         if !port.dsp.is_running()
             || port.setup_period == 0
-            || port.resetup_pending
+            || port.rebuild_pending
             || !D::servo_ready(port)
         {
             continue;
@@ -1524,12 +1264,12 @@ unsafe extern "C" fn send_command<D: Direction>(
     let state = object.cast::<State<D>>();
     assert!(!state.is_null(), "object is not supposed to be null");
     let control = unsafe { DataControl::from_raw(state) };
-    let (log, shared, resetup_work) = unsafe {
+    let (log, shared, rebuild_work) = unsafe {
         let main = std::ptr::addr_of!((*state).main);
         (
             (*main).log.clone(),
             (*main).shared.clone(),
-            (*main).resetup_worker.endpoint(),
+            (*main).rebuild_worker.endpoint(),
         )
     };
 
@@ -1584,10 +1324,10 @@ unsafe extern "C" fn send_command<D: Direction>(
             let Some(deferred) = control.query(|state| {
                 state.started = false;
                 update_timers(state);
-                state.resetup_takeover = true;
+                state.rebuild_takeover = true;
                 let deferred = state.deferred_work.take();
                 for port in &mut state.ports {
-                    port.resetup_pending = true;
+                    port.rebuild_pending = true;
                     port.generation = port.generation.wrapping_add(1);
                     state
                         .shared
@@ -1602,12 +1342,12 @@ unsafe extern "C" fn send_command<D: Direction>(
             // Catch both a completion deposited before the fence and one
             // from a worker that passed its final check just before it.
             shared.discard_swap();
-            if !resetup_work.wait_idle() {
-                release_resetup_takeover(&control, 0);
+            if !rebuild_work.wait_idle() {
+                release_rebuild_takeover(&control, 0);
                 return -libc::EIO;
             }
             shared.discard_swap();
-            if !release_resetup_takeover(&control, 0) {
+            if !release_rebuild_takeover(&control, 0) {
                 return -libc::EIO;
             }
             0
@@ -1629,12 +1369,12 @@ unsafe extern "C" fn send_command<D: Direction>(
                 state.started = false;
                 update_timers(state);
                 D::on_suspend_loop(state);
-                state.resetup_takeover = true;
+                state.rebuild_takeover = true;
                 let deferred = state.deferred_work.take();
                 let mut placeholders = placeholders.into_iter();
                 let devices: [(usize, D::Device); MAX_PORTS] = std::array::from_fn(|index| {
                     let port = &mut state.ports[index];
-                    port.resetup_pending = true;
+                    port.rebuild_pending = true;
                     port.generation = port.generation.wrapping_add(1);
                     state
                         .shared
@@ -1654,8 +1394,8 @@ unsafe extern "C" fn send_command<D: Direction>(
             // (possibly exclusive) device across the whole suspended stretch
             // (nothing polls while stopped); close it now, off the RT path.
             shared.discard_swap();
-            if !resetup_work.wait_idle() {
-                release_resetup_takeover(&control, 0);
+            if !rebuild_work.wait_idle() {
+                release_rebuild_takeover(&control, 0);
                 return -libc::EIO;
             }
             shared.discard_swap();
@@ -1668,14 +1408,14 @@ unsafe extern "C" fn send_command<D: Direction>(
                 let mut devices = devices.into_iter();
                 let placeholders: [D::Device; MAX_PORTS] = std::array::from_fn(|index| {
                     let (_, dsp) = devices.next().expect("one suspended device per port");
-                    state.ports[index].resetup_pending = false;
+                    state.ports[index].rebuild_pending = false;
                     std::mem::replace(&mut state.ports[index].dsp, dsp)
                 });
-                state.resetup_takeover = false;
+                state.rebuild_takeover = false;
                 placeholders
             });
             let Some(placeholders) = placeholders else {
-                release_resetup_takeover(&control, 0);
+                release_rebuild_takeover(&control, 0);
                 return -libc::EIO;
             };
             // Closed placeholders still own heap fields; destroy them on main.
@@ -2011,8 +1751,8 @@ fn release_format<D: Direction>(
 ) -> c_int {
     let placeholder = D::Device::new(&state.dsp_path);
     let Some((retired, deferred)) = data.query(move |state| {
-        debug_assert!(!state.resetup_takeover, "format releases serialize");
-        state.resetup_takeover = true;
+        debug_assert!(!state.rebuild_takeover, "format releases serialize");
+        state.rebuild_takeover = true;
         let deferred = state.deferred_work.take();
         let port = &mut state.ports[port_idx];
         let retired = std::mem::replace(&mut port.dsp, placeholder);
@@ -2026,7 +1766,7 @@ fn release_format<D: Direction>(
             .shared
             .generation
             .store(port.generation, std::sync::atomic::Ordering::Release);
-        port.resetup_pending = true;
+        port.rebuild_pending = true;
         (retired, deferred)
     }) else {
         return -libc::EIO; // the loop still holds the buffers; freeing them would dangle
@@ -2037,12 +1777,12 @@ fn release_format<D: Direction>(
     // and drain both sides of the wait so a late Installed deposit cannot
     // retain an exclusive fd indefinitely.
     state.shared.discard_swap();
-    if !state.resetup_worker.wait_idle() {
-        release_resetup_takeover(data, port_idx);
+    if !state.rebuild_worker.wait_idle() {
+        release_rebuild_takeover(data, port_idx);
         return -libc::EIO;
     }
     state.shared.discard_swap();
-    if release_resetup_takeover(data, port_idx) {
+    if release_rebuild_takeover(data, port_idx) {
         0
     } else {
         -libc::EIO
@@ -2205,1002 +1945,6 @@ unsafe fn port_set_param_inner<D: Direction>(
 // clamp to [64, 16384] bytes. The kernel would take 16..65536 (dsp.c:1251
 // RANGE(fragln, 4, 16)); staying well inside keeps the request grantable
 // verbatim and the buffer budget sane (CHN_2NDBUFMAXSIZE, channel.h:442).
-pub(crate) fn normalize_fragment(v: u32) -> u32 {
-    if v == 0 {
-        0
-    } else {
-        (1u32 << (31 - v.leading_zeros())).clamp(64, 16384)
-    }
-}
-
-// The oss.* tunable live re-apply path: store the new loop-owned value on the
-// data loop (the prime paths read it there), then rebuild any running port
-// from this (main) thread so the next cycle re-primes with the new layout.
-// Synchronous contract (see install_device): main-thread entry, blocking
-// frame-bounded invokes only.
-pub(crate) fn store_and_rebuild<D: Direction>(
-    state: &mut MainState<D>,
-    data: &DataControl<D>,
-    store: impl FnOnce(&mut DataState<D>) + Send,
-) -> c_int {
-    let configs: Option<[Option<PortConfig>; MAX_PORTS]> = data.query(move |data| {
-        store(data);
-        std::array::from_fn(|i| {
-            data.ports[i]
-                .dsp
-                .is_running()
-                .then(|| data.ports[i].config.clone())
-                .flatten()
-        })
-    });
-    let Some(configs) = configs else {
-        return -libc::EIO;
-    };
-    for (port_idx, config) in configs.into_iter().enumerate() {
-        if let Some(config) = config {
-            if install_device(state, data, port_idx, config) != 0 {
-                // the host didn't initiate this rebuild; without a re-announce it
-                // keeps believing a format is set on a dead port
-                emit_format_lost(state);
-            }
-        }
-    }
-    0
-}
-
-// announce a Props change (so readback stays fresh), then apply it through
-// store_and_rebuild; shared by the oss.* prop appliers of both directions
-pub(crate) fn apply_props_param<D: Direction>(
-    state: &mut MainState<D>,
-    data: &DataControl<D>,
-    store: impl FnOnce(&mut DataState<D>) + Send,
-) -> c_int {
-    state.events.with_node_info(|info| {
-        let _ = info.replace_change_mask(0);
-        info.bump_param(SPA_PARAM_Props);
-    });
-    emit_node_info(state);
-    store_and_rebuild(state, data, store)
-}
-
-// Release the synchronous rebuild lease after an error. A dead loop cannot
-// observe the retained flag, so failure remains best-effort.
-fn release_resetup_takeover<D: Direction>(data: &DataControl<D>, port_idx: usize) -> bool {
-    data.invoke(move |state| {
-        state.resetup_takeover = false;
-        state.ports[port_idx].resetup_pending = false;
-    })
-}
-
-// Open and configure on the main thread because device operations may block,
-// then swap the device on the data loop. The takeover fence invalidates
-// asynchronous rebuilds while the synchronous install is active. On EBUSY,
-// retire the current exclusive device and retry; other failures leave the
-// port cleared.
-pub(crate) fn install_device<D: Direction>(
-    state: &mut MainState<D>,
-    data: &DataControl<D>,
-    port_idx: usize,
-    config: PortConfig,
-) -> c_int {
-    // Acquire the sole-producer takeover on the data loop before waiting.
-    // The generation bump makes both queued and active resetups stale;
-    // resetup_takeover makes later cycles skip without consuming or
-    // submitting until the final swap releases the lease.
-    let Some(deferred) = data.query(move |data| {
-        debug_assert!(!data.resetup_takeover, "synchronous installs serialize");
-        data.resetup_takeover = true;
-        let deferred = data.deferred_work.take();
-        let port = &mut data.ports[port_idx];
-        port.resetup_pending = true;
-        port.generation = port.generation.wrapping_add(1);
-        data.shared
-            .generation
-            .store(port.generation, std::sync::atomic::Ordering::Release);
-        deferred
-    }) else {
-        return -libc::EIO;
-    };
-    // Any retained RetireAndRetry/device ownership now dies here, never on
-    // the data loop.
-    drop(deferred);
-
-    // Close a completion that predates the fence, then wait until an active
-    // command observes the generation change and finishes. The second drain
-    // catches the completion it may have deposited before becoming idle.
-    state.shared.discard_swap();
-    if !state.resetup_worker.wait_idle() {
-        release_resetup_takeover(data, port_idx);
-        return -libc::EIO;
-    }
-    state.shared.discard_swap();
-
-    let mut new_dsp = D::Device::new(&state.dsp_path);
-    // oss_fragment only mutates from main-thread calls, serialized with us
-    let mut res = D::try_open_configure(&mut new_dsp, &config, state.oss_fragment, &state.log);
-
-    if res == -libc::EBUSY {
-        let closed = D::Device::new(&state.dsp_path);
-        let Some(retired) =
-            data.query(move |state| std::mem::replace(&mut state.ports[port_idx].dsp, closed))
-        else {
-            release_resetup_takeover(data, port_idx);
-            return -libc::EIO;
-        };
-        drop(retired); // closes the old fd here, off the RT path
-        res = D::try_open_configure(&mut new_dsp, &config, state.oss_fragment, &state.log);
-    }
-
-    let ok = res == 0;
-    let cap_config = config.clone();
-    let old_dsp = data.query(move |state| {
-        let port = &mut state.ports[port_idx];
-        // new_dsp is a closed writer/reader when negotiation failed above
-        let old = std::mem::replace(&mut port.dsp, new_dsp);
-        port.config = if ok { Some(config) } else { None };
-        // Retire any in-flight background rebuild.
-        port.generation = port.generation.wrapping_add(1);
-        state
-            .shared
-            .generation
-            .store(port.generation, std::sync::atomic::Ordering::Release);
-        port.resetup_pending = false;
-        port.was_matching = false; // force a relock when matching resumes
-        D::on_device_swapped(state, port_idx);
-        state.resetup_takeover = false;
-        old
-    });
-    let swapped = old_dsp.is_some();
-    drop(old_dsp); // ditto
-
-    if !swapped {
-        release_resetup_takeover(data, port_idx);
-        return -libc::EIO; // the swap never ran; the port keeps its old state
-    }
-    if res == 0 {
-        publish_ring_quantum_cap(state, &cap_config); // stride is known now
-    }
-    res
-}
-
-// FreeBSD caps every soft ring at CHN_2NDBUFMAXSIZE (131 KiB); at fat strides
-// (a 20-channel S32 interface is 80 bytes/frame) the ring holds only ~1.6
-// periods at quantum 1024 and both directions glitch structurally - the
-// capture side has no room for arrival jitter, the playback side can't hold
-// two quanta plus the delay target. Publish node.max-latency once the stride
-// is known so the graph never negotiates a quantum the kernel ring can't hold
-// four of (pw_impl_node parses the fraction into max_latency, which caps the
-// driver quantum). Emitted only when the cap bites below the common
-// 2048-frame default in TIME, at a conservative 44.1 kHz reference -
-// clock.rate is unknown here and an over-published cap is inert (sound.rs
-// advertised_quantum_cap_frames); published once -
-// the props dict is append-only, and a stride change without a node rebuild
-// is not worth a duplicate entry.
-fn publish_ring_quantum_cap<D: Direction>(state: &mut MainState<D>, config: &PortConfig) {
-    let stride = config.stride.max(1);
-    let rate = config.rate;
-    // the shared ring policy (sound.rs); the published fraction is time-based
-    // (frames/device rate), so it needs no graph-rate scaling
-    let Some(frames) = crate::sound::advertised_quantum_cap_frames(stride, rate) else {
-        return;
-    };
-    if state.ring_cap_published {
-        return;
-    }
-    state.ring_cap_published = true;
-    crate::info!(
-        state.log,
-        "kernel ring ({} bytes) at stride {} holds 4 periods only up to \
-    quantum {}; publishing node.max-latency",
-        crate::sound::ring_byte_cap(stride, rate),
-        stride,
-        frames
-    );
-    state.events.with_node_info(|info| {
-        let _ = info.replace_change_mask(0);
-        info.add_prop("node.max-latency", format!("{frames}/{rate}"));
-    });
-    emit_node_info(state);
-}
-
-// Announce a failed background rebuild so the session manager renegotiates
-// the cleared format.
-fn emit_format_lost<D: Direction>(state: &MainState<D>) {
-    state.events.record_current_format_lost();
-}
-
-// Asynchronous rebuilds carry owned requests from the data loop to the
-// blocking-I/O worker. The worker never accesses State: it returns an owned
-// DeviceSwap through NodeShared, and the data loop accepts it only when the
-// port generation still matches. Retired devices also move to the worker so
-// potentially blocking closes stay off the real-time path.
-
-// The completion mailbox has one slot; multi-port support requires one slot
-// per port.
-const _: () = assert!(
-    MAX_PORTS == 1,
-    "NodeShared's completion mailbox assumes a single port"
-);
-
-// Shared state for the data loop, rebuild worker, and clear(). Worker guards
-// keep it alive independently of State.
-pub(crate) struct NodeShared<D: Direction> {
-    // A lifetime-safe main-loop event endpoint. State owns the sole strong
-    // handle; queued work can test/upgrade this Weak without ever obtaining
-    // a State pointer. Once clear drops State, later deliveries are no-ops.
-    events: std::sync::Weak<NodeEvents<D>>,
-    // mirror of State.started, written by send_command on the main thread
-    // (Start/Pause/Suspend), read by resetup_task on the worker: a
-    // stop that lands after a task was queued must win, or the task would
-    // hand a stopped node an open (possibly exclusive) device
-    started: std::sync::atomic::AtomicBool,
-    // Mirror of the single data-loop port's generation. Worker resetup
-    // work checks it before and after an open so a released/superseded
-    // request cannot leave an exclusive stale fd in the completion slot.
-    generation: std::sync::atomic::AtomicU64,
-    // The completion mailbox: a preallocated single-slot cell. The worker
-    // deposits (replacing an unconsumed predecessor); the main loop
-    // may discard during synchronous changes and teardown, while the
-    // data loop consumes at cycle start. The RT side never locks or
-    // allocates: take_swap is one CAS plus the in-place move, and when it
-    // loses the race against a mid-deposit writer it returns None and polls
-    // again next cycle. Only the non-RT writer may spin, and only while
-    // the reader is inside its few-instruction move. The value lives in the
-    // UnsafeCell and is touched exclusively by whoever holds SLOT_BUSY -
-    // the protocol behind the manual Sync impl below.
-    slot_state: std::sync::atomic::AtomicU8,
-    slot: std::cell::UnsafeCell<Option<DeviceSwap<D>>>,
-}
-
-const SLOT_EMPTY: u8 = 0; // no message; the cell is None
-const SLOT_FULL: u8 = 1; // one message; the cell is Some
-const SLOT_BUSY: u8 = 2; // one side is moving the value; the cell is theirs
-
-// SAFETY: the slot cell is only read or written by the thread that CASed
-// slot_state to SLOT_BUSY (exchange/take_swap below), and the FULL store
-// after a deposit is Release, paired with take_swap's Acquire CAS - so the
-// message payload is published before the consumer can move it out. The
-// remaining fields are atomics or thread-safe Weak handles.
-unsafe impl<D: Direction> Sync for NodeShared<D> {}
-
-// Owned event sent from the data loop to the main-loop endpoint.
-enum MainEvent {
-    // Re-announce a format cleared by a failed background rebuild.
-    FormatLost { expected_publication_epoch: u64 },
-}
-
-impl<D: Direction> NodeShared<D> {
-    fn new(events: std::sync::Weak<NodeEvents<D>>) -> Self {
-        Self {
-            events,
-            started: std::sync::atomic::AtomicBool::new(false),
-            generation: std::sync::atomic::AtomicU64::new(0),
-            slot_state: std::sync::atomic::AtomicU8::new(SLOT_EMPTY),
-            slot: std::cell::UnsafeCell::new(None),
-        }
-    }
-
-    // Queued tasks may deliver until clear() drops the event endpoint.
-    fn is_alive(&self) -> bool {
-        self.events.strong_count() != 0
-    }
-
-    // Deliver queued messages on the main-loop thread. A dead Weak drops them.
-    fn main_event(&self, event: MainEvent) {
-        let Some(events) = self.events.upgrade() else {
-            return;
-        };
-        match event {
-            // SAFETY: this endpoint message contains no State reference and
-            // its caller ended the process DataState phase before queueing it.
-            MainEvent::FormatLost {
-                expected_publication_epoch,
-            } => unsafe { events.emit_format_lost_now(expected_publication_epoch) },
-        }
-    }
-
-    // The non-RT writer side of the slot protocol: acquire SLOT_BUSY from
-    // EMPTY or FULL, swap the new value in, publish the resulting state, and
-    // hand the predecessor back to the caller to drop off the RT path.
-    fn exchange(&self, new: Option<DeviceSwap<D>>) -> Option<DeviceSwap<D>> {
-        use std::sync::atomic::Ordering;
-        loop {
-            let cur = self.slot_state.load(Ordering::Relaxed);
-            if cur == SLOT_BUSY {
-                // Writers are worker/main-loop only, never RT. Yield instead
-                // of burning a core if the few-instruction slot owner was
-                // preempted while BUSY.
-                std::thread::yield_now();
-                continue;
-            }
-            debug_assert!(cur == SLOT_EMPTY || cur == SLOT_FULL);
-            if self
-                .slot_state
-                .compare_exchange_weak(cur, SLOT_BUSY, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
-            {
-                let full = new.is_some();
-                // SAFETY: SLOT_BUSY is held; the cell is exclusively ours
-                let prev = unsafe { std::mem::replace(&mut *self.slot.get(), new) };
-                self.slot_state
-                    .store(if full { SLOT_FULL } else { SLOT_EMPTY }, Ordering::Release);
-                return prev;
-            }
-        }
-    }
-
-    // worker: leave the completion for the data loop (replacing an
-    // unconsumed predecessor, whose device closes here, off the RT path)
-    fn deposit(&self, swap: DeviceSwap<D>) {
-        let prev = self.exchange(Some(swap));
-        drop(prev);
-    }
-
-    // Data loop (single consumer): the completion, if one arrived. Never
-    // waits: a writer mid-deposit just reads as "nothing yet".
-    fn take_swap(&self) -> Option<DeviceSwap<D>> {
-        use std::sync::atomic::Ordering;
-        if self
-            .slot_state
-            .compare_exchange(SLOT_FULL, SLOT_BUSY, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            return None; // empty, or a writer holds the slot
-        }
-        // SAFETY: SLOT_BUSY is held; the cell is exclusively ours
-        let swap = unsafe { (*self.slot.get()).take() };
-        debug_assert!(swap.is_some(), "SLOT_FULL always covers a Some cell");
-        self.slot_state.store(SLOT_EMPTY, Ordering::Release);
-        swap
-    }
-
-    // main thread (install_device, Suspend, clear): void any undelivered
-    // completion; its device closes here, off the RT path
-    fn discard_swap(&self) {
-        let dropped = self.exchange(None);
-        drop(dropped);
-    }
-}
-
-// Rebuild request sent to the worker. It contains everything needed to open
-// and configure a device without accessing State.
-pub(crate) struct ResetupRequest<D: Direction> {
-    port_idx: usize,
-    generation: u64,
-    config: PortConfig,
-    path: String,
-    oss_fragment: u32,
-    retried: bool, // the EBUSY retire round trip already happened
-    // RetireAndRetry only: the port's dying fd, closed by the worker under
-    // its unwind guard before the retry opens
-    retire_first: Option<D::Device>,
-    log: crate::spa::Log,
-    // Weak avoids a NodeShared -> mailbox -> retry request -> NodeShared
-    // cycle while a RetireAndRetry completion waits for the data loop.
-    shared: std::sync::Weak<NodeShared<D>>,
-}
-
-// Worker result. The data loop applies it only while the port generation
-// still matches.
-struct DeviceSwap<D: Direction> {
-    port_idx: usize,
-    generation: u64,
-    outcome: SwapOutcome<D>,
-}
-
-enum SwapOutcome<D: Direction> {
-    // open+configure succeeded: install and resume
-    Installed {
-        dsp: D::Device,
-        config: PortConfig,
-    },
-    // the node was stopped when the task ran: drop the pending claim; the
-    // next started cycle re-queues if the port still needs a rebuild
-    Aborted,
-    // open failed with EBUSY and the port's own (dying) fd is the likely
-    // blocker on an exclusive device (bitperfect, vchans off): retire it,
-    // then re-run the request - the retire needs the data loop, so it is
-    // another message round trip
-    RetireAndRetry {
-        request: ResetupRequest<D>,
-        placeholder: D::Device,
-    },
-    // open/configure failed (even after the retire, for EBUSY): the port
-    // loses its format; poll_resetup clears the config and queues the
-    // format-lost re-announce
-    Failed {
-        placeholder: D::Device,
-    },
-}
-
-// Owned commands for the per-node blocking-I/O worker. No variant contains
-// State or a pointer into it. In particular, retirement transfers device
-// ownership all the way to this worker so a Device destructor can never run
-// on the data loop.
-enum ResetupWork<D: Direction> {
-    Resetup(ResetupRequest<D>),
-    RetireDevice(D::Device),
-    RetireSwap(DeviceSwap<D>),
-    #[cfg(test)]
-    Test(Box<dyn FnOnce() + Send>),
-}
-
-enum WorkSubmission<D: Direction> {
-    Submitted,
-    Returned(ResetupWork<D>),
-}
-
-const WORK_EMPTY: u8 = 0;
-const WORK_FULL: u8 = 1;
-const WORK_BUSY: u8 = 2;
-const WORK_CLOSED: u8 = 3;
-
-// A preallocated, single-producer/single-consumer work slot. MAX_PORTS == 1
-// and resetup_pending permit only one rebuild order at a time. DataState's
-// additional deferred_work cell retains the one retirement/retry that can
-// collide with an occupied slot. Submission never waits and never allocates.
-struct ResetupWorkSlot<D: Direction> {
-    stopping: std::sync::atomic::AtomicBool,
-    state: std::sync::atomic::AtomicU8,
-    value: std::cell::UnsafeCell<Option<ResetupWork<D>>>,
-    thread: std::sync::OnceLock<std::thread::Thread>,
-    // The worker sets active while holding this mutex before it takes a
-    // published command. That closes the otherwise-racy gap between an
-    // empty slot and execution for main-thread takeover waits.
-    active: std::sync::Mutex<bool>,
-    idle: std::sync::Condvar,
-}
-
-// SAFETY: the data loop is the sole producer and the worker is the sole
-// consumer. Either side may access value only after changing state from
-// EMPTY/FULL to BUSY; the Release publication of FULL is paired with the
-// worker's Acquire CAS. A failed producer CAS returns its still-owned value.
-unsafe impl<D: Direction> Sync for ResetupWorkSlot<D> {}
-
-impl<D: Direction> ResetupWorkSlot<D> {
-    fn new() -> Self {
-        Self {
-            stopping: std::sync::atomic::AtomicBool::new(false),
-            state: std::sync::atomic::AtomicU8::new(WORK_EMPTY),
-            value: std::cell::UnsafeCell::new(None),
-            thread: std::sync::OnceLock::new(),
-            active: std::sync::Mutex::new(false),
-            idle: std::sync::Condvar::new(),
-        }
-    }
-
-    // Data-loop producer. Ownership is returned on every failure so a
-    // device-bearing command cannot be destroyed in this call.
-    fn try_submit(&self, work: ResetupWork<D>) -> WorkSubmission<D> {
-        self.try_submit_after_claim(work, || {})
-    }
-
-    // The callback is normally empty and optimizes away. Tests use it to
-    // pause a producer after EMPTY->BUSY and deterministically exercise
-    // takeover/shutdown against an in-progress publication.
-    fn try_submit_after_claim(
-        &self,
-        work: ResetupWork<D>,
-        after_claim: impl FnOnce(),
-    ) -> WorkSubmission<D> {
-        use std::sync::atomic::Ordering;
-        if self
-            .state
-            .compare_exchange(WORK_EMPTY, WORK_BUSY, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            return WorkSubmission::Returned(work);
-        }
-        after_claim();
-        // SAFETY: this producer changed EMPTY to BUSY and owns the cell.
-        unsafe { *self.value.get() = Some(work) };
-        self.state.store(WORK_FULL, Ordering::Release);
-        if let Some(thread) = self.thread.get() {
-            thread.unpark();
-        }
-        WorkSubmission::Submitted
-    }
-
-    // Worker consumer. BUSY is reported like empty; the publishing producer
-    // will unpark us after its short in-place move.
-    fn take(&self) -> Option<ResetupWork<D>> {
-        use std::sync::atomic::Ordering;
-        if self
-            .state
-            .compare_exchange(WORK_FULL, WORK_BUSY, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            return None;
-        }
-        // SAFETY: this consumer changed FULL to BUSY and owns the cell.
-        let work = unsafe { (*self.value.get()).take() };
-        debug_assert!(work.is_some(), "WORK_FULL always covers a Some cell");
-        self.state.store(WORK_EMPTY, Ordering::Release);
-        work
-    }
-
-    fn wake(&self) {
-        if let Some(thread) = self.thread.get() {
-            thread.unpark();
-        }
-    }
-
-    // Atomically close the EMPTY claim point. A producer that already owns
-    // BUSY is allowed to publish; the worker drains it before this loop can
-    // win EMPTY->CLOSED. No stale boolean load can reopen the slot afterward.
-    fn close(&self) {
-        use std::sync::atomic::Ordering;
-        loop {
-            match self.state.compare_exchange(
-                WORK_EMPTY,
-                WORK_CLOSED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) | Err(WORK_CLOSED) => return,
-                Err(WORK_FULL | WORK_BUSY) => {
-                    self.wake();
-                    std::thread::yield_now();
-                }
-                Err(state) => unreachable!("invalid resetup work state {state}"),
-            }
-        }
-    }
-
-    // Main thread only, after DataState::resetup_takeover has excluded the
-    // ordinary producer. Wait until every command published before the lease
-    // has been taken and completely processed.
-    fn wait_idle(&self) -> bool {
-        use std::sync::atomic::Ordering;
-        self.wake();
-        let mut active = self
-            .active
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        loop {
-            if !*active && self.state.load(Ordering::Acquire) == WORK_EMPTY {
-                return true;
-            }
-            if self.stopping.load(Ordering::Acquire) {
-                return false;
-            }
-            active = self
-                .idle
-                .wait(active)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
-    }
-}
-
-// MainState's owned worker handle. Drop is deliberately idempotent: init can
-// fail after State is written but before init returns, and drop_in_place must
-// not detach a thread parked on an Arc that otherwise has no shutdown owner.
-struct ResetupWorker<D: Direction> {
-    work: std::sync::Arc<ResetupWorkSlot<D>>,
-    join: Option<std::thread::JoinHandle<()>>,
-}
-
-impl<D: Direction> ResetupWorker<D> {
-    fn start() -> std::io::Result<Self> {
-        let work = std::sync::Arc::new(ResetupWorkSlot::new());
-        let worker_work = work.clone();
-        let join = std::thread::Builder::new()
-            .name(format!("pw-oss-{}-resetup", D::MEDIA_CLASS))
-            .spawn(move || resetup_worker_loop(worker_work))?;
-        // OnceLock cannot already be set: this endpoint was just created.
-        let _ = work.thread.set(join.thread().clone());
-        // Cover the worker parking before the Thread handle was published.
-        work.wake();
-        Ok(Self {
-            work,
-            join: Some(join),
-        })
-    }
-
-    fn endpoint(&self) -> std::sync::Arc<ResetupWorkSlot<D>> {
-        self.work.clone()
-    }
-
-    fn wait_idle(&self) -> bool {
-        self.work.wait_idle()
-    }
-
-    fn stop(&mut self) {
-        use std::sync::atomic::Ordering;
-        let Some(join) = self.join.take() else {
-            return;
-        };
-        self.work.stopping.store(true, Ordering::Release);
-        self.work.wake();
-        self.work.close();
-        self.work.wake();
-        // Per-command panics are contained by the loop. A remaining panic is
-        // still joined here so no thread can outlive its node.
-        let _ = join.join();
-    }
-}
-
-impl<D: Direction> Drop for ResetupWorker<D> {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
-fn resetup_worker_loop<D: Direction>(work: std::sync::Arc<ResetupWorkSlot<D>>) {
-    use std::sync::atomic::Ordering;
-    loop {
-        // Set active under the same mutex takeover waiters use, before
-        // taking the slot. They can therefore never observe EMPTY/idle in
-        // the taken-but-not-yet-executing gap.
-        let command = {
-            let mut active = work
-                .active
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let command = work.take();
-            if command.is_some() {
-                *active = true;
-            }
-            command
-        };
-        if let Some(command) = command {
-            if work.stopping.load(Ordering::Acquire) {
-                // Device-bearing commands are destroyed here, on the worker,
-                // even during shutdown. Resetup orders are simply cancelled.
-                drop(command);
-            } else {
-                // DepositOnUnwind turns a panicking resetup into Aborted; the
-                // outer catch keeps this worker alive for later commands.
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run_resetup_work(command);
-                }));
-            }
-            let mut active = work
-                .active
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *active = false;
-            work.idle.notify_all();
-            continue;
-        }
-        if work.state.load(Ordering::Acquire) == WORK_CLOSED {
-            break;
-        }
-        if work.stopping.load(Ordering::Acquire) {
-            // stop() is waiting to win EMPTY->CLOSED. Yield until a producer
-            // publishes or the close becomes visible.
-            std::thread::yield_now();
-            continue;
-        }
-        std::thread::park();
-    }
-}
-
-fn run_resetup_work<D: Direction>(work: ResetupWork<D>) {
-    match work {
-        ResetupWork::Resetup(request) => resetup_task(request),
-        ResetupWork::RetireDevice(device) => drop(device),
-        ResetupWork::RetireSwap(swap) => drop(swap),
-        #[cfg(test)]
-        ResetupWork::Test(test) => test(),
-    }
-}
-
-// Retry one retained worker command before consuming another completion.
-// false tells the cycle to skip: the retained value may own the currently
-// retiring device and must remain the next operation observed by the worker.
-fn flush_deferred_work<D: Direction>(state: &mut DataState<D>) -> bool {
-    let Some(work) = state.deferred_work.take() else {
-        return true;
-    };
-    match state.resetup_work.try_submit(work) {
-        WorkSubmission::Submitted => true,
-        WorkSubmission::Returned(work) => {
-            state.deferred_work = Some(work);
-            false
-        }
-    }
-}
-
-// Submit without ever dropping on failure. The single deferred cell is free
-// whenever this is called: poll_resetup flushes it before taking a completion,
-// and queue_resetup refuses a second order while one is retained.
-fn submit_or_defer<D: Direction>(state: &mut DataState<D>, work: ResetupWork<D>) {
-    debug_assert!(
-        state.deferred_work.is_none(),
-        "worker work must preserve its single-producer order"
-    );
-    if let WorkSubmission::Returned(work) = state.resetup_work.try_submit(work) {
-        state.deferred_work = Some(work);
-    }
-}
-
-/// Queue an owned worker rebuild order for `port_idx`'s device and mark
-/// the port pending (cycles skip until poll_resetup consumes the
-/// completion). Data loop only. Returns whether an order is now in flight;
-/// false = no config, or an earlier worker command still needs submission.
-/// Callers must not write resetup_pending themselves.
-pub(crate) fn queue_resetup<D: Direction>(state: &mut DataState<D>, port_idx: usize) -> bool {
-    if state.resetup_takeover {
-        return false;
-    }
-    if !flush_deferred_work(state) {
-        return false;
-    }
-    let port = &state.ports[port_idx];
-    let Some(config) = port.config.clone() else {
-        return false; // no negotiated format; nothing to rebuild
-    };
-    let request = ResetupRequest {
-        port_idx,
-        generation: port.generation,
-        config,
-        path: state.dsp_path.clone(),
-        // loop-owned (the prime paths read it here), so this data-loop read
-        // is the serialization-correct snapshot
-        oss_fragment: state.oss_fragment,
-        retried: false,
-        retire_first: None,
-        log: state.log.clone(),
-        shared: std::sync::Arc::downgrade(&state.shared),
-    };
-    submit_or_defer(state, ResetupWork::Resetup(request));
-    // The request is either in the worker slot or retained in DataState.
-    state.ports[port_idx].resetup_pending = true;
-    true
-}
-
-// The unwind guard behind every worker resetup path: a task that dies
-// without depositing strands resetup_pending forever (nothing but a
-// consumed completion clears it while the node runs). Dropped while still
-// armed - i.e. during the unwind - it deposits Aborted for the request's
-// generation: the next running cycle drops the claim and may re-queue.
-struct DepositOnUnwind<D: Direction> {
-    shared: std::sync::Arc<NodeShared<D>>,
-    port_idx: usize,
-    generation: u64,
-    armed: bool,
-}
-
-impl<D: Direction> DepositOnUnwind<D> {
-    // the normal completion: deposit the computed outcome and disarm
-    fn complete(mut self, outcome: SwapOutcome<D>) {
-        self.armed = false;
-        self.shared.deposit(DeviceSwap {
-            port_idx: self.port_idx,
-            generation: self.generation,
-            outcome,
-        });
-    }
-}
-
-impl<D: Direction> Drop for DepositOnUnwind<D> {
-    fn drop(&mut self) {
-        if self.armed {
-            self.shared.deposit(DeviceSwap {
-                port_idx: self.port_idx,
-                generation: self.generation,
-                outcome: SwapOutcome::Aborted,
-            });
-        }
-    }
-}
-
-// Runs on the per-node worker with an owned request: opens and configures
-// the replacement device off the RT path and deposits the outcome into the
-// shared mailbox for poll_resetup. Atomics synchronize endpoint lifetime,
-// started changes, and data-loop generation transitions around the
-// potentially blocking open.
-fn resetup_request_is_current<D: Direction>(shared: &NodeShared<D>, generation: u64) -> bool {
-    use std::sync::atomic::Ordering;
-    shared.is_alive()
-        && shared.started.load(Ordering::Acquire)
-        && shared.generation.load(Ordering::Acquire) == generation
-}
-
-fn resetup_task<D: Direction>(mut request: ResetupRequest<D>) {
-    let Some(shared) = request.shared.upgrade() else {
-        // clear() dropped the rendezvous before this task ran
-        return;
-    };
-    if !shared.is_alive() {
-        // clear() ran; nobody is left to consume a deposit (a retire_first
-        // payload still closes when `request` drops here, on this thread)
-        return;
-    }
-    // armed from here on: even a panicking open/close below deposits
-    let guard = DepositOnUnwind {
-        shared,
-        port_idx: request.port_idx,
-        generation: request.generation,
-        armed: true,
-    };
-    // RetireAndRetry: the dying fd must close before the retry opens (an
-    // exclusive device would EBUSY otherwise); under the guard, so a
-    // panicking close still unclaims the pending flag
-    if let Some(old) = request.retire_first.take() {
-        drop(old);
-    }
-    let outcome = if !resetup_request_is_current(&guard.shared, request.generation) {
-        // A release, replacement, or Suspend/Pause landed after the queue.
-        // Do not reopen, but still deliver a completion so the ordinary
-        // generation fence can account for the task.
-        SwapOutcome::Aborted
-    } else {
-        let mut dsp = D::Device::new(&request.path);
-        let res = D::try_open_configure(
-            &mut dsp,
-            &request.config,
-            request.oss_fragment,
-            &request.log,
-        );
-        if !resetup_request_is_current(&guard.shared, request.generation) {
-            // Clear, Pause, or a concurrent data-loop transition superseded
-            // the request during the potentially blocking open/configure.
-            // Close the stale fd here, never in the mailbox.
-            drop(dsp);
-            SwapOutcome::Aborted
-        } else if res == 0 {
-            SwapOutcome::Installed {
-                dsp,
-                config: request.config.clone(),
-            }
-        } else if res == -libc::EBUSY && !request.retried {
-            // retire_first is None again here (taken above); poll_resetup
-            // fills it with the dying fd for the retry round trip
-            SwapOutcome::RetireAndRetry {
-                request: ResetupRequest {
-                    retried: true,
-                    ..request
-                },
-                // try_open_configure leaves the device closed on failure;
-                // reuse it on the RT side instead of constructing there.
-                placeholder: dsp,
-            }
-        } else {
-            crate::warn!(
-                request.log,
-                "{}: background rebuild failed ({}); the port loses its format",
-                request.path,
-                res
-            );
-            // As above, failure leaves a ready closed placeholder.
-            SwapOutcome::Failed { placeholder: dsp }
-        }
-    };
-    guard.complete(outcome);
-}
-
-// Deliver endpoint-only work after process() has ended its State phase. The
-// queued closure carries only NodeShared; no State pointer crosses loops. A
-// non-blocking invoke may execute inline on a single-loop host, which is why
-// callers must collect the event first and call here only after dropping every
-// State reference.
-fn queue_main_event<D: Direction>(
-    main_loop: Option<crate::spa::Loop>,
-    shared: std::sync::Arc<NodeShared<D>>,
-    log: crate::spa::Log,
-    event: MainEvent,
-) {
-    let Some(main_loop) = main_loop else {
-        return;
-    };
-    // SAFETY: host loops outlive the queued item (queue_task's contract)
-    let queued = unsafe {
-        crate::utils::queue_task(&main_loop, move || {
-            shared.main_event(event);
-        })
-    };
-    if !queued {
-        // emission lost: the node stays format-less until the host
-        // renegotiates on its own; nothing dangles
-        crate::warn!(
-            log,
-            "can't deliver a deferred node event (main loop unavailable)"
-        );
-    }
-}
-
-// At the start of each data-loop cycle, apply
-// a deposited rebuild completion. A matching generation applies it; a stale
-// one (superseded by install/release/Suspend) is retired to the worker for
-// closing. Returns whether the cycle must skip the port (rebuild still
-// in flight, or this cycle consumed a non-install outcome).
-pub(crate) fn poll_resetup<D: Direction>(state: &mut DataState<D>, port_idx: usize) -> bool {
-    if state.resetup_takeover {
-        return true;
-    }
-    if !flush_deferred_work(state) {
-        return true;
-    }
-    let Some(swap) = state.shared.take_swap() else {
-        return state.ports[port_idx].resetup_pending;
-    };
-    debug_assert_eq!(
-        swap.port_idx, port_idx,
-        "single mailbox slot: MAX_PORTS == 1"
-    );
-    if swap.generation != state.ports[port_idx].generation {
-        // superseded; the payload may hold an open device - transfer the
-        // whole owned message to the blocking-I/O worker.
-        submit_or_defer(state, ResetupWork::RetireSwap(swap));
-        return state.ports[port_idx].resetup_pending;
-    }
-    match swap.outcome {
-        SwapOutcome::Installed { dsp, config } => {
-            let port = &mut state.ports[port_idx];
-            let old = std::mem::replace(&mut port.dsp, dsp);
-            port.config = Some(config);
-            port.generation = port.generation.wrapping_add(1);
-            state
-                .shared
-                .generation
-                .store(port.generation, std::sync::atomic::Ordering::Release);
-            port.resetup_pending = false;
-            port.was_matching = false; // force a relock when matching resumes
-            D::on_device_swapped(state, port_idx);
-            crate::info!(
-                state.log,
-                "{}: background device rebuild applied",
-                state.dsp_path
-            );
-            submit_or_defer(state, ResetupWork::RetireDevice(old));
-            false // the cycle continues on the fresh device (prime re-runs)
-        }
-        SwapOutcome::Aborted => {
-            // stopped when the task ran; drop the claim so the next cycle
-            // (running again, or it wouldn't poll) can re-queue
-            state.ports[port_idx].resetup_pending = false;
-            true
-        }
-        SwapOutcome::RetireAndRetry {
-            mut request,
-            placeholder,
-        } => {
-            // swap the dying fd out behind a closed placeholder so the
-            // retry's open can succeed on an exclusive device; it rides the
-            // request as retire_first, so close-then-retry runs as one
-            // worker command (ordering holds) under the task's unwind guard
-            let port = &mut state.ports[port_idx];
-            let old = std::mem::replace(&mut port.dsp, placeholder);
-            request.retire_first = Some(old);
-            submit_or_defer(state, ResetupWork::Resetup(request));
-            true
-        }
-        SwapOutcome::Failed { placeholder } => {
-            // mirror install_device's failure shape: closed device, cleared
-            // config, and a re-announce so the host renegotiates instead of
-            // believing a format is set on a dead port
-            let port = &mut state.ports[port_idx];
-            let old = std::mem::replace(&mut port.dsp, placeholder);
-            port.config = None;
-            port.generation = port.generation.wrapping_add(1);
-            state
-                .shared
-                .generation
-                .store(port.generation, std::sync::atomic::Ordering::Release);
-            port.resetup_pending = false;
-            port.was_matching = false;
-            D::on_device_swapped(state, port_idx);
-            submit_or_defer(state, ResetupWork::RetireDevice(old));
-            // process() extracts and queues this only after its &mut DataState
-            // phase ends. The endpoint epoch prevents an old loss from
-            // overwriting a newer successful format publication.
-            state.pending_main_event = Some(MainEvent::FormatLost {
-                expected_publication_epoch: state.events.format_publication_epoch(),
-            });
-            true
-        }
-    }
-}
-
-// spa_node_callbacks leads with `version: u32` (the SPA vtable convention,
-// spa/node/node.h); NodeCallbacks::set's prefix read below depends on it
-const _: () = assert!(std::mem::offset_of!(spa_node_callbacks, version) == 0);
-
-// A version-checked copy of the host callback table. Hosts must call
-// set_callbacks again to publish changes; in-place table mutations are not
-// observed.
 pub(crate) struct NodeCallbacks {
     // None means no compatible table is set. The host data pointer accompanies
     // every callback.
@@ -3466,7 +2210,7 @@ unsafe extern "C" fn clear<D: Direction>(handle: *mut spa_handle) -> c_int {
         main.shared
             .started
             .store(false, std::sync::atomic::Ordering::Release);
-        main.resetup_worker.stop();
+        main.rebuild_worker.stop();
         // A final worker completion may own a device; destroy it here on the
         // main thread, after the worker can no longer deposit another one.
         main.shared.discard_swap();
@@ -3642,15 +2386,15 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
     let node_methods: &'static spa_node_methods = &D::NODE_METHODS;
     let events = std::sync::Arc::new(NodeEvents::<D>::new());
     let shared = std::sync::Arc::new(NodeShared::new(std::sync::Arc::downgrade(&events)));
-    let resetup_worker = match ResetupWorker::<D>::start() {
+    let rebuild_worker = match RebuildWorker::<D>::start() {
         Ok(worker) => worker,
         Err(err) => {
             data_system.close(timer_fd);
-            crate::error!(log, "can't start the device resetup worker: {}", err);
+            crate::error!(log, "can't start the device rebuild worker: {}", err);
             return -libc::EIO;
         }
     };
-    let resetup_work = resetup_worker.endpoint();
+    let rebuild_work = rebuild_worker.endpoint();
     let data_ext = D::data_ext(&ext);
     let main_loop = if main_loop.is_null() {
         None
@@ -3700,7 +2444,7 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
                     ],
                     process_latency: crate::utils::process_latency_default(),
                     shared: shared.clone(),
-                    resetup_worker,
+                    rebuild_worker,
                     ring_cap_published: false,
                     ext,
                 },
@@ -3738,7 +2482,7 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
                         setup_period: 0,
                         bw_adapt: std::default::Default::default(),
                         setup_blocksize: 0,
-                        resetup_pending: false,
+                        rebuild_pending: false,
                         generation: 0,
                         was_matching: false,
                         warn_limit: crate::utils::RateLimit::new(),
@@ -3747,9 +2491,9 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
                     }; MAX_PORTS],
                     oss_fragment,
                     shared,
-                    resetup_work,
+                    rebuild_work,
                     deferred_work: None,
-                    resetup_takeover: false,
+                    rebuild_takeover: false,
                     events,
                     pending_main_event: None,
                     started: false,
@@ -4139,13 +2883,13 @@ mod tests {
     }
 
     #[test]
-    fn resetup_worker_runs_off_caller_and_survives_a_panicking_job() {
-        let mut worker = ResetupWorker::<SinkDir>::start().expect("worker starts");
+    fn rebuild_worker_runs_off_caller_and_survives_a_panicking_job() {
+        let mut worker = RebuildWorker::<SinkDir>::start().expect("worker starts");
         let endpoint = worker.endpoint();
         let caller = std::thread::current().id();
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         assert!(matches!(
-            endpoint.try_submit(ResetupWork::Test(Box::new(move || {
+            endpoint.try_submit(RebuildWork::Test(Box::new(move || {
                 started_tx
                     .send(std::thread::current().id())
                     .expect("test receiver lives");
@@ -4158,7 +2902,7 @@ mod tests {
 
         let (next_tx, next_rx) = std::sync::mpsc::channel();
         assert!(matches!(
-            endpoint.try_submit(ResetupWork::Test(Box::new(move || {
+            endpoint.try_submit(RebuildWork::Test(Box::new(move || {
                 next_tx
                     .send(std::thread::current().id())
                     .expect("test receiver lives");
@@ -4174,7 +2918,7 @@ mod tests {
     }
 
     #[test]
-    fn resetup_worker_shutdown_destroys_queued_ownership_off_caller() {
+    fn rebuild_worker_shutdown_destroys_queued_ownership_off_caller() {
         struct DropThread(std::sync::mpsc::Sender<std::thread::ThreadId>);
         impl Drop for DropThread {
             fn drop(&mut self) {
@@ -4182,14 +2926,14 @@ mod tests {
             }
         }
 
-        let mut worker = ResetupWorker::<SinkDir>::start().expect("worker starts");
+        let mut worker = RebuildWorker::<SinkDir>::start().expect("worker starts");
         let caller = std::thread::current().id();
         let (drop_tx, drop_rx) = std::sync::mpsc::channel();
         let probe = DropThread(drop_tx);
         assert!(matches!(
             worker
                 .endpoint()
-                .try_submit(ResetupWork::Test(Box::new(move || drop(probe)))),
+                .try_submit(RebuildWork::Test(Box::new(move || drop(probe)))),
             WorkSubmission::Submitted
         ));
         worker.stop();
@@ -4201,13 +2945,13 @@ mod tests {
     }
 
     #[test]
-    fn resetup_takeover_waits_for_an_inflight_worker_operation() {
-        let mut worker = ResetupWorker::<SinkDir>::start().expect("worker starts");
+    fn rebuild_takeover_waits_for_an_inflight_worker_operation() {
+        let mut worker = RebuildWorker::<SinkDir>::start().expect("worker starts");
         let endpoint = worker.endpoint();
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         assert!(matches!(
-            endpoint.try_submit(ResetupWork::Test(Box::new(move || {
+            endpoint.try_submit(RebuildWork::Test(Box::new(move || {
                 entered_tx.send(()).expect("test receiver lives");
                 release_rx.recv().expect("the fake open is released");
             }))),
@@ -4237,8 +2981,8 @@ mod tests {
     }
 
     #[test]
-    fn resetup_wait_idle_covers_a_producer_mid_publication() {
-        let mut worker = ResetupWorker::<SinkDir>::start().expect("worker starts");
+    fn rebuild_wait_idle_covers_a_producer_mid_publication() {
+        let mut worker = RebuildWorker::<SinkDir>::start().expect("worker starts");
         let endpoint = worker.endpoint();
         let producer_endpoint = endpoint.clone();
         let (claimed_tx, claimed_rx) = std::sync::mpsc::channel();
@@ -4247,7 +2991,7 @@ mod tests {
         let producer = std::thread::spawn(move || {
             matches!(
                 producer_endpoint.try_submit_after_claim(
-                    ResetupWork::Test(Box::new(move || {
+                    RebuildWork::Test(Box::new(move || {
                         ran_tx.send(()).expect("test receiver lives");
                     })),
                     || {
@@ -4282,7 +3026,7 @@ mod tests {
     }
 
     #[test]
-    fn resetup_stop_closes_a_concurrently_claimed_submission() {
+    fn rebuild_stop_closes_a_concurrently_claimed_submission() {
         struct DropThread(std::sync::mpsc::Sender<std::thread::ThreadId>);
         impl Drop for DropThread {
             fn drop(&mut self) {
@@ -4290,7 +3034,7 @@ mod tests {
             }
         }
 
-        let worker = ResetupWorker::<SinkDir>::start().expect("worker starts");
+        let worker = RebuildWorker::<SinkDir>::start().expect("worker starts");
         let endpoint = worker.endpoint();
         let producer_endpoint = endpoint.clone();
         let (claimed_tx, claimed_rx) = std::sync::mpsc::channel();
@@ -4300,7 +3044,7 @@ mod tests {
             let probe = DropThread(drop_tx);
             matches!(
                 producer_endpoint.try_submit_after_claim(
-                    ResetupWork::Test(Box::new(move || drop(probe))),
+                    RebuildWork::Test(Box::new(move || drop(probe))),
                     || {
                         claimed_tx.send(()).expect("test receiver lives");
                         release_rx.recv().expect("publisher is released");
@@ -4335,8 +3079,8 @@ mod tests {
             "shutdown destruction stays off the caller"
         );
         assert!(matches!(
-            endpoint.try_submit(ResetupWork::Test(Box::new(|| {}))),
-            WorkSubmission::Returned(ResetupWork::Test(_))
+            endpoint.try_submit(RebuildWork::Test(Box::new(|| {}))),
+            WorkSubmission::Returned(RebuildWork::Test(_))
         ));
     }
 
@@ -4364,18 +3108,18 @@ mod tests {
     }
 
     #[test]
-    fn resetup_work_slot_returns_ownership_when_full_or_stopped() {
-        let slot = ResetupWorkSlot::<SinkDir>::new();
+    fn rebuild_work_slot_returns_ownership_when_full_or_stopped() {
+        let slot = RebuildWorkSlot::<SinkDir>::new();
         assert!(matches!(
-            slot.try_submit(ResetupWork::Test(Box::new(|| {}))),
+            slot.try_submit(RebuildWork::Test(Box::new(|| {}))),
             WorkSubmission::Submitted
         ));
-        let second = ResetupWork::Test(Box::new(|| {}));
+        let second = RebuildWork::Test(Box::new(|| {}));
         let second = match slot.try_submit(second) {
             WorkSubmission::Submitted => panic!("a full slot must reject the second command"),
             WorkSubmission::Returned(second) => second,
         };
-        assert!(matches!(second, ResetupWork::Test(_)));
+        assert!(matches!(second, RebuildWork::Test(_)));
 
         let _first = slot.take().expect("drain the first command");
         slot.stopping
@@ -4385,11 +3129,11 @@ mod tests {
             slot.state.load(std::sync::atomic::Ordering::Acquire),
             WORK_CLOSED
         );
-        let stopped = ResetupWork::Test(Box::new(|| {}));
+        let stopped = RebuildWork::Test(Box::new(|| {}));
         assert!(
             matches!(
                 slot.try_submit(stopped),
-                WorkSubmission::Returned(ResetupWork::Test(_))
+                WorkSubmission::Returned(RebuildWork::Test(_))
             ),
             "a stopped endpoint returns ownership"
         );
@@ -4609,7 +3353,7 @@ mod tests {
     // deposit replaces an unconsumed one (whose payload drops in the
     // depositor's thread), take is one-shot, and discard voids the slot
     #[test]
-    fn resetup_mailbox_delivers_replaces_and_discards() {
+    fn rebuild_mailbox_delivers_replaces_and_discards() {
         let shared: NodeShared<SinkDir> = NodeShared::new(std::sync::Weak::new());
         assert!(shared.take_swap().is_none());
 
@@ -4643,12 +3387,12 @@ mod tests {
     // failed opens preserve the request generation, and cleared nodes receive
     // no completion.
     #[test]
-    fn resetup_task_deposits_and_respects_the_gates() {
+    fn rebuild_task_deposits_and_respects_the_gates() {
         use std::sync::atomic::Ordering;
         let events = std::sync::Arc::new(NodeEvents::<SinkDir>::new());
         let shared = std::sync::Arc::new(NodeShared::new(std::sync::Arc::downgrade(&events)));
         shared.generation.store(7, Ordering::Release);
-        let request = |shared: &std::sync::Arc<NodeShared<SinkDir>>| ResetupRequest {
+        let request = |shared: &std::sync::Arc<NodeShared<SinkDir>>| RebuildRequest {
             port_idx: 0,
             generation: 7,
             config: PortConfig {
@@ -4668,14 +3412,14 @@ mod tests {
         };
 
         // not started: aborted without touching the device
-        resetup_task(request(&shared));
+        rebuild_task(request(&shared));
         let swap = shared.take_swap().expect("a deposit even when stopped");
         assert_eq!(swap.generation, 7);
         assert!(matches!(swap.outcome, SwapOutcome::Aborted));
 
         // started, open fails (no such device): Failed, generation echoed
         shared.started.store(true, Ordering::Release);
-        resetup_task(request(&shared));
+        rebuild_task(request(&shared));
         let swap = shared.take_swap().expect("a deposit on failure");
         assert_eq!(swap.generation, 7);
         assert!(matches!(swap.outcome, SwapOutcome::Failed { .. }));
@@ -4683,19 +3427,19 @@ mod tests {
         // superseded while queued: abort before opening or publishing a
         // device for the stale generation
         shared.generation.store(8, Ordering::Release);
-        resetup_task(request(&shared));
+        rebuild_task(request(&shared));
         let swap = shared.take_swap().expect("a stale task still completes");
         assert_eq!(swap.generation, 7);
         assert!(matches!(swap.outcome, SwapOutcome::Aborted));
 
         // cleared node (the endpoint is gone): no deposit at all
         drop(events);
-        resetup_task(request(&shared));
+        rebuild_task(request(&shared));
         assert!(shared.take_swap().is_none());
     }
 
     #[test]
-    fn resetup_gate_rechecks_started_and_generation_after_blocking_work() {
+    fn rebuild_gate_rechecks_started_and_generation_after_blocking_work() {
         use std::sync::atomic::Ordering;
 
         let events = std::sync::Arc::new(NodeEvents::<SinkDir>::new());
@@ -4706,10 +3450,10 @@ mod tests {
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
-            assert!(resetup_request_is_current(&worker_shared, 7));
+            assert!(rebuild_request_is_current(&worker_shared, 7));
             entered_tx.send(()).expect("test receiver lives");
             release_rx.recv().expect("mock open is released");
-            resetup_request_is_current(&worker_shared, 7)
+            rebuild_request_is_current(&worker_shared, 7)
         });
         entered_rx.recv().expect("mock open passed its first gate");
 
@@ -4729,7 +3473,7 @@ mod tests {
     // deposit the port's pending claim would be stranded forever); a
     // completed task's guard deposits nothing extra
     #[test]
-    fn a_panicking_resetup_path_still_deposits_aborted() {
+    fn a_panicking_rebuild_path_still_deposits_aborted() {
         let shared = std::sync::Arc::new(NodeShared::<SinkDir>::new(std::sync::Weak::new()));
 
         let guard = DepositOnUnwind {
@@ -4769,7 +3513,7 @@ mod tests {
     // data-loop takes, and main-loop discard/replacement may all overlap.
     // The reader never waits, and observed writer generations never regress.
     #[test]
-    fn resetup_mailbox_is_safe_under_contention() {
+    fn rebuild_mailbox_is_safe_under_contention() {
         let shared = std::sync::Arc::new(NodeShared::<SinkDir>::new(std::sync::Weak::new()));
         let writer = {
             let shared = shared.clone();
@@ -4828,7 +3572,7 @@ mod tests {
             setup_period: 0,
             bw_adapt: Default::default(),
             setup_blocksize: 0,
-            resetup_pending: false,
+            rebuild_pending: false,
             generation: 0,
             was_matching: false,
             warn_limit: crate::utils::RateLimit::new(),

@@ -54,7 +54,7 @@ pub(crate) struct SinkPortExt {
     // limiter, because sharing port.warn_limit would let a persistent refusal
     // consume the dropped-bytes/underrun warnings' emission slots and fold
     // unrelated events into their suppressed counts
-    pub resetup_limit: crate::utils::RateLimit,
+    pub retune_limit: crate::utils::RateLimit,
 }
 
 fn desired_delay(period: u32, oss_delay: u32) -> u32 {
@@ -295,11 +295,11 @@ fn retune_period(
         // rebuild (no main loop), the next cycle retries this retune
         // immediately instead of re-running the debounce - so this arm can run
         // every cycle; rate-limit the log (on its own limiter - see
-        // SinkPortExt::resetup_limit)
-        if let Some(suppressed) = port.ext.resetup_limit.check(now) {
+        // SinkPortExt::retune_limit)
+        if let Some(suppressed) = port.ext.retune_limit.check(now) {
             crate::info!(
                 log,
-                "{}: period {} -> {} bytes; re-setting up (+{} messages suppressed)",
+                "{}: period {} -> {} bytes; reconfiguring (+{} messages suppressed)",
                 port.dsp.path,
                 port.setup_period,
                 period_in_bytes,
@@ -688,13 +688,13 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
 
     let mut result = SPA_STATUS_OK as i32;
 
-    // indexed (not iter_mut) so the resetup arms below can end the &mut port
+    // indexed (not iter_mut) so the rebuild arms below can end the &mut port
     // borrow, borrow the whole State, and re-borrow the port
     for port_idx in 0..state.ports.len() {
         // Consume any completed background rebuild before the cycle reads the
         // port (it may swap in a fresh device or clear the config); a rebuild
         // still in flight skips the cycle.
-        if crate::node::poll_resetup(state, port_idx) {
+        if crate::node::poll_rebuild(state, port_idx) {
             let port = &mut state.ports[port_idx];
             need_data(&mut port.io, &mut result);
             continue;
@@ -711,9 +711,9 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
         if port.dsp.is_closed() {
             // Suspend closed the device but the host restarted without a fresh
             // format; rebuild off-loop instead of tripping the dsp state
-            // asserts (the &mut port borrow ends here: queue_resetup snapshots
+            // asserts (the &mut port borrow ends here: queue_rebuild snapshots
             // an owned request and owns the pending claim)
-            crate::node::queue_resetup(state, port_idx);
+            crate::node::queue_rebuild(state, port_idx);
             let port = &mut state.ports[port_idx];
             need_data(&mut port.io, &mut result);
             continue;
@@ -811,9 +811,9 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
             &state.log,
         ) {
             // the driver refused the trigger stop (dying fd): rebuild off-loop
-            // (the &mut port borrow ends here: queue_resetup snapshots an
+            // (the &mut port borrow ends here: queue_rebuild snapshots an
             // owned request and owns the pending claim)
-            let pending = crate::node::queue_resetup(state, port_idx);
+            let pending = crate::node::queue_rebuild(state, port_idx);
             if pending {
                 let port = &mut state.ports[port_idx];
                 port.was_matching = false; // the gap invalidates matching history
@@ -1171,7 +1171,7 @@ mod tests {
             setup_period: period,
             bw_adapt: Default::default(),
             setup_blocksize: 1024,
-            resetup_pending: false,
+            rebuild_pending: false,
             generation: 0,
             was_matching: false,
             warn_limit: crate::utils::RateLimit::new(),
