@@ -13,6 +13,8 @@
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_uint, c_ulong};
 
+use crate::utils::{ioctl_int, ioctl_read};
+
 pub(crate) const SOUND_MIXER_VOLUME: c_uint = 0;
 pub(crate) const SOUND_MIXER_PCM: c_uint = 4;
 pub(crate) const SOUND_MIXER_LINE: c_uint = 6;
@@ -37,12 +39,15 @@ pub(crate) const SOUND_DEVICE_NAMES: [&str; SOUND_MIXER_NRDEVICES as usize] = [
 
 // sys/soundcard.h mixer_info; the ioctl encodes the size
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct MixerInfo {
     id: [c_char; 16],
     name: [c_char; 32],
     modify_counter: c_int,
     fillers: [c_int; 10],
 }
+
+unsafe impl crate::utils::IoctlPod for MixerInfo {}
 
 fn read_req(dev: c_uint) -> c_ulong {
     nix::request_code_read!(b'M', dev, std::mem::size_of::<c_int>())
@@ -88,16 +93,11 @@ impl Mixer {
     }
 
     fn read_int(&self, dev: c_uint) -> Option<c_int> {
-        let mut v: c_int = 0;
-        if unsafe { libc::ioctl(self.fd, read_req(dev), &mut v) } == -1 {
-            return None;
-        }
-        Some(v)
+        ioctl_int(self.fd, read_req(dev), 0)
     }
 
     fn write_int(&self, dev: c_uint, value: c_int) -> bool {
-        let mut v = value;
-        unsafe { libc::ioctl(self.fd, write_req(dev), &mut v) != -1 }
+        ioctl_int(self.fd, write_req(dev), value).is_some()
     }
 
     fn has(&self, dev: c_uint) -> bool {
@@ -199,11 +199,8 @@ impl Mixer {
     // for level writes while muted (mixer_set stores level_muted and returns
     // early), so callers must value-diff and treat the counter as a hint.
     pub(crate) fn modify_counter(&self) -> Option<c_int> {
-        let mut info = std::mem::MaybeUninit::<MixerInfo>::zeroed();
-        if unsafe { libc::ioctl(self.fd, SOUND_MIXER_INFO, info.as_mut_ptr()) } == -1 {
-            return None;
-        }
-        Some(unsafe { info.assume_init().modify_counter })
+        unsafe { ioctl_read::<MixerInfo>(self.fd, SOUND_MIXER_INFO) }
+            .map(|info| info.modify_counter)
     }
 }
 

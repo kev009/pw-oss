@@ -1,7 +1,70 @@
 use libc::sysctlbyname;
 use nix::errno::Errno;
 use std::ffi::{CStr, CString};
-use std::os::raw::c_void;
+use std::os::raw::{c_int, c_ulong, c_void};
+
+/// An fd returned by `libc::open` and closed with `libc::close`.
+pub(crate) struct LibcFd(c_int);
+
+impl LibcFd {
+    pub(crate) fn open(path: &CStr, flags: c_int) -> Option<Self> {
+        let fd = unsafe { libc::open(path.as_ptr(), flags | libc::O_CLOEXEC) };
+        (fd != -1).then(|| Self(fd))
+    }
+
+    pub(crate) fn raw(&self) -> c_int {
+        self.0
+    }
+}
+
+impl Drop for LibcFd {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.0);
+        }
+    }
+}
+
+/// A C-compatible plain-data type that an ioctl may initialize byte-for-byte.
+///
+/// # Safety
+/// Implementors must be `Copy`, contain no references or drop state, accept
+/// the all-zero value and every bit pattern the kernel can return, and have
+/// the exact C layout encoded by the corresponding ioctl request.
+pub(crate) unsafe trait IoctlPod: Copy {}
+
+unsafe impl IoctlPod for c_int {}
+
+pub(crate) fn ioctl_zeroed<T: IoctlPod>() -> T {
+    // IoctlPod requires the all-zero value to be valid.
+    unsafe { std::mem::zeroed() }
+}
+
+pub(crate) fn ioctl_int(fd: c_int, req: c_ulong, value: c_int) -> Option<c_int> {
+    unsafe { ioctl_value(fd, req, value) }
+}
+
+/// Pass an initialized POD value through an ioctl that may update it.
+///
+/// # Safety
+/// `req` must address exactly `T` and may not retain the pointer.
+pub(crate) unsafe fn ioctl_value<T: IoctlPod>(fd: c_int, req: c_ulong, mut value: T) -> Option<T> {
+    (unsafe { libc::ioctl(fd, req, &mut value) } != -1).then_some(value)
+}
+
+/// Read a POD value fully initialized by an ioctl.
+///
+/// # Safety
+/// `req` must address exactly `T`, fully initialize it on success, and not
+/// retain the pointer.
+pub(crate) unsafe fn ioctl_read<T: IoctlPod>(fd: c_int, req: c_ulong) -> Option<T> {
+    let mut value = std::mem::MaybeUninit::<T>::uninit();
+    if unsafe { libc::ioctl(fd, req, value.as_mut_ptr()) } == -1 {
+        None
+    } else {
+        Some(unsafe { value.assume_init() })
+    }
+}
 
 // the shared read-only sysctlbyname shape (no new value): `buf` may be null
 // for a size probe, `len` is in/out. Callers pass a `buf` valid for `len`

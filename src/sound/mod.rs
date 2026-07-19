@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_long, c_uint, c_ulong, c_void};
 
+use crate::utils::{LibcFd, ioctl_int, ioctl_read, ioctl_value, ioctl_zeroed};
+
 pub(crate) const AFMT_S16_LE: u32 = 0x00000010;
 pub(crate) const AFMT_S16_BE: u32 = 0x00000020;
 pub(crate) const AFMT_S32_LE: u32 = 0x00001000;
@@ -39,6 +41,7 @@ const SNDCTL_ENGINEINFO: c_ulong =
 // sys/soundcard.h; the ioctl encodes the size, so a layout mismatch fails
 // cleanly instead of corrupting memory
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct oss_audioinfo {
     dev: c_int,
     name: [c_char; 64],
@@ -72,6 +75,8 @@ struct oss_audioinfo {
     next_rec_engine: c_int,
     filler: [c_int; 184],
 }
+
+unsafe impl crate::utils::IoctlPod for oss_audioinfo {}
 
 // sys/dev/sound/pcm/matrix.h: SETCHANNELS requests are clamped to this
 const SND_CHN_MAX: c_int = 8;
@@ -138,6 +143,7 @@ pub(crate) fn advertised_quantum_cap_frames(stride: u32, rate: u32) -> Option<u3
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Default)]
 struct audio_buf_info {
     fragments: c_int,
     fragstotal: c_int,
@@ -146,6 +152,7 @@ struct audio_buf_info {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Default)]
 struct audio_errinfo {
     play_underruns: c_int,
     rec_overruns: c_int,
@@ -160,27 +167,8 @@ struct audio_errinfo {
     filler: [c_int; 16],
 }
 
-fn ioctl_int(fd: c_int, req: c_ulong, value: c_int) -> Option<c_int> {
-    let mut value = value;
-    (unsafe { libc::ioctl(fd, req, &mut value) } != -1).then_some(value)
-}
-
-/// Read a structure filled by an ioctl.
-///
-/// # Safety
-///
-/// `T` must be POD, and `req` must fully initialize it whenever the ioctl
-/// succeeds. On failure the uninitialized value is discarded.
-unsafe fn ioctl_read<T>(fd: c_int, req: c_ulong) -> Option<T> {
-    let mut value = std::mem::MaybeUninit::<T>::uninit();
-    unsafe {
-        if libc::ioctl(fd, req, value.as_mut_ptr()) == -1 {
-            None
-        } else {
-            Some(value.assume_init())
-        }
-    }
-}
+unsafe impl crate::utils::IoctlPod for audio_buf_info {}
+unsafe impl crate::utils::IoctlPod for audio_errinfo {}
 
 #[derive(Debug, PartialEq)]
 enum DspState {
@@ -269,20 +257,11 @@ pub(crate) struct SndstatDspInfo {
 
 // one packed snapshot of every sound device from sndstat(4)
 fn sndstat_snapshot() -> Option<crate::nv::NvList> {
-    let fd = unsafe { libc::open(c"/dev/sndstat".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-    if fd == -1 {
-        return None;
-    }
-    struct FdGuard(c_int);
-    impl Drop for FdGuard {
-        fn drop(&mut self) {
-            unsafe { libc::close(self.0) };
-        }
-    }
-    let _guard = FdGuard(fd);
+    let fd = LibcFd::open(c"/dev/sndstat", libc::O_RDONLY)?;
+    let raw_fd = fd.raw();
 
     // best-effort; GET still returns the last snapshot if refresh fails
-    let _ = unsafe { libc::ioctl(fd, SNDSTIOC_REFRESH_DEVS) };
+    let _ = unsafe { libc::ioctl(raw_fd, SNDSTIOC_REFRESH_DEVS) };
 
     // two-call protocol (size, then fill); the snapshot is per-open cdevpriv,
     // so it can't change between the calls (a too-small buffer would come back
@@ -296,7 +275,7 @@ fn sndstat_snapshot() -> Option<crate::nv::NvList> {
         if buf.is_empty() {
             arg.buf = std::ptr::null_mut();
         }
-        if unsafe { libc::ioctl(fd, SNDSTIOC_GET_DEVS, &mut arg) } == -1 {
+        if unsafe { libc::ioctl(raw_fd, SNDSTIOC_GET_DEVS, &mut arg) } == -1 {
             return None;
         }
         if !buf.is_empty() && arg.nbytes <= buf.len() {
@@ -400,21 +379,16 @@ fn native_rates(path: &str, play: bool) -> Vec<u32> {
         return vec![];
     };
     let mode = if play { libc::O_WRONLY } else { libc::O_RDONLY };
-    let fd = unsafe { libc::open(cpath.as_ptr(), mode | libc::O_NONBLOCK | libc::O_CLOEXEC) };
-    if fd == -1 {
+    let Some(fd) = LibcFd::open(&cpath, mode | libc::O_NONBLOCK) else {
         return vec![]; // busy: the caller keeps the min..max range
-    }
+    };
     let mut rates = vec![];
-    unsafe {
-        let mut ai = std::mem::MaybeUninit::<oss_audioinfo>::zeroed();
-        (*ai.as_mut_ptr()).dev = -1; // this fd's channel
-        if libc::ioctl(fd, SNDCTL_ENGINEINFO, ai.as_mut_ptr()) != -1 {
-            let ai = ai.assume_init();
-            for i in 0..ai.nrates.min(20) as usize {
-                rates.push(ai.rates[i]);
-            }
+    let mut ai: oss_audioinfo = ioctl_zeroed();
+    ai.dev = -1; // this fd's channel
+    if let Some(ai) = unsafe { ioctl_value(fd.raw(), SNDCTL_ENGINEINFO, ai) } {
+        for i in 0..ai.nrates.min(20) as usize {
+            rates.push(ai.rates[i]);
         }
-        libc::close(fd);
     }
     rates.retain(|r| *r > 0);
     rates.sort_unstable();
@@ -444,27 +418,24 @@ pub(crate) fn probe_caps(path: &str, play: bool) -> Option<DspCaps> {
 
     let cpath = CString::new(path).ok()?;
     let mode = if play { libc::O_WRONLY } else { libc::O_RDONLY };
-    let fd = unsafe { libc::open(cpath.as_ptr(), mode | libc::O_NONBLOCK | libc::O_CLOEXEC) };
-    if fd == -1 {
+    let Some(fd) = LibcFd::open(&cpath, mode | libc::O_NONBLOCK) else {
         // busy or transiently gone: the native info still beats the caller's
         // conservative stereo fallback
         return native.as_ref().map(|nv| caps_from_sndstat(nv, vec![]));
-    }
+    };
+    let raw_fd = fd.raw();
 
-    let formats = ioctl_int(fd, SNDCTL_DSP_GETFMTS, 0);
+    let formats = ioctl_int(raw_fd, SNDCTL_DSP_GETFMTS, 0);
 
     // ENGINEINFO with dev == -1 resolves the channel bound to THIS fd, so the
     // limits are per-direction (AUDIOINFO blends play and rec across the
     // device). Note: kernels before the 15.x sound rewrite report a vchan's
     // fixed rate here instead of the feeder range; harmless, since these
     // values are only consulted when the empirical probe fails.
-    let (ai_min_ch, ai_max_ch, ai_min_rate, ai_max_rate, ai_caps) = unsafe {
-        let mut ai = std::mem::MaybeUninit::<oss_audioinfo>::zeroed();
-        (*ai.as_mut_ptr()).dev = -1; // this fd's channel
-        if libc::ioctl(fd, SNDCTL_ENGINEINFO, ai.as_mut_ptr()) == -1 {
-            (0, 0, 0, 0, 0)
-        } else {
-            let ai = ai.assume_init();
+    let mut ai: oss_audioinfo = ioctl_zeroed();
+    ai.dev = -1; // this fd's channel
+    let (ai_min_ch, ai_max_ch, ai_min_rate, ai_max_rate, ai_caps) =
+        unsafe { ioctl_value(raw_fd, SNDCTL_ENGINEINFO, ai) }.map_or((0, 0, 0, 0, 0), |ai| {
             (
                 ai.min_channels,
                 ai.max_channels,
@@ -472,8 +443,7 @@ pub(crate) fn probe_caps(path: &str, play: bool) -> Option<DspCaps> {
                 ai.max_rate,
                 ai.caps,
             )
-        }
-    };
+        });
     const PCM_CAP_VIRTUAL: c_int = 0x0004_0000;
 
     // a failed or degenerate probe defers to the audioinfo limits
@@ -485,19 +455,20 @@ pub(crate) fn probe_caps(path: &str, play: bool) -> Option<DspCaps> {
     // native format and wider counts are genuinely negotiable, so the engine
     // width extends the probe there (e.g. 10-channel USB mixers).
     let direct = ai_caps != 0 && ai_caps & PCM_CAP_VIRTUAL == 0;
-    let min_channels = pick(ioctl_int(fd, SNDCTL_DSP_CHANNELS, 1), ai_min_ch);
+    let min_channels = pick(ioctl_int(raw_fd, SNDCTL_DSP_CHANNELS, 1), ai_min_ch);
     let max_channels = {
-        let probed = pick(ioctl_int(fd, SNDCTL_DSP_CHANNELS, SND_CHN_MAX), ai_max_ch);
+        let probed = pick(
+            ioctl_int(raw_fd, SNDCTL_DSP_CHANNELS, SND_CHN_MAX),
+            ai_max_ch,
+        );
         if direct {
             probed.max(ai_max_ch)
         } else {
             probed
         }
     };
-    let min_rate = pick(ioctl_int(fd, SNDCTL_DSP_SPEED, 8000), ai_min_rate);
-    let max_rate = pick(ioctl_int(fd, SNDCTL_DSP_SPEED, 192000), ai_max_rate);
-
-    unsafe { libc::close(fd) };
+    let min_rate = pick(ioctl_int(raw_fd, SNDCTL_DSP_SPEED, 8000), ai_min_rate);
+    let max_rate = pick(ioctl_int(raw_fd, SNDCTL_DSP_SPEED, 192000), ai_max_rate);
 
     let formats = formats?;
     if min_channels < 1 || max_channels < min_channels || min_rate < 1 || max_rate < min_rate {
