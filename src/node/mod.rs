@@ -1257,6 +1257,46 @@ unsafe extern "C" fn set_io<D: Direction>(
     0
 }
 
+type ExtractedDevices<D> = [(usize, <D as Direction>::Device); MAX_PORTS];
+
+fn replace_port_devices<D: Direction>(
+    ports: &mut [Port<D>; MAX_PORTS],
+    devices: ExtractedDevices<D>,
+) -> [D::Device; MAX_PORTS] {
+    devices.map(|(index, device)| {
+        ports[index].rebuild_pending = false;
+        std::mem::replace(&mut ports[index].dsp, device)
+    })
+}
+
+// Return devices extracted by Suspend without transferring their ownership
+// into the loop closure. If the invoke cannot run, the caller still owns them
+// and can retry or release them only after the loop is known unavailable.
+fn restore_extracted_devices<D: Direction>(
+    control: &DataControl<D>,
+    devices: &mut Option<ExtractedDevices<D>>,
+) -> Option<[D::Device; MAX_PORTS]> {
+    devices.as_ref()?;
+    control.query(|state| {
+        let devices = devices
+            .take()
+            .expect("the caller retains extracted devices until this invoke runs");
+        let placeholders = replace_port_devices(&mut state.ports, devices);
+        state.rebuild_takeover = false;
+        placeholders
+    })
+}
+
+fn restore_started_if_stop_unobserved(
+    started: &std::sync::atomic::AtomicBool,
+    was_started: bool,
+    data_stopped: &std::sync::atomic::AtomicBool,
+) {
+    if !data_stopped.load(std::sync::atomic::Ordering::Acquire) {
+        started.store(was_started, std::sync::atomic::Ordering::Release);
+    }
+}
+
 unsafe extern "C" fn send_command<D: Direction>(
     object: *mut c_void,
     command: *const spa_command,
@@ -1304,8 +1344,16 @@ unsafe extern "C" fn send_command<D: Direction>(
                 update_timers(state);
                 true
             });
-            let Some(true) = started else {
-                return -libc::EIO; // not negotiated yet (ALSA rejects this too)
+            match started {
+                Some(true) => (),
+                Some(false) => {
+                    crate::warn!(log, "can't start: ports are not negotiated");
+                    return -libc::EIO;
+                }
+                None => {
+                    crate::warn!(log, "can't start: data loop did not accept the command");
+                    return -libc::EIO;
+                }
             };
             // Publish only after DataState is fully started. The worker
             // pairs this Release with its pre/post-open Acquire checks.
@@ -1318,11 +1366,13 @@ unsafe extern "C" fn send_command<D: Direction>(
             // Publish the stop before the blocking data-loop handoff. A
             // worker open finishing in that window must retire its result,
             // not hand an already-paused node a fresh exclusive fd.
-            shared
+            let was_started = shared
                 .started
-                .store(false, std::sync::atomic::Ordering::Release);
+                .swap(false, std::sync::atomic::Ordering::AcqRel);
+            let data_stopped = std::sync::atomic::AtomicBool::new(false);
             let Some(deferred) = control.query(|state| {
                 state.started = false;
+                data_stopped.store(true, std::sync::atomic::Ordering::Release);
                 update_timers(state);
                 state.rebuild_takeover = true;
                 let deferred = state.deferred_work.take();
@@ -1336,6 +1386,7 @@ unsafe extern "C" fn send_command<D: Direction>(
                 }
                 deferred
             }) else {
+                restore_started_if_stop_unobserved(&shared.started, was_started, &data_stopped);
                 return -libc::EIO;
             };
             drop(deferred);
@@ -1354,9 +1405,11 @@ unsafe extern "C" fn send_command<D: Direction>(
         }
         (SPA_TYPE_COMMAND_Node, SPA_NODE_COMMAND_Suspend) => {
             // As with Pause, stop wins before waiting for the data loop.
-            shared
+            let was_started = shared
                 .started
-                .store(false, std::sync::atomic::Ordering::Release);
+                .swap(false, std::sync::atomic::Ordering::AcqRel);
+            let data_stopped = std::sync::atomic::AtomicBool::new(false);
+            let data_stopped_ref = &data_stopped;
             // Device::new may probe sndstat (the sink does), so build every
             // closed placeholder here on main rather than inside DataControl.
             let dsp_path = unsafe { &*std::ptr::addr_of!((*state).main.dsp_path) };
@@ -1365,8 +1418,9 @@ unsafe extern "C" fn send_command<D: Direction>(
             // Quiesce and transfer device ownership out of DataState. Potentially
             // sleeping SETTRIGGER/close operations then run on this thread while
             // the data loop sees only closed placeholders.
-            let Some((mut devices, deferred)) = control.query(move |state| {
+            let Some((devices, deferred)) = control.query(move |state| {
                 state.started = false;
+                data_stopped_ref.store(true, std::sync::atomic::Ordering::Release);
                 update_timers(state);
                 D::on_suspend_loop(state);
                 state.rebuild_takeover = true;
@@ -1387,35 +1441,51 @@ unsafe extern "C" fn send_command<D: Direction>(
                 });
                 (devices, deferred)
             }) else {
+                restore_started_if_stop_unobserved(&shared.started, was_started, &data_stopped);
                 return -libc::EIO;
             };
+            let mut devices = Some(devices);
             drop(deferred);
             // a deposited-but-unconsumed rebuild would hold an open
             // (possibly exclusive) device across the whole suspended stretch
             // (nothing polls while stopped); close it now, off the RT path.
             shared.discard_swap();
             if !rebuild_work.wait_idle() {
-                release_rebuild_takeover(&control, 0);
+                let mut placeholders = restore_extracted_devices(&control, &mut devices);
+                if placeholders.is_none() && devices.is_some() {
+                    placeholders = restore_extracted_devices(&control, &mut devices);
+                }
+                if placeholders.is_none() && devices.is_some() {
+                    crate::warn!(
+                        log,
+                        "can't restore devices after rebuild worker shutdown: data loop is unavailable"
+                    );
+                }
+                drop(placeholders);
                 return -libc::EIO;
             }
             shared.discard_swap();
-            for (_, dsp) in &mut devices {
+            for (_, dsp) in devices
+                .as_mut()
+                .expect("Suspend retains the extracted devices until restoration")
+            {
                 if !dsp.is_closed() && !dsp.suspend() {
                     dsp.close();
                 }
             }
-            let placeholders = control.query(move |state| {
-                let mut devices = devices.into_iter();
-                let placeholders: [D::Device; MAX_PORTS] = std::array::from_fn(|index| {
-                    let (_, dsp) = devices.next().expect("one suspended device per port");
-                    state.ports[index].rebuild_pending = false;
-                    std::mem::replace(&mut state.ports[index].dsp, dsp)
-                });
-                state.rebuild_takeover = false;
-                placeholders
-            });
+            let placeholders = restore_extracted_devices(&control, &mut devices);
             let Some(placeholders) = placeholders else {
-                release_rebuild_takeover(&control, 0);
+                // The first invoke retained ownership on failure. Retry once
+                // so a transient handoff error does not release live or
+                // suspended descriptors while placeholders remain installed.
+                let restored = devices.is_none()
+                    || restore_extracted_devices(&control, &mut devices).is_some();
+                if !restored {
+                    crate::warn!(
+                        log,
+                        "can't restore suspended devices: data loop is unavailable"
+                    );
+                }
                 return -libc::EIO;
             };
             // Closed placeholders still own heap fields; destroy them on main.

@@ -1005,6 +1005,46 @@ fn test_port(fd: std::os::raw::c_int) -> Port<SinkDir> {
     }
 }
 
+#[test]
+fn failed_stop_handoff_restores_the_worker_gate_until_acknowledged() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let worker_started = AtomicBool::new(false);
+    let data_stopped = AtomicBool::new(false);
+    restore_started_if_stop_unobserved(&worker_started, true, &data_stopped);
+    assert!(worker_started.load(Ordering::Acquire));
+
+    worker_started.store(false, Ordering::Release);
+    data_stopped.store(true, Ordering::Release);
+    restore_started_if_stop_unobserved(&worker_started, true, &data_stopped);
+    assert!(
+        !worker_started.load(Ordering::Acquire),
+        "an acknowledged data-loop stop must remain published"
+    );
+}
+
+#[test]
+fn extracted_devices_restore_ports_and_clear_pending_claims() {
+    let (old_read, old_write) = crate::sound::test_util::pipe_pair(true, true);
+    let (new_read, new_write) = crate::sound::test_util::pipe_pair(true, true);
+    let mut ports = [test_port(old_write)];
+    ports[0].rebuild_pending = true;
+
+    let devices = [(0, crate::sound::DspWriter::test_on_fd(new_write, 8))];
+    let mut placeholders = replace_port_devices(&mut ports, devices);
+
+    assert!(!ports[0].rebuild_pending);
+    assert_eq!(ports[0].dsp.write(&[2; 8]), 8);
+    assert_eq!(placeholders[0].write(&[1; 8]), 8);
+    assert_eq!(crate::sound::test_util::drain(new_read), [2; 8]);
+    assert_eq!(crate::sound::test_util::drain(old_read), [1; 8]);
+
+    unsafe {
+        libc::close(old_read);
+        libc::close(new_read);
+    }
+}
+
 // a stack fixture: one spa_buffer with one MemPtr data block; the tests
 // then break one field at a time
 fn fixture(payload: &mut [u8], chunk: *mut spa_chunk) -> (spa_buffer, Box<spa_data>) {
