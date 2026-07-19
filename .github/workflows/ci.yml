@@ -28,4 +28,5 @@ jobs:
             cargo fmt --check
             cargo build --release
             cargo test
+            cargo test --release --all-targets
             cargo clippy --all-targets -- -D warnings
