@@ -1,5 +1,8 @@
 use super::*;
 
+#[cfg(test)]
+mod tests;
+
 struct EventInfo {
     node: crate::spa::NodeInfo,
     port: crate::spa::PortInfo,
@@ -339,5 +342,179 @@ impl<D: Direction> NodeEvents<D> {
     // SAFETY: no associated State reference may be live.
     pub(super) unsafe fn emit_result(&self, seq: c_int, result: &spa_result_node_params) {
         crate::spa::node_emit_result(&self.hooks, seq, 0, SPA_RESULT_TYPE_NODE_PARAMS, result);
+    }
+}
+
+pub(super) unsafe extern "C" fn add_listener<D: Direction>(
+    object: *mut c_void,
+    listener: *mut spa_hook,
+    events: *const spa_node_events,
+    data: *mut c_void,
+) -> c_int {
+    let state: *mut State<D> = object.cast();
+    assert!(!state.is_null(), "object is not supposed to be null");
+    let node_events = unsafe { main_ref(state).events.clone() };
+
+    let initial = |hooks: &crate::spa::ListenerList<spa_node_events>| {
+        // The initial emissions only reach the newly added listener (the list
+        // is isolated). One method per traversal, mirroring C's
+        // spa_hook_list_call: a listener that removes and frees its hook
+        // inside a callback must not be read for the next method.
+        let (node_info, port_info) = node_events.initial_snapshots();
+        // Hold the endpoint's dispatch turn across the whole initial
+        // transaction. Reentrant mutations queue behind both snapshots
+        // instead of publishing newer state between them.
+        let dispatch_claim = node_events.begin_dispatch();
+        hooks.emit(|f, data| {
+            if let Some(node_info_fun) = f.info {
+                // through the C listener vtable (add_listener contract)
+                unsafe { node_info_fun(data, node_info.raw()) };
+            }
+        });
+        hooks.emit(|f, data| {
+            if let Some(port_info_fun) = f.port_info {
+                // through the C listener vtable (add_listener contract)
+                unsafe { port_info_fun(data, D::DIRECTION, 0, port_info.raw()) };
+            }
+        });
+        dispatch_claim
+    };
+    let dispatch_claim = unsafe { node_events.with_new_listener(listener, events, data, initial) };
+    if let Some(claim) = dispatch_claim.as_ref() {
+        // SAFETY: the State snapshot borrow ended before isolation, and the
+        // scoped helper restored the complete list before nested work drains.
+        unsafe { node_events.drain(claim) };
+    }
+
+    0
+}
+
+// re-emit node_info to every listener (carrying whatever change_mask the caller
+// set, e.g. PARAMS), then clear the mask
+pub(super) fn emit_node_info<D: Direction>(state: &MainState<D>) {
+    let events = state.events.clone();
+    events.queue_node_info();
+}
+
+// the process latency (user-set latency offset) shifts the node's reported
+// latency, so a change re-emits the Props/ProcessLatency node params and the
+// port Latency param
+pub(crate) fn handle_process_latency<D: Direction>(
+    state: &mut MainState<D>,
+    info: spa_process_latency_info,
+) {
+    let ns_changed = state.process_latency.ns != info.ns;
+    if state.process_latency.quantum == info.quantum
+        && state.process_latency.rate == info.rate
+        && !ns_changed
+    {
+        return;
+    }
+
+    state.process_latency = info;
+
+    state.events.with_node_info(|info| {
+        let _ = info.replace_change_mask(0);
+        if ns_changed {
+            info.bump_param(SPA_PARAM_Props);
+        }
+        info.bump_param(SPA_PARAM_ProcessLatency);
+    });
+    emit_node_info(state);
+
+    state.events.with_port_info(|info| {
+        let _ = info.replace_change_mask(0);
+        info.bump_param(SPA_PARAM_Latency);
+    });
+    emit_port_info(state);
+}
+
+// re-emit port_info to every listener (carrying whatever change_mask the caller
+// set, e.g. RATE/PARAMS), then clear the mask
+pub(super) fn emit_port_info<D: Direction>(state: &MainState<D>) {
+    let events = state.events.clone();
+    events.queue_port_info();
+}
+
+pub(super) unsafe extern "C" fn set_callbacks<D: Direction>(
+    object: *mut c_void,
+    callbacks: *const spa_node_callbacks,
+    data: *mut c_void,
+) -> c_int {
+    let state: *mut State<D> = object.cast();
+    assert!(!state.is_null());
+
+    // SAFETY: `callbacks`, when non-null, points at a live table whose
+    // version prefix describes its true length, and the host keeps `data`
+    // valid while the table is set (the set_callbacks contract)
+    let mut new_callbacks = NodeCallbacks::none();
+    unsafe { new_callbacks.set(callbacks, data) };
+
+    // on_timeout/process call the table from the data loop; store it there.
+    // SAFETY: a by-value table copy plus the host data pointer, which stays
+    // valid while set (the same contract)
+    let new_callbacks = unsafe { crate::spa::SendWrap::new(new_callbacks) };
+    let control = unsafe { DataControl::from_raw(state) };
+    if !control.invoke(move |state| state.callbacks = new_callbacks.into_inner()) {
+        return -libc::EIO;
+    }
+    0
+}
+
+pub(super) unsafe extern "C" fn sync<D: Direction>(object: *mut c_void, seq: c_int) -> c_int {
+    let state: *mut State<D> = object.cast();
+    assert!(!state.is_null(), "object is not supposed to be null");
+    let events = unsafe { main_ref(state).events.clone() };
+    // SAFETY: only the independently owned endpoint is borrowed.
+    unsafe { events.emit_done(seq) };
+    0
+}
+
+// emit one filtered enum_params result to every listener (node and port
+// enumeration share this shape)
+pub(super) unsafe fn emit_param_result<D: Direction>(
+    events: &NodeEvents<D>,
+    seq: c_int,
+    id: u32,
+    index: u32,
+    param: *mut spa_pod,
+) {
+    let result = spa_result_node_params {
+        id,
+        index,
+        next: index + 1,
+        param,
+    };
+    unsafe { events.emit_result(seq, &result) };
+}
+
+pub(super) unsafe extern "C" fn enum_params<D: Direction>(
+    object: *mut c_void,
+    seq: c_int,
+    id: u32,
+    start: u32,
+    max: u32,
+    filter: *const spa_pod,
+) -> c_int {
+    let state: *mut State<D> = object.cast();
+    assert!(!state.is_null(), "object is not supposed to be null");
+    // Clone the independently allocated endpoint before enumeration. Each
+    // build step below gets a fresh State borrow; dispatch uses only events.
+    let events = unsafe { main_ref(state).events.clone() };
+    let main = unsafe { main_ptr(state) };
+
+    unsafe {
+        crate::spa::enum_params_loop(
+            main,
+            (start, max),
+            filter,
+            |state, index| match D::build_node_param(state, id, index) {
+                ParamBuild::Built(pod) => crate::spa::ParamStep::Built(pod),
+                ParamBuild::Exhausted => crate::spa::ParamStep::Stop(0),
+                // unknown param id (ALSA convention)
+                ParamBuild::Unknown => crate::spa::ParamStep::Stop(-libc::ENOENT),
+            },
+            |index, param| emit_param_result(&events, seq, id, index, param),
+        )
     }
 }

@@ -1,0 +1,205 @@
+use nix::errno::Errno;
+use std::os::raw::{c_char, c_int, c_long, c_uint, c_ulong};
+
+use crate::freebsd::{ioctl_int, ioctl_read};
+
+pub(crate) const AFMT_U8: u32 = 0x00000008;
+pub(crate) const AFMT_S16_LE: u32 = 0x00000010;
+pub(crate) const AFMT_S16_BE: u32 = 0x00000020;
+pub(crate) const AFMT_S32_LE: u32 = 0x00001000;
+pub(crate) const AFMT_S32_BE: u32 = 0x00002000;
+pub(crate) const AFMT_S24_LE: u32 = 0x00010000;
+pub(crate) const AFMT_S24_BE: u32 = 0x00020000;
+pub(crate) const AFMT_F32_LE: u32 = 0x10000000;
+pub(crate) const AFMT_F32_BE: u32 = 0x20000000;
+
+pub(super) const SNDCTL_DSP_SPEED: c_ulong =
+    nix::request_code_readwrite!(b'P', 2, std::mem::size_of::<c_int>());
+pub(super) const SNDCTL_DSP_SETFMT: c_ulong =
+    nix::request_code_readwrite!(b'P', 5, std::mem::size_of::<c_int>());
+pub(super) const SNDCTL_DSP_CHANNELS: c_ulong =
+    nix::request_code_readwrite!(b'P', 6, std::mem::size_of::<c_int>());
+pub(super) const SNDCTL_DSP_SETFRAGMENT: c_ulong =
+    nix::request_code_readwrite!(b'P', 10, std::mem::size_of::<c_int>());
+pub(super) const SNDCTL_DSP_LOW_WATER: c_ulong =
+    nix::request_code_write!(b'P', 34, std::mem::size_of::<c_int>());
+pub(super) const SNDCTL_DSP_GETFMTS: c_ulong =
+    nix::request_code_read!(b'P', 11, std::mem::size_of::<c_int>());
+pub(super) const SNDCTL_DSP_GETOSPACE: c_ulong =
+    nix::request_code_read!(b'P', 12, std::mem::size_of::<audio_buf_info>());
+pub(super) const SNDCTL_DSP_GETISPACE: c_ulong =
+    nix::request_code_read!(b'P', 13, std::mem::size_of::<audio_buf_info>());
+pub(super) const SNDCTL_DSP_SETTRIGGER: c_ulong =
+    nix::request_code_write!(b'P', 16, std::mem::size_of::<c_int>());
+//const SNDCTL_DSP_GETPLAYVOL:  c_ulong = nix::request_code_read!     (b'P', 24, std::mem::size_of::<c_int>());
+//const SNDCTL_DSP_SETPLAYVOL:  c_ulong = nix::request_code_readwrite!(b'P', 24, std::mem::size_of::<c_int>());
+pub(super) const SNDCTL_DSP_GETODELAY: c_ulong =
+    nix::request_code_read!(b'P', 23, std::mem::size_of::<c_int>());
+pub(super) const SNDCTL_DSP_GETERROR: c_ulong =
+    nix::request_code_read!(b'P', 25, std::mem::size_of::<audio_errinfo>());
+pub(super) const SNDCTL_DSP_HALT: c_ulong = nix::request_code_none!(b'P', 0); // aka SNDCTL_DSP_RESET
+pub(super) const SNDCTL_ENGINEINFO: c_ulong =
+    nix::request_code_readwrite!(b'X', 12, std::mem::size_of::<oss_audioinfo>());
+
+// sys/soundcard.h; the ioctl encodes the size, so a layout mismatch fails
+// cleanly instead of corrupting memory
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct oss_audioinfo {
+    pub(super) dev: c_int,
+    pub(super) name: [c_char; 64],
+    pub(super) busy: c_int,
+    pub(super) pid: c_int,
+    pub(super) caps: c_int,
+    pub(super) iformats: c_int,
+    pub(super) oformats: c_int,
+    pub(super) magic: c_int,
+    pub(super) cmd: [c_char; 64],
+    pub(super) card_number: c_int,
+    pub(super) port_number: c_int,
+    pub(super) mixer_dev: c_int,
+    pub(super) legacy_device: c_int,
+    pub(super) enabled: c_int,
+    pub(super) flags: c_int,
+    pub(super) min_rate: c_int,
+    pub(super) max_rate: c_int,
+    pub(super) min_channels: c_int,
+    pub(super) max_channels: c_int,
+    pub(super) binding: c_int,
+    pub(super) rate_source: c_int,
+    pub(super) handle: [c_char; 32],
+    pub(super) nrates: c_uint,
+    pub(super) rates: [c_uint; 20],
+    pub(super) song_name: [c_char; 64],
+    pub(super) label: [c_char; 16],
+    pub(super) latency: c_int,
+    pub(super) devnode: [c_char; 32],
+    pub(super) next_play_engine: c_int,
+    pub(super) next_rec_engine: c_int,
+    pub(super) filler: [c_int; 184],
+}
+
+unsafe impl crate::freebsd::IoctlPod for oss_audioinfo {}
+
+// sys/dev/sound/pcm/matrix.h: SETCHANNELS requests are clamped to this
+pub(super) const SND_CHN_MAX: c_int = 8;
+
+pub(super) const PCM_ENABLE_INPUT: c_int = 0x00000001;
+pub(super) const PCM_ENABLE_OUTPUT: c_int = 0x00000002;
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(super) struct audio_buf_info {
+    pub(super) fragments: c_int,
+    pub(super) fragstotal: c_int,
+    pub(super) fragsize: c_int,
+    pub(super) bytes: c_int,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(super) struct audio_errinfo {
+    pub(super) play_underruns: c_int,
+    pub(super) rec_overruns: c_int,
+    pub(super) play_ptradjust: c_uint,
+    pub(super) rec_ptradjust: c_uint,
+    pub(super) play_errorcount: c_int,
+    pub(super) rec_errorcount: c_int,
+    pub(super) play_lasterror: c_int,
+    pub(super) rec_lasterror: c_int,
+    pub(super) play_errorparm: c_long,
+    pub(super) rec_errorparm: c_long,
+    pub(super) filler: [c_int; 16],
+}
+
+unsafe impl crate::freebsd::IoctlPod for audio_buf_info {}
+unsafe impl crate::freebsd::IoctlPod for audio_errinfo {}
+
+#[derive(Debug, PartialEq)]
+pub(super) enum DspState {
+    Closed,
+    Setup,
+    Running,
+}
+// hw.snd.feeder_rate_round: the kernel snaps a requested rate within this of
+// the hardware clock to the exact hardware rate (channel.c chn_setparam);
+// it's a runtime sysctl (0..500), so read it, falling back to the default
+pub(super) const FEEDER_RATE_ROUND_DEFAULT: u32 = 25;
+
+pub(super) fn feeder_rate_round() -> u32 {
+    crate::freebsd::SysctlReader::new()
+        .read_u32("hw.snd.feeder_rate_round")
+        .unwrap_or(FEEDER_RATE_ROUND_DEFAULT)
+        .min(500)
+}
+
+// OSS grants the nearest supported value instead of failing, so a grant that
+// differs from the request beyond `tolerance` is a rejection here
+pub(super) fn set_value(fd: c_int, req: c_ulong, value: u32, tolerance: u32) -> Result<(), Errno> {
+    let Some(v) = ioctl_int(fd, req, value as c_int) else {
+        return Err(Errno::last());
+    };
+    if (v as i64 - value as i64).unsigned_abs() > tolerance as u64 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(())
+}
+
+pub(super) fn ospace_in_bytes(fd: c_int) -> c_int {
+    // e.g. the device was unplugged mid-stream
+    unsafe { ioctl_read::<audio_buf_info>(fd, SNDCTL_DSP_GETOSPACE) }.map_or(0, |info| info.bytes)
+}
+
+pub(super) fn set_fragment(fd: c_int, n_frags: u16, frag_size_selector: u16) {
+    let s = (((n_frags as u32) << 16) | frag_size_selector as u32) as c_int;
+    // best-effort: the caller reads the real grant back via GETOSPACE
+    let _ = ioctl_int(fd, SNDCTL_DSP_SETFRAGMENT, s);
+    // FreeBSD can grant a smaller layout than requested. The caller reads the real
+    // size from GETOSPACE, so don't assert the request was honored.
+}
+
+pub(super) fn set_trigger(fd: c_int, mask: c_int) -> bool {
+    ioctl_int(fd, SNDCTL_DSP_SETTRIGGER, mask).is_some()
+}
+
+pub(super) fn odelay(fd: c_int) -> c_int {
+    // e.g. the device was unplugged mid-stream
+    ioctl_int(fd, SNDCTL_DSP_GETODELAY, -1).unwrap_or(0)
+}
+
+// The fragment size the driver actually granted, which need not match the
+// SETFRAGMENT request: some drivers (e.g. snd_hdspe) force a fixed period.
+// GETBLKSIZE returns EINVAL here, so read GETOSPACE's fragsize field.
+pub(super) fn blocksize(fd: c_int) -> c_int {
+    unsafe { ioctl_read::<audio_buf_info>(fd, SNDCTL_DSP_GETOSPACE) }
+        .map_or(0, |info| info.fragsize)
+}
+
+pub(super) fn get_error(fd: c_int) -> audio_errinfo {
+    // e.g. the device was unplugged mid-stream
+    unsafe {
+        ioctl_read::<audio_errinfo>(fd, SNDCTL_DSP_GETERROR).unwrap_or_else(|| std::mem::zeroed())
+    }
+}
+
+// frame bytes for a sound4 AFMT value (width by encoding bit, channels from
+// the AFMT_CHANNEL field, sound.h:344); approximate widths are fine - the
+// quantum this feeds is a floor, and overstating errs toward more margin
+pub(super) fn afmt_frame_bytes(format: u32) -> u32 {
+    const AFMT_U16_MASK: u32 = 0x00000180;
+    const AFMT_U24_MASK: u32 = 0x000c0000;
+    const AFMT_U32_MASK: u32 = 0x0000c000;
+
+    let width: u32 =
+        if format & (AFMT_S32_LE | AFMT_S32_BE | AFMT_F32_LE | AFMT_F32_BE | AFMT_U32_MASK) != 0 {
+            4 // S32/U32/F32
+        } else if format & (AFMT_S24_LE | AFMT_S24_BE | AFMT_U24_MASK) != 0 {
+            // 3-byte S24/U24
+            3
+        } else if format & (AFMT_S16_LE | AFMT_S16_BE | AFMT_U16_MASK) != 0 {
+            2
+        } else {
+            1
+        };
+    let channels = ((format & 0x07f00000) >> 20).max(1); // AFMT_CHANNEL (sound.h:344)
+    width * channels
+}

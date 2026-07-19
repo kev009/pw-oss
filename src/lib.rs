@@ -21,22 +21,16 @@ use std::os::raw::c_int;
 mod device;
 mod monitor;
 mod node;
-mod nv;
-mod sink;
-mod source;
 mod spa;
 
-mod dll;
+mod freebsd;
 
 mod keys;
-mod mixer;
-mod sound;
-mod utils;
+mod oss;
 
 use device::OSS_DEVICE_FACTORY;
 use monitor::OSS_MONITOR_FACTORY;
-use sink::OSS_SINK_FACTORY;
-use source::OSS_SOURCE_FACTORY;
+use node::{OSS_SINK_FACTORY, OSS_SOURCE_FACTORY};
 
 /// The SPA plugin entry point, called by the PipeWire host loader.
 ///
@@ -121,13 +115,13 @@ static mut spa_log_topic_export_oss_device: TopicPointer =
 #[used]
 #[allow(non_upper_case_globals)]
 static mut spa_log_topic_export_oss_sink: TopicPointer =
-    TopicPointer(&raw mut sink::OSS_SINK_TOPIC);
+    TopicPointer(&raw mut node::OSS_SINK_TOPIC);
 
 #[unsafe(link_section = "spa_log_topic")]
 #[used]
 #[allow(non_upper_case_globals)]
 static mut spa_log_topic_export_oss_source: TopicPointer =
-    TopicPointer(&raw mut source::OSS_SOURCE_TOPIC);
+    TopicPointer(&raw mut node::OSS_SOURCE_TOPIC);
 
 #[unsafe(link_section = "spa_log_topic")]
 #[used]

@@ -177,7 +177,7 @@ struct Runtime {
     events: std::rc::Rc<MonitorEvents>,
     pcm_indexes: BTreeMap<String, Vec<u32>>,
     main_loop: crate::spa::Loop,
-    devd_socket: Option<crate::utils::DevdSocket>, // None when devd isn't running (no hotplug)
+    devd_socket: Option<crate::freebsd::DevdSocket>, // None when devd isn't running (no hotplug)
     devd_source: crate::spa::LoopSource,
     log: crate::spa::Log,
 }
@@ -401,14 +401,14 @@ fn resync_devices(state: &mut Runtime, detached: &[String]) -> Vec<MonitorObject
         }
     }
 
-    let indexes = match crate::sound::read_sndstat() {
+    let indexes = match crate::oss::read_sndstat() {
         Ok(indexes) => indexes,
         Err(err) => {
             crate::warn!(state.log, "can't re-read sndstat: {}", err);
             return notifications;
         }
     };
-    let new_map = crate::sound::group_pcm_devices_by_parent(&indexes);
+    let new_map = crate::oss::group_pcm_devices_by_parent(&indexes);
     let old_map = std::mem::replace(&mut state.pcm_indexes, new_map);
 
     for (driver, old_indexes) in &old_map {
@@ -460,8 +460,8 @@ unsafe extern "C" fn init(
     let state = handle.cast::<State>();
     assert!(!state.is_null(), "handle is not supposed to be null");
 
-    let pcm_indexes = match crate::sound::read_sndstat() {
-        Ok(indexes) => crate::sound::group_pcm_devices_by_parent(&indexes),
+    let pcm_indexes = match crate::oss::read_sndstat() {
+        Ok(indexes) => crate::oss::group_pcm_devices_by_parent(&indexes),
         Err(err) => {
             crate::error!(log, "Can't open /dev/sndstat: {}", err);
             return -(err as c_int);
@@ -469,7 +469,7 @@ unsafe extern "C" fn init(
     };
 
     // no devd (jails, minimal systems) just means no hotplug
-    let devd_socket = match crate::utils::DevdSocket::open() {
+    let devd_socket = match crate::freebsd::DevdSocket::open() {
         Ok(socket) => Some(socket),
         Err(err) => {
             crate::warn!(log, "can't connect to devd, hotplug disabled: {}", err);
@@ -588,4 +588,90 @@ pub(crate) static mut OSS_MONITOR_TOPIC: spa_log_topic = spa_log_topic {
 };
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    use super::*;
+
+    struct LateMonitorListener {
+        seen: Vec<u32>,
+    }
+
+    unsafe extern "C" fn record_late_monitor_object(
+        data: *mut c_void,
+        id: u32,
+        _info: *const spa_device_object_info,
+    ) {
+        unsafe { &mut *data.cast::<LateMonitorListener>() }
+            .seen
+            .push(id);
+    }
+
+    struct AddMonitorListenerContext {
+        events: *const MonitorEvents,
+        late_hook: *mut spa_hook,
+        late_table: *const spa_device_events,
+        late_data: *mut c_void,
+        seen: Vec<u32>,
+    }
+
+    unsafe extern "C" fn add_monitor_listener_during_dispatch(
+        data: *mut c_void,
+        id: u32,
+        _info: *const spa_device_object_info,
+    ) {
+        let context = unsafe { &mut *data.cast::<AddMonitorListenerContext>() };
+        context.seen.push(id);
+        if context.seen.len() != 1 {
+            return;
+        }
+        let events = unsafe { &*context.events };
+        let initial = |hooks: &crate::spa::ListenerList<spa_device_events>| unsafe {
+            events.emit_object_on(hooks, &MonitorObjectEvent::Removed { id: 3 });
+        };
+        unsafe {
+            events.with_new_listener(
+                context.late_hook,
+                context.late_table,
+                context.late_data,
+                initial,
+            );
+            events.dispatch_all(vec![MonitorObjectEvent::Removed { id: 4 }]);
+        }
+    }
+
+    #[test]
+    fn monitor_listener_added_during_dispatch_starts_at_its_barrier() {
+        let events = MonitorEvents::new();
+        let mut late = LateMonitorListener { seen: Vec::new() };
+        let mut late_table: spa_device_events = unsafe { std::mem::zeroed() };
+        late_table.version = SPA_VERSION_DEVICE_EVENTS;
+        late_table.object_info = Some(record_late_monitor_object);
+        let mut late_hook: spa_hook = unsafe { std::mem::zeroed() };
+        let mut context = AddMonitorListenerContext {
+            events: &events,
+            late_hook: &mut late_hook,
+            late_table: &late_table,
+            late_data: (&raw mut late).cast(),
+            seen: Vec::new(),
+        };
+        let mut table: spa_device_events = unsafe { std::mem::zeroed() };
+        table.version = SPA_VERSION_DEVICE_EVENTS;
+        table.object_info = Some(add_monitor_listener_during_dispatch);
+        let mut hook: spa_hook = unsafe { std::mem::zeroed() };
+        unsafe {
+            events.with_new_listener(
+                &mut hook,
+                &raw const table,
+                (&raw mut context).cast(),
+                |_hooks| {},
+            );
+            events.dispatch_all(vec![
+                MonitorObjectEvent::Removed { id: 1 },
+                MonitorObjectEvent::Removed { id: 2 },
+            ]);
+            events.dispatch_all(vec![MonitorObjectEvent::Removed { id: 5 }]);
+        }
+
+        assert_eq!(context.seen, [1, 2, 4, 5]);
+        assert_eq!(late.seen, [3, 4, 5]);
+    }
+}
