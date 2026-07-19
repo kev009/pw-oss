@@ -518,28 +518,30 @@ pub(crate) fn latency_info_default(
     }
 }
 
-// spa_latency_parse is static inline C, so reimplemented here
-pub(crate) unsafe fn parse_latency_info(
-    param: *const libspa::sys::spa_pod,
+// spa_latency_parse is static inline C, so reimplemented here; takes the
+// already-deserialized Value (the extern fns call deserialize_pod at the
+// FFI boundary), so the parse itself is safe code
+pub(crate) fn parse_latency_info(
+    value: Option<&libspa::pod::Value>,
 ) -> Option<libspa::sys::spa_latency_info> {
     use libspa::pod::{Object, Value};
     use libspa::sys::*;
 
-    match unsafe { crate::utils::deserialize_pod(param) } {
+    match value {
         Some(Value::Object(Object {
             type_, properties, ..
-        })) if type_ == SPA_TYPE_OBJECT_ParamLatency => {
+        })) if *type_ == SPA_TYPE_OBJECT_ParamLatency => {
             let mut info = latency_info_default(SPA_DIRECTION_INPUT);
             for p in properties {
                 #[allow(non_upper_case_globals)]
-                match (p.key, p.value) {
+                match (p.key, &p.value) {
                     (SPA_PARAM_LATENCY_direction, Value::Id(v)) => info.direction = v.0 & 1,
-                    (SPA_PARAM_LATENCY_minQuantum, Value::Float(v)) => info.min_quantum = v,
-                    (SPA_PARAM_LATENCY_maxQuantum, Value::Float(v)) => info.max_quantum = v,
-                    (SPA_PARAM_LATENCY_minRate, Value::Int(v)) => info.min_rate = v,
-                    (SPA_PARAM_LATENCY_maxRate, Value::Int(v)) => info.max_rate = v,
-                    (SPA_PARAM_LATENCY_minNs, Value::Long(v)) => info.min_ns = v,
-                    (SPA_PARAM_LATENCY_maxNs, Value::Long(v)) => info.max_ns = v,
+                    (SPA_PARAM_LATENCY_minQuantum, Value::Float(v)) => info.min_quantum = *v,
+                    (SPA_PARAM_LATENCY_maxQuantum, Value::Float(v)) => info.max_quantum = *v,
+                    (SPA_PARAM_LATENCY_minRate, Value::Int(v)) => info.min_rate = *v,
+                    (SPA_PARAM_LATENCY_maxRate, Value::Int(v)) => info.max_rate = *v,
+                    (SPA_PARAM_LATENCY_minNs, Value::Long(v)) => info.min_ns = *v,
+                    (SPA_PARAM_LATENCY_maxNs, Value::Long(v)) => info.max_ns = *v,
                     _ => (),
                 }
             }
@@ -578,24 +580,25 @@ pub(crate) fn process_latency_default() -> libspa::sys::spa_process_latency_info
     }
 }
 
-// spa_process_latency_parse is static inline C, so reimplemented here
-pub(crate) unsafe fn parse_process_latency_info(
-    param: *const libspa::sys::spa_pod,
+// spa_process_latency_parse is static inline C, so reimplemented here;
+// takes the already-deserialized Value (see parse_latency_info)
+pub(crate) fn parse_process_latency_info(
+    value: Option<&libspa::pod::Value>,
 ) -> Option<libspa::sys::spa_process_latency_info> {
     use libspa::pod::{Object, Value};
     use libspa::sys::*;
 
-    match unsafe { crate::utils::deserialize_pod(param) } {
+    match value {
         Some(Value::Object(Object {
             type_, properties, ..
-        })) if type_ == SPA_TYPE_OBJECT_ParamProcessLatency => {
+        })) if *type_ == SPA_TYPE_OBJECT_ParamProcessLatency => {
             let mut info = process_latency_default();
             for p in properties {
                 #[allow(non_upper_case_globals)]
-                match (p.key, p.value) {
-                    (SPA_PARAM_PROCESS_LATENCY_quantum, Value::Float(v)) => info.quantum = v,
-                    (SPA_PARAM_PROCESS_LATENCY_rate, Value::Int(v)) => info.rate = v,
-                    (SPA_PARAM_PROCESS_LATENCY_ns, Value::Long(v)) => info.ns = v,
+                match (p.key, &p.value) {
+                    (SPA_PARAM_PROCESS_LATENCY_quantum, Value::Float(v)) => info.quantum = *v,
+                    (SPA_PARAM_PROCESS_LATENCY_rate, Value::Int(v)) => info.rate = *v,
+                    (SPA_PARAM_PROCESS_LATENCY_ns, Value::Long(v)) => info.ns = *v,
                     _ => (),
                 }
             }
@@ -811,22 +814,19 @@ pub(crate) fn parse_back(pod: &[u8]) -> libspa::pod::Value {
     value
 }
 
-// Fire-and-forget: queue `f` to run once on the given loop (from any thread;
-// non-blocking, RT-safe on the caller side). The closure is boxed and freed
-// after it runs. Returns false when it could not even be queued.
-// F: Send + 'static - the boxed closure crosses to the loop thread and runs
-// after this call returns, so captured stack borrows would dangle
-pub(crate) unsafe fn invoke_on_loop<T, F: FnOnce(&mut T) + Send + 'static>(
+// Queue an owned closure on the target loop. spa_loop.invoke may execute it
+// inline when called from that loop, so callers must release reentrant state
+// borrows first and real-time callers must not enqueue blocking work. A false
+// return means the closure and its payload were dropped on the calling thread.
+//
+// # Safety
+// The loop must outlive the queued item's execution: host loops come from
+// the spa_support array and live for the plugin host's lifetime.
+pub(crate) unsafe fn queue_task<F: FnOnce() + Send + 'static>(
     loop_: &crate::spa::Loop,
-    target: *mut T,
     f: F,
 ) -> bool {
-    struct Ctx<T, F> {
-        target: *mut T,
-        f: F,
-    }
-
-    unsafe extern "C" fn trampoline<T, F: FnOnce(&mut T) + Send + 'static>(
+    unsafe extern "C" fn trampoline<F: FnOnce() + Send + 'static>(
         _loop: *mut libspa::sys::spa_loop,
         _async: bool,
         _seq: u32,
@@ -834,27 +834,22 @@ pub(crate) unsafe fn invoke_on_loop<T, F: FnOnce(&mut T) + Send + 'static>(
         _size: usize,
         user_data: *mut std::os::raw::c_void,
     ) -> std::os::raw::c_int {
-        // user_data is the Box::into_raw'd ctx below; the loop runs each
+        // user_data is the Box::into_raw'd closure below; the loop runs each
         // queued item exactly once, so this is the sole owner
-        let ctx = unsafe { Box::from_raw(user_data.cast::<Ctx<T, F>>()) };
-        let target = ctx.target;
-        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            // target validity is the caller's contract on invoke_on_loop
-            (ctx.f)(unsafe { target.as_mut() }.expect("target is not supposed to be null"));
-        }));
+        let f = unsafe { Box::from_raw(user_data.cast::<F>()) };
+        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
         if ok.is_err() {
-            eprintln!("freebsd-oss: panic in a queued main-loop task (swallowed)");
+            eprintln!("freebsd-oss: panic in a queued loop task (swallowed)");
         }
-        // never return negative: when the loop flushes the item INLINE (same
-        // thread, or the loop not currently entered) the invoke returns this
-        // value, and a negative would make the caller free the ctx a second time
+        // never negative: an inline flush returns this value to the caller,
+        // and a negative would make it free the closure a second time
         0
     }
 
-    let ctx = Box::into_raw(Box::new(Ctx { target, f }));
+    let ctx = Box::into_raw(Box::new(f));
     let err = unsafe {
         loop_.invoke(
-            Some(trampoline::<T, F>),
+            Some(trampoline::<F>),
             0,
             std::ptr::null(),
             0,
@@ -913,7 +908,7 @@ pub(crate) fn try_now_ns(system: &crate::spa::System) -> Option<u64> {
         tv_sec: 0,
         tv_nsec: 0,
     };
-    let err = unsafe { system.clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
+    let err = system.clock_gettime(libc::CLOCK_MONOTONIC, &mut now);
     if err < 0 {
         return None;
     }

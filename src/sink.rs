@@ -2,30 +2,43 @@ use std::os::raw::c_int;
 
 use libspa::sys::*;
 
-use crate::node::{Direction, MAX_PORTS, ParamBuild, PortConfig, State};
+use crate::node::{
+    DataControl, DataState, Direction, MAX_PORTS, MainState, ParamBuild, PortConfig,
+};
 
-// several State fields are per-port in disguise (the single PortInfo,
-// on_timeout's last-port-wins clock delay); fix those before raising this
+// PortInfo and clock-delay state currently support one playback port.
 const _: () = assert!(MAX_PORTS == 1);
 
 pub(crate) enum SinkDir {}
 
-// direction-specific State fields (State.ext)
-pub(crate) struct SinkExt {
-    pub cur_timestamp: u64, // method invocation timestamp for `process`
-    pub old_timestamp: u64,
-    pub oss_delay: u32,         // additional delay in 1/8ths of period
-    pub oss_delay_default: u32, // init-time value, restored by a NULL Props reset
+// main-loop property model
+pub(crate) struct SinkMainExt {
+    pub oss_delay: u32,
+    pub oss_delay_default: u32,
 }
 
-impl Default for SinkExt {
+impl Default for SinkMainExt {
+    fn default() -> Self {
+        Self {
+            oss_delay: 10,
+            oss_delay_default: 10,
+        }
+    }
+}
+
+// direction-specific data-loop fields (DataState.ext)
+pub(crate) struct SinkDataExt {
+    pub cur_timestamp: u64, // method invocation timestamp for `process`
+    pub old_timestamp: u64,
+    pub oss_delay: u32, // additional delay in 1/8ths of period
+}
+
+impl Default for SinkDataExt {
     fn default() -> Self {
         Self {
             cur_timestamp: 0,
             old_timestamp: 0,
-            // default fill target: 10/8 of a period
             oss_delay: 10,
-            oss_delay_default: 10,
         }
     }
 }
@@ -465,7 +478,6 @@ fn detect_underrun(
     underrun_count: u32,
     cur_timestamp: u64,
     clock_nsec: u64,
-    callbacks: &spa_callbacks,
     log: &crate::spa::Log,
 ) {
     let Some((stride, cfg_rate)) = port.stride_rate() else {
@@ -501,9 +513,10 @@ fn detect_underrun(
             // late cycle
             port.ext.xrun_timestamp = clock_nsec.max(1);
 
-            // once per event, not per held cycle
-            // the host callback table outlives the node (set_callbacks contract)
-            unsafe { crate::node::emit_xrun(callbacks, cur_timestamp / 1000) };
+            // once per event, not per held cycle; deposited, not called -
+            // process() notifies the host after the State borrows end
+            // (collect-then-notify, see node::process)
+            port.pending_xrun = Some(cur_timestamp / 1000);
         }
     } else {
         // suppressed counts stay diagnosable: a marginal system that
@@ -654,7 +667,7 @@ fn need_data(io: &mut crate::spa::IoArea<spa_io_buffers>, result: &mut c_int) {
     *result |= SPA_STATUS_NEED_DATA as i32;
 }
 
-unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
+fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
     state.ext.old_timestamp = state.ext.cur_timestamp;
     // on a failed clock read reuse the previous stamp (rate limits and the
     // underrun gate degrade for a cycle) rather than abort the data loop
@@ -674,9 +687,19 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
     }
 
     let mut result = SPA_STATUS_OK as i32;
-    let state_ptr: *mut State<SinkDir> = state;
 
-    for (port_idx, port) in state.ports.iter_mut().enumerate() {
+    // indexed (not iter_mut) so the resetup arms below can end the &mut port
+    // borrow, borrow the whole State, and re-borrow the port
+    for port_idx in 0..state.ports.len() {
+        // Consume any completed background rebuild before the cycle reads the
+        // port (it may swap in a fresh device or clear the config); a rebuild
+        // still in flight skips the cycle.
+        if crate::node::poll_resetup(state, port_idx) {
+            let port = &mut state.ports[port_idx];
+            need_data(&mut port.io, &mut result);
+            continue;
+        }
+        let port = &mut state.ports[port_idx];
         let Some((stride, cfg_rate)) = port.stride_rate() else {
             continue; // no format negotiated yet
         };
@@ -685,16 +708,13 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
             continue; // not (fully) negotiated yet
         }
 
-        if port.resetup_pending {
-            // the main thread is rebuilding the device; drop cycles until it lands
-            need_data(&mut port.io, &mut result);
-            continue;
-        }
-
         if port.dsp.is_closed() {
             // Suspend closed the device but the host restarted without a fresh
-            // format; rebuild off-loop instead of tripping the dsp state asserts
-            port.resetup_pending = unsafe { crate::node::queue_resetup(state_ptr, port_idx) };
+            // format; rebuild off-loop instead of tripping the dsp state
+            // asserts (the &mut port borrow ends here: queue_resetup snapshots
+            // an owned request and owns the pending claim)
+            crate::node::queue_resetup(state, port_idx);
+            let port = &mut state.ports[port_idx];
             need_data(&mut port.io, &mut result);
             continue;
         }
@@ -708,6 +728,9 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
 
         // io is non-null here (the HAVE_DATA gate above read through it)
         let buffer_id = port.io.with_ref(|io| io.buffer_id).unwrap_or(u32::MAX);
+        // SAFETY: the host keeps the registered buffer pointers valid until
+        // the next port_use_buffers (its contract), and the returned block is
+        // used within this cycle only
         let Some(data_0) = (unsafe { crate::node::valid_data_block(port, buffer_id, &state.log) })
         else {
             // return status, not just io, so the host refills
@@ -715,19 +738,11 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
             continue;
         };
 
-        // chunk non-null and maxsize > 0 guaranteed above
-        let offset = unsafe { (*data_0.chunk.as_ptr()).offset } % data_0.maxsize;
-        let size = unsafe { (*data_0.chunk.as_ptr()).size }.min(data_0.maxsize - offset);
-        // the raw block becomes a slice here: offset/size were just clamped
-        // against maxsize, so the range is in bounds for the cycle
-        let cycle_data = unsafe {
-            std::slice::from_raw_parts(
-                data_0.data.as_ptr().cast::<u8>().add(offset as usize),
-                size as usize,
-            )
-        };
+        // the chunk-clamped view of the block, valid for this cycle
+        let cycle_data = data_0.input_slice();
+        let size = cycle_data.len() as u32;
 
-        debug_assert_eq!(unsafe { (*data_0.chunk.as_ptr()).stride }, stride as i32);
+        debug_assert_eq!(data_0.chunk_stride(), stride as i32);
 
         #[cfg(debug_assertions)]
         if state.position.with_ref(|p| p.clock.flags).unwrap_or(0) & SPA_IO_CLOCK_FLAG_XRUN_RECOVER
@@ -743,15 +758,9 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
 
         #[cfg(debug_assertions)]
         if state.log.log_level() >= SPA_LOG_LEVEL_TRACE {
-            crate::trace!(state.log, "offset: {}, chunk size: {}", offset, size);
-            // offset is in bounds for the block (clamped against maxsize above)
-            unsafe {
-                spa_debug_mem(
-                    0,
-                    data_0.data.as_ptr().offset(offset as isize),
-                    16.min(size) as usize,
-                );
-            }
+            crate::trace!(state.log, "chunk size: {}", size);
+            // the slice head is in bounds by construction (input_slice)
+            unsafe { spa_debug_mem(0, cycle_data.as_ptr().cast(), 16.min(size) as usize) };
         }
 
         // position is non-null on the process path (checked by process); the
@@ -802,8 +811,11 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
             &state.log,
         ) {
             // the driver refused the trigger stop (dying fd): rebuild off-loop
-            port.resetup_pending = unsafe { crate::node::queue_resetup(state_ptr, port_idx) };
-            if port.resetup_pending {
+            // (the &mut port borrow ends here: queue_resetup snapshots an
+            // owned request and owns the pending claim)
+            let pending = crate::node::queue_resetup(state, port_idx);
+            if pending {
+                let port = &mut state.ports[port_idx];
                 port.was_matching = false; // the gap invalidates matching history
                 need_data(&mut port.io, &mut result);
                 continue;
@@ -811,6 +823,8 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
             // no main loop (unusual host): keep running at the stale size; the
             // write path drops or underruns but nothing stalls or aborts
         }
+        // re-borrow: the retune arm above may have borrowed the whole State
+        let port = &mut state.ports[port_idx];
 
         if !port.dsp.is_running() {
             if period_in_bytes == 0 {
@@ -839,7 +853,6 @@ unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
                     underruns,
                     state.ext.cur_timestamp,
                     driver_clock.nsec,
-                    &state.callbacks,
                     &state.log,
                 );
             }
@@ -917,14 +930,15 @@ impl Direction for SinkDir {
     const CMD_WARN_PREFIX: &'static str = "";
 
     type Device = crate::sound::DspWriter;
-    type Ext = SinkExt;
+    type MainExt = SinkMainExt;
+    type DataExt = SinkDataExt;
     type PortExt = SinkPortExt;
 
     fn log_topic() -> std::ptr::NonNull<spa_log_topic> {
         std::ptr::NonNull::new(&raw mut OSS_SINK_TOPIC).expect("a static's address is never null")
     }
 
-    fn info_item(ext: &mut SinkExt, key: &str, value: &str) {
+    fn info_item(ext: &mut SinkMainExt, key: &str, value: &str) {
         if key == crate::keys::OSS_DELAY {
             // per-device default, e.g. from a wireplumber node rule
             if let Ok(v) = value.parse::<u32>() {
@@ -933,11 +947,18 @@ impl Direction for SinkDir {
         }
     }
 
-    fn ext_ready(ext: &mut SinkExt) {
+    fn ext_ready(ext: &mut SinkMainExt) {
         ext.oss_delay_default = ext.oss_delay;
     }
 
-    fn build_node_param(state: &mut State<SinkDir>, id: u32, index: u32) -> ParamBuild {
+    fn data_ext(ext: &SinkMainExt) -> SinkDataExt {
+        SinkDataExt {
+            oss_delay: ext.oss_delay,
+            ..Default::default()
+        }
+    }
+
+    fn build_node_param(state: &mut MainState<SinkDir>, id: u32, index: u32) -> ParamBuild {
         #[allow(non_upper_case_globals)]
         let pod = match (id, index) {
             (SPA_PARAM_PropInfo, 0) => crate::utils::build_latency_offset_prop_info(),
@@ -972,70 +993,45 @@ impl Direction for SinkDir {
     }
 
     // a NULL Props pod resets the props to their defaults and re-applies them
-    unsafe fn reset_props(state: &mut State<SinkDir>) -> c_int {
-        let res = unsafe {
-            crate::node::store_and_rebuild(state, |state| {
-                state.ext.oss_delay = state.ext.oss_delay_default; // read by process()
-                state.oss_fragment = state.oss_fragment_default; // ditto (the prime path)
-            })
-        };
+    fn reset_props(state: &mut MainState<SinkDir>, data: &DataControl<SinkDir>) -> c_int {
+        let delay = state.ext.oss_delay_default;
+        let fragment = state.oss_fragment_default;
+        let old_delay = state.ext.oss_delay;
+        let old_fragment = state.oss_fragment;
+        state.ext.oss_delay = delay;
+        state.oss_fragment = fragment;
+        let res = crate::node::store_and_rebuild(state, data, move |state| {
+            state.ext.oss_delay = delay;
+            state.oss_fragment = fragment;
+        });
         if res != 0 {
+            state.ext.oss_delay = old_delay;
+            state.oss_fragment = old_fragment;
             return res;
         }
-        unsafe {
-            crate::node::handle_process_latency(state, crate::utils::process_latency_default());
-        }
+        crate::node::handle_process_latency(state, crate::utils::process_latency_default());
         0
     }
 
-    unsafe fn set_props_params(state: &mut State<SinkDir>, value: &libspa::pod::Value) -> c_int {
-        use libspa::pod::Value;
-        match value {
-            Value::Struct(values) if values.len() % 2 == 0 => {
-                for kv in values.chunks(2) {
-                    match (&kv[0], &kv[1]) {
-                        // pw-cli set-param <object-id> Props '{ "params": ["oss.delay", 8]}'
-                        (Value::String(s), Value::Int(x))
-                            if s == crate::keys::OSS_DELAY && *x >= 0 =>
-                        {
-                            // cap it: period/8 * oss_delay runs in the RT path and must not overflow
-                            let new_delay = (*x as u32).min(1024);
-                            if new_delay != state.ext.oss_delay {
-                                // unchanged echoes must not rebuild a running device
-                                let res = unsafe {
-                                    crate::node::apply_props_param(state, move |state| {
-                                        state.ext.oss_delay = new_delay;
-                                    })
-                                };
-                                if res != 0 {
-                                    return res;
-                                }
-                            }
-                        }
-                        (Value::String(s), Value::Int(x))
-                            if s == crate::keys::OSS_FRAGMENT && *x >= 0 =>
-                        {
-                            // stored normalized, so the Props readback reports the
-                            // effective (rounded/clamped) value, not the raw request
-                            let new_fragment = crate::node::normalize_fragment(*x as u32);
-                            if new_fragment != state.oss_fragment {
-                                let res = unsafe {
-                                    crate::node::apply_props_param(state, move |state| {
-                                        state.oss_fragment = new_fragment;
-                                    })
-                                };
-                                if res != 0 {
-                                    return res;
-                                }
-                            }
-                        }
-                        _ => (),
-                    }
-                }
-            }
-            _ => (),
+    fn apply_oss_delay(
+        state: &mut MainState<SinkDir>,
+        data: &DataControl<SinkDir>,
+        delay: u32,
+    ) -> c_int {
+        // cap it: period/8 * oss_delay runs in the RT path and must not overflow
+        let new_delay = delay.min(1024);
+        if new_delay == state.ext.oss_delay {
+            return 0; // unchanged echoes must not rebuild a running device
         }
-        0
+        let old_delay = state.ext.oss_delay;
+        state.ext.oss_delay = new_delay;
+        let res = crate::node::apply_props_param(state, data, move |state| {
+            state.ext.oss_delay = new_delay;
+        });
+        if res != 0 {
+            state.ext.oss_delay = old_delay;
+        }
+        res
     }
 
     fn try_open_configure(
@@ -1049,13 +1045,13 @@ impl Direction for SinkDir {
         try_open_configure(dsp, config, log)
     }
 
-    fn on_device_swapped(state: &mut State<SinkDir>, port_idx: usize) {
+    fn on_device_swapped(state: &mut DataState<SinkDir>, port_idx: usize) {
         state.ports[port_idx].ext.xrun_timestamp = 0;
     }
 
-    fn on_buffers_swapped(_state: &mut State<SinkDir>, _port_idx: usize) {}
+    fn on_buffers_swapped(_state: &mut DataState<SinkDir>, _port_idx: usize) {}
 
-    fn on_start_loop(state: &mut State<SinkDir>) {
+    fn on_start_loop(state: &mut DataState<SinkDir>) {
         for port in &mut state.ports {
             port.ext.xrun_timestamp = 0;
             // Start recomputes `following`, and a role flip that happened
@@ -1072,9 +1068,9 @@ impl Direction for SinkDir {
         state.ext.old_timestamp = 0;
     }
 
-    fn on_suspend_loop(_state: &mut State<SinkDir>) {}
+    fn on_suspend_loop(_state: &mut DataState<SinkDir>) {}
 
-    fn on_role_flip(state: &mut State<SinkDir>) {
+    fn on_role_flip(state: &mut DataState<SinkDir>) {
         // a role flip shifts the servo's measurement phase, not the fill:
         // relock the DLL instead of holding playback like an underrun (the
         // fill snap in the write path corrects any real level error)
@@ -1085,7 +1081,7 @@ impl Direction for SinkDir {
         }
     }
 
-    unsafe fn debug_cycle(state: &State<SinkDir>, now: u64, nsec: u64) {
+    fn debug_cycle(state: &DataState<SinkDir>, now: u64, nsec: u64) {
         if cfg!(debug_assertions) {
             eprintln!(
                 "cycle: {}, delay: {} ms @ {}",
@@ -1117,8 +1113,8 @@ impl Direction for SinkDir {
         fill as f64 - port.ext.target_delay as f64
     }
 
-    unsafe fn process_ports(state: &mut State<SinkDir>) -> c_int {
-        unsafe { process_ports(state) }
+    fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
+        process_ports(state)
     }
 }
 
@@ -1154,7 +1150,7 @@ mod tests {
     use super::{buffer_request, buffer_required, desired_delay, fill_floor, target_delay};
     use crate::node::PortConfig;
     use crate::sound::test_util::{drain, fill_pipe, free_space, pattern, pipe_pair};
-    use libspa::sys::{SPA_IO_CLOCK_FLAG_XRUN_RECOVER, spa_callbacks};
+    use libspa::sys::SPA_IO_CLOCK_FLAG_XRUN_RECOVER;
 
     // a Port on a pipe-backed device: the pipe's buffer plays the OSS ring
     // (byte-exact accounting, short writes on a full ring), GETODELAY reads 0
@@ -1176,8 +1172,10 @@ mod tests {
             bw_adapt: Default::default(),
             setup_blocksize: 1024,
             resetup_pending: false,
+            generation: 0,
             was_matching: false,
             warn_limit: crate::utils::RateLimit::new(),
+            pending_xrun: None,
             ext: SinkPortExt {
                 target_delay,
                 ..Default::default()
@@ -1354,18 +1352,18 @@ mod tests {
             flags: 0,
             stride: 8,
         });
-        let callbacks = spa_callbacks {
-            funcs: std::ptr::null(),
-            data: std::ptr::null_mut(),
-        };
         let log = crate::spa::Log::test_null();
 
-        detect_underrun(&mut port, 2048, 3, 1_000_000, 500_000, &callbacks, &log);
+        detect_underrun(&mut port, 2048, 3, 1_000_000, 500_000, &log);
         assert_eq!(port.ext.xrun_timestamp, 500_000);
+        // Deposit one xrun event for process() to notify.
+        assert_eq!(port.pending_xrun.take(), Some(1_000));
 
-        // a later cycle's count must not move the armed snapshot
-        detect_underrun(&mut port, 2048, 5, 2_000_000, 700_000, &callbacks, &log);
+        // a later cycle's count must not move the armed snapshot (and must
+        // not deposit a second event for the same hold)
+        detect_underrun(&mut port, 2048, 5, 2_000_000, 700_000, &log);
         assert_eq!(port.ext.xrun_timestamp, 500_000);
+        assert_eq!(port.pending_xrun, None);
         unsafe { libc::close(r) };
     }
 

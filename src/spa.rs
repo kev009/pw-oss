@@ -40,6 +40,17 @@ pub(crate) fn version_ok(version: u32, min: u32) -> bool {
 // shape) - a second callback on the same hook after the first freed it would
 // still be a use-after-free even with the copied callbacks.
 pub(crate) unsafe fn for_each_hook(head: *mut spa_hook_list, mut apply: impl FnMut(spa_callbacks)) {
+    struct CursorGuard(*mut spa_list);
+
+    impl Drop for CursorGuard {
+        fn drop(&mut self) {
+            unsafe {
+                (*(*self.0).prev).next = (*self.0).next;
+                (*(*self.0).next).prev = (*self.0).prev;
+            }
+        }
+    }
+
     let list = unsafe { std::ptr::addr_of_mut!((*head).list) };
     // all-zero is the C-struct cursor's valid initial state
     let mut cursor: spa_hook = unsafe { std::mem::zeroed() };
@@ -52,6 +63,8 @@ pub(crate) unsafe fn for_each_hook(head: *mut spa_hook_list, mut apply: impl FnM
         (*(*list).next).prev = cur;
         (*list).next = cur;
     }
+    // Unlink on both normal return and a Rust-only unwind from `apply`.
+    let _cursor_guard = CursorGuard(cur);
 
     loop {
         let item = unsafe { (*cur).next };
@@ -78,12 +91,6 @@ pub(crate) unsafe fn for_each_hook(head: *mut spa_hook_list, mut apply: impl FnM
         }
         // copy the callbacks out before the callback can free the hook
         apply(hook.cb);
-    }
-
-    // unlink the cursor
-    unsafe {
-        (*(*cur).prev).next = (*cur).next;
-        (*(*cur).next).prev = (*cur).prev;
     }
 }
 
@@ -142,21 +149,142 @@ pub(crate) unsafe fn emit_events<E: HookEvents>(
     }
 }
 
-pub(crate) unsafe fn dev_emit_result(
-    hooks: &mut spa_hook_list,
+// A typed spa_hook_list. Hooks enter through typed add_listener functions, so
+// each funcs pointer names an E vtable. emit_events checks the version prefix
+// before reading the full table.
+pub(crate) struct ListenerList<E: HookEvents> {
+    // Box: the head is intrusive and self-referential (its links point back
+    // at it, and every registered hook links to it), so it needs an address
+    // that survives moves of the ListenerList value; the heap cell is
+    // initialized once in new() and never moves again. UnsafeCell: listener
+    // callbacks re-enter through raw pointers while emit() walks the list
+    // (add_listener's isolate/join, a hook unlinking itself), so no Rust
+    // reference may claim exclusive access to the head across an emission -
+    // every access goes through the raw cell pointer.
+    list: Box<std::cell::UnsafeCell<spa_hook_list>>,
+    _events: std::marker::PhantomData<E>,
+}
+
+impl<E: HookEvents> ListenerList<E> {
+    pub(crate) fn new() -> Self {
+        let list = Box::new(std::cell::UnsafeCell::new(spa_hook_list {
+            list: spa_list {
+                next: std::ptr::null_mut(),
+                prev: std::ptr::null_mut(),
+            },
+        }));
+        // Initialize self-referential links at their final heap address.
+        unsafe { spa_hook_list_init(list.get()) };
+        Self {
+            list,
+            _events: std::marker::PhantomData,
+        }
+    }
+
+    /// Register one listener in isolation while its initial events are emitted.
+    ///
+    /// The save list stays at a stable address until the closure returns, and
+    /// the guard restores the full list before the result leaves this method.
+    /// It also restores the list if a Rust-only caller unwinds.
+    ///
+    /// # Safety
+    ///
+    /// `listener` must point to writable hook storage, `events` must point to a
+    /// valid `E` vtable, and `data` must remain valid for that vtable's calls
+    /// for as long as the listener remains linked.
+    pub(crate) unsafe fn with_isolated_listener<R>(
+        &self,
+        listener: *mut spa_hook,
+        events: *const E,
+        data: *mut c_void,
+        initial: impl FnOnce() -> R,
+    ) -> R {
+        struct JoinGuard {
+            list: *mut spa_hook_list,
+            save: *mut spa_hook_list,
+        }
+
+        impl Drop for JoinGuard {
+            fn drop(&mut self) {
+                unsafe { spa_hook_list_join(self.list, self.save) };
+            }
+        }
+
+        let mut save_storage = std::mem::MaybeUninit::<spa_hook_list>::uninit();
+        let save = save_storage.as_mut_ptr();
+        unsafe {
+            spa_hook_list_isolate(self.list.get(), save, listener, events.cast(), data);
+        }
+        // Keep only a raw pointer across arbitrary listener code: callbacks
+        // may unlink hooks in the saved list, so an &mut save would make those
+        // raw list mutations violate Rust exclusivity.
+        let guard = JoinGuard {
+            list: self.list.get(),
+            save,
+        };
+        let result = initial();
+        drop(guard);
+        // Keep the stack allocation lexical through join without ever
+        // creating a Rust reference to its initialized spa_hook_list value.
+        let _ = &mut save_storage;
+        result
+    }
+
+    /// Move every hook from `other` to the tail of this list.
+    ///
+    /// # Safety
+    ///
+    /// Neither list may be under traversal, and they must be distinct list
+    /// heads. Both lists carry the same `E` vtable type by construction.
+    pub(crate) unsafe fn append_from(&self, other: &Self) {
+        let list = self.list.get();
+        let other = other.list.get();
+        assert_ne!(list, other, "a listener list cannot append itself");
+        unsafe {
+            let list_head = std::ptr::addr_of_mut!((*list).list);
+            let other_head = std::ptr::addr_of_mut!((*other).list);
+            if (*other_head).next == other_head {
+                return;
+            }
+            // spa_list_insert_list inserts after its first argument. Using
+            // the destination tail preserves listener registration order.
+            spa_list_insert_list((*list_head).prev, other_head);
+            spa_hook_list_init(other);
+        }
+    }
+
+    // Emit one listener method to every hook (see emit_events for the
+    // one-method-per-traversal contract and the version gate). Safe per the
+    // construction invariant above; &self on purpose - a callback may
+    // re-enter add_listener or unlink hooks mid-walk through raw pointers,
+    // mutation an exclusive &mut here would falsely rule out. The closure
+    // still owns the unsafe FFI call into each vtable entry it extracts.
+    // This proves only the list traversal: an owner whose C callback can
+    // re-enter other state must separately end those state borrows before
+    // calling emit (the node/device/monitor endpoint dispatch contracts).
+    pub(crate) fn emit(&self, call: impl FnMut(E, *mut c_void)) {
+        // SAFETY: the head was initialized at its final heap address in
+        // new(), every hook carries an E vtable (the construction invariant
+        // above), and for_each_hook's woven cursor is built for reentrant
+        // list mutation during the walk
+        unsafe { emit_events(self.list.get(), call) };
+    }
+}
+
+pub(crate) fn dev_emit_result(
+    hooks: &ListenerList<spa_device_events>,
     seq: c_int,
     res: c_int,
     type_: u32,
     result: &spa_result_device_params,
 ) {
-    // one emission through the C listener vtables end to end
-    unsafe {
-        emit_events(hooks, |f: spa_device_events, data| {
-            if let Some(result_fun) = f.result {
-                result_fun(data, seq, res, type_, result as *const _ as *const c_void);
-            }
-        });
-    }
+    hooks.emit(|f, data| {
+        if let Some(result_fun) = f.result {
+            // one emission through the C listener vtable (the add_listener
+            // contract keeps data valid for the call)
+            unsafe { result_fun(data, seq, res, type_, result as *const _ as *const c_void) };
+        }
+    });
 }
 
 // A host-shared io area (spa_io_clock/position/buffers/rate_match): a typed
@@ -234,27 +362,36 @@ pub(crate) enum ParamStep {
 /// The shared enum_params frame behind node, port and device param
 /// enumeration: walk indices from `start`, build one pod per step, filter it
 /// against the host's filter pod and emit up to `max` matches as result
-/// events. `state` is threaded through both closures so building may borrow
-/// it mutably (the caps re-probe) and emission may reach the hook list.
+/// events. Each build gets a fresh, short State borrow; that borrow ends
+/// before `emit`, so a result listener may safely re-enter and the following
+/// index observes any resulting state change.
 ///
 /// # Safety
-/// `filter` must be null or point at a valid pod (the spa_pod_filter
-/// contract); the emit closure receives a pointer into a buffer that is only
-/// valid for the duration of that call.
+/// `state` must remain live for the call, and a reentrant listener must not
+/// destroy it before enumeration returns. `filter` must be null or point at
+/// a valid pod (the spa_pod_filter contract). The emit closure receives a
+/// pointer into a buffer valid only for that call.
 pub(crate) unsafe fn enum_params_loop<S>(
-    state: &mut S,
+    state: *mut S,
     (start, max): (u32, u32),
     filter: *const spa_pod,
     mut build: impl FnMut(&mut S, u32) -> ParamStep,
-    mut emit: impl FnMut(&mut S, u32, *mut spa_pod),
+    mut emit: impl FnMut(u32, *mut spa_pod),
 ) -> c_int {
+    assert!(!state.is_null(), "enumerated state must not be null");
     let mut fbuffer = vec![]; // spa_pod_filter output; kept apart from the source pod (see filter_pod)
 
     let mut index = start;
     let mut count = 0;
 
     while count < max {
-        let mut buffer = match build(state, index) {
+        // Reborrow for one build step only. The reference ends before the
+        // listener call below, which may re-enter and mutably borrow S.
+        let step = build(
+            unsafe { state.as_mut() }.expect("state was checked non-null"),
+            index,
+        );
+        let mut buffer = match step {
             ParamStep::Built(pod) => pod,
             ParamStep::Skip => {
                 index += 1;
@@ -267,7 +404,7 @@ pub(crate) unsafe fn enum_params_loop<S>(
         if let Some(param) =
             unsafe { filter_pod(&mut fbuffer, buffer.as_mut_ptr() as *mut spa_pod, filter) }
         {
-            emit(state, index, param);
+            emit(index, param);
             count += 1;
         }
 
@@ -277,33 +414,20 @@ pub(crate) unsafe fn enum_params_loop<S>(
     0
 }
 
-// sync() replies with an empty result carrying the sequence number
-pub(crate) unsafe fn node_emit_done(hooks: &mut spa_hook_list, seq: c_int) {
-    // one emission through the C listener vtables end to end
-    unsafe {
-        emit_events(hooks, |f: spa_node_events, data| {
-            if let Some(result_fun) = f.result {
-                result_fun(data, seq, 0, 0, std::ptr::null());
-            }
-        });
-    }
-}
-
-pub(crate) unsafe fn node_emit_result(
-    hooks: &mut spa_hook_list,
+pub(crate) fn node_emit_result(
+    hooks: &ListenerList<spa_node_events>,
     seq: c_int,
     res: c_int,
     type_: u32,
     result: &spa_result_node_params,
 ) {
-    // one emission through the C listener vtables end to end
-    unsafe {
-        emit_events(hooks, |f: spa_node_events, data| {
-            if let Some(result_fun) = f.result {
-                result_fun(data, seq, res, type_, result as *const _ as *const c_void);
-            }
-        });
-    }
+    hooks.emit(|f, data| {
+        if let Some(result_fun) = f.result {
+            // one emission through the C listener vtable (the add_listener
+            // contract keeps data valid for the call)
+            unsafe { result_fun(data, seq, res, type_, result as *const _ as *const c_void) };
+        }
+    });
 }
 
 pub(crate) unsafe fn for_each_dict_item(dict: &spa_dict, mut apply: impl FnMut(&str, &str)) {
@@ -445,6 +569,21 @@ impl Dictionary {
         self.dict.n_items = self.items.len() as u32;
         self.fix_pointers();
     }
+
+    // An owned copy with freshly woven pointers. Event payload snapshots use
+    // this instead of copying spa_dict_item verbatim: those raw pointers refer
+    // into the source dictionary's CString storage.
+    fn snapshot(&self) -> Self {
+        let mut result = Self::new();
+        for item in &self.items {
+            // SAFETY: Dictionary construction guarantees both pointers are
+            // live NUL-terminated strings for the dictionary's lifetime.
+            let key = unsafe { CStr::from_ptr(item.key) }.to_string_lossy();
+            let value = unsafe { CStr::from_ptr(item.value) }.to_string_lossy();
+            result.add_item(key.as_ref(), value.as_ref());
+        }
+        result
+    }
 }
 
 const MAX_PARAMS: u32 = 16;
@@ -478,12 +617,24 @@ impl DeviceInfo {
     }
 
     pub(crate) fn fix_pointers(&mut self) {
-        self.info.props = self.props.raw();
+        self.info.props = self.props.raw_mut();
         self.info.params = self.params.as_mut_ptr();
     }
 
     pub(crate) fn raw(&self) -> *const spa_device_info {
         &self.info as *const spa_device_info
+    }
+
+    // Stable, self-contained payload for a potentially reentrant device-info
+    // callback. Box first, then weave the pointers to the boxed fields.
+    pub(crate) fn snapshot(&self) -> Box<Self> {
+        let mut result = Box::new(Self {
+            info: self.info,
+            props: self.props.snapshot(),
+            params: self.params,
+        });
+        result.fix_pointers();
+        result
     }
 
     pub(crate) fn add_prop<K: Into<DictionaryString>, V: Into<DictionaryString>>(
@@ -563,6 +714,20 @@ impl NodeInfo {
 
     pub(crate) fn raw(&self) -> *const spa_node_info {
         &self.info as *const spa_node_info
+    }
+
+    // See PortInfo::snapshot: event callbacks receive an owned payload so
+    // reentrant listeners cannot invalidate its backing dictionary/params.
+    pub(crate) fn snapshot(&self) -> Box<Self> {
+        let mut result = Box::new(Self {
+            info: self.info,
+            props: self.props.snapshot(),
+            params: self.params,
+        });
+        // Box pins the inline params array and Dictionary header at the
+        // addresses installed here; moving the Box afterward is harmless.
+        result.fix_pointers();
+        result
     }
 
     pub(crate) fn set_max_input_ports(&mut self, max_ports: u32) {
@@ -658,6 +823,22 @@ impl PortInfo {
         &self.info as *const spa_port_info
     }
 
+    // A self-contained callback payload: the scalar info and fixed params
+    // copy by value, while the dictionary is rebuilt so none of its pointers
+    // refer back into the live PortInfo. Reentrant listeners may then mutate
+    // the live state without invalidating the outer callback's payload.
+    pub(crate) fn snapshot(&self) -> Box<Self> {
+        let mut result = Box::new(Self {
+            info: self.info,
+            props: self.props.snapshot(),
+            params: self.params,
+        });
+        // As for NodeInfo::snapshot, the Box makes these self-pointers
+        // stable across return and callback dispatch.
+        result.fix_pointers();
+        result
+    }
+
     pub(crate) fn set_flags(&mut self, flags: u64) {
         self.info.flags = flags;
         self.info.change_mask |= SPA_PORT_CHANGE_MASK_FLAGS as u64;
@@ -719,38 +900,76 @@ impl PortInfo {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct Loop {
-    loop_: &'static spa_loop, // not really 'static, but it should outlive our plugin anyway
-    methods: &'static spa_loop_methods, // ditto
+    // Keep the host-owned spa_loop as a raw pointer because the host may
+    // mutate it. wrap() validates and copies the method slots once; data is
+    // read through the raw interface for each call.
+    loop_: std::ptr::NonNull<spa_loop>,
+    add_source_fn: unsafe extern "C" fn(*mut c_void, *mut spa_source) -> c_int,
+    remove_source_fn: unsafe extern "C" fn(*mut c_void, *mut spa_source) -> c_int,
+    #[allow(clippy::type_complexity)] // the C slot's signature, verbatim
+    invoke_fn: unsafe extern "C" fn(
+        *mut c_void,
+        spa_invoke_func_t,
+        u32,
+        *const c_void,
+        usize,
+        bool,
+        *mut c_void,
+    ) -> c_int,
 }
 
 impl Loop {
+    /// # Safety
+    /// `loop_` must point at a live, initialized spa_loop from the host's
+    /// support array, and the host keeps it (and its methods vtable) valid
+    /// for the plugin's lifetime (the spa_support contract).
     pub(crate) unsafe fn wrap(loop_: *mut spa_loop) -> Self {
-        let loop_ =
-            unsafe { loop_.cast::<spa_loop>().as_ref() }.expect("loop should be initialized");
-        let methods = unsafe { loop_.iface.cb.funcs.cast::<spa_loop_methods>().as_ref() }
-            .expect("loop methods should be initialized");
-        assert!(version_ok(methods.version, SPA_VERSION_LOOP_METHODS));
-        Self { loop_, methods }
+        let loop_ = std::ptr::NonNull::new(loop_).expect("loop should be initialized");
+        // Validate the version and every required slot during initialization.
+        let funcs = unsafe { (*loop_.as_ptr()).iface.cb.funcs };
+        let methods = std::ptr::NonNull::new(funcs.cast::<spa_loop_methods>().cast_mut())
+            .expect("loop methods should be initialized")
+            .as_ptr();
+        assert!(version_ok(
+            unsafe { (*methods).version },
+            SPA_VERSION_LOOP_METHODS
+        ));
+        Self {
+            loop_,
+            add_source_fn: unsafe { (*methods).add_source }
+                .expect("add_source should be initialized"),
+            remove_source_fn: unsafe { (*methods).remove_source }
+                .expect("remove_source should be initialized"),
+            invoke_fn: unsafe { (*methods).invoke }.expect("invoke should be initialized"),
+        }
     }
 
+    fn data(&self) -> *mut c_void {
+        // per-call raw read (see the struct comment); valid per wrap()'s contract
+        unsafe { (*self.loop_.as_ptr()).iface.cb.data }
+    }
+
+    /// # Safety
+    /// `source` must stay valid (and pinned) until it is removed from the
+    /// loop again; the loop stores the pointer.
     pub(crate) unsafe fn add_source(&self, source: *mut spa_source) -> c_int {
-        let spa_loop_add_source = self
-            .methods
-            .add_source
-            .expect("add_source should be initialized");
-        unsafe { spa_loop_add_source(self.loop_.iface.cb.data, source) }
+        unsafe { (self.add_source_fn)(self.data(), source) }
     }
 
-    // must be called from the loop thread (or through an invoke)
+    /// # Safety
+    /// Must be called from the loop thread (or through an invoke); `source`
+    /// must be the pointer previously registered with add_source.
     pub(crate) unsafe fn remove_source(&self, source: *mut spa_source) -> c_int {
-        let spa_loop_remove_source = self
-            .methods
-            .remove_source
-            .expect("remove_source should be initialized");
-        unsafe { spa_loop_remove_source(self.loop_.iface.cb.data, source) }
+        unsafe { (self.remove_source_fn)(self.data(), source) }
     }
 
+    /// # Safety
+    /// The marshaling contract: `func` must treat `data`/`user_data`
+    /// according to `block` (a non-blocking invoke copies `data` and runs
+    /// after this call returns, so pointees must outlive the run); see
+    /// utils::block_on_loop / utils::queue_task.
     pub(crate) unsafe fn invoke(
         &self,
         func: spa_invoke_func_t,
@@ -760,82 +979,94 @@ impl Loop {
         block: bool,
         user_data: *mut c_void,
     ) -> c_int {
-        let spa_loop_invoke = self.methods.invoke.expect("invoke should be initialized");
-        unsafe {
-            spa_loop_invoke(
-                self.loop_.iface.cb.data,
-                func,
-                seq,
-                data,
-                size,
-                block,
-                user_data,
-            )
-        }
+        unsafe { (self.invoke_fn)(self.data(), func, seq, data, size, block, user_data) }
     }
 }
 
 pub(crate) struct System {
-    system: &'static spa_system, // not really 'static, but it should outlive our plugin anyway
-    methods: &'static spa_system_methods, // ditto
+    // Keep the host-owned spa_system as a raw pointer and copy its validated
+    // method slots. Safe wrappers pass only scalars and call-scoped references.
+    system: std::ptr::NonNull<spa_system>,
+    close_fn: unsafe extern "C" fn(*mut c_void, c_int) -> c_int,
+    clock_gettime_fn: unsafe extern "C" fn(*mut c_void, c_int, *mut timespec) -> c_int,
+    timerfd_create_fn: unsafe extern "C" fn(*mut c_void, c_int, c_int) -> c_int,
+    timerfd_read_fn: unsafe extern "C" fn(*mut c_void, c_int, *mut u64) -> c_int,
+    timerfd_settime_fn: unsafe extern "C" fn(
+        *mut c_void,
+        c_int,
+        c_int,
+        *const itimerspec,
+        *mut itimerspec,
+    ) -> c_int,
 }
 
 impl System {
+    /// # Safety
+    /// `system` must point at a live, initialized spa_system from the host's
+    /// support array, and the host keeps it (and its methods vtable) valid
+    /// for the plugin's lifetime (the spa_support contract). That contract
+    /// is what makes the safe methods below sound.
     pub(crate) unsafe fn wrap(system: *mut spa_system) -> Self {
-        let system =
-            unsafe { system.cast::<spa_system>().as_ref() }.expect("system should be initialized");
-        let methods = unsafe { system.iface.cb.funcs.cast::<spa_system_methods>().as_ref() }
-            .expect("system methods should be initialized");
-        assert!(version_ok(methods.version, SPA_VERSION_SYSTEM_METHODS));
-        Self { system, methods }
+        let system = std::ptr::NonNull::new(system).expect("system should be initialized");
+        // the whole vtable is validated once here (non-null, version, every
+        // slot the methods below call - see Loop::wrap)
+        let funcs = unsafe { (*system.as_ptr()).iface.cb.funcs };
+        let methods = std::ptr::NonNull::new(funcs.cast::<spa_system_methods>().cast_mut())
+            .expect("system methods should be initialized")
+            .as_ptr();
+        assert!(version_ok(
+            unsafe { (*methods).version },
+            SPA_VERSION_SYSTEM_METHODS
+        ));
+        Self {
+            system,
+            close_fn: unsafe { (*methods).close }.expect("close should be initialized"),
+            clock_gettime_fn: unsafe { (*methods).clock_gettime }
+                .expect("clock_gettime should be initialized"),
+            timerfd_create_fn: unsafe { (*methods).timerfd_create }
+                .expect("timerfd_create should be initialized"),
+            timerfd_read_fn: unsafe { (*methods).timerfd_read }
+                .expect("timerfd_read should be initialized"),
+            timerfd_settime_fn: unsafe { (*methods).timerfd_settime }
+                .expect("timerfd_settime should be initialized"),
+        }
     }
 
-    pub(crate) unsafe fn close(&self, fd: c_int) -> c_int {
-        let spa_system_close = self.methods.close.expect("close should be initialized");
-        unsafe { spa_system_close(self.system.iface.cb.data, fd) }
+    fn data(&self) -> *mut c_void {
+        // per-call raw read (see Loop::data); valid per wrap()'s contract
+        unsafe { (*self.system.as_ptr()).iface.cb.data }
     }
 
-    pub(crate) unsafe fn clock_gettime(&self, clock_id: c_int, value: *mut timespec) -> c_int {
-        let spa_system_clock_gettime = self
-            .methods
-            .clock_gettime
-            .expect("clock_gettime should be initialized");
-        unsafe { spa_system_clock_gettime(self.system.iface.cb.data, clock_id, value) }
+    pub(crate) fn close(&self, fd: c_int) -> c_int {
+        // sound per wrap()'s contract; fd is an owned scalar
+        unsafe { (self.close_fn)(self.data(), fd) }
     }
 
-    pub(crate) unsafe fn timerfd_create(&self, clock_id: c_int, flags: c_int) -> c_int {
-        let spa_system_timerfd_create = self
-            .methods
-            .timerfd_create
-            .expect("timerfd_create should be assigned");
-        unsafe { spa_system_timerfd_create(self.system.iface.cb.data, clock_id, flags) }
+    pub(crate) fn clock_gettime(&self, clock_id: c_int, value: &mut timespec) -> c_int {
+        // sound per wrap()'s contract; `value` is a live &mut for the call
+        unsafe { (self.clock_gettime_fn)(self.data(), clock_id, value) }
     }
 
-    pub(crate) unsafe fn timerfd_read(&self, fd: c_int, expirations: *mut u64) -> c_int {
-        let spa_system_timerfd_read = self
-            .methods
-            .timerfd_read
-            .expect("timerfd_read should be initialized");
-        unsafe { spa_system_timerfd_read(self.system.iface.cb.data, fd, expirations) }
+    pub(crate) fn timerfd_create(&self, clock_id: c_int, flags: c_int) -> c_int {
+        // sound per wrap()'s contract; both arguments are owned scalars
+        unsafe { (self.timerfd_create_fn)(self.data(), clock_id, flags) }
     }
 
-    pub(crate) unsafe fn timerfd_settime(
-        &self,
-        fd: c_int,
-        flags: c_int,
-        new_value: *const itimerspec,
-        old_value: *mut itimerspec,
-    ) -> c_int {
-        let spa_system_timerfd_settime = self
-            .methods
-            .timerfd_settime
-            .expect("timerfd_settime should be initialized");
+    pub(crate) fn timerfd_read(&self, fd: c_int, expirations: &mut u64) -> c_int {
+        // sound per wrap()'s contract; `expirations` is a live &mut for the call
+        unsafe { (self.timerfd_read_fn)(self.data(), fd, expirations) }
+    }
+
+    // Callers do not request the previous timer value.
+    pub(crate) fn timerfd_settime(&self, fd: c_int, flags: c_int, new_value: &itimerspec) -> c_int {
+        // sound per wrap()'s contract; `new_value` is a live shared reference
         unsafe {
-            spa_system_timerfd_settime(self.system.iface.cb.data, fd, flags, new_value, old_value)
+            (self.timerfd_settime_fn)(self.data(), fd, flags, new_value, std::ptr::null_mut())
         }
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct Log {
     // Raw pointers end to end, never long-lived references: the host logger
     // mutates the spa_log pointee (level) and the registered topic
@@ -848,6 +1079,10 @@ pub(crate) struct Log {
     // the module's registered topic (see the lib.rs section entries)
     topic: Option<std::ptr::NonNull<spa_log_topic>>,
 }
+
+// The host logger is thread-safe and outlives every node, so cloned handles
+// may travel with cross-loop messages.
+unsafe impl Send for Log {}
 
 impl Log {
     pub(crate) unsafe fn wrap(
@@ -1069,6 +1304,58 @@ mod tests {
         assert_eq!(seen, [0, 2]);
     }
 
+    #[test]
+    fn hook_cursor_is_unlinked_during_rust_unwind() {
+        let (mut head, _hooks) = hook_list(2);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            for_each_hook(&mut *head, |_cb| panic!("injected traversal panic"));
+        }));
+        assert!(panicked.is_err());
+
+        let mut seen = Vec::new();
+        unsafe { for_each_hook(&mut *head, |cb| seen.push(cb.data as usize)) };
+        assert_eq!(seen, [0, 1], "the stack cursor must not remain linked");
+    }
+
+    #[test]
+    fn isolated_listener_allows_saved_hook_removal_and_unwind() {
+        let list = ListenerList::<spa_node_events>::new();
+        let mut table: spa_node_events = unsafe { std::mem::zeroed() };
+        table.version = SPA_VERSION_NODE_EVENTS;
+        let mut old_hook: spa_hook = unsafe { std::mem::zeroed() };
+        let mut new_hook: spa_hook = unsafe { std::mem::zeroed() };
+        let mut unwind_hook: spa_hook = unsafe { std::mem::zeroed() };
+
+        unsafe {
+            list.with_isolated_listener(
+                &mut old_hook,
+                &raw const table,
+                std::ptr::without_provenance_mut::<c_void>(1),
+                || {},
+            );
+            list.with_isolated_listener(
+                &mut new_hook,
+                &raw const table,
+                std::ptr::without_provenance_mut::<c_void>(2),
+                || spa_hook_remove(&mut old_hook),
+            );
+        }
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            list.with_isolated_listener(
+                &mut unwind_hook,
+                &raw const table,
+                std::ptr::without_provenance_mut::<c_void>(3),
+                || panic!("injected initial-listener panic"),
+            );
+        }));
+        assert!(panicked.is_err());
+
+        let mut seen = Vec::new();
+        list.emit(|_events, data| seen.push(data as usize));
+        assert_eq!(seen, [2, 3]);
+    }
+
     // the per-method-traversal contract behind the add_listener emitters: a
     // callback that removes its own hook during one traversal is not visited
     // by the next one (so freeing the hook mid-callback stays sound)
@@ -1109,5 +1396,98 @@ mod tests {
         }
         assert_eq!(outer, [0, 1]);
         assert_eq!(inner, [0, 1]); // both real hooks, no phantom cursor
+    }
+
+    // the head is boxed precisely so the handle may move while hooks stay
+    // linked to a stable address: register a hook, move the ListenerList
+    // value, and the emission must still reach the hook (with the head
+    // inline, the old address would keep dangling links)
+    #[test]
+    fn listener_list_emits_after_the_handle_moves() {
+        let mut events: Box<spa_node_events> = Box::new(unsafe { std::mem::zeroed() });
+        events.version = SPA_VERSION_NODE_EVENTS; // pass the version gate
+        let list: ListenerList<spa_node_events> = ListenerList::new();
+
+        // register a hook the way add_listener does
+        let mut hook: Box<spa_hook> = Box::new(unsafe { std::mem::zeroed() });
+        unsafe {
+            list.with_isolated_listener(
+                &mut *hook,
+                &raw const *events,
+                7 as *mut std::os::raw::c_void,
+                || {},
+            );
+        }
+
+        let moved = list; // move the handle; the boxed head must not move
+        let mut seen = Vec::new();
+        moved.emit(|_events, data| seen.push(data as usize));
+        assert_eq!(seen, [7]);
+    }
+
+    // Info payloads contain raw self-pointers. A callback snapshot must
+    // point into its own stable allocation after returning from snapshot(),
+    // not at the moved temporary or the mutable live info it copied.
+    #[test]
+    fn info_snapshots_reweave_their_self_pointers() {
+        let mut node = NodeInfo::new();
+        node.add_prop("snapshot.key", "snapshot.value");
+        node.add_param(SPA_PARAM_Props, SPA_PARAM_INFO_READ);
+        node.fix_pointers();
+        let node = node.snapshot();
+        let node_raw = unsafe { &*node.raw() };
+        assert_eq!(node_raw.params, node.params.as_ptr().cast_mut());
+        assert_eq!(
+            node_raw.props,
+            std::ptr::addr_of!(node.props.dict).cast_mut()
+        );
+
+        let mut port = PortInfo::new();
+        port.add_param(SPA_PARAM_Format, SPA_PARAM_INFO_WRITE);
+        port.fix_pointers();
+        let port = port.snapshot();
+        let port_raw = unsafe { &*port.raw() };
+        assert_eq!(port_raw.params, port.params.as_ptr().cast_mut());
+        assert_eq!(
+            port_raw.props,
+            std::ptr::addr_of!(port.props.dict).cast_mut()
+        );
+
+        let mut device = DeviceInfo::new();
+        device.add_prop("snapshot.key", "snapshot.value");
+        device.add_param(SPA_PARAM_Profile, SPA_PARAM_INFO_READ);
+        device.fix_pointers();
+        let device = device.snapshot();
+        let device_raw = unsafe { &*device.raw() };
+        assert_eq!(device_raw.params, device.params.as_ptr().cast_mut());
+        assert_eq!(
+            device_raw.props,
+            std::ptr::addr_of!(device.props.dict).cast_mut()
+        );
+    }
+
+    // A result callback may mutate the enumerated object. The next build
+    // step must reacquire State and observe that mutation; retaining &mut S
+    // across emit would make this exact pattern formally unsound.
+    #[test]
+    fn enumeration_reborrows_state_after_reentrant_emit() {
+        let mut state = vec![10i32, 20];
+        let state_ptr = &raw mut state;
+        let mut built = Vec::new();
+        let build = |state: &mut Vec<i32>, index: u32| {
+            let value = state[index as usize];
+            built.push(value);
+            ParamStep::Built(crate::utils::serialize_pod(&libspa::pod::Value::Int(value)))
+        };
+        let emit = |index: u32, _param: *mut spa_pod| {
+            if index == 0 {
+                // SAFETY: enum_params_loop guarantees its per-step reference
+                // ended before emit.
+                unsafe { (&mut *state_ptr)[1] = 99 };
+            }
+        };
+        let result = unsafe { enum_params_loop(state_ptr, (0, 2), std::ptr::null(), build, emit) };
+        assert_eq!(result, 0);
+        assert_eq!(built, [10, 99]);
     }
 }

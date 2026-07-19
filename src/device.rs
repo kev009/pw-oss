@@ -1,5 +1,4 @@
 use libspa::sys::*;
-use std::mem::MaybeUninit;
 use std::os::raw::{c_char, c_int, c_uint, c_void};
 
 // One hardware route per (pcm device, direction) that has a usable mixer
@@ -29,14 +28,272 @@ struct MixerHandle {
     recsrc: u32,    // RECSRC shadow; polled by value (the counter never ticks for it)
 }
 
+// Listener and info state lives outside State so a C callback may re-enter a
+// device method without overlapping a Rust reference to the containing State.
+// All device methods run on the main loop; Rc/RefCell express that ownership
+// without claiming cross-thread access.
+struct DeviceEvents {
+    hooks: crate::spa::ListenerList<spa_device_events>,
+    info: std::cell::RefCell<crate::spa::DeviceInfo>,
+    pending: std::cell::RefCell<PendingDeviceNotifications>,
+}
+
+enum DeviceObjectEvent {
+    Added {
+        id: u32,
+        rec: bool,
+        description: String,
+        route_count: usize,
+    },
+    Removed {
+        id: u32,
+    },
+}
+
+enum DeviceNotification {
+    Info(Box<crate::spa::DeviceInfo>),
+    Object(DeviceObjectEvent),
+    Event(Vec<u8>),
+    Done(c_int),
+    ActivateListeners(std::rc::Rc<crate::spa::ListenerList<spa_device_events>>),
+}
+
+struct PendingDeviceNotifications {
+    queue: std::collections::VecDeque<DeviceNotification>,
+    dispatching: bool,
+}
+
+struct DeviceDispatchGuard<'a> {
+    pending: &'a std::cell::RefCell<PendingDeviceNotifications>,
+}
+
+impl Drop for DeviceDispatchGuard<'_> {
+    fn drop(&mut self) {
+        self.pending.borrow_mut().dispatching = false;
+    }
+}
+
+impl DeviceEvents {
+    fn new() -> Self {
+        Self {
+            hooks: crate::spa::ListenerList::new(),
+            info: std::cell::RefCell::new(crate::spa::DeviceInfo::new()),
+            pending: std::cell::RefCell::new(PendingDeviceNotifications {
+                queue: std::collections::VecDeque::new(),
+                dispatching: false,
+            }),
+        }
+    }
+
+    fn with_info<R>(&self, apply: impl FnOnce(&mut crate::spa::DeviceInfo) -> R) -> R {
+        apply(&mut self.info.borrow_mut())
+    }
+
+    fn initial_info(&self) -> Box<crate::spa::DeviceInfo> {
+        let mut snapshot = self.info.borrow().snapshot();
+        let _ = snapshot.replace_change_mask(crate::spa::SPA_DEVICE_CHANGE_MASK_ALL as u64);
+        snapshot
+    }
+
+    fn take_info(&self) -> Box<crate::spa::DeviceInfo> {
+        let mut info = self.info.borrow_mut();
+        let snapshot = info.snapshot();
+        let _ = info.replace_change_mask(0);
+        snapshot
+    }
+
+    // SAFETY: no reference into the associated State may be live; listener
+    // code may synchronously re-enter any device method.
+    unsafe fn emit_info(&self, snapshot: &crate::spa::DeviceInfo) {
+        unsafe { self.emit_info_on(&self.hooks, snapshot) };
+    }
+
+    // SAFETY: as emit_info(); `hooks` is either the active list or one
+    // isolated activation batch with the same event-table type.
+    unsafe fn emit_info_on(
+        &self,
+        hooks: &crate::spa::ListenerList<spa_device_events>,
+        snapshot: &crate::spa::DeviceInfo,
+    ) {
+        hooks.emit(|f, data| {
+            if let Some(info) = f.info {
+                // through the C listener vtable (the add_listener contract)
+                unsafe { info(data, snapshot.raw()) };
+            }
+        });
+    }
+
+    // SAFETY: as emit_info().
+    unsafe fn emit_done(&self, seq: c_int) {
+        self.hooks.emit(|f, data| {
+            if let Some(result) = f.result {
+                // through the C listener vtable (the add_listener contract)
+                unsafe { result(data, seq, 0, 0, std::ptr::null()) };
+            }
+        });
+    }
+
+    // SAFETY: as emit_info().
+    unsafe fn emit_result(&self, seq: c_int, result: &spa_result_device_params) {
+        crate::spa::dev_emit_result(&self.hooks, seq, 0, SPA_RESULT_TYPE_DEVICE_PARAMS, result);
+    }
+
+    // SAFETY: as emit_info().
+    unsafe fn emit_object(&self, event: &DeviceObjectEvent) {
+        unsafe { self.emit_object_on(&self.hooks, event) };
+    }
+
+    // SAFETY: as emit_info_on().
+    unsafe fn emit_object_on(
+        &self,
+        hooks: &crate::spa::ListenerList<spa_device_events>,
+        event: &DeviceObjectEvent,
+    ) {
+        match event {
+            DeviceObjectEvent::Removed { id } => hooks.emit(|f, data| {
+                if let Some(object_info) = f.object_info {
+                    unsafe { object_info(data, *id, std::ptr::null()) };
+                }
+            }),
+            DeviceObjectEvent::Added {
+                id,
+                rec,
+                description,
+                route_count,
+            } => {
+                let index = *id / 2;
+                let mut dict = crate::spa::Dictionary::new();
+                dict.add_item(
+                    crate::spa::key(SPA_KEY_NODE_NAME),
+                    format!("pcm{index}.{}", if *rec { "rec" } else { "play" }),
+                );
+                dict.add_item(
+                    crate::spa::key(SPA_KEY_NODE_DESCRIPTION),
+                    description.as_str(),
+                );
+                dict.add_item(crate::keys::OSS_DSP_PATH, format!("/dev/dsp{index}"));
+                if *route_count > 0 {
+                    dict.add_item("card.profile.device", format!("{id}"));
+                    dict.add_item("device.routes", format!("{route_count}"));
+                }
+                let info = spa_device_object_info {
+                    version: SPA_VERSION_DEVICE_OBJECT_INFO,
+                    type_: SPA_TYPE_INTERFACE_Node.as_ptr().cast(),
+                    factory_name: if *rec {
+                        c"freebsd-oss.source".as_ptr()
+                    } else {
+                        c"freebsd-oss.sink".as_ptr()
+                    },
+                    change_mask: crate::spa::SPA_DEVICE_OBJECT_CHANGE_MASK_ALL as u64,
+                    flags: 0,
+                    props: dict.raw(),
+                };
+                // Keep the dictionary beside the callback payload for the
+                // entire traversal.
+                hooks.emit(|f, data| {
+                    if let Some(object_info) = f.object_info {
+                        unsafe { object_info(data, *id, &info) };
+                    }
+                });
+            }
+        }
+    }
+
+    // SAFETY: as emit_info().
+    unsafe fn dispatch(&self, notification: &DeviceNotification) {
+        match notification {
+            DeviceNotification::Info(info) => unsafe { self.emit_info(info) },
+            DeviceNotification::Object(object) => unsafe { self.emit_object(object) },
+            DeviceNotification::Event(buffer) => {
+                self.hooks.emit(|f, data| {
+                    if let Some(event) = f.event {
+                        unsafe { event(data, buffer.as_ptr().cast()) };
+                    }
+                });
+            }
+            DeviceNotification::Done(seq) => unsafe { self.emit_done(*seq) },
+            DeviceNotification::ActivateListeners(hooks) => {
+                // SAFETY: FIFO barriers run between traversals, after the
+                // isolated batch's synchronous initial callbacks returned.
+                unsafe { self.hooks.append_from(hooks) };
+            }
+        }
+    }
+
+    // See NodeEvents::with_new_listener: the barrier is queued before initial
+    // callbacks whenever older FIFO work exists, so the listener skips only
+    // those entries and is active for every notification the callbacks append.
+    unsafe fn with_new_listener<R>(
+        &self,
+        listener: *mut spa_hook,
+        events: *const spa_device_events,
+        data: *mut c_void,
+        initial: impl FnOnce(&crate::spa::ListenerList<spa_device_events>) -> R,
+    ) -> R {
+        let deferred = {
+            let mut pending = self.pending.borrow_mut();
+            if pending.dispatching || !pending.queue.is_empty() {
+                let hooks = std::rc::Rc::new(crate::spa::ListenerList::new());
+                pending
+                    .queue
+                    .push_back(DeviceNotification::ActivateListeners(hooks.clone()));
+                Some(hooks)
+            } else {
+                None
+            }
+        };
+        let hooks = deferred.as_deref().unwrap_or(&self.hooks);
+        unsafe { hooks.with_isolated_listener(listener, events, data, || initial(hooks)) }
+    }
+
+    // Claim the main-loop endpoint's dispatch turn. Reentrant methods append
+    // complete transactions to the FIFO and return; the outer owner drains
+    // them after finishing its current transaction.
+    fn begin_dispatch(&self) -> Option<DeviceDispatchGuard<'_>> {
+        let mut pending = self.pending.borrow_mut();
+        if pending.dispatching {
+            None
+        } else {
+            pending.dispatching = true;
+            drop(pending);
+            Some(DeviceDispatchGuard {
+                pending: &self.pending,
+            })
+        }
+    }
+
+    // SAFETY: as emit_info(); only the begin_dispatch() owner may call this.
+    // RefCell borrows end before every callback, so listener reentry can append.
+    unsafe fn drain(&self, _guard: DeviceDispatchGuard<'_>) {
+        loop {
+            let notification = {
+                let mut pending = self.pending.borrow_mut();
+                match pending.queue.pop_front() {
+                    Some(notification) => notification,
+                    None => return,
+                }
+            };
+            unsafe { self.dispatch(&notification) };
+        }
+    }
+
+    // SAFETY: as emit_info(). The entire input vector is enqueued atomically
+    // before dispatch starts, preserving transaction order under reentry.
+    unsafe fn dispatch_all(&self, notifications: Vec<DeviceNotification>) {
+        self.pending.borrow_mut().queue.extend(notifications);
+        if let Some(guard) = self.begin_dispatch() {
+            unsafe { self.drain(guard) };
+        }
+    }
+}
+
 // repr(C): the host casts spa_handle* to State*, so `handle` must stay
 // the first field at offset 0
 #[repr(C)]
 struct State {
     handle: spa_handle,
     device: spa_device,
-    dev_info: crate::spa::DeviceInfo,
-    hooks: spa_hook_list,
+    events: std::rc::Rc<DeviceEvents>,
     pcm_devices: Vec<crate::sound::PcmDevice>,
     description: String,
     profile: u32,       // 0 = off, 1 = default
@@ -76,31 +333,15 @@ fn oss_to_linear(l: u32) -> f32 {
 const ROUTE_CHANNELS: u32 = 2;
 const ROUTE_MAP: [u32; ROUTE_CHANNELS as usize] = [SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR];
 
-// one object_info emission to every listener; its own list traversal, so a
-// listener freeing its hook mid-callback is never revisited (see for_each_hook)
-unsafe fn emit_object_info(
-    hooks: *mut spa_hook_list,
-    id: u32,
-    obj_info: *const spa_device_object_info,
-) {
-    unsafe {
-        crate::spa::emit_events(hooks, |f: spa_device_events, data| {
-            if let Some(obj_info_fun) = f.object_info {
-                obj_info_fun(data, id, obj_info);
-            }
-        });
-    }
-}
-
-// emit (or, with present = false, retract) the node object for every pcm
-// device, one traversal per object (the C spa_device_emit_object_info shape)
-unsafe fn emit_objects(
-    hooks: *mut spa_hook_list,
+// Build owned add/remove events while State is borrowed. Dispatch happens
+// afterward, one traversal per object, with no State reference alive.
+fn object_events(
     pcm_devices: &[crate::sound::PcmDevice],
     routes: &[RouteState],
     description: &str,
     present: bool,
-) {
+) -> Vec<DeviceObjectEvent> {
+    let mut events = Vec::new();
     for device in pcm_devices {
         for (rec, enabled) in [(false, device.play), (true, device.rec)] {
             if !enabled {
@@ -110,73 +351,28 @@ unsafe fn emit_objects(
             let id = device.index * 2 + rec as u32;
 
             if !present {
-                unsafe { emit_object_info(hooks, id, std::ptr::null()) };
+                events.push(DeviceObjectEvent::Removed { id });
                 continue;
             }
-
-            let mut dict = crate::spa::Dictionary::new();
-
-            dict.add_item(
-                crate::spa::key(SPA_KEY_NODE_NAME),
-                format!("pcm{}.{}", device.index, if rec { "rec" } else { "play" }),
-            );
-
-            if device.desc == description && !device.location.is_empty() {
-                dict.add_item(
-                    crate::spa::key(SPA_KEY_NODE_DESCRIPTION),
-                    format!("{} @ {}", device.desc, device.location),
-                );
+            let object_description = if device.desc == description && !device.location.is_empty() {
+                format!("{} @ {}", device.desc, device.location)
             } else {
-                dict.add_item(
-                    crate::spa::key(SPA_KEY_NODE_DESCRIPTION),
-                    device.desc.as_str(),
-                );
-            }
-
-            dict.add_item(
-                crate::keys::OSS_DSP_PATH,
-                format!("/dev/dsp{}", device.index),
-            );
+                device.desc.clone()
+            };
 
             // Only nodes with a hardware route get linked to it; the rest (no
             // mixer, or no usable control - the bitperfect-purist case included)
             // keep the session manager's node softvol as their only volume.
             let route_count = routes.iter().filter(|r| r.node_id == id).count();
-            if route_count > 0 {
-                dict.add_item("card.profile.device", format!("{id}"));
-                dict.add_item("device.routes", format!("{route_count}"));
-            }
-
-            let obj_info = spa_device_object_info {
-                version: SPA_VERSION_DEVICE_OBJECT_INFO,
-                type_: SPA_TYPE_INTERFACE_Node.as_ptr().cast(),
-                factory_name: if rec {
-                    c"freebsd-oss.source".as_ptr()
-                } else {
-                    c"freebsd-oss.sink".as_ptr()
-                },
-                change_mask: crate::spa::SPA_DEVICE_OBJECT_CHANGE_MASK_ALL as u64,
-                flags: 0,
-                props: dict.raw(),
-            };
-
-            unsafe { emit_object_info(hooks, id, &obj_info) };
+            events.push(DeviceObjectEvent::Added {
+                id,
+                rec,
+                description: object_description,
+                route_count,
+            });
         }
     }
-}
-
-// re-emit dev_info to every listener (carrying whatever change_mask the caller
-// set, e.g. PARAMS), then clear the mask
-unsafe fn emit_device_info(state: &mut State) {
-    // one emission through the C listener vtables end to end
-    unsafe {
-        crate::spa::emit_events(&mut state.hooks, |f: spa_device_events, data| {
-            if let Some(info_fun) = f.info {
-                info_fun(data, state.dev_info.raw());
-            }
-        });
-    }
-    let _ = state.dev_info.replace_change_mask(0);
+    events
 }
 
 fn build_profile_info(
@@ -443,7 +639,12 @@ fn build_object_config(
 // node's Props (channelVolumes/softVolumes or mute/softMute), keeping
 // audioconvert at unity - the anti-double-attenuation mechanism
 // (pod shape: alsa-acp-device.c:1015-1084).
-unsafe fn emit_object_config(state: &mut State, pos: usize, volume: bool) {
+fn queue_object_config(
+    state: &State,
+    pos: usize,
+    volume: bool,
+    notifications: &mut Vec<DeviceNotification>,
+) {
     let route = &state.routes[pos];
     let (node_id, levels, mute) = (route.node_id, route.levels, route.mute);
     let hw = route.control.is_some();
@@ -454,21 +655,16 @@ unsafe fn emit_object_config(state: &mut State, pos: usize, volume: bool) {
         build_object_config(node_id, None, Some(mute))
     };
 
-    // one emission through the C listener vtables end to end
-    unsafe {
-        crate::spa::emit_events(&mut state.hooks, |f: spa_device_events, data| {
-            if let Some(event_fun) = f.event {
-                event_fun(data, buffer.as_ptr() as *const spa_event);
-            }
-        });
-    }
+    notifications.push(DeviceNotification::Event(buffer));
 }
 
 // announce a Route change: flip the serial so consumers re-read the param
-unsafe fn announce_route_change(state: &mut State) {
-    let _ = state.dev_info.replace_change_mask(0);
-    state.dev_info.bump_param(SPA_PARAM_Route);
-    unsafe { emit_device_info(state) };
+fn queue_route_change(state: &State, notifications: &mut Vec<DeviceNotification>) {
+    state.events.with_info(|info| {
+        let _ = info.replace_change_mask(0);
+        info.bump_param(SPA_PARAM_Route);
+    });
+    notifications.push(DeviceNotification::Info(state.events.take_info()));
 }
 
 // The ~1 Hz external-change poll: on a modify_counter tick, value-diff the
@@ -541,9 +737,10 @@ fn sync_recsrc(state: &mut State, mi: usize) -> Option<usize> {
     Some(pos)
 }
 
-unsafe fn poll_mixers(state: &mut State) {
+fn poll_mixers(state: &mut State) -> Vec<DeviceNotification> {
+    let mut notifications = Vec::new();
     if state.profile == 0 {
-        return; // nodes are retracted under the Off profile; nothing to announce
+        return notifications; // nodes are retracted under Off
     }
 
     let mut changed: Vec<(usize, bool, bool)> = vec![]; // (route, volume, mute)
@@ -609,46 +806,52 @@ unsafe fn poll_mixers(state: &mut State) {
     }
 
     if changed.is_empty() && switched.is_empty() {
-        return;
+        return notifications;
     }
 
-    unsafe { announce_route_change(state) };
+    queue_route_change(state, &mut notifications);
 
     for pos in switched {
         // the node's effective input volume is the new source's control now
         if state.routes[pos].control.is_some() {
-            unsafe {
-                emit_object_config(state, pos, true);
-                emit_object_config(state, pos, false);
-            }
+            queue_object_config(state, pos, true, &mut notifications);
+            queue_object_config(state, pos, false, &mut notifications);
         }
     }
 
     for (pos, vol_changed, mute_changed) in changed {
         if vol_changed {
-            unsafe { emit_object_config(state, pos, true) };
+            queue_object_config(state, pos, true, &mut notifications);
         }
         if mute_changed {
-            unsafe { emit_object_config(state, pos, false) };
+            queue_object_config(state, pos, false, &mut notifications);
         }
     }
+    notifications
 }
 
 unsafe extern "C" fn on_mixer_timeout(source: *mut spa_source) {
-    // the source we registered in arm_mixer_watch; its data points at our State
-    let state = unsafe { (*source).data.cast::<State>().as_mut() }
-        .expect("(*source).data is not supposed to be null");
+    let state: *mut State = unsafe { (*source).data.cast() };
+    assert!(
+        !state.is_null(),
+        "(*source).data is not supposed to be null"
+    );
 
-    // drain the periodic timerfd or the level-triggered source spins the loop
-    let Some(system) = &state.system else {
-        return; // the source is only registered when the system interface exists
+    let (events, notifications) = {
+        // Scoped State borrow: all mixer mutations and payload construction
+        // finish before arbitrary listener code runs below.
+        let state = unsafe { &mut *state };
+        let Some(system) = &state.system else {
+            return;
+        };
+        let mut expirations = 0;
+        if system.timerfd_read(state.timer_source.fd, &mut expirations) < 0 {
+            return;
+        }
+        (state.events.clone(), poll_mixers(state))
     };
-    let mut expirations = 0;
-    if unsafe { system.timerfd_read(state.timer_source.fd, &mut expirations) } < 0 {
-        return;
-    }
-
-    unsafe { poll_mixers(state) };
+    // SAFETY: the scoped State borrow ended above.
+    unsafe { events.dispatch_all(notifications) };
 }
 
 // devd "SND CONN" watcher. What the kernel actually emits (verified against
@@ -669,47 +872,57 @@ unsafe extern "C" fn on_mixer_timeout(source: *mut spa_source) {
 // (hdaa_autorecsrc_handler, hdaa.c:562) and pin mutes, so the one sound
 // reaction is nudging the mixer poll instead of waiting out the 1 Hz tick.
 unsafe extern "C" fn on_devd_event(source: *mut spa_source) {
-    // the source we registered in arm_mixer_watch; its data points at our State
-    let state = unsafe { (*source).data.cast::<State>().as_mut() }
-        .expect("(*source).data is not supposed to be null");
+    let state: *mut State = unsafe { (*source).data.cast() };
+    assert!(
+        !state.is_null(),
+        "(*source).data is not supposed to be null"
+    );
 
-    let Some(devd_socket) = state.devd_socket.as_mut() else {
-        return; // the source is only registered when the socket exists
-    };
+    let (events, notifications) = {
+        let state = unsafe { &mut *state };
+        let Some(devd_socket) = state.devd_socket.as_mut() else {
+            return;
+        };
 
-    let pcm_devices = &state.pcm_devices;
-    let mut nudged = false;
-    let alive = devd_socket.read_event(|line| {
-        static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-        let re = RE.get_or_init(|| {
-            regex::Regex::new(r"^!system=SND subsystem=CONN type=(?:IN|OUT) cdev=dsp([0-9]+)")
-                .unwrap()
-        });
-        if let Some(groups) = re.captures(line) {
-            if let Ok(unit) = groups[1].parse::<u32>() {
-                nudged |= pcm_devices.iter().any(|d| d.index == unit);
+        let pcm_devices = &state.pcm_devices;
+        let mut nudged = false;
+        let alive = devd_socket.read_event(|line| {
+            static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+            let re = RE.get_or_init(|| {
+                regex::Regex::new(r"^!system=SND subsystem=CONN type=(?:IN|OUT) cdev=dsp([0-9]+)")
+                    .unwrap()
+            });
+            if let Some(groups) = re.captures(line) {
+                if let Ok(unit) = groups[1].parse::<u32>() {
+                    nudged |= pcm_devices.iter().any(|d| d.index == unit);
+                }
             }
-        }
-    });
+        });
 
-    if nudged {
-        crate::debug!(state.log, "SND CONN event; re-polling the mixers");
-        unsafe { poll_mixers(state) };
-    }
+        let notifications = if nudged {
+            crate::debug!(state.log, "SND CONN event; re-polling the mixers");
+            poll_mixers(state)
+        } else {
+            Vec::new()
+        };
 
-    if !alive {
-        // devd restarted or dropped us; deregister or the level-triggered fd
-        // spins the main loop forever. The 1 Hz poll still covers the changes.
-        crate::warn!(
-            state.log,
-            "devd connection lost; falling back to the mixer poll alone"
-        );
-        if let Some(main_loop) = &state.main_loop {
-            unsafe { main_loop.remove_source(&mut state.devd_source) };
+        if !alive {
+            // devd restarted or dropped us; deregister or the level-triggered fd
+            // spins the main loop forever. The 1 Hz poll still covers changes.
+            crate::warn!(
+                state.log,
+                "devd connection lost; falling back to the mixer poll alone"
+            );
+            if let Some(main_loop) = &state.main_loop {
+                unsafe { main_loop.remove_source(&mut state.devd_source) };
+            }
+            state.devd_socket = None;
+            state.devd_added = false;
         }
-        state.devd_socket = None;
-        state.devd_added = false;
-    }
+        (state.events.clone(), notifications)
+    };
+    // SAFETY: the scoped State borrow ended above.
+    unsafe { events.dispatch_all(notifications) };
 }
 
 unsafe extern "C" fn add_listener(
@@ -718,61 +931,54 @@ unsafe extern "C" fn add_listener(
     events: *const spa_device_events,
     data: *mut c_void,
 ) -> c_int {
-    let state =
-        unsafe { object.cast::<State>().as_mut() }.expect("object is not supposed to be null");
+    let state: *mut State = object.cast();
+    assert!(!state.is_null(), "object is not supposed to be null");
+    let (device_events, objects) = {
+        let state = unsafe { &*state };
+        (
+            state.events.clone(),
+            object_events(
+                &state.pcm_devices,
+                &state.routes,
+                &state.description,
+                state.profile != 0,
+            ),
+        )
+    };
 
-    let mut save = MaybeUninit::<spa_hook_list>::uninit();
-    unsafe {
-        spa_hook_list_isolate(
-            &mut state.hooks,
-            save.as_mut_ptr(),
-            listener,
-            events.cast(),
-            data,
-        );
+    let initial = |hooks: &crate::spa::ListenerList<spa_device_events>| {
+        // The initial emissions only reach the newly added listener (the list
+        // is isolated). One method per traversal, mirroring C's
+        // spa_hook_list_call: a listener that removes and frees its hook
+        // inside a callback must not be read for the next method.
+        let info = device_events.initial_info();
+        let dispatch_guard = device_events.begin_dispatch();
+        // SAFETY: all State-backed object data was copied above.
+        unsafe { device_events.emit_info_on(hooks, &info) };
+        for object in &objects {
+            unsafe { device_events.emit_object_on(hooks, object) };
+        }
+        dispatch_guard
+    };
+    let dispatch_guard =
+        unsafe { device_events.with_new_listener(listener, events, data, initial) };
+    if let Some(guard) = dispatch_guard {
+        // Nested profile/route changes queued during the initial transaction
+        // are delivered only after every initial snapshot, and after the full
+        // listener list has been restored.
+        unsafe { device_events.drain(guard) };
     }
-
-    // The initial emissions only reach the newly added listener (the list is
-    // isolated). One method per traversal, mirroring C's spa_hook_list_call:
-    // a listener that removes and frees its hook from inside a callback must
-    // not be called (or have its hook read) again for the next method.
-    unsafe {
-        let old_mask = state
-            .dev_info
-            .replace_change_mask(crate::spa::SPA_DEVICE_CHANGE_MASK_ALL as u64);
-        crate::spa::emit_events(&mut state.hooks, |f: spa_device_events, data| {
-            if let Some(dev_info_fun) = f.info {
-                dev_info_fun(data, state.dev_info.raw());
-            }
-        });
-        let _ = state.dev_info.replace_change_mask(old_mask);
-
-        emit_objects(
-            &mut state.hooks,
-            &state.pcm_devices,
-            &state.routes,
-            &state.description,
-            state.profile != 0,
-        );
-    }
-
-    // isolate above initialized `save`
-    unsafe { spa_hook_list_join(&mut state.hooks, save.assume_init_mut()) };
     0
 }
 
 unsafe extern "C" fn sync(object: *mut c_void, seq: c_int) -> c_int {
-    let state =
-        unsafe { object.cast::<State>().as_mut() }.expect("object is not supposed to be null");
-
-    // one emission through the C listener vtables end to end
-    unsafe {
-        crate::spa::emit_events(&mut state.hooks, |f: spa_device_events, data| {
-            if let Some(result_fun) = f.result {
-                result_fun(data, seq, 0, 0, std::ptr::null());
-            }
-        });
-    }
+    let state: *mut State = object.cast();
+    assert!(!state.is_null(), "object is not supposed to be null");
+    let events = unsafe { (*state).events.clone() };
+    // SAFETY: only the independent endpoint remains borrowed. Done joins the
+    // same FIFO as info/object transactions, so reentrant sync cannot overtake
+    // already-produced state notifications.
+    unsafe { events.dispatch_all(vec![DeviceNotification::Done(seq)]) };
 
     0
 }
@@ -785,8 +991,9 @@ unsafe extern "C" fn enum_params(
     max: u32,
     filter: *const spa_pod,
 ) -> c_int {
-    let state =
-        unsafe { object.cast::<State>().as_mut() }.expect("object is not supposed to be null");
+    let state: *mut State = object.cast();
+    assert!(!state.is_null(), "object is not supposed to be null");
+    let events = unsafe { (*state).events.clone() };
 
     unsafe {
         crate::spa::enum_params_loop(
@@ -853,36 +1060,56 @@ unsafe extern "C" fn enum_params(
                     _ => ParamStep::Stop(-libc::ENOENT),
                 }
             },
-            |state, index, param| {
+            |index, param| {
                 let result = spa_result_device_params {
                     id,
                     index,
                     next: index + 1,
                     param,
                 };
-                crate::spa::dev_emit_result(
-                    &mut state.hooks,
-                    seq,
-                    0,
-                    SPA_RESULT_TYPE_DEVICE_PARAMS,
-                    &result,
-                );
+                // SAFETY: enum_params_loop ended its per-step State borrow
+                // before invoking this closure.
+                events.emit_result(seq, &result);
             },
         )
     }
 }
 
-// apply a Route props object to the hardware and the shadow; unknown props
-// are ignored (WirePlumber sends softVolumes and friends along)
+// Route properties accepted from set_param. Unknown properties are ignored
+// because session managers may include adapter-owned values such as
+// softVolumes. Mute is applied before channelVolumes, and the last duplicate
+// property wins.
+#[derive(Debug, Default, PartialEq)]
+struct RouteProps {
+    mute: Option<bool>,
+    channel_volumes: Option<Vec<f32>>, // non-empty (decode drops empty arrays)
+}
+
+fn decode_route_props(object: libspa::pod::Object) -> RouteProps {
+    use libspa::pod::{Value, ValueArray};
+
+    let mut props = RouteProps::default();
+    for p in object.properties {
+        #[allow(non_upper_case_globals)]
+        match (p.key, p.value) {
+            (SPA_PROP_mute, Value::Bool(mute)) => props.mute = Some(mute),
+            (SPA_PROP_channelVolumes, Value::ValueArray(ValueArray::Float(v))) if !v.is_empty() => {
+                props.channel_volumes = Some(v);
+            }
+            _ => (),
+        }
+    }
+    props
+}
+
+// Apply route properties to the hardware and cached state.
 fn apply_route_props(
     state: &mut State,
     pos: usize,
-    props: libspa::pod::Object,
+    props: RouteProps,
     vol_changed: &mut bool,
     mute_changed: &mut bool,
 ) {
-    use libspa::pod::{Value, ValueArray};
-
     // the cached control may lag a recording-source change by up to a poll
     // tick; a write must target the CURRENT source
     resolve_recsrc(state, pos);
@@ -891,76 +1118,77 @@ fn apply_route_props(
     // emit_object_config pushes them into the node's softVolumes
     let control = state.routes[pos].control;
 
-    for p in props.properties {
-        #[allow(non_upper_case_globals)]
-        match (p.key, p.value) {
-            (SPA_PROP_mute, Value::Bool(mute)) => {
-                if mute != state.routes[pos].mute {
-                    let applied = match control {
-                        Some(c) => state.mixers[mi].mixer.set_muted(c, mute),
-                        None => true, // soft route: the shadow is the state
-                    };
-                    if applied {
-                        state.routes[pos].mute = mute;
-                        *mute_changed = true;
-                    }
-                }
+    if let Some(mute) = props.mute {
+        if mute != state.routes[pos].mute {
+            let applied = match control {
+                Some(c) => state.mixers[mi].mixer.set_muted(c, mute),
+                None => true, // soft route: the shadow is the state
+            };
+            if applied {
+                state.routes[pos].mute = mute;
+                *mute_changed = true;
             }
-            (SPA_PROP_channelVolumes, Value::ValueArray(ValueArray::Float(v))) if !v.is_empty() => {
-                // any width is accepted: mixer channel i reads v[i % n], so a mono
-                // request fans out and a wider-than-stereo one folds down
-                // log what the session manager actually sent; misapplied volumes
-                // are hard to attribute after the fact (PIPEWIRE_DEBUG="spa.oss.*:4")
-                crate::debug!(
-                    state.log,
-                    "route {} channelVolumes {:?}",
-                    state.routes[pos].name,
-                    v
-                );
-                let levels = (linear_to_oss(v[0]), linear_to_oss(v[1 % v.len()]));
-                if levels != state.routes[pos].levels {
-                    let applied = match control {
-                        Some(c) => state.mixers[mi].mixer.set_level(c, levels.0, levels.1),
-                        None => true,
-                    };
-                    if applied {
-                        state.routes[pos].levels = levels;
-                        *vol_changed = true;
-                    }
-                }
+        }
+    }
+
+    if let Some(v) = props.channel_volumes {
+        // non-empty per decode_route_props; the indexing below relies on it
+        assert!(!v.is_empty(), "decode admits only non-empty volume arrays");
+        // any width is accepted: mixer channel i reads v[i % n], so a mono
+        // request fans out and a wider-than-stereo one folds down
+        // log what the session manager actually sent; misapplied volumes
+        // are hard to attribute after the fact (PIPEWIRE_DEBUG="spa.oss.*:4")
+        crate::debug!(
+            state.log,
+            "route {} channelVolumes {:?}",
+            state.routes[pos].name,
+            v
+        );
+        let levels = (linear_to_oss(v[0]), linear_to_oss(v[1 % v.len()]));
+        if levels != state.routes[pos].levels {
+            let applied = match control {
+                Some(c) => state.mixers[mi].mixer.set_level(c, levels.0, levels.1),
+                None => true,
+            };
+            if applied {
+                state.routes[pos].levels = levels;
+                *vol_changed = true;
             }
-            _ => (),
         }
     }
 }
 
-// set_param(Profile): switch between Off (0) and the default profile (1),
-// addressed by index or name; a NULL pod resets to the boot default (on)
-unsafe fn set_profile_param(state: &mut State, param: *const spa_pod) -> c_int {
+// A validated Profile request. Profiles may be addressed by index or name;
+// both forms resolve before the device state is borrowed. A NULL pod selects
+// the default profile, and an invalid address returns -EINVAL.
+#[derive(Debug, PartialEq)]
+struct ProfileRequest {
+    index: u32, // 0 = off, 1 = default
+    save: bool,
+}
+
+fn decode_profile_request(value: Option<libspa::pod::Value>) -> Result<ProfileRequest, c_int> {
     use libspa::pod::Value;
 
     let mut index = None;
     let mut name = None;
     let mut save = false;
-    if param.is_null() {
-        index = Some(1);
-    } else {
-        match unsafe { crate::utils::deserialize_pod(param) } {
-            Some(Value::Object(o)) if o.type_ == SPA_TYPE_OBJECT_ParamProfile => {
-                for p in o.properties {
-                    #[allow(non_upper_case_globals)]
-                    match (p.key, p.value) {
-                        (SPA_PARAM_PROFILE_index, Value::Int(v)) if (0..=1).contains(&v) => {
-                            index = Some(v as u32);
-                        }
-                        (SPA_PARAM_PROFILE_name, Value::String(v)) => name = Some(v),
-                        (SPA_PARAM_PROFILE_save, Value::Bool(v)) => save = v,
-                        _ => (),
+    match value {
+        None => index = Some(1),
+        Some(Value::Object(o)) if o.type_ == SPA_TYPE_OBJECT_ParamProfile => {
+            for p in o.properties {
+                #[allow(non_upper_case_globals)]
+                match (p.key, p.value) {
+                    (SPA_PARAM_PROFILE_index, Value::Int(v)) if (0..=1).contains(&v) => {
+                        index = Some(v as u32);
                     }
+                    (SPA_PARAM_PROFILE_name, Value::String(v)) => name = Some(v),
+                    (SPA_PARAM_PROFILE_save, Value::Bool(v)) => save = v,
+                    _ => (),
                 }
             }
-            _ => return -libc::EINVAL,
         }
+        _ => return Err(-libc::EINVAL),
     }
 
     // session managers may address profiles by name instead of index
@@ -972,9 +1200,19 @@ unsafe fn set_profile_param(state: &mut State, param: *const spa_pod) -> c_int {
         };
     }
 
-    let Some(index) = index else {
-        return -libc::EINVAL;
-    };
+    match index {
+        Some(index) => Ok(ProfileRequest { index, save }),
+        None => Err(-libc::EINVAL),
+    }
+}
+
+// Apply a resolved Profile request: 0 is Off and 1 is the default profile.
+fn set_profile_param(
+    state: &mut State,
+    request: ProfileRequest,
+    notifications: &mut Vec<DeviceNotification>,
+) -> c_int {
+    let ProfileRequest { index, save } = request;
 
     let profile_save_changed = state.profile_save != save;
     state.profile_save = save;
@@ -1003,26 +1241,31 @@ unsafe fn set_profile_param(state: &mut State, param: *const spa_pod) -> c_int {
 
         // add or remove the nodes, then re-announce the params tied to the
         // active profile (Route pods appear/vanish with it)
-        unsafe {
-            emit_objects(
-                &mut state.hooks,
+        notifications.extend(
+            object_events(
                 &state.pcm_devices,
                 &state.routes,
                 &state.description,
                 index != 0,
-            );
-        }
+            )
+            .into_iter()
+            .map(DeviceNotification::Object),
+        );
 
-        let _ = state.dev_info.replace_change_mask(0);
-        state.dev_info.bump_param(SPA_PARAM_Profile);
-        state.dev_info.bump_param(SPA_PARAM_EnumRoute);
-        state.dev_info.bump_param(SPA_PARAM_Route);
-        unsafe { emit_device_info(state) };
+        state.events.with_info(|info| {
+            let _ = info.replace_change_mask(0);
+            info.bump_param(SPA_PARAM_Profile);
+            info.bump_param(SPA_PARAM_EnumRoute);
+            info.bump_param(SPA_PARAM_Route);
+        });
+        notifications.push(DeviceNotification::Info(state.events.take_info()));
     } else if profile_save_changed {
         // the save flag is part of the Profile readback; keep it fresh
-        let _ = state.dev_info.replace_change_mask(0);
-        state.dev_info.bump_param(SPA_PARAM_Profile);
-        unsafe { emit_device_info(state) };
+        state.events.with_info(|info| {
+            let _ = info.replace_change_mask(0);
+            info.bump_param(SPA_PARAM_Profile);
+        });
+        notifications.push(DeviceNotification::Info(state.events.take_info()));
     }
 
     0
@@ -1056,18 +1299,25 @@ fn resolve_route_pos(
         })
 }
 
-// set_param(Route): a volume/mute write to a route's props, a recording
-// port switch (selecting an inactive source route), or both
-unsafe fn set_route_param(state: &mut State, param: *const spa_pod) -> c_int {
+// A validated Route request. The handler resolves its index/name/device
+// address against the live route table before applying properties. The
+// device field is required, and Route has no NULL reset operation.
+#[derive(Debug, PartialEq)]
+struct RouteRequest {
+    index: Option<usize>,
+    name: Option<String>,
+    device: u32,
+    save: bool,
+    props: Option<RouteProps>,
+}
+
+fn decode_route_request(value: Option<libspa::pod::Value>) -> Result<RouteRequest, c_int> {
     use libspa::pod::Value;
 
-    if param.is_null() || state.profile == 0 {
-        return -libc::EINVAL; // no routes exist under the Off profile
-    }
-
-    let object = match unsafe { crate::utils::deserialize_pod(param) } {
+    let object = match value {
         Some(Value::Object(o)) if o.type_ == SPA_TYPE_OBJECT_ParamRoute => o,
-        _ => return -libc::EINVAL,
+        // includes None (a NULL pod): there is no route state to reset
+        _ => return Err(-libc::EINVAL),
     };
 
     let mut index = None;
@@ -1084,15 +1334,42 @@ unsafe fn set_route_param(state: &mut State, param: *const spa_pod) -> c_int {
             (SPA_PARAM_ROUTE_device, Value::Int(v)) if v >= 0 => device = Some(v as u32),
             (SPA_PARAM_ROUTE_save, Value::Bool(v)) => save = v,
             (SPA_PARAM_ROUTE_props, Value::Object(o)) if o.type_ == SPA_TYPE_OBJECT_Props => {
-                props = Some(o);
+                props = Some(decode_route_props(o));
             }
             _ => (),
         }
     }
 
     let Some(device) = device else {
-        return -libc::EINVAL;
+        return Err(-libc::EINVAL);
     };
+    Ok(RouteRequest {
+        index,
+        name,
+        device,
+        save,
+        props,
+    })
+}
+
+// Apply route properties, a recording-source switch, or both.
+fn set_route_param(
+    state: &mut State,
+    request: RouteRequest,
+    notifications: &mut Vec<DeviceNotification>,
+) -> c_int {
+    if state.profile == 0 {
+        return -libc::EINVAL; // no routes exist under the Off profile
+    }
+
+    let RouteRequest {
+        index,
+        name,
+        device,
+        save,
+        props,
+    } = request;
+
     let Some(pos) = resolve_route_pos(state, index, name.as_deref(), device) else {
         return -libc::EINVAL;
     };
@@ -1118,7 +1395,7 @@ unsafe fn set_route_param(state: &mut State, param: *const spa_pod) -> c_int {
                 );
                 // re-announce even so: the session manager applied the switch
                 // optimistically and must re-read what really happened
-                unsafe { announce_route_change(state) };
+                queue_route_change(state, notifications);
             }
         } else {
             crate::warn!(
@@ -1146,7 +1423,7 @@ unsafe fn set_route_param(state: &mut State, param: *const spa_pod) -> c_int {
     // bump only on an observable change: every spurious serial flip costs
     // the session manager a full param re-enumeration
     if vol_changed || mute_changed || save_changed || switched.is_some() {
-        unsafe { announce_route_change(state) };
+        queue_route_change(state, notifications);
     }
 
     // A switch changes which control feeds the node, so push the newly
@@ -1159,18 +1436,18 @@ unsafe fn set_route_param(state: &mut State, param: *const spa_pod) -> c_int {
     }
     if let Some(active_pos) = switched {
         if !(active_pos == pos && vol_changed) {
-            unsafe { emit_object_config(state, active_pos, true) };
+            queue_object_config(state, active_pos, true, notifications);
         }
         if !(active_pos == pos && mute_changed) {
-            unsafe { emit_object_config(state, active_pos, false) };
+            queue_object_config(state, active_pos, false, notifications);
         }
     }
 
     if vol_changed {
-        unsafe { emit_object_config(state, pos, true) };
+        queue_object_config(state, pos, true, notifications);
     }
     if mute_changed {
-        unsafe { emit_object_config(state, pos, false) };
+        queue_object_config(state, pos, false, notifications);
     }
 
     0
@@ -1182,15 +1459,46 @@ unsafe extern "C" fn set_param(
     _flags: u32,
     param: *const spa_pod,
 ) -> c_int {
-    let state =
-        unsafe { object.cast::<State>().as_mut() }.expect("object is not supposed to be null");
+    let state: *mut State = object.cast();
+    assert!(!state.is_null(), "object is not supposed to be null");
 
     #[allow(non_upper_case_globals)]
     match id {
-        SPA_PARAM_Profile => unsafe { set_profile_param(state, param) },
-        SPA_PARAM_Route => unsafe { set_route_param(state, param) },
-        _ => -libc::ENOENT, // unknown param id (ALSA convention)
+        SPA_PARAM_Profile | SPA_PARAM_Route => (),
+        _ => return -libc::ENOENT, // unknown param id (ALSA convention)
     }
+
+    // Deserialize the pod before borrowing State. None represents a NULL pod.
+    let value = if param.is_null() {
+        None
+    } else {
+        match unsafe { crate::utils::deserialize_pod(param) } {
+            Some(value) => Some(value),
+            None => return -libc::EINVAL,
+        }
+    };
+
+    // Validate the request before mutating device state.
+    let (events, result, notifications) = {
+        let state = unsafe { &mut *state };
+        let mut notifications = Vec::new();
+        #[allow(non_upper_case_globals)]
+        let result = match id {
+            SPA_PARAM_Profile => match decode_profile_request(value) {
+                Ok(request) => set_profile_param(state, request, &mut notifications),
+                Err(err) => err,
+            },
+            SPA_PARAM_Route => match decode_route_request(value) {
+                Ok(request) => set_route_param(state, request, &mut notifications),
+                Err(err) => err,
+            },
+            _ => -libc::ENOENT, // filtered above
+        };
+        (state.events.clone(), result, notifications)
+    };
+    // SAFETY: the mutation phase's State borrow ended above.
+    unsafe { events.dispatch_all(notifications) };
+    result
 }
 
 const DEVICE_IMPL: spa_device_methods = spa_device_methods {
@@ -1227,7 +1535,7 @@ unsafe extern "C" fn clear(handle: *mut spa_handle) -> c_int {
             unsafe { main_loop.remove_source(&mut state.timer_source) };
         }
         if let Some(system) = &state.system {
-            unsafe { system.close(state.timer_source.fd) };
+            system.close(state.timer_source.fd);
         }
         state.timer_source.fd = -1;
         state.timer_added = false;
@@ -1481,12 +1789,10 @@ unsafe fn arm_mixer_watch(state: &mut State) {
     }
 
     if let (Some(main_loop), Some(system)) = (&state.main_loop, &state.system) {
-        let fd = unsafe {
-            system.timerfd_create(
-                libc::CLOCK_MONOTONIC,
-                (SPA_FD_CLOEXEC | SPA_FD_NONBLOCK) as c_int,
-            )
-        };
+        let fd = system.timerfd_create(
+            libc::CLOCK_MONOTONIC,
+            (SPA_FD_CLOEXEC | SPA_FD_NONBLOCK) as c_int,
+        );
         if fd < 0 {
             crate::warn!(
                 state.log,
@@ -1504,7 +1810,7 @@ unsafe fn arm_mixer_watch(state: &mut State) {
                     tv_nsec: 0,
                 },
             };
-            if unsafe { system.timerfd_settime(fd, 0, &timerspec, std::ptr::null_mut()) } < 0 {
+            if system.timerfd_settime(fd, 0, &timerspec) < 0 {
                 crate::warn!(state.log, "can't arm the mixer poll timer");
             }
             state.timer_source.fd = fd;
@@ -1515,7 +1821,7 @@ unsafe fn arm_mixer_watch(state: &mut State) {
                     state.log,
                     "can't watch the mixer; external volume changes won't be noticed"
                 );
-                unsafe { system.close(fd) };
+                system.close(fd);
                 state.timer_source.fd = -1;
             }
         }
@@ -1611,6 +1917,7 @@ unsafe extern "C" fn init(
 
     let (routes, mixers) = probe_routes(&pcm_devices);
     let common_desc = common_description(&pcm_devices);
+    let events = std::rc::Rc::new(DeviceEvents::new());
 
     // the host hands us uninitialized memory of get_size() bytes; write the
     // whole State without dropping the garbage "old" value
@@ -1635,14 +1942,7 @@ unsafe extern "C" fn init(
                     },
                 },
 
-                dev_info: crate::spa::DeviceInfo::new(),
-
-                hooks: spa_hook_list {
-                    list: spa_list {
-                        next: std::ptr::null_mut(),
-                        prev: std::ptr::null_mut(),
-                    },
-                },
+                events,
 
                 pcm_devices,
                 description: common_desc,
@@ -1683,36 +1983,23 @@ unsafe extern "C" fn init(
         );
     }
 
-    state.dev_info.fix_pointers();
-    state
-        .dev_info
-        .add_prop(crate::spa::key(SPA_KEY_DEVICE_API), "freebsd-oss");
-    state
-        .dev_info
-        .add_prop(crate::spa::key(SPA_KEY_MEDIA_CLASS), "Audio/Device");
-    if let Some(pcm_parent_device) = pcm_parent_device {
-        state
-            .dev_info
-            .add_prop(crate::spa::key(SPA_KEY_DEVICE_NAME), pcm_parent_device);
-    }
-    state.dev_info.add_prop(
-        crate::spa::key(SPA_KEY_DEVICE_DESCRIPTION),
-        state.description.as_str(),
-    );
-    state
-        .dev_info
-        .add_param(SPA_PARAM_EnumProfile, SPA_PARAM_INFO_READ);
-    state
-        .dev_info
-        .add_param(SPA_PARAM_Profile, SPA_PARAM_INFO_READWRITE);
-    state
-        .dev_info
-        .add_param(SPA_PARAM_EnumRoute, SPA_PARAM_INFO_READ);
-    state
-        .dev_info
-        .add_param(SPA_PARAM_Route, SPA_PARAM_INFO_READWRITE);
-
-    unsafe { spa_hook_list_init(&mut state.hooks) };
+    let description = state.description.clone();
+    state.events.with_info(|info| {
+        info.fix_pointers();
+        info.add_prop(crate::spa::key(SPA_KEY_DEVICE_API), "freebsd-oss");
+        info.add_prop(crate::spa::key(SPA_KEY_MEDIA_CLASS), "Audio/Device");
+        if let Some(pcm_parent_device) = pcm_parent_device {
+            info.add_prop(crate::spa::key(SPA_KEY_DEVICE_NAME), pcm_parent_device);
+        }
+        info.add_prop(
+            crate::spa::key(SPA_KEY_DEVICE_DESCRIPTION),
+            description.as_str(),
+        );
+        info.add_param(SPA_PARAM_EnumProfile, SPA_PARAM_INFO_READ);
+        info.add_param(SPA_PARAM_Profile, SPA_PARAM_INFO_READWRITE);
+        info.add_param(SPA_PARAM_EnumRoute, SPA_PARAM_INFO_READ);
+        info.add_param(SPA_PARAM_Route, SPA_PARAM_INFO_READWRITE);
+    });
 
     unsafe { arm_mixer_watch(state) };
 
@@ -1768,7 +2055,286 @@ pub(crate) static mut OSS_DEVICE_TOPIC: spa_log_topic = spa_log_topic {
 
 #[cfg(test)]
 mod tests {
-    use super::RouteState;
+    use super::*;
+
+    struct ReentrantDeviceInfoContext {
+        events: *const DeviceEvents,
+        seen: Vec<u32>,
+    }
+
+    unsafe extern "C" fn reentrant_device_info(data: *mut c_void, info: *const spa_device_info) {
+        let context = unsafe { &mut *data.cast::<ReentrantDeviceInfoContext>() };
+        let info = unsafe { &*info };
+        let params = unsafe { std::slice::from_raw_parts(info.params, info.n_params as usize) };
+        context.seen.push(
+            params
+                .iter()
+                .find(|param| param.id == SPA_PARAM_Profile)
+                .expect("Profile is published")
+                .flags,
+        );
+        if context.seen.len() == 1 {
+            let events = unsafe { &*context.events };
+            events.with_info(|info| info.bump_param(SPA_PARAM_Profile));
+            let nested = DeviceNotification::Info(events.take_info());
+            // SAFETY: the test owns no State; the endpoint queues this behind
+            // the remaining outer notification.
+            unsafe { events.dispatch_all(vec![nested]) };
+        }
+    }
+
+    #[test]
+    fn device_notifications_preserve_fifo_order_under_reentry() {
+        let events = DeviceEvents::new();
+        events.with_info(|info| {
+            info.fix_pointers();
+            info.add_param(SPA_PARAM_Profile, SPA_PARAM_INFO_READ);
+        });
+
+        let mut context = ReentrantDeviceInfoContext {
+            events: &events,
+            seen: Vec::new(),
+        };
+        let mut table: spa_device_events = unsafe { std::mem::zeroed() };
+        table.version = SPA_VERSION_DEVICE_EVENTS;
+        table.info = Some(reentrant_device_info);
+        let mut hook: spa_hook = unsafe { std::mem::zeroed() };
+        let initial = || {
+            events.with_info(|info| info.bump_param(SPA_PARAM_Profile));
+            let first = DeviceNotification::Info(events.take_info());
+            events.with_info(|info| info.bump_param(SPA_PARAM_Profile));
+            let second = DeviceNotification::Info(events.take_info());
+            unsafe { events.dispatch_all(vec![first, second]) };
+        };
+        unsafe {
+            events.hooks.with_isolated_listener(
+                &mut hook,
+                &raw const table,
+                (&raw mut context).cast(),
+                initial,
+            );
+        }
+
+        assert_eq!(
+            context.seen,
+            [
+                SPA_PARAM_INFO_READ | SPA_PARAM_INFO_SERIAL,
+                SPA_PARAM_INFO_READ,
+                SPA_PARAM_INFO_READ | SPA_PARAM_INFO_SERIAL,
+            ]
+        );
+    }
+
+    struct InitialDeviceContext {
+        events: *const DeviceEvents,
+        sequence: Vec<&'static str>,
+    }
+
+    unsafe extern "C" fn initial_device_info(data: *mut c_void, _info: *const spa_device_info) {
+        let context = unsafe { &mut *data.cast::<InitialDeviceContext>() };
+        context.sequence.push("info");
+        let events = unsafe { &*context.events };
+        unsafe {
+            events.dispatch_all(vec![DeviceNotification::Object(
+                DeviceObjectEvent::Removed { id: 2 },
+            )]);
+        }
+    }
+
+    unsafe extern "C" fn initial_device_object(
+        data: *mut c_void,
+        _id: u32,
+        info: *const spa_device_object_info,
+    ) {
+        let context = unsafe { &mut *data.cast::<InitialDeviceContext>() };
+        context
+            .sequence
+            .push(if info.is_null() { "removed" } else { "added" });
+    }
+
+    #[test]
+    fn initial_device_transaction_finishes_before_reentrant_changes() {
+        let events = DeviceEvents::new();
+        events.with_info(|info| info.fix_pointers());
+        let info = events.initial_info();
+        let initial_object = DeviceObjectEvent::Added {
+            id: 2,
+            rec: false,
+            description: "Playback".into(),
+            route_count: 0,
+        };
+        let mut context = InitialDeviceContext {
+            events: &events,
+            sequence: Vec::new(),
+        };
+        let mut table: spa_device_events = unsafe { std::mem::zeroed() };
+        table.version = SPA_VERSION_DEVICE_EVENTS;
+        table.info = Some(initial_device_info);
+        table.object_info = Some(initial_device_object);
+        let mut hook: spa_hook = unsafe { std::mem::zeroed() };
+        let initial = || {
+            let dispatch_guard = events.begin_dispatch().expect("the test owns dispatch");
+            unsafe {
+                events.emit_info(&info);
+                events.emit_object(&initial_object);
+            }
+            dispatch_guard
+        };
+        let dispatch_guard = unsafe {
+            events.hooks.with_isolated_listener(
+                &mut hook,
+                &raw const table,
+                (&raw mut context).cast(),
+                initial,
+            )
+        };
+        unsafe {
+            events.drain(dispatch_guard);
+        }
+        assert_eq!(context.sequence, ["info", "added", "removed"]);
+    }
+
+    struct LateDeviceListener {
+        seen: Vec<u32>,
+    }
+
+    unsafe extern "C" fn record_late_device_object(
+        data: *mut c_void,
+        id: u32,
+        _info: *const spa_device_object_info,
+    ) {
+        unsafe { &mut *data.cast::<LateDeviceListener>() }
+            .seen
+            .push(id);
+    }
+
+    struct AddDeviceListenerContext {
+        events: *const DeviceEvents,
+        late_hook: *mut spa_hook,
+        late_table: *const spa_device_events,
+        late_data: *mut c_void,
+        seen: Vec<u32>,
+    }
+
+    unsafe extern "C" fn add_device_listener_during_dispatch(
+        data: *mut c_void,
+        id: u32,
+        _info: *const spa_device_object_info,
+    ) {
+        let context = unsafe { &mut *data.cast::<AddDeviceListenerContext>() };
+        context.seen.push(id);
+        if context.seen.len() != 1 {
+            return;
+        }
+        let events = unsafe { &*context.events };
+        let initial = |hooks: &crate::spa::ListenerList<spa_device_events>| unsafe {
+            events.emit_object_on(hooks, &DeviceObjectEvent::Removed { id: 3 });
+        };
+        unsafe {
+            events.with_new_listener(
+                context.late_hook,
+                context.late_table,
+                context.late_data,
+                initial,
+            );
+            events.dispatch_all(vec![DeviceNotification::Object(
+                DeviceObjectEvent::Removed { id: 4 },
+            )]);
+        }
+    }
+
+    #[test]
+    fn device_listener_added_during_dispatch_starts_at_its_barrier() {
+        let events = DeviceEvents::new();
+        let mut late = LateDeviceListener { seen: Vec::new() };
+        let mut late_table: spa_device_events = unsafe { std::mem::zeroed() };
+        late_table.version = SPA_VERSION_DEVICE_EVENTS;
+        late_table.object_info = Some(record_late_device_object);
+        let mut late_hook: spa_hook = unsafe { std::mem::zeroed() };
+        let mut context = AddDeviceListenerContext {
+            events: &events,
+            late_hook: &mut late_hook,
+            late_table: &late_table,
+            late_data: (&raw mut late).cast(),
+            seen: Vec::new(),
+        };
+        let mut table: spa_device_events = unsafe { std::mem::zeroed() };
+        table.version = SPA_VERSION_DEVICE_EVENTS;
+        table.object_info = Some(add_device_listener_during_dispatch);
+        let mut hook: spa_hook = unsafe { std::mem::zeroed() };
+        unsafe {
+            events.with_new_listener(
+                &mut hook,
+                &raw const table,
+                (&raw mut context).cast(),
+                |_hooks| {},
+            );
+            events.dispatch_all(vec![
+                DeviceNotification::Object(DeviceObjectEvent::Removed { id: 1 }),
+                DeviceNotification::Object(DeviceObjectEvent::Removed { id: 2 }),
+            ]);
+            events.dispatch_all(vec![DeviceNotification::Object(
+                DeviceObjectEvent::Removed { id: 5 },
+            )]);
+        }
+
+        assert_eq!(context.seen, [1, 2, 4, 5]);
+        assert_eq!(late.seen, [3, 4, 5]);
+    }
+
+    struct DoneBarrierContext {
+        events: *const DeviceEvents,
+        sequence: Vec<&'static str>,
+    }
+
+    unsafe extern "C" fn done_barrier_info(data: *mut c_void, _info: *const spa_device_info) {
+        let context = unsafe { &mut *data.cast::<DoneBarrierContext>() };
+        context.sequence.push("info");
+        if context.sequence.len() == 1 {
+            let events = unsafe { &*context.events };
+            unsafe { events.dispatch_all(vec![DeviceNotification::Done(7)]) };
+        }
+    }
+
+    unsafe extern "C" fn done_barrier_result(
+        data: *mut c_void,
+        seq: c_int,
+        _res: c_int,
+        _type: u32,
+        _result: *const c_void,
+    ) {
+        assert_eq!(seq, 7);
+        unsafe { &mut *data.cast::<DoneBarrierContext>() }
+            .sequence
+            .push("done");
+    }
+
+    #[test]
+    fn device_done_does_not_overtake_an_active_transaction() {
+        let events = DeviceEvents::new();
+        events.with_info(|info| info.fix_pointers());
+        let first = DeviceNotification::Info(events.take_info());
+        let second = DeviceNotification::Info(events.take_info());
+        let mut context = DoneBarrierContext {
+            events: &events,
+            sequence: Vec::new(),
+        };
+        let mut table: spa_device_events = unsafe { std::mem::zeroed() };
+        table.version = SPA_VERSION_DEVICE_EVENTS;
+        table.info = Some(done_barrier_info);
+        table.result = Some(done_barrier_result);
+        let mut hook: spa_hook = unsafe { std::mem::zeroed() };
+        let initial = || unsafe { events.dispatch_all(vec![first, second]) };
+        unsafe {
+            events.hooks.with_isolated_listener(
+                &mut hook,
+                &raw const table,
+                (&raw mut context).cast(),
+                initial,
+            );
+        }
+        assert_eq!(context.sequence, ["info", "info", "done"]);
+    }
 
     fn pcm_device(index: u32, play: bool, rec: bool) -> crate::sound::PcmDevice {
         crate::sound::PcmDevice {
@@ -1959,5 +2525,145 @@ mod tests {
                 ],
             })
         );
+    }
+
+    // Profile requests accept NULL reset, valid indexes, and durable names.
+    #[test]
+    fn profile_requests_decode_and_reject_like_the_inline_parse() {
+        use libspa::pod::{Object, Value};
+        use libspa::sys::*;
+        let prop = crate::utils::pod_prop;
+
+        assert_eq!(
+            super::decode_profile_request(None),
+            Ok(super::ProfileRequest {
+                index: 1,
+                save: false
+            })
+        );
+        let pod = |props| {
+            Some(Value::Object(Object {
+                type_: SPA_TYPE_OBJECT_ParamProfile,
+                id: SPA_PARAM_Profile,
+                properties: props,
+            }))
+        };
+        assert_eq!(
+            super::decode_profile_request(pod(vec![
+                prop(SPA_PARAM_PROFILE_index, Value::Int(0)),
+                prop(SPA_PARAM_PROFILE_save, Value::Bool(true)),
+            ])),
+            Ok(super::ProfileRequest {
+                index: 0,
+                save: true
+            })
+        );
+        // Resolve durable profile names.
+        assert_eq!(
+            super::decode_profile_request(pod(vec![prop(
+                SPA_PARAM_PROFILE_name,
+                Value::String("off".into())
+            )])),
+            Ok(super::ProfileRequest {
+                index: 0,
+                save: false
+            })
+        );
+        // out-of-range index is ignored, an unknown name resolves nothing
+        assert_eq!(
+            super::decode_profile_request(pod(vec![
+                prop(SPA_PARAM_PROFILE_index, Value::Int(7)),
+                prop(SPA_PARAM_PROFILE_name, Value::String("bogus".into())),
+            ])),
+            Err(-libc::EINVAL)
+        );
+        // a non-Profile object is rejected whole
+        assert_eq!(
+            super::decode_profile_request(Some(Value::Int(1))),
+            Err(-libc::EINVAL)
+        );
+    }
+
+    // Route requests require a device and ignore unsupported properties.
+    #[test]
+    fn route_requests_decode_with_typed_props() {
+        use libspa::pod::{Object, Value, ValueArray};
+        use libspa::sys::*;
+        let prop = crate::utils::pod_prop;
+
+        let pod = |props| {
+            Some(Value::Object(Object {
+                type_: SPA_TYPE_OBJECT_ParamRoute,
+                id: SPA_PARAM_Route,
+                properties: props,
+            }))
+        };
+        assert_eq!(
+            super::decode_route_request(pod(vec![
+                prop(SPA_PARAM_ROUTE_index, Value::Int(1)),
+                prop(SPA_PARAM_ROUTE_name, Value::String("oss-output".into())),
+                prop(SPA_PARAM_ROUTE_device, Value::Int(2)),
+                prop(SPA_PARAM_ROUTE_save, Value::Bool(true)),
+                prop(
+                    SPA_PARAM_ROUTE_props,
+                    Value::Object(Object {
+                        type_: SPA_TYPE_OBJECT_Props,
+                        id: SPA_PARAM_Route,
+                        properties: vec![
+                            prop(SPA_PROP_mute, Value::Bool(true)),
+                            prop(
+                                SPA_PROP_channelVolumes,
+                                Value::ValueArray(ValueArray::Float(vec![0.5, 0.25])),
+                            ),
+                            // ignored at decode: softVolumes ride along
+                            prop(
+                                SPA_PROP_softVolumes,
+                                Value::ValueArray(ValueArray::Float(vec![1.0, 1.0])),
+                            ),
+                        ],
+                    }),
+                ),
+            ])),
+            Ok(super::RouteRequest {
+                index: Some(1),
+                name: Some("oss-output".into()),
+                device: 2,
+                save: true,
+                props: Some(super::RouteProps {
+                    mute: Some(true),
+                    channel_volumes: Some(vec![0.5, 0.25]),
+                }),
+            })
+        );
+        // an empty volume array is dropped (the apply indexes v[0])
+        assert_eq!(
+            super::decode_route_request(pod(vec![
+                prop(SPA_PARAM_ROUTE_device, Value::Int(2)),
+                prop(
+                    SPA_PARAM_ROUTE_props,
+                    Value::Object(Object {
+                        type_: SPA_TYPE_OBJECT_Props,
+                        id: SPA_PARAM_Route,
+                        properties: vec![prop(
+                            SPA_PROP_channelVolumes,
+                            Value::ValueArray(ValueArray::Float(vec![])),
+                        )],
+                    }),
+                ),
+            ])),
+            Ok(super::RouteRequest {
+                index: None,
+                name: None,
+                device: 2,
+                save: false,
+                props: Some(super::RouteProps::default()),
+            })
+        );
+        // no device: unaddressable; no pod: nothing to reset
+        assert_eq!(
+            super::decode_route_request(pod(vec![prop(SPA_PARAM_ROUTE_index, Value::Int(0))])),
+            Err(-libc::EINVAL)
+        );
+        assert_eq!(super::decode_route_request(None), Err(-libc::EINVAL));
     }
 }
