@@ -127,7 +127,7 @@ impl<'a> NvRef<'a> {
             }
             let mut nitems = 0usize;
             let items = nvlist_get_nvlist_array(self.ptr, name.as_ptr(), &mut nitems);
-            if items.is_null() {
+            if items.is_null() || !crate::utils::raw_slice_len_ok::<*const c_void>(nitems) {
                 return vec![];
             }
             std::slice::from_raw_parts(items, nitems)

@@ -32,7 +32,7 @@ fn decode_route_props(object: libspa::pod::Object) -> RouteProps {
 
 // Apply route properties to the hardware and cached state.
 fn apply_route_props(
-    state: &mut State,
+    state: &mut Runtime,
     pos: usize,
     props: RouteProps,
     vol_changed: &mut bool,
@@ -141,7 +141,7 @@ pub(super) fn decode_profile_request(
 
 // Apply a resolved Profile request: 0 is Off and 1 is the default profile.
 fn set_profile_param(
-    state: &mut State,
+    state: &mut Runtime,
     request: ProfileRequest,
     notifications: &mut Vec<DeviceNotification>,
 ) -> c_int {
@@ -209,7 +209,7 @@ fn set_profile_param(
 // since the state was saved) must lose to the durable name instead of
 // winning and then failing the device check.
 fn resolve_route_pos(
-    state: &State,
+    state: &Runtime,
     index: Option<usize>,
     name: Option<&str>,
     device: u32,
@@ -289,7 +289,7 @@ pub(super) fn decode_route_request(
 
 // Apply route properties, a recording-source switch, or both.
 fn set_route_param(
-    state: &mut State,
+    state: &mut Runtime,
     request: RouteRequest,
     notifications: &mut Vec<DeviceNotification>,
 ) -> c_int {
@@ -414,22 +414,23 @@ pub(super) unsafe extern "C" fn set_param(
     };
 
     // Validate the request before mutating device state.
-    let (events, result, notifications) = {
-        let state = unsafe { &mut *state };
-        let mut notifications = Vec::new();
-        #[allow(non_upper_case_globals)]
-        let result = match id {
-            SPA_PARAM_Profile => match decode_profile_request(value) {
-                Ok(request) => set_profile_param(state, request, &mut notifications),
-                Err(err) => err,
-            },
-            SPA_PARAM_Route => match decode_route_request(value) {
-                Ok(request) => set_route_param(state, request, &mut notifications),
-                Err(err) => err,
-            },
-            _ => -libc::ENOENT, // filtered above
-        };
-        (state.events.clone(), result, notifications)
+    let (events, result, notifications) = unsafe {
+        with_runtime_mut(state, |state| {
+            let mut notifications = Vec::new();
+            #[allow(non_upper_case_globals)]
+            let result = match id {
+                SPA_PARAM_Profile => match decode_profile_request(value) {
+                    Ok(request) => set_profile_param(state, request, &mut notifications),
+                    Err(err) => err,
+                },
+                SPA_PARAM_Route => match decode_route_request(value) {
+                    Ok(request) => set_route_param(state, request, &mut notifications),
+                    Err(err) => err,
+                },
+                _ => -libc::ENOENT, // filtered above
+            };
+            (state.events.clone(), result, notifications)
+        })
     };
     // SAFETY: the mutation phase's State borrow ended above.
     unsafe { events.dispatch_all(notifications) };

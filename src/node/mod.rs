@@ -12,7 +12,7 @@ use libspa::sys::*;
 mod events;
 mod rebuild;
 
-use events::NodeEvents;
+use events::{FormatPublication, MainEventTarget, NodeEvents};
 use rebuild::{
     MainEvent, NodeShared, RebuildWork, RebuildWorkSlot, RebuildWorker, install_device,
     queue_main_event, release_rebuild_takeover,
@@ -238,8 +238,15 @@ unsafe fn main_mut<'a, D: Direction>(state: *mut State<D>) -> &'a mut MainState<
     unsafe { &mut *std::ptr::addr_of_mut!((*state).main) }
 }
 
-unsafe fn data_mut<'a, D: Direction>(state: *mut State<D>) -> &'a mut DataState<D> {
-    unsafe { &mut *std::ptr::addr_of_mut!((*state).data) }
+// Keep direct data-loop borrows inside a lexical callback. Unlike a helper
+// returning &mut with a caller-chosen lifetime, this cannot leak the borrow
+// into a later DataControl handoff.
+unsafe fn with_data_mut<D: Direction, R>(
+    state: *mut State<D>,
+    apply: impl for<'a> FnOnce(&'a mut DataState<D>) -> R,
+) -> R {
+    let data = unsafe { &mut *std::ptr::addr_of_mut!((*state).data) };
+    apply(data)
 }
 
 unsafe fn gate_ref<'a, D: Direction>(state: *const State<D>) -> &'a DataThreadGate {
@@ -256,7 +263,7 @@ struct DataThreadGate {
 }
 
 pub(crate) struct MainState<D: Direction> {
-    events: std::sync::Arc<NodeEvents<D>>,
+    events: std::rc::Rc<NodeEvents<D>>,
     // A copyable host-loop endpoint plus the stable address of State::data are
     // combined into DataControl at each control entry point.
     pub data_loop: crate::spa::Loop,
@@ -286,8 +293,8 @@ pub(crate) struct DataState<D: Direction> {
     pub clock_name: std::ffi::CString, // stamped into spa_io_clock.name
     pub main_loop: Option<crate::spa::Loop>, // for endpoint-only notifications
     pub dsp_path: String,
-    timer_fd: Option<crate::spa::TimerFd>, // owns timer_source.fd
-    pub timer_source: spa_source,          // fd is a non-owning SPA registration mirror
+    timer_fd: Option<crate::spa::TimerFd>, // owns the LoopSource fd mirror
+    timer_source: crate::spa::LoopSource,
     pub next_time: u64,
     pub callbacks: NodeCallbacks,
     pub ports: [Port<D>; MAX_PORTS],
@@ -304,7 +311,8 @@ pub(crate) struct DataState<D: Direction> {
     // waiting for the worker. While set, process neither consumes a
     // completion nor submits new work.
     rebuild_takeover: bool,
-    events: std::sync::Arc<NodeEvents<D>>,
+    format_publication: FormatPublication,
+    main_events: MainEventTarget<D>,
     // Data-loop-owned: process_ports records endpoint work here, and generic
     // process() extracts it before ending its DataState phase. Delivery happens
     // only afterward, so an inline loop invoke cannot overlap the data borrow.
@@ -971,7 +979,7 @@ unsafe extern "C" fn on_timeout<D: Direction>(source: *mut spa_source) {
     // fresh &mut DataState, so the callback must not run under this borrow.
     // SAFETY: the registered source data points at our live State (the
     // add_source contract); the borrow ends before the notify call below.
-    let notify = timeout_cycle(unsafe { data_mut(root) });
+    let notify = unsafe { with_data_mut(root, timeout_cycle) };
 
     let Some(hook) = notify else {
         return; // early exit; the timer was armed or parked inside
@@ -981,7 +989,9 @@ unsafe extern "C" fn on_timeout<D: Direction>(source: *mut spa_source) {
             // no State borrow is live here; sound per NodeCallbacks::hook
             let err = unsafe { ready_fun(data, D::READY_STATUS) };
             #[cfg(debug_assertions)]
-            crate::trace!(unsafe { data_mut(root) }.log, "ready -> {}", err);
+            unsafe {
+                with_data_mut(root, |state| crate::trace!(state.log, "ready -> {}", err));
+            };
             #[cfg(not(debug_assertions))]
             let _ = err;
         }
@@ -992,12 +1002,19 @@ unsafe extern "C" fn on_timeout<D: Direction>(source: *mut spa_source) {
     // live; the source stays registered while the node lives. The callback
     // may have synchronously paused the node or cleared its IO, so do not
     // undo the timer park that transition just installed.
-    let state = unsafe { data_mut(root) };
-    if state.started && !state.following && !state.position.is_null() && !state.clock.is_null() {
-        set_timeout(state, state.next_time);
-    } else {
-        set_timeout(state, 0);
-    }
+    unsafe {
+        with_data_mut(root, |state| {
+            if state.started
+                && !state.following
+                && !state.position.is_null()
+                && !state.clock.is_null()
+            {
+                set_timeout(state, state.next_time);
+            } else {
+                set_timeout(state, 0);
+            }
+        });
+    };
 }
 
 // the on_timeout cycle body, run under one scoped &mut DataState borrow. None =
@@ -2120,32 +2137,35 @@ unsafe extern "C" fn process<D: Direction>(object: *mut c_void) -> c_int {
     // port) so the C callback below runs with no DataState borrow live.
     // SAFETY: object is our State shell (the spa_interface data contract); the
     // borrow ends before any callback is invoked.
-    let (result, xrun, main_event) = {
-        let state = unsafe { data_mut(root) };
+    let phase = unsafe {
+        with_data_mut(root, |state| {
+            // a cycle that was already signaled when we paused can still land here;
+            // drop it instead of assert!()ing, which aborts the daemon across
+            // extern "C"
+            if !state.started || state.position.is_null() {
+                return None;
+            }
 
-        // a cycle that was already signaled when we paused can still land here;
-        // drop it instead of assert!()ing, which aborts the daemon across
-        // extern "C"
-        if !state.started || state.position.is_null() {
-            return SPA_STATUS_OK as i32;
-        }
-
-        let result = D::process_ports(state);
-        // collect-then-notify: drain the deposited xrun stamp with the hook copy
-        let pending = state.ports.iter_mut().find_map(|p| p.pending_xrun.take());
-        let main_event = state.pending_main_event.take().map(|event| {
-            (
-                state.main_loop,
-                state.shared.clone(),
-                state.log.clone(),
-                event,
-            )
-        });
-        (
-            result,
-            pending.map(|t| (t, state.callbacks.hook())),
-            main_event,
-        )
+            let result = D::process_ports(state);
+            // collect-then-notify: drain the deposited xrun stamp with the hook copy
+            let pending = state.ports.iter_mut().find_map(|p| p.pending_xrun.take());
+            let main_event = state.pending_main_event.take().map(|event| {
+                (
+                    state.main_loop,
+                    state.main_events.clone(),
+                    state.log.clone(),
+                    event,
+                )
+            });
+            Some((
+                result,
+                pending.map(|t| (t, state.callbacks.hook())),
+                main_event,
+            ))
+        })
+    };
+    let Some((result, xrun, main_event)) = phase else {
+        return SPA_STATUS_OK as i32;
     };
 
     if let Some((trigger_us, Some((cb, data)))) = xrun {
@@ -2157,12 +2177,12 @@ unsafe extern "C" fn process<D: Direction>(object: *mut c_void) -> c_int {
         }
     }
 
-    if let Some((main_loop, shared, log, event)) = main_event {
+    if let Some((main_loop, target, log, event)) = main_event {
         // queue_task may execute inline. No DataState reference is live here, so
         // listener reentry through the endpoint is sound. Deliver after the
         // copied xrun hook: a listener may replace callbacks and invalidate
         // the old callback data pointer.
-        queue_main_event(main_loop, shared, log, event);
+        queue_main_event(main_loop, target, log, event);
     }
 
     result
@@ -2184,9 +2204,13 @@ unsafe extern "C" fn port_use_buffers<D: Direction>(
     }
     let _ = flags;
 
+    let n_buffers = n_buffers as usize;
+    if !crate::utils::raw_slice_len_ok::<*mut spa_buffer>(n_buffers) {
+        return -libc::EINVAL;
+    }
     let new_buffers = if !buffers.is_null() && n_buffers > 0 {
         // the host passes n_buffers valid pointers; copied before the loop swap
-        unsafe { std::slice::from_raw_parts(buffers, n_buffers as usize) }.to_vec()
+        unsafe { std::slice::from_raw_parts(buffers, n_buffers) }.to_vec()
     } else {
         vec![]
     };
@@ -2283,13 +2307,13 @@ unsafe extern "C" fn clear<D: Direction>(handle: *mut spa_handle) -> c_int {
     let state: *mut State<D> = handle.cast();
     assert!(!state.is_null());
 
-    // Queued tasks own only messages and a Weak event endpoint, so no task
-    // can dereference State after this function drops it. What clear() must
-    // still guarantee: the host has stopped driving the node before clear
-    // (Suspend/Pause and io teardown precede it in the SPA lifecycle). A
-    // host that still calls process()/on_timeout() afterward frees the
-    // ground under the data loop; timer detachment below is our side of the
-    // contract.
+    // Queued tasks own only messages and MainEventTarget, never State. close()
+    // revokes deliveries before State drops its Rc<NodeEvents>; a delivery
+    // already running holds its own main-thread Rc through listener callbacks.
+    // The host must still stop driving the node before clear (Suspend/Pause and
+    // io teardown precede it in the SPA lifecycle). A host that calls
+    // process()/on_timeout() afterward frees the ground under the data loop;
+    // timer detachment below is our side of the contract.
     {
         let main = unsafe { main_mut(state) };
         // Win every open/configure race before asking the worker to stop.
@@ -2298,6 +2322,7 @@ unsafe extern "C" fn clear<D: Direction>(handle: *mut spa_handle) -> c_int {
         main.shared
             .started
             .store(false, std::sync::atomic::Ordering::Release);
+        main.shared.close();
         main.rebuild_worker.stop();
         // A final worker completion may own a device; destroy it here on the
         // main thread, after the worker can no longer deposit another one.
@@ -2307,11 +2332,16 @@ unsafe extern "C" fn clear<D: Direction>(handle: *mut spa_handle) -> c_int {
     // the data loop still holds the timer source; detach it there before the
     // state is freed, then close the timerfd
     let control = unsafe { DataControl::from_raw(state) };
-    if !control.invoke(|state| {
-        unsafe { state.data_loop.remove_source(&mut state.timer_source) };
-        drop(state.timer_fd.take());
-        state.timer_source.fd = -1;
-    }) {
+    let detached = control.query(|state| {
+        // SAFETY: this closure runs on the source's registered data loop.
+        let err = unsafe { state.timer_source.unregister() };
+        if err >= 0 {
+            drop(state.timer_fd.take());
+            state.timer_source.set_fd(-1);
+        }
+        err
+    });
+    if !matches!(detached, Some(err) if err >= 0) {
         // freeing the state now would leave the loop a dangling source; a clean
         // abort beats a use-after-free on the next timer tick
         eprintln!("freebsd-oss: can't detach the timer source; aborting");
@@ -2369,7 +2399,7 @@ unsafe fn parse_init_dict<D: Direction>(
 // directory (the readable/writable flags flip later in port_set_param)
 fn publish_static_info<D: Direction>(state: &MainState<D>) {
     state.events.with_info(|node, port| {
-        // NodeEvents is now at its final Arc allocation, so weave the inline
+        // NodeEvents is now at its final Rc allocation, so weave the inline
         // params arrays' self-pointers only after State construction.
         node.fix_pointers();
         port.fix_pointers();
@@ -2473,8 +2503,10 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
     assert!(!state.is_null(), "handle is not supposed to be null");
 
     let node_methods: &'static spa_node_methods = &D::NODE_METHODS;
-    let events = std::sync::Arc::new(NodeEvents::<D>::new());
-    let shared = std::sync::Arc::new(NodeShared::new(std::sync::Arc::downgrade(&events)));
+    let events = NodeEvents::<D>::new();
+    let shared = std::sync::Arc::new(NodeShared::new());
+    let main_events = MainEventTarget::new(&events, shared.alive_token());
+    let format_publication = events.format_publication();
     let rebuild_worker = match RebuildWorker::<D>::start() {
         Ok(worker) => worker,
         Err(err) => {
@@ -2550,7 +2582,7 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
                     main_loop,
                     dsp_path: dsp_path.clone(),
                     timer_fd: Some(timer_fd),
-                    timer_source: spa_source {
+                    timer_source: crate::spa::LoopSource::new(spa_source {
                         loop_: std::ptr::null_mut(),
                         func: Some(on_timeout::<D>),
                         data: state.cast::<c_void>(),
@@ -2558,7 +2590,7 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
                         mask: SPA_IO_IN,
                         rmask: 0,
                         priv_: std::ptr::null_mut(),
-                    },
+                    }),
                     next_time: 0,
                     callbacks: NodeCallbacks::none(),
                     ports: [Port {
@@ -2583,7 +2615,8 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
                     rebuild_work,
                     deferred_work: None,
                     rebuild_takeover: false,
-                    events,
+                    format_publication,
+                    main_events,
                     pending_main_event: None,
                     started: false,
                     following: false,
@@ -2596,16 +2629,21 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
     let main = unsafe { main_ref(state) };
     publish_static_info(main);
 
-    let err = {
-        let data = unsafe { data_mut(state) };
-        unsafe { data.data_loop.add_source(&mut data.timer_source) }
+    let err = unsafe {
+        with_data_mut(state, |data| {
+            let data_loop = data.data_loop;
+            // SAFETY: init performs registration on the data loop endpoint; the
+            // pinned source and its State data pointer live until clear.
+            data.timer_source.register(&data_loop)
+        })
     };
     if err < 0 {
-        {
-            let data = unsafe { data_mut(state) };
-            drop(data.timer_fd.take());
-            data.timer_source.fd = -1;
-        }
+        unsafe {
+            with_data_mut(state, |data| {
+                drop(data.timer_fd.take());
+                data.timer_source.set_fd(-1);
+            });
+        };
         // the host won't call clear() after a failed init; free what we built
         unsafe { std::ptr::drop_in_place(state) };
         return err;

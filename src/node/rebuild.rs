@@ -223,10 +223,9 @@ const _: () = assert!(
 // Shared state for the data loop, rebuild worker, and clear(). Worker guards
 // keep it alive independently of State.
 pub(crate) struct NodeShared<D: Direction> {
-    // A lifetime-safe main-loop event endpoint. State owns the sole strong
-    // handle; queued work can test/upgrade this Weak without ever obtaining
-    // a State pointer. Once clear drops State, later deliveries are no-ops.
-    pub(super) events: std::sync::Weak<NodeEvents<D>>,
+    // Shared lifetime gate. clear() closes it before main-loop event state is
+    // dropped; workers use the same gate to reject late rebuild completions.
+    alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
     // mirror of State.started, written by send_command on the main thread
     // (Start/Pause/Suspend), read by rebuild_task on the worker: a
     // stop that lands after a task was queued must win, or the task would
@@ -258,7 +257,7 @@ const SLOT_BUSY: u8 = 2; // one side is moving the value; the cell is theirs
 // slot_state to SLOT_BUSY (exchange/take_swap below), and the FULL store
 // after a deposit is Release, paired with take_swap's Acquire CAS - so the
 // message payload is published before the consumer can move it out. The
-// remaining fields are atomics or thread-safe Weak handles.
+// remaining fields are atomics or thread-safe Arc handles.
 unsafe impl<D: Direction> Sync for NodeShared<D> {}
 
 // Owned event sent from the data loop to the main-loop endpoint.
@@ -268,9 +267,9 @@ pub(super) enum MainEvent {
 }
 
 impl<D: Direction> NodeShared<D> {
-    pub(super) fn new(events: std::sync::Weak<NodeEvents<D>>) -> Self {
+    pub(super) fn new() -> Self {
         Self {
-            events,
+            alive: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             started: std::sync::atomic::AtomicBool::new(false),
             generation: std::sync::atomic::AtomicU64::new(0),
             slot_state: std::sync::atomic::AtomicU8::new(SLOT_EMPTY),
@@ -278,23 +277,19 @@ impl<D: Direction> NodeShared<D> {
         }
     }
 
-    // Queued tasks may deliver until clear() drops the event endpoint.
+    // close() explicitly revokes queued delivery and late worker completion
+    // before clear drops the main-thread endpoint.
     pub(super) fn is_alive(&self) -> bool {
-        self.events.strong_count() != 0
+        self.alive.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    // Deliver queued messages on the main-loop thread. A dead Weak drops them.
-    pub(super) fn main_event(&self, event: MainEvent) {
-        let Some(events) = self.events.upgrade() else {
-            return;
-        };
-        match event {
-            // SAFETY: this endpoint message contains no State reference and
-            // its caller ended the process DataState phase before queueing it.
-            MainEvent::FormatLost {
-                expected_publication_epoch,
-            } => unsafe { events.emit_format_lost_now(expected_publication_epoch) },
-        }
+    pub(super) fn alive_token(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.alive.clone()
+    }
+
+    pub(super) fn close(&self) {
+        self.alive
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 
     // The non-RT writer side of the slot protocol: acquire SLOT_BUSY from
@@ -864,13 +859,13 @@ pub(super) fn rebuild_task<D: Direction>(mut request: RebuildRequest<D>) {
 }
 
 // Deliver endpoint-only work after process() has ended its State phase. The
-// queued closure carries only NodeShared; no State pointer crosses loops. A
-// non-blocking invoke may execute inline on a single-loop host, which is why
-// callers must collect the event first and call here only after dropping every
+// queued closure carries MainEventTarget and an owned message; no State pointer
+// crosses loops. A non-blocking invoke may execute inline on a single-loop host,
+// so callers collect the event first and call here only after dropping every
 // State reference.
 pub(super) fn queue_main_event<D: Direction>(
     main_loop: Option<crate::spa::Loop>,
-    shared: std::sync::Arc<NodeShared<D>>,
+    target: MainEventTarget<D>,
     log: crate::spa::Log,
     event: MainEvent,
 ) {
@@ -880,7 +875,8 @@ pub(super) fn queue_main_event<D: Direction>(
     // SAFETY: host loops outlive the queued item (queue_task's contract)
     let queued = unsafe {
         crate::utils::queue_task(&main_loop, move || {
-            shared.main_event(event);
+            // SAFETY: queue_task invokes this closure through `main_loop`.
+            target.deliver_on_main(event);
         })
     };
     if !queued {
@@ -979,7 +975,7 @@ pub(crate) fn poll_rebuild<D: Direction>(state: &mut DataState<D>, port_idx: usi
             // phase ends. The endpoint epoch prevents an old loss from
             // overwriting a newer successful format publication.
             state.pending_main_event = Some(MainEvent::FormatLost {
-                expected_publication_epoch: state.events.format_publication_epoch(),
+                expected_publication_epoch: state.format_publication.epoch(),
             });
             true
         }

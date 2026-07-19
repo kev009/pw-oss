@@ -438,8 +438,12 @@ pub(crate) unsafe fn for_each_dict_item(dict: &spa_dict, mut apply: impl FnMut(&
     if dict.n_items == 0 || dict.items.is_null() {
         return;
     }
+    let len = dict.n_items as usize;
+    if !crate::utils::raw_slice_len_ok::<spa_dict_item>(len) {
+        return;
+    }
     // items is non-null (checked above) and valid for n_items per the caller
-    for item in unsafe { std::slice::from_raw_parts(dict.items, dict.n_items as usize) } {
+    for item in unsafe { std::slice::from_raw_parts(dict.items, len) } {
         if item.key.is_null() || item.value.is_null() {
             continue; // malformed host dict; skip rather than fault
         }
@@ -984,6 +988,81 @@ impl Loop {
         user_data: *mut c_void,
     ) -> c_int {
         unsafe { (self.invoke_fn)(self.data(), func, seq, data, size, block, user_data) }
+    }
+}
+
+// A spa_source pinned at a stable address for the entire interval in which a
+// host loop retains its pointer. Registration is explicit because removal has
+// to run on the owning loop; Drop aborts rather than free a still-linked source.
+pub(crate) struct LoopSource {
+    source: std::pin::Pin<Box<spa_source>>,
+    loop_: Option<Loop>,
+}
+
+impl LoopSource {
+    pub(crate) fn new(source: spa_source) -> Self {
+        Self {
+            source: Box::pin(source),
+            loop_: None,
+        }
+    }
+
+    pub(crate) fn is_registered(&self) -> bool {
+        self.loop_.is_some()
+    }
+
+    pub(crate) fn set_fd(&mut self, fd: c_int) {
+        assert!(
+            !self.is_registered(),
+            "a registered loop source cannot change its fd"
+        );
+        // Pin protects the allocation address, not field mutation.
+        unsafe { self.source.as_mut().get_unchecked_mut() }.fd = fd;
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut spa_source {
+        // The Box allocation stays pinned when LoopSource itself moves.
+        unsafe { self.source.as_mut().get_unchecked_mut() }
+    }
+
+    /// Register this pinned source on `loop_`.
+    ///
+    /// # Safety
+    /// The caller must use a host context in which `add_source` is valid. The
+    /// source callback and data pointer must satisfy SPA's lifetime contract
+    /// until `unregister` succeeds.
+    pub(crate) unsafe fn register(&mut self, loop_: &Loop) -> c_int {
+        assert!(!self.is_registered(), "loop source is already registered");
+        let err = unsafe { loop_.add_source(self.as_mut_ptr()) };
+        if err >= 0 {
+            self.loop_ = Some(*loop_);
+        }
+        err
+    }
+
+    /// Remove this source from its owning loop.
+    ///
+    /// # Safety
+    /// Must run on the registered loop thread. On failure the source remains
+    /// registered and must stay alive.
+    pub(crate) unsafe fn unregister(&mut self) -> c_int {
+        let Some(loop_) = self.loop_ else {
+            return 0;
+        };
+        let err = unsafe { loop_.remove_source(self.as_mut_ptr()) };
+        if err >= 0 {
+            self.loop_ = None;
+        }
+        err
+    }
+}
+
+impl Drop for LoopSource {
+    fn drop(&mut self) {
+        if self.is_registered() {
+            eprintln!("freebsd-oss: dropping a registered SPA loop source; aborting");
+            std::process::abort();
+        }
     }
 }
 

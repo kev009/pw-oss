@@ -17,20 +17,89 @@ struct PendingNodeNotifications {
     dispatching: bool,
 }
 
-// Main-loop-owned listener and info state. The Arc gives queued messages a
-// lifetime-safe endpoint without exposing State across loops. Info mutation
-// is locked only on the main loop; callbacks run after the lock is released,
-// against owned snapshots, so listener reentry cannot alias or invalidate the
-// live payload. The hook list itself follows SPA's main-loop serialization.
+// Main-loop-owned listener and info state. Callbacks run against owned
+// snapshots after mutations finish, so listener reentry cannot alias or
+// invalidate the live payload. Cross-loop code receives only the atomic
+// publication counter and MainEventTarget, never this listener endpoint.
 pub(super) struct NodeEvents<D: Direction> {
     pub(super) hooks: crate::spa::ListenerList<spa_node_events>,
     info: std::sync::Mutex<EventInfo>,
     pending: std::sync::Mutex<PendingNodeNotifications>,
+    // Deferred main-loop delivery upgrades this weak self-reference before it
+    // invokes listeners. The resulting Rc keeps the endpoint alive if a
+    // listener synchronously destroys the node.
+    self_weak: std::rc::Weak<NodeEvents<D>>,
     // Changes only when the advertised Format/Buffers state is published.
     // Deferred FormatLost messages carry the value they observed so a newer
     // successful format publication cannot be overwritten by a stale task.
-    format_publication_epoch: std::sync::atomic::AtomicU64,
+    format_publication: FormatPublication,
     _direction: std::marker::PhantomData<fn() -> D>,
+}
+
+#[derive(Clone)]
+pub(super) struct FormatPublication(std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+impl FormatPublication {
+    fn new() -> Self {
+        Self(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)))
+    }
+
+    pub(super) fn epoch(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn advance(&self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+pub(super) struct MainEventTarget<D: Direction> {
+    events: *const NodeEvents<D>,
+    alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+// SAFETY: the raw pointer is never dereferenced on the sending thread. On the
+// main loop, `alive` guarantees that a strong owner remains long enough to
+// upgrade NodeEvents::self_weak. Delivery holds that owner through callbacks,
+// including callbacks that synchronously clear the node.
+unsafe impl<D: Direction> Send for MainEventTarget<D> {}
+
+impl<D: Direction> Clone for MainEventTarget<D> {
+    fn clone(&self) -> Self {
+        Self {
+            events: self.events,
+            alive: self.alive.clone(),
+        }
+    }
+}
+
+impl<D: Direction> MainEventTarget<D> {
+    pub(super) fn new(
+        events: &std::rc::Rc<NodeEvents<D>>,
+        alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self {
+            events: std::rc::Rc::as_ptr(events),
+            alive,
+        }
+    }
+
+    // SAFETY: callers must run this on the main loop. clear() runs there too,
+    // stores false before dropping the State owner, and cannot interleave
+    // between the liveness check and the weak upgrade.
+    pub(super) unsafe fn deliver_on_main(&self, event: MainEvent) {
+        if !self.alive.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        let Some(events) = (unsafe { &*self.events }).self_weak.upgrade() else {
+            return;
+        };
+        match event {
+            MainEvent::FormatLost {
+                expected_publication_epoch,
+            } => unsafe { events.emit_format_lost_now(expected_publication_epoch) },
+        }
+    }
 }
 
 pub(super) struct NodeDispatchClaim<'a, D: Direction>(&'a NodeEvents<D>);
@@ -41,17 +110,9 @@ impl<D: Direction> Drop for NodeDispatchClaim<'_, D> {
     }
 }
 
-// SAFETY: NodeEvents' safe methods serialize info through the mutex and never
-// expose it. Listener-list access is confined to those methods and the SPA
-// add-listener entry point, all of which the host calls on the main loop.
-// Cross-loop users hold only Weak/Arc handles and queue an owned MainEvent
-// back to that loop; they never traverse the list themselves.
-unsafe impl<D: Direction> Send for NodeEvents<D> {}
-unsafe impl<D: Direction> Sync for NodeEvents<D> {}
-
 impl<D: Direction> NodeEvents<D> {
-    pub(super) fn new() -> Self {
-        Self {
+    pub(super) fn new() -> std::rc::Rc<Self> {
+        std::rc::Rc::new_cyclic(|self_weak| Self {
             hooks: crate::spa::ListenerList::new(),
             info: std::sync::Mutex::new(EventInfo {
                 node: crate::spa::NodeInfo::new(),
@@ -61,9 +122,14 @@ impl<D: Direction> NodeEvents<D> {
                 queue: std::collections::VecDeque::new(),
                 dispatching: false,
             }),
-            format_publication_epoch: std::sync::atomic::AtomicU64::new(0),
+            self_weak: self_weak.clone(),
+            format_publication: FormatPublication::new(),
             _direction: std::marker::PhantomData,
-        }
+        })
+    }
+
+    pub(super) fn format_publication(&self) -> FormatPublication {
+        self.format_publication.clone()
     }
 
     pub(super) fn with_info<R>(
@@ -126,13 +192,11 @@ impl<D: Direction> NodeEvents<D> {
     }
 
     pub(super) fn format_publication_epoch(&self) -> u64 {
-        self.format_publication_epoch
-            .load(std::sync::atomic::Ordering::Acquire)
+        self.format_publication.epoch()
     }
 
     pub(super) fn advance_format_publication_epoch(&self) {
-        self.format_publication_epoch
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.format_publication.advance();
     }
 
     // Register immediately on the active list when no older FIFO work exists.
@@ -149,10 +213,10 @@ impl<D: Direction> NodeEvents<D> {
         let deferred = {
             let mut pending = self.pending.lock_unpoisoned();
             if pending.dispatching || !pending.queue.is_empty() {
-                // Arc is intentional even though ListenerList itself remains
-                // main-loop-only: NodeEvents has cross-loop Arc handles, while
-                // this atomic owner keeps a reentrantly drained cohort alive
-                // through its synchronous initial callback.
+                // Reentrant draining may consume the queued activation while
+                // the synchronous initial callback still uses this cohort.
+                // Keep a local owner through that callback; listener access
+                // itself remains main-loop-only.
                 #[allow(clippy::arc_with_non_send_sync)]
                 let hooks = std::sync::Arc::new(crate::spa::ListenerList::new());
                 pending

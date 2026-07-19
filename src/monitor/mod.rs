@@ -170,12 +170,34 @@ impl MonitorEvents {
 struct State {
     handle: spa_handle,
     device: spa_device,
+    runtime: Runtime,
+}
+
+struct Runtime {
     events: std::rc::Rc<MonitorEvents>,
     pcm_indexes: BTreeMap<String, Vec<u32>>,
     main_loop: crate::spa::Loop,
     devd_socket: Option<crate::utils::DevdSocket>, // None when devd isn't running (no hotplug)
-    devd_source: spa_source,
+    devd_source: crate::spa::LoopSource,
     log: crate::spa::Log,
+}
+
+unsafe fn with_runtime_mut<R>(
+    state: *mut State,
+    apply: impl for<'a> FnOnce(&'a mut Runtime) -> R,
+) -> R {
+    assert!(!state.is_null(), "state is not supposed to be null");
+    let runtime = unsafe { &mut *std::ptr::addr_of_mut!((*state).runtime) };
+    apply(runtime)
+}
+
+unsafe fn with_runtime_ref<R>(
+    state: *const State,
+    apply: impl for<'a> FnOnce(&'a Runtime) -> R,
+) -> R {
+    assert!(!state.is_null(), "state is not supposed to be null");
+    let runtime = unsafe { &*std::ptr::addr_of!((*state).runtime) };
+    apply(runtime)
 }
 
 unsafe extern "C" fn add_listener(
@@ -187,21 +209,24 @@ unsafe extern "C" fn add_listener(
     let state: *mut State = object.cast();
     assert!(!state.is_null(), "object is not supposed to be null");
     let (monitor_events, objects) = {
-        let state = unsafe { &*state };
-        (
-            state.events.clone(),
-            state
-                .pcm_indexes
-                .iter()
-                .filter_map(|(driver, indexes)| {
-                    Some(MonitorObjectEvent::Added {
-                        id: *indexes.first()?,
-                        driver: driver.clone(),
-                        indexes: indexes.clone(),
-                    })
-                })
-                .collect::<Vec<_>>(),
-        )
+        unsafe {
+            with_runtime_ref(state, |state| {
+                (
+                    state.events.clone(),
+                    state
+                        .pcm_indexes
+                        .iter()
+                        .filter_map(|(driver, indexes)| {
+                            Some(MonitorObjectEvent::Added {
+                                id: *indexes.first()?,
+                                driver: driver.clone(),
+                                indexes: indexes.clone(),
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+        }
     };
 
     let initial = |hooks: &crate::spa::ListenerList<spa_device_events>| {
@@ -238,14 +263,16 @@ unsafe extern "C" fn get_interface(
     type_: *const c_char,
     interface: *mut *mut c_void,
 ) -> c_int {
-    let state =
-        unsafe { handle.cast::<State>().as_mut() }.expect("handle is not supposed to be null");
+    let state = handle.cast::<State>();
+    assert!(!state.is_null(), "handle is not supposed to be null");
 
     assert!(!interface.is_null());
 
     if unsafe { spa_streq(type_, SPA_TYPE_INTERFACE_Device.as_ptr().cast()) } {
         // interface is non-null (asserted above) and writable per the contract
-        unsafe { *interface = &mut state.device as *mut _ as *mut c_void };
+        unsafe {
+            *interface = std::ptr::addr_of_mut!((*state).device).cast::<c_void>();
+        }
     } else {
         return -libc::ENOENT;
     }
@@ -254,12 +281,19 @@ unsafe extern "C" fn get_interface(
 }
 
 unsafe extern "C" fn clear(handle: *mut spa_handle) -> c_int {
-    let state =
-        unsafe { handle.cast::<State>().as_mut() }.expect("handle is not supposed to be null");
-    // clear runs on the main loop's thread, so detach the devd source directly;
-    // the socket fd itself is closed by the DevdSocket drop below
-    if state.devd_socket.is_some() {
-        unsafe { state.main_loop.remove_source(&mut state.devd_source) };
+    let state = handle.cast::<State>();
+    assert!(!state.is_null(), "handle is not supposed to be null");
+    unsafe {
+        with_runtime_mut(state, |runtime| {
+            // clear runs on the registered main loop.
+            if runtime.devd_source.is_registered() && runtime.devd_source.unregister() < 0 {
+                eprintln!("freebsd-oss: can't detach the monitor devd source; aborting");
+                std::process::abort();
+            }
+            if !runtime.devd_source.is_registered() {
+                runtime.devd_source.set_fd(-1);
+            }
+        });
     }
     // the host frees the memory after clear; drop the fields exactly once here
     unsafe { std::ptr::drop_in_place(state) };
@@ -284,40 +318,50 @@ unsafe extern "C" fn on_devd_event(source: *mut spa_source) {
     );
 
     let (events, notifications) = {
-        let state = unsafe { &mut *state };
-        let Some(devd_socket) = state.devd_socket.as_mut() else {
+        let Some(result) = (unsafe {
+            with_runtime_mut(state, |state| {
+                let devd_socket = state.devd_socket.as_mut()?;
+
+                // Any pcm (or its uaudio parent) attach/detach can change the device
+                // set. Resync and build owned notifications before listener dispatch.
+                let mut resync = false;
+                let mut detached: Vec<String> = Vec::new();
+                let alive = devd_socket.read_event(|line| {
+                    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+                    let re = RE
+                        .get_or_init(|| regex::Regex::new(r"^([\+-])((?:pcm|uaudio)\d+)").unwrap());
+                    if let Some(groups) = re.captures(line) {
+                        resync = true;
+                        if groups.get(1).unwrap().as_str() == "-" {
+                            detached.push(groups.get(2).unwrap().as_str().to_string());
+                        }
+                    }
+                });
+
+                let notifications = if resync {
+                    resync_devices(state, &detached)
+                } else {
+                    Vec::new()
+                };
+
+                if !alive {
+                    // devd restarted or dropped us; deregister or the level-triggered
+                    // fd spins the main loop forever.
+                    crate::warn!(state.log, "devd connection lost; hotplug disabled");
+                    // SAFETY: this callback runs on the registered main loop.
+                    if state.devd_source.unregister() < 0 {
+                        eprintln!("freebsd-oss: can't detach the monitor devd source; aborting");
+                        std::process::abort();
+                    }
+                    state.devd_socket = None;
+                    state.devd_source.set_fd(-1);
+                }
+                Some((state.events.clone(), notifications))
+            })
+        }) else {
             return;
         };
-
-        // Any pcm (or its uaudio parent) attach/detach can change the device
-        // set. Resync and build owned notifications before listener dispatch.
-        let mut resync = false;
-        let mut detached: Vec<String> = Vec::new();
-        let alive = devd_socket.read_event(|line| {
-            static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-            let re = RE.get_or_init(|| regex::Regex::new(r"^([\+-])((?:pcm|uaudio)\d+)").unwrap());
-            if let Some(groups) = re.captures(line) {
-                resync = true;
-                if groups.get(1).unwrap().as_str() == "-" {
-                    detached.push(groups.get(2).unwrap().as_str().to_string());
-                }
-            }
-        });
-
-        let notifications = if resync {
-            resync_devices(state, &detached)
-        } else {
-            Vec::new()
-        };
-
-        if !alive {
-            // devd restarted or dropped us; deregister or the level-triggered
-            // fd spins the main loop forever.
-            crate::warn!(state.log, "devd connection lost; hotplug disabled");
-            unsafe { state.main_loop.remove_source(&mut state.devd_source) };
-            state.devd_socket = None;
-        }
-        (state.events.clone(), notifications)
+        result
     };
     // SAFETY: the scoped State mutation ended above.
     unsafe { events.dispatch_all(notifications) };
@@ -326,7 +370,7 @@ unsafe extern "C" fn on_devd_event(source: *mut spa_source) {
 // re-read sndstat, diff the parent->indexes map, and retract/emit whatever
 // changed; a parent whose index set changed is retracted and re-emitted so a
 // reused unit number never leaves a node bound to the wrong hardware
-fn resync_devices(state: &mut State, detached: &[String]) -> Vec<MonitorObjectEvent> {
+fn resync_devices(state: &mut Runtime, detached: &[String]) -> Vec<MonitorObjectEvent> {
     let mut notifications = Vec::new();
     // Force-retract every group a detach event names BEFORE diffing: a fast
     // replug can land the '-' event after the replacement re-attached with the
@@ -413,8 +457,8 @@ unsafe extern "C" fn init(
 
     let main_loop = unsafe { crate::spa::Loop::wrap(main_loop) };
 
-    let state =
-        unsafe { handle.cast::<State>().as_mut() }.expect("handle is not supposed to be null");
+    let state = handle.cast::<State>();
+    assert!(!state.is_null(), "handle is not supposed to be null");
 
     let pcm_indexes = match crate::sound::read_sndstat() {
         Ok(indexes) => crate::sound::group_pcm_devices_by_parent(&indexes),
@@ -433,15 +477,15 @@ unsafe extern "C" fn init(
         }
     };
 
-    let devd_source = spa_source {
+    let devd_source = crate::spa::LoopSource::new(spa_source {
         loop_: std::ptr::null_mut(),
         func: Some(on_devd_event),
-        data: state as *mut _ as *mut c_void,
+        data: state.cast::<c_void>(),
         fd: devd_socket.as_ref().map(|s| s.fd()).unwrap_or(-1),
         mask: SPA_IO_IN,
         rmask: 0,
         priv_: std::ptr::null_mut(),
-    };
+    });
     let events = std::rc::Rc::new(MonitorEvents::new());
 
     // the host hands us uninitialized memory of get_size() bytes; write the
@@ -467,26 +511,36 @@ unsafe extern "C" fn init(
                     },
                 },
 
-                events,
+                runtime: Runtime {
+                    events,
 
-                pcm_indexes,
+                    pcm_indexes,
 
-                main_loop,
-                devd_socket,
-                devd_source,
+                    main_loop,
+                    devd_socket,
+                    devd_source,
 
-                log,
+                    log,
+                },
             },
         );
     }
 
-    if state.devd_socket.is_some() {
-        let err = unsafe { state.main_loop.add_source(&mut state.devd_source) };
-        if err < 0 {
-            // no hotplug then; enumeration still works
-            crate::warn!(state.log, "can't watch devd: {}", err);
-            state.devd_socket = None;
-        }
+    unsafe {
+        with_runtime_mut(state, |state| {
+            if state.devd_socket.is_some() {
+                let main_loop = state.main_loop;
+                // SAFETY: init uses the host context accepted by add_source; clear
+                // unregisters the pinned source before State is dropped.
+                let err = state.devd_source.register(&main_loop);
+                if err < 0 {
+                    // no hotplug then; enumeration still works
+                    crate::warn!(state.log, "can't watch devd: {}", err);
+                    state.devd_socket = None;
+                    state.devd_source.set_fd(-1);
+                }
+            }
+        });
     }
 
     0

@@ -28,7 +28,7 @@ fn node_notifications_preserve_fifo_order_under_reentrant_flush() {
         port.fix_pointers();
     });
     let mut context = ReentrantInfoContext {
-        events: &events,
+        events: std::rc::Rc::as_ptr(&events),
         seen: Vec::new(),
     };
     let mut table: spa_node_events = unsafe { std::mem::zeroed() };
@@ -119,7 +119,7 @@ fn node_listener_added_during_dispatch_starts_at_its_barrier() {
     late_table.info = Some(record_late_node_info);
     let mut late_hook: spa_hook = unsafe { std::mem::zeroed() };
     let mut context = AddNodeListenerContext {
-        events: &events,
+        events: std::rc::Rc::as_ptr(&events),
         late_hook: &mut late_hook,
         late_table: &late_table,
         late_data: (&raw mut late).cast(),
@@ -190,7 +190,7 @@ fn node_done_does_not_overtake_an_active_transaction() {
     let events = NodeEvents::<SinkDir>::new();
     events.with_node_info(|node| node.fix_pointers());
     let mut context = ReentrantDoneContext {
-        events: &events,
+        events: std::rc::Rc::as_ptr(&events),
         order: Vec::new(),
     };
     let mut table: spa_node_events = unsafe { std::mem::zeroed() };
@@ -242,7 +242,7 @@ fn published_port_param_flags(events: &NodeEvents<SinkDir>, id: u32) -> u32 {
 
 #[test]
 fn format_loss_epoch_rejects_stale_delivery_but_survives_suspend() {
-    let events = std::sync::Arc::new(NodeEvents::<SinkDir>::new());
+    let events = NodeEvents::<SinkDir>::new();
     events.with_port_info(|port| {
         port.fix_pointers();
         port.add_param(SPA_PARAM_Format, SPA_PARAM_INFO_WRITE);
@@ -252,13 +252,16 @@ fn format_loss_epoch_rejects_stale_delivery_but_survives_suspend() {
     });
     events.advance_format_publication_epoch();
     let failed_epoch = events.format_publication_epoch();
-    let shared = NodeShared::new(std::sync::Arc::downgrade(&events));
+    let shared = NodeShared::<SinkDir>::new();
+    let target = MainEventTarget::new(&events, shared.alive_token());
 
     // A newer successful format publication retires the delayed loss.
     events.advance_format_publication_epoch();
-    shared.main_event(MainEvent::FormatLost {
-        expected_publication_epoch: failed_epoch,
-    });
+    unsafe {
+        target.deliver_on_main(MainEvent::FormatLost {
+            expected_publication_epoch: failed_epoch,
+        });
+    }
     assert_eq!(
         published_port_param_flags(&events, SPA_PARAM_Format),
         SPA_PARAM_INFO_READWRITE
@@ -271,9 +274,11 @@ fn format_loss_epoch_rejects_stale_delivery_but_survives_suspend() {
     // Suspend changes the device generation but not this publication
     // epoch. A current loss must therefore still be applied.
     let current_epoch = events.format_publication_epoch();
-    shared.main_event(MainEvent::FormatLost {
-        expected_publication_epoch: current_epoch,
-    });
+    unsafe {
+        target.deliver_on_main(MainEvent::FormatLost {
+            expected_publication_epoch: current_epoch,
+        });
+    }
     assert_eq!(
         published_port_param_flags(&events, SPA_PARAM_Format),
         SPA_PARAM_INFO_WRITE
@@ -283,7 +288,7 @@ fn format_loss_epoch_rejects_stale_delivery_but_survives_suspend() {
 
 #[test]
 fn synchronous_format_loss_retires_a_same_epoch_deferred_loss() {
-    let events = std::sync::Arc::new(NodeEvents::<SinkDir>::new());
+    let events = NodeEvents::<SinkDir>::new();
     events.with_port_info(|port| {
         port.fix_pointers();
         port.add_param(SPA_PARAM_Format, SPA_PARAM_INFO_READWRITE);
@@ -300,11 +305,93 @@ fn synchronous_format_loss_retires_a_same_epoch_deferred_loss() {
 
     // A data-path loss already queued against the old format must now be
     // inert, rather than toggling the EnumFormat serial a second time.
-    let shared = NodeShared::new(std::sync::Arc::downgrade(&events));
-    shared.main_event(MainEvent::FormatLost {
-        expected_publication_epoch: old_epoch,
-    });
+    let shared = NodeShared::<SinkDir>::new();
+    let target = MainEventTarget::new(&events, shared.alive_token());
+    unsafe {
+        target.deliver_on_main(MainEvent::FormatLost {
+            expected_publication_epoch: old_epoch,
+        });
+    }
     assert_eq!(events.format_publication_epoch(), loss_epoch);
+}
+
+struct DropNodeEventsOwner {
+    owner: *mut Option<std::rc::Rc<NodeEvents<SinkDir>>>,
+    weak: std::rc::Weak<NodeEvents<SinkDir>>,
+    shared: std::sync::Arc<NodeShared<SinkDir>>,
+    calls: usize,
+    strong_count_after_drop: usize,
+}
+
+unsafe extern "C" fn drop_node_events_owner(
+    data: *mut c_void,
+    _direction: spa_direction,
+    _port_id: u32,
+    _info: *const spa_port_info,
+) {
+    let context = unsafe { &mut *data.cast::<DropNodeEventsOwner>() };
+    context.calls += 1;
+    // Model a listener synchronously destroying the node and dropping State's
+    // sole main-thread owner. Deferred delivery must retain its own Rc first.
+    context.shared.close();
+    drop(unsafe { &mut *context.owner }.take());
+    context.strong_count_after_drop = context.weak.strong_count();
+}
+
+#[test]
+fn deferred_node_event_survives_reentrant_owner_drop() {
+    let events = NodeEvents::<SinkDir>::new();
+    events.with_port_info(|port| {
+        port.fix_pointers();
+        port.add_param(SPA_PARAM_Format, SPA_PARAM_INFO_READWRITE);
+        port.add_param(SPA_PARAM_Buffers, SPA_PARAM_INFO_READ);
+    });
+
+    let shared = std::sync::Arc::new(NodeShared::<SinkDir>::new());
+    let target = MainEventTarget::new(&events, shared.alive_token());
+    let weak = std::rc::Rc::downgrade(&events);
+    let epoch = events.format_publication_epoch();
+    let mut owner = Some(events);
+    let mut context = DropNodeEventsOwner {
+        owner: &raw mut owner,
+        weak: weak.clone(),
+        shared: shared.clone(),
+        calls: 0,
+        strong_count_after_drop: 0,
+    };
+    let mut table: spa_node_events = unsafe { std::mem::zeroed() };
+    table.version = SPA_VERSION_NODE_EVENTS;
+    table.port_info = Some(drop_node_events_owner);
+    let mut hook: spa_hook = unsafe { std::mem::zeroed() };
+    let registration_owner = weak.upgrade().expect("test endpoint");
+    unsafe {
+        registration_owner.with_new_listener(
+            &mut hook,
+            &raw const table,
+            (&raw mut context).cast(),
+            |_hooks| {},
+        );
+    }
+    drop(registration_owner);
+
+    unsafe {
+        target.deliver_on_main(MainEvent::FormatLost {
+            expected_publication_epoch: epoch,
+        });
+    }
+
+    assert!(owner.is_none());
+    assert!(!shared.is_alive());
+    assert_eq!(context.calls, 1);
+    assert_eq!(
+        context.strong_count_after_drop, 1,
+        "delivery must own the endpoint while listeners run"
+    );
+    assert_eq!(
+        weak.strong_count(),
+        0,
+        "delivery releases its temporary owner afterward"
+    );
 }
 
 #[test]
@@ -778,7 +865,7 @@ fn decode_format_roundtrips_and_rejects_degenerate_values() {
 // depositor's thread), take is one-shot, and discard voids the slot
 #[test]
 fn rebuild_mailbox_delivers_replaces_and_discards() {
-    let shared: NodeShared<SinkDir> = NodeShared::new(std::sync::Weak::new());
+    let shared: NodeShared<SinkDir> = NodeShared::new();
     assert!(shared.take_swap().is_none());
 
     shared.deposit(DeviceSwap {
@@ -813,8 +900,7 @@ fn rebuild_mailbox_delivers_replaces_and_discards() {
 #[test]
 fn rebuild_task_deposits_and_respects_the_gates() {
     use std::sync::atomic::Ordering;
-    let events = std::sync::Arc::new(NodeEvents::<SinkDir>::new());
-    let shared = std::sync::Arc::new(NodeShared::new(std::sync::Arc::downgrade(&events)));
+    let shared = std::sync::Arc::new(NodeShared::<SinkDir>::new());
     shared.generation.store(7, Ordering::Release);
     let request = |shared: &std::sync::Arc<NodeShared<SinkDir>>| RebuildRequest {
         port_idx: 0,
@@ -857,7 +943,7 @@ fn rebuild_task_deposits_and_respects_the_gates() {
     assert!(matches!(swap.outcome, SwapOutcome::Aborted));
 
     // cleared node (the endpoint is gone): no deposit at all
-    drop(events);
+    shared.close();
     rebuild_task(request(&shared));
     assert!(shared.take_swap().is_none());
 }
@@ -866,8 +952,7 @@ fn rebuild_task_deposits_and_respects_the_gates() {
 fn rebuild_gate_rechecks_started_and_generation_after_blocking_work() {
     use std::sync::atomic::Ordering;
 
-    let events = std::sync::Arc::new(NodeEvents::<SinkDir>::new());
-    let shared = std::sync::Arc::new(NodeShared::new(std::sync::Arc::downgrade(&events)));
+    let shared = std::sync::Arc::new(NodeShared::<SinkDir>::new());
     shared.started.store(true, Ordering::Release);
     shared.generation.store(7, Ordering::Release);
     let worker_shared = shared.clone();
@@ -898,7 +983,7 @@ fn rebuild_gate_rechecks_started_and_generation_after_blocking_work() {
 // completed task's guard deposits nothing extra
 #[test]
 fn a_panicking_rebuild_path_still_deposits_aborted() {
-    let shared = std::sync::Arc::new(NodeShared::<SinkDir>::new(std::sync::Weak::new()));
+    let shared = std::sync::Arc::new(NodeShared::<SinkDir>::new());
 
     let guard = DepositOnUnwind {
         shared: shared.clone(),
@@ -938,7 +1023,7 @@ fn a_panicking_rebuild_path_still_deposits_aborted() {
 // The reader never waits, and observed writer generations never regress.
 #[test]
 fn rebuild_mailbox_is_safe_under_contention() {
-    let shared = std::sync::Arc::new(NodeShared::<SinkDir>::new(std::sync::Weak::new()));
+    let shared = std::sync::Arc::new(NodeShared::<SinkDir>::new());
     let writer = {
         let shared = shared.clone();
         std::thread::spawn(move || {

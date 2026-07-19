@@ -261,6 +261,10 @@ impl DeviceEvents {
 struct State {
     handle: spa_handle,
     device: spa_device,
+    runtime: Runtime,
+}
+
+struct Runtime {
     events: std::rc::Rc<DeviceEvents>,
     pcm_devices: Vec<crate::sound::PcmDevice>,
     description: String,
@@ -270,13 +274,32 @@ struct State {
     mixers: Vec<MixerHandle>,
     main_loop: Option<crate::spa::Loop>, // for the mixer poll timer
     system: Option<crate::spa::System>,  // ditto
-    timer_fd: Option<crate::spa::TimerFd>, // owns timer_source.fd
-    timer_source: spa_source,            // fd is a non-owning SPA registration mirror
-    timer_added: bool,
+    timer_fd: Option<crate::spa::TimerFd>, // owns the LoopSource fd mirror
+    timer_source: crate::spa::LoopSource,
     devd_socket: Option<crate::utils::DevdSocket>, // jack/default-unit nudges; None = poll only
-    devd_source: spa_source,
-    devd_added: bool,
+    devd_source: crate::spa::LoopSource,
     log: crate::spa::Log,
+}
+
+// Project only the mutable runtime payload. The host-visible handle and
+// interface stay outside every callback borrow, so listener reentry cannot
+// overlap a broad &mut State.
+unsafe fn with_runtime_mut<R>(
+    state: *mut State,
+    apply: impl for<'a> FnOnce(&'a mut Runtime) -> R,
+) -> R {
+    assert!(!state.is_null(), "state is not supposed to be null");
+    let runtime = unsafe { &mut *std::ptr::addr_of_mut!((*state).runtime) };
+    apply(runtime)
+}
+
+unsafe fn with_runtime_ref<R>(
+    state: *const State,
+    apply: impl for<'a> FnOnce(&'a Runtime) -> R,
+) -> R {
+    assert!(!state.is_null(), "state is not supposed to be null");
+    let runtime = unsafe { &*std::ptr::addr_of!((*state).runtime) };
+    apply(runtime)
 }
 
 // OSS levels are a 0-100 slider scale, so map them through the cubic curve
@@ -609,7 +632,7 @@ fn build_object_config(
 // audioconvert at unity - the anti-double-attenuation mechanism
 // (pod shape: alsa-acp-device.c:1015-1084).
 fn queue_object_config(
-    state: &State,
+    state: &Runtime,
     pos: usize,
     volume: bool,
     notifications: &mut Vec<DeviceNotification>,
@@ -628,7 +651,7 @@ fn queue_object_config(
 }
 
 // announce a Route change: flip the serial so consumers re-read the param
-fn queue_route_change(state: &State, notifications: &mut Vec<DeviceNotification>) {
+fn queue_route_change(state: &Runtime, notifications: &mut Vec<DeviceNotification>) {
     state.events.with_info(|info| {
         let _ = info.replace_change_mask(0);
         info.bump_param(SPA_PARAM_Route);
@@ -642,7 +665,7 @@ fn queue_route_change(state: &State, notifications: &mut Vec<DeviceNotification>
 // value diff is what prevents spurious re-emissions either way.
 // re-resolve a recsrc-derived capture control (RECSRC changes never tick the
 // modify counter, and the write path must not adjust the OLD source)
-fn resolve_recsrc(state: &mut State, pos: usize) {
+fn resolve_recsrc(state: &mut Runtime, pos: usize) {
     if !state.routes[pos].follows_recsrc {
         return;
     }
@@ -653,7 +676,7 @@ fn resolve_recsrc(state: &mut State, pos: usize) {
 }
 
 // pull the hardware state into a route's shadow (no emissions)
-fn refresh_route_shadow(state: &mut State, pos: usize) {
+fn refresh_route_shadow(state: &mut Runtime, pos: usize) {
     resolve_recsrc(state, pos);
     let mi = state.routes[pos].mixer;
     let Some(control) = state.routes[pos].control else {
@@ -672,7 +695,7 @@ fn refresh_route_shadow(state: &mut State, pos: usize) {
 // (mixer_setrecsrc, mixer.c:334-361), so external mixer(8) changes are only
 // visible this way. Multiple set bits collapse to the lowest (the v1
 // single-route convention). Returns the newly active route when it moved.
-fn sync_recsrc(state: &mut State, mi: usize) -> Option<usize> {
+fn sync_recsrc(state: &mut Runtime, mi: usize) -> Option<usize> {
     if !state
         .routes
         .iter()
@@ -706,7 +729,7 @@ fn sync_recsrc(state: &mut State, mi: usize) -> Option<usize> {
     Some(pos)
 }
 
-fn poll_mixers(state: &mut State) -> Vec<DeviceNotification> {
+fn poll_mixers(state: &mut Runtime) -> Vec<DeviceNotification> {
     let mut notifications = Vec::new();
     if state.profile == 0 {
         return notifications; // nodes are retracted under Off
@@ -807,17 +830,19 @@ unsafe extern "C" fn on_mixer_timeout(source: *mut spa_source) {
     );
 
     let (events, notifications) = {
-        // Scoped State borrow: all mixer mutations and payload construction
+        // Scoped runtime borrow: all mixer mutations and payload construction
         // finish before arbitrary listener code runs below.
-        let state = unsafe { &mut *state };
-        let Some(timer_fd) = &state.timer_fd else {
+        let Some(result) = (unsafe {
+            with_runtime_mut(state, |state| {
+                let timer_fd = state.timer_fd.as_ref()?;
+                let mut expirations = 0;
+                (timer_fd.read(&mut expirations) >= 0)
+                    .then(|| (state.events.clone(), poll_mixers(state)))
+            })
+        }) else {
             return;
         };
-        let mut expirations = 0;
-        if timer_fd.read(&mut expirations) < 0 {
-            return;
-        }
-        (state.events.clone(), poll_mixers(state))
+        result
     };
     // SAFETY: the scoped State borrow ended above.
     unsafe { events.dispatch_all(notifications) };
@@ -848,47 +873,55 @@ unsafe extern "C" fn on_devd_event(source: *mut spa_source) {
     );
 
     let (events, notifications) = {
-        let state = unsafe { &mut *state };
-        let Some(devd_socket) = state.devd_socket.as_mut() else {
+        let Some(result) = (unsafe {
+            with_runtime_mut(state, |state| {
+                let devd_socket = state.devd_socket.as_mut()?;
+
+                let pcm_devices = &state.pcm_devices;
+                let mut nudged = false;
+                let alive = devd_socket.read_event(|line| {
+                    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+                    let re = RE.get_or_init(|| {
+                        regex::Regex::new(
+                            r"^!system=SND subsystem=CONN type=(?:IN|OUT) cdev=dsp([0-9]+)",
+                        )
+                        .unwrap()
+                    });
+                    if let Some(groups) = re.captures(line) {
+                        if let Ok(unit) = groups[1].parse::<u32>() {
+                            nudged |= pcm_devices.iter().any(|d| d.index == unit);
+                        }
+                    }
+                });
+
+                let notifications = if nudged {
+                    crate::debug!(state.log, "SND CONN event; re-polling the mixers");
+                    poll_mixers(state)
+                } else {
+                    Vec::new()
+                };
+
+                if !alive {
+                    // devd restarted or dropped us; deregister or the level-triggered fd
+                    // spins the main loop forever. The 1 Hz poll still covers changes.
+                    crate::warn!(
+                        state.log,
+                        "devd connection lost; falling back to the mixer poll alone"
+                    );
+                    // SAFETY: this callback runs on the registered main loop.
+                    if state.devd_source.unregister() < 0 {
+                        eprintln!("freebsd-oss: can't detach the devd source; aborting");
+                        std::process::abort();
+                    }
+                    state.devd_socket = None;
+                    state.devd_source.set_fd(-1);
+                }
+                Some((state.events.clone(), notifications))
+            })
+        }) else {
             return;
         };
-
-        let pcm_devices = &state.pcm_devices;
-        let mut nudged = false;
-        let alive = devd_socket.read_event(|line| {
-            static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-            let re = RE.get_or_init(|| {
-                regex::Regex::new(r"^!system=SND subsystem=CONN type=(?:IN|OUT) cdev=dsp([0-9]+)")
-                    .unwrap()
-            });
-            if let Some(groups) = re.captures(line) {
-                if let Ok(unit) = groups[1].parse::<u32>() {
-                    nudged |= pcm_devices.iter().any(|d| d.index == unit);
-                }
-            }
-        });
-
-        let notifications = if nudged {
-            crate::debug!(state.log, "SND CONN event; re-polling the mixers");
-            poll_mixers(state)
-        } else {
-            Vec::new()
-        };
-
-        if !alive {
-            // devd restarted or dropped us; deregister or the level-triggered fd
-            // spins the main loop forever. The 1 Hz poll still covers changes.
-            crate::warn!(
-                state.log,
-                "devd connection lost; falling back to the mixer poll alone"
-            );
-            if let Some(main_loop) = &state.main_loop {
-                unsafe { main_loop.remove_source(&mut state.devd_source) };
-            }
-            state.devd_socket = None;
-            state.devd_added = false;
-        }
-        (state.events.clone(), notifications)
+        result
     };
     // SAFETY: the scoped State borrow ended above.
     unsafe { events.dispatch_all(notifications) };
@@ -903,16 +936,19 @@ unsafe extern "C" fn add_listener(
     let state: *mut State = object.cast();
     assert!(!state.is_null(), "object is not supposed to be null");
     let (device_events, objects) = {
-        let state = unsafe { &*state };
-        (
-            state.events.clone(),
-            object_events(
-                &state.pcm_devices,
-                &state.routes,
-                &state.description,
-                state.profile != 0,
-            ),
-        )
+        unsafe {
+            with_runtime_ref(state, |state| {
+                (
+                    state.events.clone(),
+                    object_events(
+                        &state.pcm_devices,
+                        &state.routes,
+                        &state.description,
+                        state.profile != 0,
+                    ),
+                )
+            })
+        }
     };
 
     let initial = |hooks: &crate::spa::ListenerList<spa_device_events>| {
@@ -943,7 +979,7 @@ unsafe extern "C" fn add_listener(
 unsafe extern "C" fn sync(object: *mut c_void, seq: c_int) -> c_int {
     let state: *mut State = object.cast();
     assert!(!state.is_null(), "object is not supposed to be null");
-    let events = unsafe { (*state).events.clone() };
+    let events = unsafe { with_runtime_ref(state, |state| state.events.clone()) };
     // SAFETY: only the independent endpoint remains borrowed. Done joins the
     // same FIFO as info/object transactions, so reentrant sync cannot overtake
     // already-produced state notifications.
@@ -962,11 +998,12 @@ unsafe extern "C" fn enum_params(
 ) -> c_int {
     let state: *mut State = object.cast();
     assert!(!state.is_null(), "object is not supposed to be null");
-    let events = unsafe { (*state).events.clone() };
+    let events = unsafe { with_runtime_ref(state, |state| state.events.clone()) };
+    let runtime = unsafe { std::ptr::addr_of_mut!((*state).runtime) };
 
     unsafe {
         crate::spa::enum_params_loop(
-            state,
+            runtime,
             (start, max),
             filter,
             |state, index| {
@@ -1036,7 +1073,7 @@ unsafe extern "C" fn enum_params(
                     next: index + 1,
                     param,
                 };
-                // SAFETY: enum_params_loop ended its per-step State borrow
+                // SAFETY: enum_params_loop ended its per-step runtime borrow
                 // before invoking this closure.
                 events.emit_result(seq, &result);
             },
@@ -1057,12 +1094,14 @@ unsafe extern "C" fn get_interface(
     type_: *const c_char,
     interface: *mut *mut c_void,
 ) -> c_int {
-    let state =
-        unsafe { handle.cast::<State>().as_mut() }.expect("handle is not supposed to be null");
+    let state = handle.cast::<State>();
+    assert!(!state.is_null(), "handle is not supposed to be null");
     assert!(!interface.is_null());
     if unsafe { spa_streq(type_, SPA_TYPE_INTERFACE_Device.as_ptr().cast()) } {
         // interface is non-null (asserted above) and writable per the contract
-        unsafe { *interface = &mut state.device as *mut _ as *mut c_void };
+        unsafe {
+            *interface = std::ptr::addr_of_mut!((*state).device).cast::<c_void>();
+        }
     } else {
         return -libc::ENOENT;
     }
@@ -1070,23 +1109,27 @@ unsafe extern "C" fn get_interface(
 }
 
 unsafe extern "C" fn clear(handle: *mut spa_handle) -> c_int {
-    let state =
-        unsafe { handle.cast::<State>().as_mut() }.expect("handle is not supposed to be null");
-    // clear runs on the main loop's thread, so detach the poll source directly
-    if state.timer_added {
-        if let Some(main_loop) = &state.main_loop {
-            unsafe { main_loop.remove_source(&mut state.timer_source) };
-        }
-        drop(state.timer_fd.take());
-        state.timer_source.fd = -1;
-        state.timer_added = false;
-    }
-    // ditto for the devd watch; the socket fd closes with the DevdSocket drop
-    if state.devd_added {
-        if let Some(main_loop) = &state.main_loop {
-            unsafe { main_loop.remove_source(&mut state.devd_source) };
-        }
-        state.devd_added = false;
+    let state = handle.cast::<State>();
+    assert!(!state.is_null(), "handle is not supposed to be null");
+    unsafe {
+        with_runtime_mut(state, |runtime| {
+            // clear runs on the main loop's thread, so detach both sources there.
+            if runtime.timer_source.is_registered() {
+                if runtime.timer_source.unregister() < 0 {
+                    eprintln!("freebsd-oss: can't detach the mixer timer source; aborting");
+                    std::process::abort();
+                }
+                drop(runtime.timer_fd.take());
+                runtime.timer_source.set_fd(-1);
+            }
+            if runtime.devd_source.is_registered() && runtime.devd_source.unregister() < 0 {
+                eprintln!("freebsd-oss: can't detach the devd source; aborting");
+                std::process::abort();
+            }
+            if !runtime.devd_source.is_registered() {
+                runtime.devd_source.set_fd(-1);
+            }
+        });
     }
     // the host frees the memory after clear; drop the fields exactly once here
     unsafe { std::ptr::drop_in_place(state) };
@@ -1324,7 +1367,7 @@ fn common_description(pcm_devices: &[crate::sound::PcmDevice]) -> String {
 // socket (jack sense / recording-source flips). Both are best-effort - a
 // failure only costs noticing external changes - and only worth arming
 // when something is routed.
-unsafe fn arm_mixer_watch(state: &mut State) {
+unsafe fn arm_mixer_watch(state: &mut Runtime) {
     if state.routes.is_empty() {
         return;
     }
@@ -1354,19 +1397,17 @@ unsafe fn arm_mixer_watch(state: &mut State) {
                 if timer_fd.settime(0, &timerspec) < 0 {
                     crate::warn!(state.log, "can't arm the mixer poll timer");
                 }
-                // spa_source stores only the registration mirror; TimerFd
-                // remains the owner and closes through its SPA System.
-                state.timer_source.fd = timer_fd.raw();
+                state.timer_source.set_fd(timer_fd.raw());
                 state.timer_fd = Some(timer_fd);
-                if unsafe { main_loop.add_source(&mut state.timer_source) } >= 0 {
-                    state.timer_added = true;
-                } else {
+                // SAFETY: init runs in the host context accepted by add_source;
+                // the pinned source remains alive until clear unregisters it.
+                if unsafe { state.timer_source.register(main_loop) } < 0 {
                     crate::warn!(
                         state.log,
                         "can't watch the mixer; external volume changes won't be noticed"
                     );
                     drop(state.timer_fd.take());
-                    state.timer_source.fd = -1;
+                    state.timer_source.set_fd(-1);
                 }
             }
         }
@@ -1378,17 +1419,16 @@ unsafe fn arm_mixer_watch(state: &mut State) {
     if let Some(main_loop) = &state.main_loop {
         match crate::utils::DevdSocket::open() {
             Ok(socket) => {
-                state.devd_source.fd = socket.fd();
+                state.devd_source.set_fd(socket.fd());
                 state.devd_socket = Some(socket);
-                if unsafe { main_loop.add_source(&mut state.devd_source) } >= 0 {
-                    state.devd_added = true;
-                } else {
+                // SAFETY: as for the mixer source above.
+                if unsafe { state.devd_source.register(main_loop) } < 0 {
                     crate::warn!(
                         state.log,
                         "can't watch devd; jack events will wait for the mixer poll"
                     );
                     state.devd_socket = None;
-                    state.devd_source.fd = -1;
+                    state.devd_source.set_fd(-1);
                 }
             }
             Err(err) => {
@@ -1439,8 +1479,8 @@ unsafe extern "C" fn init(
         Some(unsafe { crate::spa::System::wrap(system) })
     };
 
-    let state =
-        unsafe { handle.cast::<State>().as_mut() }.expect("handle is not supposed to be null");
+    let state = handle.cast::<State>();
+    assert!(!state.is_null(), "handle is not supposed to be null");
 
     let (pcm_parent_device, pcm_device_indexes) = unsafe { parse_device_dict(info) };
 
@@ -1487,67 +1527,71 @@ unsafe extern "C" fn init(
                     },
                 },
 
-                events,
+                runtime: Runtime {
+                    events,
 
-                pcm_devices,
-                description: common_desc,
-                profile: 1, // default on until a session manager decides otherwise
-                profile_save: false,
+                    pcm_devices,
+                    description: common_desc,
+                    profile: 1, // default on until a session manager decides otherwise
+                    profile_save: false,
 
-                routes,
-                mixers,
+                    routes,
+                    mixers,
 
-                main_loop,
-                system,
+                    main_loop,
+                    system,
 
-                timer_fd: None,
-                timer_source: spa_source {
-                    loop_: std::ptr::null_mut(),
-                    func: Some(on_mixer_timeout),
-                    data: state as *mut _ as *mut c_void,
-                    fd: -1,
-                    mask: SPA_IO_IN,
-                    rmask: 0,
-                    priv_: std::ptr::null_mut(),
+                    timer_fd: None,
+                    timer_source: crate::spa::LoopSource::new(spa_source {
+                        loop_: std::ptr::null_mut(),
+                        func: Some(on_mixer_timeout),
+                        data: state.cast::<c_void>(),
+                        fd: -1,
+                        mask: SPA_IO_IN,
+                        rmask: 0,
+                        priv_: std::ptr::null_mut(),
+                    }),
+
+                    devd_socket: None,
+                    devd_source: crate::spa::LoopSource::new(spa_source {
+                        loop_: std::ptr::null_mut(),
+                        func: Some(on_devd_event),
+                        data: state.cast::<c_void>(),
+                        fd: -1,
+                        mask: SPA_IO_IN,
+                        rmask: 0,
+                        priv_: std::ptr::null_mut(),
+                    }),
+
+                    log,
                 },
-                timer_added: false,
-
-                devd_socket: None,
-                devd_source: spa_source {
-                    loop_: std::ptr::null_mut(),
-                    func: Some(on_devd_event),
-                    data: state as *mut _ as *mut c_void,
-                    fd: -1,
-                    mask: SPA_IO_IN,
-                    rmask: 0,
-                    priv_: std::ptr::null_mut(),
-                },
-                devd_added: false,
-
-                log,
             },
         );
     }
 
-    let description = state.description.clone();
-    state.events.with_info(|info| {
-        info.fix_pointers();
-        info.add_prop(crate::spa::key(SPA_KEY_DEVICE_API), "freebsd-oss");
-        info.add_prop(crate::spa::key(SPA_KEY_MEDIA_CLASS), "Audio/Device");
-        if let Some(pcm_parent_device) = pcm_parent_device {
-            info.add_prop(crate::spa::key(SPA_KEY_DEVICE_NAME), pcm_parent_device);
-        }
-        info.add_prop(
-            crate::spa::key(SPA_KEY_DEVICE_DESCRIPTION),
-            description.as_str(),
-        );
-        info.add_param(SPA_PARAM_EnumProfile, SPA_PARAM_INFO_READ);
-        info.add_param(SPA_PARAM_Profile, SPA_PARAM_INFO_READWRITE);
-        info.add_param(SPA_PARAM_EnumRoute, SPA_PARAM_INFO_READ);
-        info.add_param(SPA_PARAM_Route, SPA_PARAM_INFO_READWRITE);
-    });
+    unsafe {
+        with_runtime_mut(state, |state| {
+            let description = state.description.clone();
+            state.events.with_info(|info| {
+                info.fix_pointers();
+                info.add_prop(crate::spa::key(SPA_KEY_DEVICE_API), "freebsd-oss");
+                info.add_prop(crate::spa::key(SPA_KEY_MEDIA_CLASS), "Audio/Device");
+                if let Some(pcm_parent_device) = pcm_parent_device {
+                    info.add_prop(crate::spa::key(SPA_KEY_DEVICE_NAME), pcm_parent_device);
+                }
+                info.add_prop(
+                    crate::spa::key(SPA_KEY_DEVICE_DESCRIPTION),
+                    description.as_str(),
+                );
+                info.add_param(SPA_PARAM_EnumProfile, SPA_PARAM_INFO_READ);
+                info.add_param(SPA_PARAM_Profile, SPA_PARAM_INFO_READWRITE);
+                info.add_param(SPA_PARAM_EnumRoute, SPA_PARAM_INFO_READ);
+                info.add_param(SPA_PARAM_Route, SPA_PARAM_INFO_READWRITE);
+            });
 
-    unsafe { arm_mixer_watch(state) };
+            arm_mixer_watch(state);
+        });
+    }
 
     0
 }

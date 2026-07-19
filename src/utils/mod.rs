@@ -3,6 +3,13 @@ use nix::errno::Errno;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_int, c_ulong, c_void};
 
+// slice::from_raw_parts requires the byte size to fit in isize even when the
+// host claims the backing allocation is valid.
+pub(crate) fn raw_slice_len_ok<T>(len: usize) -> bool {
+    let size = std::mem::size_of::<T>();
+    size == 0 || len <= (isize::MAX as usize) / size
+}
+
 /// An owned libc descriptor closed with `libc::close`.
 pub(crate) struct LibcFd(c_int);
 
