@@ -160,6 +160,28 @@ struct audio_errinfo {
     filler: [c_int; 16],
 }
 
+fn ioctl_int(fd: c_int, req: c_ulong, value: c_int) -> Option<c_int> {
+    let mut value = value;
+    (unsafe { libc::ioctl(fd, req, &mut value) } != -1).then_some(value)
+}
+
+/// Read a structure filled by an ioctl.
+///
+/// # Safety
+///
+/// `T` must be POD, and `req` must fully initialize it whenever the ioctl
+/// succeeds. On failure the uninitialized value is discarded.
+unsafe fn ioctl_read<T>(fd: c_int, req: c_ulong) -> Option<T> {
+    let mut value = std::mem::MaybeUninit::<T>::uninit();
+    unsafe {
+        if libc::ioctl(fd, req, value.as_mut_ptr()) == -1 {
+            None
+        } else {
+            Some(value.assume_init())
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 enum DspState {
     Closed,
@@ -429,8 +451,7 @@ pub(crate) fn probe_caps(path: &str, play: bool) -> Option<DspCaps> {
         return native.as_ref().map(|nv| caps_from_sndstat(nv, vec![]));
     }
 
-    let mut formats: c_int = 0;
-    let formats_ok = unsafe { libc::ioctl(fd, SNDCTL_DSP_GETFMTS, &mut formats) } != -1;
+    let formats = ioctl_int(fd, SNDCTL_DSP_GETFMTS, 0);
 
     // ENGINEINFO with dev == -1 resolves the channel bound to THIS fd, so the
     // limits are per-direction (AUDIOINFO blends play and rec across the
@@ -455,13 +476,6 @@ pub(crate) fn probe_caps(path: &str, play: bool) -> Option<DspCaps> {
     };
     const PCM_CAP_VIRTUAL: c_int = 0x0004_0000;
 
-    // None = the ioctl failed (bitperfect devices reject unsupported values
-    // instead of snapping)
-    let probe = |req: c_ulong, val: c_int| {
-        let mut v = val;
-        (unsafe { libc::ioctl(fd, req, &mut v) } != -1).then_some(v)
-    };
-
     // a failed or degenerate probe defers to the audioinfo limits
     let pick = |probed: Option<c_int>, ai_val: c_int| probed.filter(|&v| v >= 1).unwrap_or(ai_val);
 
@@ -471,26 +485,22 @@ pub(crate) fn probe_caps(path: &str, play: bool) -> Option<DspCaps> {
     // native format and wider counts are genuinely negotiable, so the engine
     // width extends the probe there (e.g. 10-channel USB mixers).
     let direct = ai_caps != 0 && ai_caps & PCM_CAP_VIRTUAL == 0;
-    let min_channels = pick(probe(SNDCTL_DSP_CHANNELS, 1), ai_min_ch);
+    let min_channels = pick(ioctl_int(fd, SNDCTL_DSP_CHANNELS, 1), ai_min_ch);
     let max_channels = {
-        let probed = pick(probe(SNDCTL_DSP_CHANNELS, SND_CHN_MAX), ai_max_ch);
+        let probed = pick(ioctl_int(fd, SNDCTL_DSP_CHANNELS, SND_CHN_MAX), ai_max_ch);
         if direct {
             probed.max(ai_max_ch)
         } else {
             probed
         }
     };
-    let min_rate = pick(probe(SNDCTL_DSP_SPEED, 8000), ai_min_rate);
-    let max_rate = pick(probe(SNDCTL_DSP_SPEED, 192000), ai_max_rate);
+    let min_rate = pick(ioctl_int(fd, SNDCTL_DSP_SPEED, 8000), ai_min_rate);
+    let max_rate = pick(ioctl_int(fd, SNDCTL_DSP_SPEED, 192000), ai_max_rate);
 
     unsafe { libc::close(fd) };
 
-    if !formats_ok
-        || min_channels < 1
-        || max_channels < min_channels
-        || min_rate < 1
-        || max_rate < min_rate
-    {
+    let formats = formats?;
+    if min_channels < 1 || max_channels < min_channels || min_rate < 1 || max_rate < min_rate {
         return None;
     }
 
@@ -529,10 +539,9 @@ fn feeder_rate_round() -> u32 {
 // OSS grants the nearest supported value instead of failing, so a grant that
 // differs from the request beyond `tolerance` is a rejection here
 fn set_value(fd: c_int, req: c_ulong, value: u32, tolerance: u32) -> Result<(), Errno> {
-    let mut v = value as c_int;
-    if unsafe { libc::ioctl(fd, req, &mut v) } == -1 {
+    let Some(v) = ioctl_int(fd, req, value as c_int) else {
         return Err(Errno::last());
-    }
+    };
     if (v as i64 - value as i64).unsigned_abs() > tolerance as u64 {
         return Err(Errno::EINVAL);
     }
@@ -540,56 +549,39 @@ fn set_value(fd: c_int, req: c_ulong, value: u32, tolerance: u32) -> Result<(), 
 }
 
 fn ospace_in_bytes(fd: c_int) -> c_int {
-    let mut info = std::mem::MaybeUninit::<audio_buf_info>::uninit();
-    unsafe {
-        if libc::ioctl(fd, SNDCTL_DSP_GETOSPACE, info.as_mut_ptr()) == -1 {
-            return 0; // e.g. the device was unplugged mid-stream
-        }
-        info.assume_init().bytes
-    }
+    // e.g. the device was unplugged mid-stream
+    unsafe { ioctl_read::<audio_buf_info>(fd, SNDCTL_DSP_GETOSPACE) }.map_or(0, |info| info.bytes)
 }
 
 fn set_fragment(fd: c_int, n_frags: u16, frag_size_selector: u16) {
-    let mut s = ((n_frags as u32) << 16) | frag_size_selector as u32;
+    let s = (((n_frags as u32) << 16) | frag_size_selector as u32) as c_int;
     // best-effort: the caller reads the real grant back via GETOSPACE
-    let _ = unsafe { libc::ioctl(fd, SNDCTL_DSP_SETFRAGMENT, &mut s) };
+    let _ = ioctl_int(fd, SNDCTL_DSP_SETFRAGMENT, s);
     // FreeBSD can grant a smaller layout than requested. The caller reads the real
     // size from GETOSPACE, so don't assert the request was honored.
 }
 
 fn set_trigger(fd: c_int, mask: c_int) -> bool {
-    let mut m = mask;
-    unsafe { libc::ioctl(fd, SNDCTL_DSP_SETTRIGGER, &mut m) != -1 }
+    ioctl_int(fd, SNDCTL_DSP_SETTRIGGER, mask).is_some()
 }
 
 fn odelay(fd: c_int) -> c_int {
-    let mut delay: c_int = -1;
-    if unsafe { libc::ioctl(fd, SNDCTL_DSP_GETODELAY, &mut delay) } == -1 {
-        return 0; // e.g. the device was unplugged mid-stream
-    }
-    delay
+    // e.g. the device was unplugged mid-stream
+    ioctl_int(fd, SNDCTL_DSP_GETODELAY, -1).unwrap_or(0)
 }
 
 // The fragment size the driver actually granted, which need not match the
 // SETFRAGMENT request: some drivers (e.g. snd_hdspe) force a fixed period.
 // GETBLKSIZE returns EINVAL here, so read GETOSPACE's fragsize field.
 fn blocksize(fd: c_int) -> c_int {
-    let mut info = std::mem::MaybeUninit::<audio_buf_info>::uninit();
-    let err = unsafe { libc::ioctl(fd, SNDCTL_DSP_GETOSPACE, info.as_mut_ptr()) };
-    if err != -1 {
-        unsafe { info.assume_init().fragsize }
-    } else {
-        0
-    }
+    unsafe { ioctl_read::<audio_buf_info>(fd, SNDCTL_DSP_GETOSPACE) }
+        .map_or(0, |info| info.fragsize)
 }
 
 fn get_error(fd: c_int) -> audio_errinfo {
-    let mut info = std::mem::MaybeUninit::<audio_errinfo>::zeroed();
+    // e.g. the device was unplugged mid-stream
     unsafe {
-        if libc::ioctl(fd, SNDCTL_DSP_GETERROR, info.as_mut_ptr()) == -1 {
-            return std::mem::zeroed(); // e.g. the device was unplugged mid-stream
-        }
-        info.assume_init()
+        ioctl_read::<audio_errinfo>(fd, SNDCTL_DSP_GETERROR).unwrap_or_else(|| std::mem::zeroed())
     }
 }
 
@@ -682,7 +674,7 @@ impl Dsp {
     // mark survives a trigger suspend since chn_resetbuf doesn't touch it).
     // `fragment` is the normalized oss.fragment override (0 = the 1 KiB
     // default); either way the ring keeps the MIN_RING_BYTES budget.
-    pub(crate) fn set_small_fragments(&mut self, fragment: u32, ring: u32) {
+    pub(crate) fn set_small_fragments(&self, fragment: u32, ring: u32) {
         if self.state != DspState::Setup {
             return; // triggered channels can't retune; the next re-prime will
         }
@@ -704,9 +696,8 @@ impl Dsp {
                 fragment.trailing_zeros() as u16,
             );
         }
-        let mut lw: c_int = 1;
         // best-effort: without it, poll readiness is merely fragment-coarse
-        let _ = unsafe { libc::ioctl(self.fd, SNDCTL_DSP_LOW_WATER, &mut lw) };
+        let _ = ioctl_int(self.fd, SNDCTL_DSP_LOW_WATER, 1);
     }
 
     // Stop the channel but keep the fd: SETTRIGGER(0) aborts, resets the ring
@@ -791,13 +782,8 @@ impl Dsp {
 
     pub(crate) fn ispace_in_bytes(&mut self) -> c_int {
         assert_eq!(self.state, DspState::Running);
-        let mut info = std::mem::MaybeUninit::<audio_buf_info>::uninit();
-        let err = unsafe { libc::ioctl(self.fd, SNDCTL_DSP_GETISPACE, info.as_mut_ptr()) };
-        if err != -1 {
-            unsafe { info.assume_init().bytes }
-        } else {
-            0
-        }
+        unsafe { ioctl_read::<audio_buf_info>(self.fd, SNDCTL_DSP_GETISPACE) }
+            .map_or(0, |info| info.bytes)
     }
 
     // fill, granted fragment and total ring from ONE GETISPACE: the prime path
@@ -806,11 +792,10 @@ impl Dsp {
     // ioctl failed (e.g. device unplugged mid-stream).
     pub(crate) fn ispace_layout(&mut self) -> (u32, u32, u32) {
         assert_eq!(self.state, DspState::Running);
-        let mut info = std::mem::MaybeUninit::<audio_buf_info>::uninit();
-        if unsafe { libc::ioctl(self.fd, SNDCTL_DSP_GETISPACE, info.as_mut_ptr()) } == -1 {
+        let Some(info) = (unsafe { ioctl_read::<audio_buf_info>(self.fd, SNDCTL_DSP_GETISPACE) })
+        else {
             return (0, 0, 0);
-        }
-        let info = unsafe { info.assume_init() };
+        };
         (
             info.bytes.max(0) as u32,
             info.fragsize.max(0) as u32,
