@@ -987,6 +987,7 @@ impl Loop {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct System {
     // Keep the host-owned spa_system as a raw pointer and copy its validated
     // method slots. Safe wrappers pass only scalars and call-scoped references.
@@ -1041,31 +1042,57 @@ impl System {
         unsafe { (*self.system.as_ptr()).iface.cb.data }
     }
 
-    pub(crate) fn close(&self, fd: c_int) -> c_int {
-        // sound per wrap()'s contract; fd is an owned scalar
-        unsafe { (self.close_fn)(self.data(), fd) }
-    }
-
     pub(crate) fn clock_gettime(&self, clock_id: c_int, value: &mut timespec) -> c_int {
         // sound per wrap()'s contract; `value` is a live &mut for the call
         unsafe { (self.clock_gettime_fn)(self.data(), clock_id, value) }
     }
 
-    pub(crate) fn timerfd_create(&self, clock_id: c_int, flags: c_int) -> c_int {
-        // sound per wrap()'s contract; both arguments are owned scalars
-        unsafe { (self.timerfd_create_fn)(self.data(), clock_id, flags) }
+    pub(crate) fn timerfd_create(&self, clock_id: c_int, flags: c_int) -> Result<TimerFd, c_int> {
+        let fd = unsafe { (self.timerfd_create_fn)(self.data(), clock_id, flags) };
+        if fd < 0 {
+            Err(fd)
+        } else {
+            Ok(TimerFd { system: *self, fd })
+        }
+    }
+}
+
+pub(crate) struct TimerFd {
+    system: System,
+    fd: c_int,
+}
+
+impl TimerFd {
+    /// Borrow the descriptor for host registration. `TimerFd` remains its
+    /// sole owner, and callers must invalidate any stored mirror after drop.
+    pub(crate) fn raw(&self) -> c_int {
+        self.fd
     }
 
-    pub(crate) fn timerfd_read(&self, fd: c_int, expirations: &mut u64) -> c_int {
+    pub(crate) fn read(&self, expirations: &mut u64) -> c_int {
         // sound per wrap()'s contract; `expirations` is a live &mut for the call
-        unsafe { (self.timerfd_read_fn)(self.data(), fd, expirations) }
+        unsafe { (self.system.timerfd_read_fn)(self.system.data(), self.fd, expirations) }
     }
 
     // Callers do not request the previous timer value.
-    pub(crate) fn timerfd_settime(&self, fd: c_int, flags: c_int, new_value: &itimerspec) -> c_int {
+    pub(crate) fn settime(&self, flags: c_int, new_value: &itimerspec) -> c_int {
         // sound per wrap()'s contract; `new_value` is a live shared reference
         unsafe {
-            (self.timerfd_settime_fn)(self.data(), fd, flags, new_value, std::ptr::null_mut())
+            (self.system.timerfd_settime_fn)(
+                self.system.data(),
+                self.fd,
+                flags,
+                new_value,
+                std::ptr::null_mut(),
+            )
+        }
+    }
+}
+
+impl Drop for TimerFd {
+    fn drop(&mut self) {
+        unsafe {
+            (self.system.close_fn)(self.system.data(), self.fd);
         }
     }
 }

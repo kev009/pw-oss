@@ -227,6 +227,29 @@ pub(crate) struct State<D: Direction> {
     data: DataState<D>,
 }
 
+// Raw State pointers enter through the SPA interface. These helpers project
+// one field at a time so callers cannot accidentally borrow the whole shell.
+// A MainState borrow may coexist with DataControl; a DataState borrow may not.
+unsafe fn main_ref<'a, D: Direction>(state: *const State<D>) -> &'a MainState<D> {
+    unsafe { &*std::ptr::addr_of!((*state).main) }
+}
+
+unsafe fn main_mut<'a, D: Direction>(state: *mut State<D>) -> &'a mut MainState<D> {
+    unsafe { &mut *std::ptr::addr_of_mut!((*state).main) }
+}
+
+unsafe fn data_mut<'a, D: Direction>(state: *mut State<D>) -> &'a mut DataState<D> {
+    unsafe { &mut *std::ptr::addr_of_mut!((*state).data) }
+}
+
+unsafe fn gate_ref<'a, D: Direction>(state: *const State<D>) -> &'a DataThreadGate {
+    unsafe { &*std::ptr::addr_of!((*state).gate) }
+}
+
+unsafe fn main_ptr<D: Direction>(state: *mut State<D>) -> *mut MainState<D> {
+    unsafe { std::ptr::addr_of_mut!((*state).main) }
+}
+
 struct DataThreadGate {
     thread: std::sync::atomic::AtomicUsize,
     log: crate::spa::Log,
@@ -263,7 +286,8 @@ pub(crate) struct DataState<D: Direction> {
     pub clock_name: std::ffi::CString, // stamped into spa_io_clock.name
     pub main_loop: Option<crate::spa::Loop>, // for endpoint-only notifications
     pub dsp_path: String,
-    pub timer_source: spa_source,
+    timer_fd: Option<crate::spa::TimerFd>, // owns timer_source.fd
+    pub timer_source: spa_source,          // fd is a non-owning SPA registration mirror
     pub next_time: u64,
     pub callbacks: NodeCallbacks,
     pub ports: [Port<D>; MAX_PORTS],
@@ -298,26 +322,18 @@ impl<D: Direction> DataState<D> {
     }
 }
 
-// A main-loop capability for exactly one operation: synchronously run a
-// closure against the disjoint data-loop state. It is constructed from raw
-// projections of the pinned FFI shell, so no reference to the shell exists
-// while the data loop borrows its field.
+// A short-lived, non-Copy main-loop capability for synchronously borrowing
+// the disjoint data-loop state. The host serializes control methods on the
+// main loop; callers must not retain this past State teardown.
 pub(crate) struct DataControl<D: Direction> {
     loop_: crate::spa::Loop,
     data: *mut DataState<D>,
 }
 
-impl<D: Direction> Copy for DataControl<D> {}
-impl<D: Direction> Clone for DataControl<D> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
 impl<D: Direction> DataControl<D> {
     unsafe fn from_raw(state: *mut State<D>) -> Self {
         Self {
-            loop_: unsafe { std::ptr::addr_of!((*state).main.data_loop).read() },
+            loop_: unsafe { main_ref(state).data_loop },
             data: unsafe { std::ptr::addr_of_mut!((*state).data) },
         }
     }
@@ -512,7 +528,7 @@ unsafe extern "C" fn add_listener<D: Direction>(
 ) -> c_int {
     let state: *mut State<D> = object.cast();
     assert!(!state.is_null(), "object is not supposed to be null");
-    let node_events = unsafe { (*std::ptr::addr_of!((*state).main)).events.clone() };
+    let node_events = unsafe { main_ref(state).events.clone() };
 
     let initial = |hooks: &crate::spa::ListenerList<spa_node_events>| {
         // The initial emissions only reach the newly added listener (the list
@@ -623,7 +639,7 @@ unsafe extern "C" fn set_callbacks<D: Direction>(
 unsafe extern "C" fn sync<D: Direction>(object: *mut c_void, seq: c_int) -> c_int {
     let state: *mut State<D> = object.cast();
     assert!(!state.is_null(), "object is not supposed to be null");
-    let events = unsafe { (*std::ptr::addr_of!((*state).main)).events.clone() };
+    let events = unsafe { main_ref(state).events.clone() };
     // SAFETY: only the independently owned endpoint is borrowed.
     unsafe { events.emit_done(seq) };
     0
@@ -659,8 +675,8 @@ unsafe extern "C" fn enum_params<D: Direction>(
     assert!(!state.is_null(), "object is not supposed to be null");
     // Clone the independently allocated endpoint before enumeration. Each
     // build step below gets a fresh State borrow; dispatch uses only events.
-    let events = unsafe { (*std::ptr::addr_of!((*state).main)).events.clone() };
-    let main = unsafe { std::ptr::addr_of_mut!((*state).main) };
+    let events = unsafe { main_ref(state).events.clone() };
+    let main = unsafe { main_ptr(state) };
 
     unsafe {
         crate::spa::enum_params_loop(
@@ -828,7 +844,7 @@ unsafe extern "C" fn set_param<D: Direction>(
 ) -> c_int {
     let state: *mut State<D> = object.cast();
     assert!(!state.is_null(), "object is not supposed to be null");
-    let log = unsafe { (*std::ptr::addr_of!((*state).main)).log.clone() };
+    let log = unsafe { main_ref(state).log.clone() };
 
     use libspa::pod::{Object, Value};
 
@@ -873,7 +889,7 @@ unsafe extern "C" fn set_param<D: Direction>(
     let (events, result) = {
         // All info emissions produced by the safe phase are queued as owned
         // snapshots. End this State borrow before invoking any listener.
-        let state = unsafe { &mut *std::ptr::addr_of_mut!((*state).main) };
+        let state = unsafe { main_mut(state) };
         let events = state.events.clone();
         let result = apply_node_param(state, &control, request);
         (events, result)
@@ -947,7 +963,6 @@ unsafe extern "C" fn on_timeout<D: Direction>(source: *mut spa_source) {
     // the timer source we registered in init; its data points at our State
     let root: *mut State<D> = unsafe { (*source).data.cast() };
     assert!(!root.is_null(), "(*source).data is not supposed to be null");
-    let state = unsafe { std::ptr::addr_of_mut!((*root).data) };
 
     // Phase 1, under a scoped borrow: drain the timer, run the servo and
     // publish the clock (every early exit arms or parks the timer itself).
@@ -956,7 +971,7 @@ unsafe extern "C" fn on_timeout<D: Direction>(source: *mut spa_source) {
     // fresh &mut DataState, so the callback must not run under this borrow.
     // SAFETY: the registered source data points at our live State (the
     // add_source contract); the borrow ends before the notify call below.
-    let notify = timeout_cycle(unsafe { &mut *state });
+    let notify = timeout_cycle(unsafe { data_mut(root) });
 
     let Some(hook) = notify else {
         return; // early exit; the timer was armed or parked inside
@@ -966,7 +981,7 @@ unsafe extern "C" fn on_timeout<D: Direction>(source: *mut spa_source) {
             // no State borrow is live here; sound per NodeCallbacks::hook
             let err = unsafe { ready_fun(data, D::READY_STATUS) };
             #[cfg(debug_assertions)]
-            crate::trace!(unsafe { &(*state).log }, "ready -> {}", err);
+            crate::trace!(unsafe { data_mut(root) }.log, "ready -> {}", err);
             #[cfg(not(debug_assertions))]
             let _ = err;
         }
@@ -977,7 +992,7 @@ unsafe extern "C" fn on_timeout<D: Direction>(source: *mut spa_source) {
     // live; the source stays registered while the node lives. The callback
     // may have synchronously paused the node or cleared its IO, so do not
     // undo the timer park that transition just installed.
-    let state = unsafe { &mut *state };
+    let state = unsafe { data_mut(root) };
     if state.started && !state.following && !state.position.is_null() && !state.clock.is_null() {
         set_timeout(state, state.next_time);
     } else {
@@ -998,8 +1013,10 @@ fn timeout_cycle<D: Direction>(
 
     let mut expirations = 0;
     if state
-        .data_system
-        .timerfd_read(state.timer_source.fd, &mut expirations)
+        .timer_fd
+        .as_ref()
+        .expect("the node timer lives until clear")
+        .read(&mut expirations)
         < 0
     {
         // disarmed (Pause/Suspend) in this same wakeup; nothing to read
@@ -1143,8 +1160,10 @@ fn arm_timer<D: Direction>(state: &DataState<D>, value_ns: u64, flags: i32) {
     };
 
     state
-        .data_system
-        .timerfd_settime(state.timer_source.fd, flags, &timerspec);
+        .timer_fd
+        .as_ref()
+        .expect("the node timer lives until clear")
+        .settime(flags, &timerspec);
 }
 
 // the io areas set_io accepts, with the geometry a full deref needs
@@ -1304,12 +1323,12 @@ unsafe extern "C" fn send_command<D: Direction>(
     let state = object.cast::<State<D>>();
     assert!(!state.is_null(), "object is not supposed to be null");
     let control = unsafe { DataControl::from_raw(state) };
-    let (log, shared, rebuild_work) = unsafe {
-        let main = std::ptr::addr_of!((*state).main);
+    let (log, shared, rebuild_work) = {
+        let main = unsafe { main_ref(state) };
         (
-            (*main).log.clone(),
-            (*main).shared.clone(),
-            (*main).rebuild_worker.endpoint(),
+            main.log.clone(),
+            main.shared.clone(),
+            main.rebuild_worker.endpoint(),
         )
     };
 
@@ -1412,7 +1431,7 @@ unsafe extern "C" fn send_command<D: Direction>(
             let data_stopped_ref = &data_stopped;
             // Device::new may probe sndstat (the sink does), so build every
             // closed placeholder here on main rather than inside DataControl.
-            let dsp_path = unsafe { &*std::ptr::addr_of!((*state).main.dsp_path) };
+            let dsp_path = unsafe { &main_ref(state).dsp_path };
             let placeholders: [D::Device; MAX_PORTS] =
                 std::array::from_fn(|_| D::Device::new(dsp_path));
             // Quiesce and transfer device ownership out of DataState. Potentially
@@ -1577,8 +1596,8 @@ unsafe extern "C" fn port_enum_params<D: Direction>(
     if direction != D::DIRECTION || (port_id as usize) >= MAX_PORTS {
         return -libc::EINVAL;
     }
-    let events = unsafe { (*std::ptr::addr_of!((*state).main)).events.clone() };
-    let main = unsafe { std::ptr::addr_of_mut!((*state).main) };
+    let events = unsafe { main_ref(state).events.clone() };
+    let main = unsafe { main_ptr(state) };
     let control = unsafe { DataControl::from_raw(state) };
 
     unsafe {
@@ -1931,7 +1950,7 @@ unsafe extern "C" fn port_set_param<D: Direction>(
     let state: *mut State<D> = object.cast();
     assert!(!state.is_null(), "object is not supposed to be null");
     let control = unsafe { DataControl::from_raw(state) };
-    let main = unsafe { std::ptr::addr_of_mut!((*state).main) };
+    let main = unsafe { main_ptr(state) };
     let events = unsafe { (*main).events.clone() };
     // SAFETY: the host keeps param valid for this method call. The inner
     // phase queues owned snapshots and invokes no listeners.
@@ -2091,11 +2110,10 @@ unsafe extern "C" fn process<D: Direction>(object: *mut c_void) -> c_int {
     let root: *mut State<D> = object.cast();
     assert!(!root.is_null(), "object is not supposed to be null");
     // Reject a divergent process loop before projecting or borrowing DataState.
-    let gate = unsafe { &*std::ptr::addr_of!((*root).gate) };
+    let gate = unsafe { gate_ref(root) };
     if !check_loop_identity(gate) {
         return SPA_STATUS_OK as i32;
     }
-    let state = unsafe { std::ptr::addr_of_mut!((*root).data) };
 
     // Phase 1, under a scoped borrow: the data path. Xrun notifications are
     // collected only (detect_underrun/recover_overrun deposit them on the
@@ -2103,7 +2121,7 @@ unsafe extern "C" fn process<D: Direction>(object: *mut c_void) -> c_int {
     // SAFETY: object is our State shell (the spa_interface data contract); the
     // borrow ends before any callback is invoked.
     let (result, xrun, main_event) = {
-        let state = unsafe { &mut *state };
+        let state = unsafe { data_mut(root) };
 
         // a cycle that was already signaled when we paused can still land here;
         // drop it instead of assert!()ing, which aborts the daemon across
@@ -2273,7 +2291,7 @@ unsafe extern "C" fn clear<D: Direction>(handle: *mut spa_handle) -> c_int {
     // ground under the data loop; timer detachment below is our side of the
     // contract.
     {
-        let main = unsafe { &mut *std::ptr::addr_of_mut!((*state).main) };
+        let main = unsafe { main_mut(state) };
         // Win every open/configure race before asking the worker to stop.
         // stop() drains device-bearing commands on that thread and joins it,
         // so no blocking device destructor remains concurrent with teardown.
@@ -2291,7 +2309,8 @@ unsafe extern "C" fn clear<D: Direction>(handle: *mut spa_handle) -> c_int {
     let control = unsafe { DataControl::from_raw(state) };
     if !control.invoke(|state| {
         unsafe { state.data_loop.remove_source(&mut state.timer_source) };
-        state.data_system.close(state.timer_source.fd);
+        drop(state.timer_fd.take());
+        state.timer_source.fd = -1;
     }) {
         // freeing the state now would leave the loop a dangling source; a clean
         // abort beats a use-after-free on the next timer tick
@@ -2422,18 +2441,18 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
     let data_loop = unsafe { crate::spa::Loop::wrap(data_loop) };
     let data_system = unsafe { crate::spa::System::wrap(data_system) };
 
-    let timer_fd = data_system.timerfd_create(
+    let timer_fd = match data_system.timerfd_create(
         libc::CLOCK_MONOTONIC,
         (SPA_FD_CLOEXEC | SPA_FD_NONBLOCK) as i32,
-    );
-    if timer_fd < 0 {
-        return timer_fd; // fd exhaustion fails node creation, not the daemon
-    }
+    ) {
+        Ok(timer_fd) => timer_fd,
+        Err(err) => return err, // fd exhaustion fails node creation, not the daemon
+    };
+    let timer_fd_raw = timer_fd.raw();
 
     let (dsp_path, oss_fragment, ext) = unsafe { parse_init_dict::<D>(info) };
 
     let Some(dsp_path) = dsp_path else {
-        data_system.close(timer_fd);
         crate::error!(
             log,
             "{} missing from the node properties",
@@ -2459,7 +2478,6 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
     let rebuild_worker = match RebuildWorker::<D>::start() {
         Ok(worker) => worker,
         Err(err) => {
-            data_system.close(timer_fd);
             crate::error!(log, "can't start the device rebuild worker: {}", err);
             return -libc::EIO;
         }
@@ -2531,11 +2549,12 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
                     .unwrap_or_default(),
                     main_loop,
                     dsp_path: dsp_path.clone(),
+                    timer_fd: Some(timer_fd),
                     timer_source: spa_source {
                         loop_: std::ptr::null_mut(),
                         func: Some(on_timeout::<D>),
                         data: state.cast::<c_void>(),
-                        fd: timer_fd,
+                        fd: timer_fd_raw,
                         mask: SPA_IO_IN,
                         rmask: 0,
                         priv_: std::ptr::null_mut(),
@@ -2574,17 +2593,21 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
         );
     }
 
-    let main = unsafe { &*std::ptr::addr_of!((*state).main) };
+    let main = unsafe { main_ref(state) };
     publish_static_info(main);
 
-    let data = unsafe { &mut *std::ptr::addr_of_mut!((*state).data) };
-    let err = unsafe { data.data_loop.add_source(&mut data.timer_source) };
+    let err = {
+        let data = unsafe { data_mut(state) };
+        unsafe { data.data_loop.add_source(&mut data.timer_source) }
+    };
     if err < 0 {
-        unsafe {
-            data.data_system.close(data.timer_source.fd);
-            // the host won't call clear() after a failed init; free what we built
-            std::ptr::drop_in_place(state);
+        {
+            let data = unsafe { data_mut(state) };
+            drop(data.timer_fd.take());
+            data.timer_source.fd = -1;
         }
+        // the host won't call clear() after a failed init; free what we built
+        unsafe { std::ptr::drop_in_place(state) };
         return err;
     }
 
@@ -2592,7 +2615,8 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
     // check_loop_identity); pw's data loops run before any node loads, so
     // this executes on the loop thread, not inline
     let control = unsafe { DataControl::from_raw(state) };
-    let thread = unsafe { std::ptr::addr_of!((*state).gate.thread) };
+    let gate = unsafe { gate_ref(state) };
+    let thread = std::ptr::addr_of!(gate.thread);
     let loop_thread = unsafe { crate::utils::SendWrap::new(thread.cast_mut()) };
     let seeded = control.invoke(move |_data| {
         let thread = loop_thread.into_inner();
@@ -2609,7 +2633,7 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
     if !seeded {
         unsafe { &*thread }.store(usize::MAX, std::sync::atomic::Ordering::Release);
         crate::warn!(
-            unsafe { &*std::ptr::addr_of!((*state).gate.log) },
+            gate.log,
             "can't seed the data-loop thread identity; disabling processing"
         );
     }

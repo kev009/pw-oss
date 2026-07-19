@@ -270,7 +270,8 @@ struct State {
     mixers: Vec<MixerHandle>,
     main_loop: Option<crate::spa::Loop>, // for the mixer poll timer
     system: Option<crate::spa::System>,  // ditto
-    timer_source: spa_source,
+    timer_fd: Option<crate::spa::TimerFd>, // owns timer_source.fd
+    timer_source: spa_source,            // fd is a non-owning SPA registration mirror
     timer_added: bool,
     devd_socket: Option<crate::utils::DevdSocket>, // jack/default-unit nudges; None = poll only
     devd_source: spa_source,
@@ -809,11 +810,11 @@ unsafe extern "C" fn on_mixer_timeout(source: *mut spa_source) {
         // Scoped State borrow: all mixer mutations and payload construction
         // finish before arbitrary listener code runs below.
         let state = unsafe { &mut *state };
-        let Some(system) = &state.system else {
+        let Some(timer_fd) = &state.timer_fd else {
             return;
         };
         let mut expirations = 0;
-        if system.timerfd_read(state.timer_source.fd, &mut expirations) < 0 {
+        if timer_fd.read(&mut expirations) < 0 {
             return;
         }
         (state.events.clone(), poll_mixers(state))
@@ -1076,9 +1077,7 @@ unsafe extern "C" fn clear(handle: *mut spa_handle) -> c_int {
         if let Some(main_loop) = &state.main_loop {
             unsafe { main_loop.remove_source(&mut state.timer_source) };
         }
-        if let Some(system) = &state.system {
-            system.close(state.timer_source.fd);
-        }
+        drop(state.timer_fd.take());
         state.timer_source.fd = -1;
         state.timer_added = false;
     }
@@ -1331,40 +1330,44 @@ unsafe fn arm_mixer_watch(state: &mut State) {
     }
 
     if let (Some(main_loop), Some(system)) = (&state.main_loop, &state.system) {
-        let fd = system.timerfd_create(
+        match system.timerfd_create(
             libc::CLOCK_MONOTONIC,
             (SPA_FD_CLOEXEC | SPA_FD_NONBLOCK) as c_int,
-        );
-        if fd < 0 {
-            crate::warn!(
-                state.log,
-                "can't create the mixer poll timer; external volume changes won't be noticed"
-            );
-        }
-        if fd >= 0 {
-            let timerspec = itimerspec {
-                it_value: timespec {
-                    tv_sec: 1,
-                    tv_nsec: 0,
-                },
-                it_interval: timespec {
-                    tv_sec: 1,
-                    tv_nsec: 0,
-                },
-            };
-            if system.timerfd_settime(fd, 0, &timerspec) < 0 {
-                crate::warn!(state.log, "can't arm the mixer poll timer");
-            }
-            state.timer_source.fd = fd;
-            if unsafe { main_loop.add_source(&mut state.timer_source) } >= 0 {
-                state.timer_added = true;
-            } else {
+        ) {
+            Err(_) => {
                 crate::warn!(
                     state.log,
-                    "can't watch the mixer; external volume changes won't be noticed"
+                    "can't create the mixer poll timer; external volume changes won't be noticed"
                 );
-                system.close(fd);
-                state.timer_source.fd = -1;
+            }
+            Ok(timer_fd) => {
+                let timerspec = itimerspec {
+                    it_value: timespec {
+                        tv_sec: 1,
+                        tv_nsec: 0,
+                    },
+                    it_interval: timespec {
+                        tv_sec: 1,
+                        tv_nsec: 0,
+                    },
+                };
+                if timer_fd.settime(0, &timerspec) < 0 {
+                    crate::warn!(state.log, "can't arm the mixer poll timer");
+                }
+                // spa_source stores only the registration mirror; TimerFd
+                // remains the owner and closes through its SPA System.
+                state.timer_source.fd = timer_fd.raw();
+                state.timer_fd = Some(timer_fd);
+                if unsafe { main_loop.add_source(&mut state.timer_source) } >= 0 {
+                    state.timer_added = true;
+                } else {
+                    crate::warn!(
+                        state.log,
+                        "can't watch the mixer; external volume changes won't be noticed"
+                    );
+                    drop(state.timer_fd.take());
+                    state.timer_source.fd = -1;
+                }
             }
         }
     }
@@ -1497,6 +1500,7 @@ unsafe extern "C" fn init(
                 main_loop,
                 system,
 
+                timer_fd: None,
                 timer_source: spa_source {
                     loop_: std::ptr::null_mut(),
                     func: Some(on_mixer_timeout),
