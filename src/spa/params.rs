@@ -99,11 +99,7 @@ pub(crate) fn serialize_pod(value: &libspa::pod::Value) -> Vec<u8> {
 
 // a flag-less object property (the common case)
 pub(crate) fn pod_prop(key: u32, value: libspa::pod::Value) -> libspa::pod::Property {
-    libspa::pod::Property {
-        key,
-        flags: libspa::pod::PropertyFlags::empty(),
-        value,
-    }
+    libspa::pod::Property::new(key, value)
 }
 
 pub(crate) fn pod_int_range(default: i32, min: i32, max: i32) -> libspa::pod::Value {

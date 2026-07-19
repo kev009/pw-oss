@@ -186,10 +186,12 @@ pub(super) unsafe fn decode_format(
     param: *const spa_pod,
     log: &crate::spa::Log,
 ) -> Result<RequestedFormat, c_int> {
+    use libspa::param::audio::AudioInfoRaw;
     use libspa::param::format::{MediaSubtype, MediaType};
     use libspa::param::format_utils::parse_format;
 
-    match parse_format(unsafe { libspa::pod::Pod::from_raw(param) }) {
+    let pod = unsafe { libspa::pod::Pod::from_raw(param) };
+    match parse_format(pod) {
         Ok((MediaType::Audio, MediaSubtype::Raw)) => (),
         Ok((t, st)) => {
             crate::warn!(log, "unknown media type combination: {:?}, {:?}", t, st);
@@ -201,14 +203,14 @@ pub(super) unsafe fn decode_format(
         }
     }
 
-    // zeroed, not MaybeUninit: the C parse treats every key as optional and
-    // leaves absent ones untouched, so a hostile pod omitting rate/channels
-    // would otherwise graduate stack garbage into "parsed" values
-    let mut raw: spa_audio_info_raw = unsafe { std::mem::zeroed() };
-    if unsafe { spa_format_audio_raw_parse(param, &mut raw) } < 0 {
-        crate::warn!(log, "spa_format_audio_raw_parse failed");
+    // AudioInfoRaw starts every optional field from its defined defaults,
+    // then contains the raw C parser behind its safe result-returning API.
+    let mut info = AudioInfoRaw::new();
+    if let Err(err) = info.parse(pod) {
+        crate::warn!(log, "audio format parse failed: {}", err);
         return Err(-libc::EINVAL);
     }
+    let raw = info.as_raw();
 
     // format flags are stored but unused, OSS writes interleaved frames
     if raw.rate == 0 || raw.channels == 0 || raw.channels > SPA_AUDIO_MAX_CHANNELS {
