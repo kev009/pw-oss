@@ -11,7 +11,7 @@ pub(crate) use devices::{
     DspCaps, MIN_RING_BYTES, PcmDevice, drain_quantum_ns, group_pcm_devices_by_parent,
     list_pcm_devices, probe_caps, read_sndstat, ring_byte_cap,
 };
-pub(crate) use dsp::{Dsp, DspWriter};
+pub(crate) use dsp::{Dsp, DspWriter, PlaybackWrite};
 pub(crate) use mixer::{
     Mixer, SOUND_DEVICE_NAMES, SOUND_MIXER_LINE, SOUND_MIXER_MIC, SOUND_MIXER_NRDEVICES,
 };

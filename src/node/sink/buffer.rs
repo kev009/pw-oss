@@ -81,7 +81,7 @@ pub(super) fn target_delay(
         // The ceiling always leaves room above target for the largest expected
         // write (write_max: a quantum, or the resampler's size if larger) plus
         // one fragment of servo wander: the OSS write is non-blocking, so a
-        // write that doesn't fit short-writes and DROPS the tail. A driver that
+        // write that doesn't fit must retain and retry its tail. A driver that
         // grants many small fragments in a large buffer (uaudio) must
         // not be fill-targeted near-full - that both adds 100+ ms of
         // latency and leaves one fragment of headroom, dropping a chunk on

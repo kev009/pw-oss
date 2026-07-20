@@ -1,6 +1,7 @@
 use super::{
-    SinkDir, SinkPortExt, detect_underrun, follower_servo, level_correct, recover_or_hold,
-    retune_period,
+    SinkDir, SinkPortExt, consume_freewheel_input, detect_underrun, follower_servo, level_correct,
+    pending_write_offset, prepare_pending_write, recover_or_hold, release_input,
+    retain_partial_write, retune_period, write_retained_tail,
 };
 use super::{buffer_request, buffer_required, desired_delay, fill_floor, target_delay};
 use crate::node::PortConfig;
@@ -95,11 +96,9 @@ fn oversized_delay_is_capped_and_reported() {
     assert!(capped);
 }
 
-// The recovery sequencing behind the 0.9.7 underrun fix: on the first
-// data cycle past the event, the fill re-primes to target FIRST and the
-// cycle's data follows in the SAME cycle - into a ring that is already
-// near-full, so both writes short-write and must stay frame-aligned
-// while the tail drops as whole frames.
+// On the first data cycle past an underrun, re-prime the fill before writing
+// that cycle's data. Both writes may be short against a near-full ring, so
+// preserve frame alignment and leave the untouched tail with the caller.
 #[test]
 fn recovery_reprimes_then_writes_into_a_near_full_ring() {
     let (r, w) = pipe_pair(true, true);
@@ -115,12 +114,12 @@ fn recovery_reprimes_then_writes_into_a_near_full_ring() {
     let data = pattern(2048, 1);
     let n = recover_or_hold(&mut port, 2_000, 0, &data);
 
-    // the hold cleared and the overfull ring dropped the tail: only the
-    // frames that fit after the re-prime were consumed
+    // The hold cleared and only the prefix that fit after the re-prime was
+    // consumed; process_ports retains the returned tail in production.
     assert_eq!(port.ext.xrun_timestamp, 0);
-    assert_eq!(n, 1024);
+    assert_eq!(n.bytes, 1024);
     let out = drain(r);
-    assert_eq!(out.len(), capacity); // filler + re-prime zeroes + data head
+    assert_eq!(out.len(), capacity); // filler + re-prime silence + data head
     let tail = &out[out.len() - 5120..];
     assert!(
         tail[..4096].iter().all(|&b| b == 0),
@@ -144,7 +143,7 @@ fn recovery_holds_buffers_until_the_clock_passes_the_event() {
 
     // same-cycle clock: not past the event yet
     let n = recover_or_hold(&mut port, 5_000, 0, &data);
-    assert_eq!(n, 2048);
+    assert_eq!(n.bytes, 2048);
     assert_eq!(port.ext.xrun_timestamp, 5_000);
     assert!(
         drain(r).is_empty(),
@@ -153,18 +152,185 @@ fn recovery_holds_buffers_until_the_clock_passes_the_event() {
 
     // past the event, but the host flags its own xrun recovery: still held
     let n = recover_or_hold(&mut port, 6_000, SPA_IO_CLOCK_FLAG_XRUN_RECOVER, &data);
-    assert_eq!(n, 2048);
+    assert_eq!(n.bytes, 2048);
     assert_eq!(port.ext.xrun_timestamp, 5_000);
     assert!(drain(r).is_empty());
 
     // past the event with no host recovery: re-primes and writes
     let n = recover_or_hold(&mut port, 6_000, 0, &data);
-    assert_eq!(n, 2048);
+    assert_eq!(n.bytes, 2048);
     assert_eq!(port.ext.xrun_timestamp, 0);
     let out = drain(r);
     assert_eq!(out.len(), 4096 + 2048);
     assert!(out[..4096].iter().all(|&b| b == 0));
     assert_eq!(&out[4096..], &data[..]);
+    unsafe { libc::close(r) };
+}
+
+#[test]
+fn partial_writes_advance_only_within_the_same_host_buffer() {
+    let mut ext = SinkPortExt::default();
+
+    assert_eq!(pending_write_offset(&mut ext, 7, 16384), 0);
+    assert!(retain_partial_write(
+        &mut ext,
+        16384,
+        crate::oss::PlaybackWrite {
+            bytes: 8192,
+            error: None,
+        },
+    ));
+    assert_eq!(pending_write_offset(&mut ext, 7, 16384), 8192);
+
+    assert!(retain_partial_write(
+        &mut ext,
+        8192,
+        crate::oss::PlaybackWrite {
+            bytes: 4096,
+            error: Some(nix::errno::Errno::EAGAIN),
+        },
+    ));
+    assert_eq!(pending_write_offset(&mut ext, 7, 16384), 12288);
+
+    // Buffer ids may be reused after NEED_DATA, so a different current id
+    // always starts at the beginning of its own chunk.
+    assert_eq!(pending_write_offset(&mut ext, 8, 16384), 0);
+
+    // A non-retryable device error is not mistaken for ordinary backpressure.
+    assert!(!retain_partial_write(
+        &mut ext,
+        16384,
+        crate::oss::PlaybackWrite {
+            bytes: 4096,
+            error: Some(nix::errno::Errno::EIO),
+        },
+    ));
+    assert_eq!(ext.pending_offset, 0);
+}
+
+#[test]
+fn zero_byte_write_is_retryable_backpressure() {
+    let write = crate::oss::PlaybackWrite {
+        bytes: 0,
+        error: None,
+    };
+    assert!(write.would_block());
+}
+
+#[test]
+fn retained_tail_precedes_fill_correction() {
+    let (r, w) = pipe_pair(true, true);
+    let mut port = test_port(w, 4096, 2048);
+    port.dsp.write_silence(0);
+    let capacity = fill_pipe(w);
+    free_space(r, 2048);
+
+    let data = pattern(4096, 21);
+    let first = port.dsp.write(&data);
+    assert_eq!(first.bytes, 2048);
+    assert!(retain_partial_write(
+        &mut port.ext,
+        data.len() as u32,
+        first
+    ));
+
+    // Conditions that would normally hold or correct a new graph buffer must
+    // not discard or splice this accepted buffer's remaining bytes.
+    port.ext.xrun_timestamp = 1;
+    free_space(r, data.len());
+    let tail = &data[port.ext.pending_offset as usize..];
+    let written = write_retained_tail(&mut port, tail).unwrap();
+    assert_eq!(written.bytes, tail.len() as isize);
+    assert_eq!(port.ext.xrun_timestamp, 1);
+
+    let queued = drain(r);
+    assert_eq!(queued.len(), capacity - 2048);
+    assert_eq!(&queued[queued.len() - tail.len()..], tail);
+    unsafe { libc::close(r) };
+}
+
+#[test]
+fn releasing_a_partial_write_closes_its_open_frame() {
+    let (r, w) = pipe_pair(true, true);
+    let mut port = test_port(w, 4096, 2048);
+    port.dsp.write_silence(0);
+    fill_pipe(w);
+    free_space(r, 2046);
+
+    let data = pattern(4096, 22);
+    let first = port.dsp.write(&data);
+    assert_eq!(first.bytes, 2046);
+    assert!(retain_partial_write(
+        &mut port.ext,
+        data.len() as u32,
+        first
+    ));
+
+    // A hard-error/drop path releases this host buffer. Its six accepted
+    // bytes of the final frame are completed with format silence, not bytes
+    // from the next graph buffer.
+    free_space(r, 2);
+    let mut result = 0;
+    release_input(&mut port, &mut result);
+    assert_eq!(port.ext.pending_offset, 0);
+
+    let queued = drain(r);
+    assert_eq!(&queued[queued.len() - 2..], &[0, 0]);
+    unsafe { libc::close(r) };
+}
+
+#[test]
+fn changed_retained_buffer_closes_its_open_frame() {
+    let (r, w) = pipe_pair(true, true);
+    let mut port = test_port(w, 4096, 2048);
+    port.dsp.write_silence(0);
+    let data = pattern(4096, 24);
+
+    for (old_id, new_id, new_size) in [(7, 8, data.len()), (9, 9, 1024)] {
+        fill_pipe(w);
+        free_space(r, 2046);
+        assert_eq!(prepare_pending_write(&mut port, old_id, data.len()), 0);
+        let first = port.dsp.write(&data);
+        assert_eq!(first.bytes, 2046);
+        assert!(retain_partial_write(
+            &mut port.ext,
+            data.len() as u32,
+            first
+        ));
+
+        free_space(r, 2);
+        assert_eq!(prepare_pending_write(&mut port, new_id, new_size), 0);
+        assert_eq!(port.ext.pending_buffer, Some(new_id));
+        assert_eq!(port.ext.pending_offset, 0);
+
+        let queued = drain(r);
+        assert_eq!(&queued[queued.len() - 2..], &[0, 0]);
+    }
+    unsafe { libc::close(r) };
+}
+
+#[test]
+fn freewheel_closes_an_abandoned_partial_frame() {
+    let (r, w) = pipe_pair(true, true);
+    let mut port = test_port(w, 4096, 2048);
+    port.dsp.write_silence(0);
+    fill_pipe(w);
+    free_space(r, 2046);
+
+    let data = pattern(4096, 23);
+    let first = port.dsp.write(&data);
+    assert_eq!(first.bytes, 2046);
+    assert!(retain_partial_write(
+        &mut port.ext,
+        data.len() as u32,
+        first
+    ));
+
+    free_space(r, 2);
+    consume_freewheel_input(&mut port);
+    assert_eq!(port.ext.pending_offset, 0);
+    let queued = drain(r);
+    assert_eq!(&queued[queued.len() - 2..], &[0, 0]);
     unsafe { libc::close(r) };
 }
 
@@ -341,8 +507,8 @@ fn retune_snap_then_data_drops_whole_frames_on_a_near_full_ring() {
     // short write, the tail dropped as whole frames
     let data = pattern(2048, 3);
     let n = port.dsp.write(&data);
-    assert_eq!(n, 1024);
-    assert_eq!(n % 8, 0);
+    assert_eq!(n.bytes, 1024);
+    assert_eq!(n.bytes % 8, 0);
 
     let out = drain(r);
     assert_eq!(out.len(), capacity); // filler + snap zeroes + data head

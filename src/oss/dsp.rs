@@ -277,6 +277,23 @@ fn now_ns_libc() -> u64 {
     (now.tv_sec * libspa::sys::SPA_NSEC_PER_SEC as i64 + now.tv_nsec) as u64
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PlaybackWrite {
+    pub bytes: ssize_t,
+    pub error: Option<Errno>,
+}
+
+impl PlaybackWrite {
+    pub(crate) fn consumed(bytes: ssize_t) -> Self {
+        Self { bytes, error: None }
+    }
+
+    pub(crate) fn would_block(&self) -> bool {
+        (self.bytes < 0 && self.error == Some(Errno::EAGAIN))
+            || (self.bytes == 0 && (self.error.is_none() || self.error == Some(Errno::EAGAIN)))
+    }
+}
+
 pub(crate) struct DspWriter {
     pub path: String,
     pub hw_quantum_ns: u64, // the hardware drain quantum (sndstat); 0 = fragment-accurate
@@ -447,64 +464,116 @@ impl DspWriter {
     /// fd is O_NONBLOCK and chn_write is byte-granular: a short return can
     /// split a frame, after which the kernel parses every later sample offset
     /// by the remainder - loud static with the audio faintly underneath. A
-    /// split frame is completed from `buf` (the true continuation bytes) with
-    /// a bounded retry; the ring drains continuously, so the few missing bytes
-    /// fit within microseconds. Returns the frame-aligned byte count consumed
-    /// from `buf` (callers drop only whole frames).
-    pub(crate) fn write(&mut self, buf: &[u8]) -> ssize_t {
+    /// split frame is completed from the next `buf` slice (the true
+    /// continuation bytes) with a bounded retry; the ring drains continuously,
+    /// so the few missing bytes fit within microseconds. The result counts only
+    /// bytes accepted from this slice and preserves errno at the write(2)
+    /// boundary, before debug diagnostics can issue more ioctls. Callers retain
+    /// the unaccepted suffix and pass it back on the next call.
+    pub(crate) fn write(&mut self, buf: &[u8]) -> PlaybackWrite {
         let count = buf.len() as u32;
         if self.state == DspState::Setup {
             self.state = DspState::Running;
         }
-        let ret = if !self.realign_stream() {
-            -1 // a previously split frame couldn't be closed; don't compound it
-        } else {
-            let n = self.write_buffered(buf);
-            if n > 0 {
-                let mut done = n as u32;
-                if self.frame_off != 0 && done < count {
-                    // never read past the caller's buffer: an unaligned `count` that
-                    // wrote fully leaves the split for the next call's zero realign
-                    let need = (self.stride - self.frame_off).min(count - done);
-                    done += self.write_exact(&buf[done as usize..(done + need) as usize]);
-                    // on failure frame_off holds the split; the next call realigns
-                }
-                done as ssize_t
-            } else {
-                n
+        let mut done = 0u32;
+        let mut error = None;
+        let mut frame_complete = true;
+
+        // A prior short write left the device in the middle of this PCM
+        // frame. The retained input suffix starts with its missing bytes, so
+        // finish it from real audio before presenting another bulk write.
+        if self.frame_off != 0 && count != 0 {
+            let need = (self.stride - self.frame_off).min(count);
+            let tail = self.write_exact(&buf[..need as usize]);
+            done = tail.bytes.max(0) as u32;
+            if done < need {
+                error = tail.error;
+                frame_complete = false;
             }
-        };
+        }
+
+        if frame_complete && done < count {
+            let first = self.write_buffered(&buf[done as usize..]);
+            if first.bytes <= 0 {
+                error = first.error;
+            } else {
+                done += first.bytes as u32;
+                if self.frame_off != 0 && done < count {
+                    // Complete only the split frame here. Any whole-frame
+                    // suffix stays in the caller's retained buffer and can be
+                    // retried after the next device drain.
+                    let need = (self.stride - self.frame_off).min(count - done);
+                    let tail = self.write_exact(&buf[done as usize..(done + need) as usize]);
+                    done += tail.bytes.max(0) as u32;
+                    if tail.bytes < need as ssize_t {
+                        error = tail.error;
+                    }
+                }
+            }
+        }
+
         // a trigger-suspended channel starts once real data is buffered
         self.arm();
-        ret
+        PlaybackWrite {
+            bytes: done as ssize_t,
+            error: if done < count { error } else { None },
+        }
     }
 
-    // close an open frame with format silence (one corrupt sample beats a
-    // permanently misaligned stream); true = the stream is back on a frame boundary
-    fn realign_stream(&mut self) -> bool {
+    // Synthetic fill has no real continuation to retain. Close an open frame
+    // with format silence before writing more silence; this path is used only
+    // after recovery deliberately chose synthetic audio over continuity.
+    fn realign_with_silence(&mut self) -> Result<(), Option<Errno>> {
         if self.frame_off != 0 {
             let need = self.stride - self.frame_off;
             let silence = self.silence_buffer();
-            self.write_exact(&silence[..need as usize]);
+            let result = self.write_exact(&silence[..need as usize]);
+            if self.frame_off != 0 {
+                return Err(result.error);
+            }
         }
-        self.frame_off == 0
+        Ok(())
+    }
+
+    /// End a retained input sequence before its backing buffer disappears.
+    /// Complete an open PCM frame with format silence so the next sequence
+    /// starts on a frame boundary. If the channel cannot accept that small
+    /// tail, reset its ring instead.
+    pub(crate) fn end_buffer_sequence(&mut self) {
+        if self.frame_off == 0 {
+            return;
+        }
+        if self.state != DspState::Running {
+            // Setup and Closed own no accepted stream bytes. Their normal
+            // transitions also clear frame_off; keep this boundary robust if
+            // a future path reaches it with stale bookkeeping.
+            self.frame_off = 0;
+            return;
+        }
+        if self.realign_with_silence().is_ok() {
+            return;
+        }
+        let _ = self.suspend();
     }
 
     // push exactly `count` bytes (a partial frame's tail), waiting out EAGAIN
     // briefly: at audio rates the ring frees a byte every few microseconds, so
     // the tail fits well inside the retry budget - unless the channel is
     // trigger-suspended and nothing drains, where waiting is pointless.
-    fn write_exact(&mut self, buf: &[u8]) -> u32 {
+    fn write_exact(&mut self, buf: &[u8]) -> PlaybackWrite {
         let count = buf.len() as u32;
         let mut done = 0u32;
         let mut tries = 0;
+        let mut error = None;
         while done < count {
-            let n = self.write_buffered(&buf[done as usize..]);
-            if n > 0 {
-                done += n as u32;
+            let attempt = self.write_buffered(&buf[done as usize..]);
+            if attempt.bytes > 0 {
+                done += attempt.bytes as u32;
+                error = None;
                 continue;
             }
-            if (n < 0 && Errno::last() != Errno::EAGAIN) || self.needs_trigger {
+            error = attempt.error;
+            if (attempt.bytes < 0 && error != Some(Errno::EAGAIN)) || self.needs_trigger {
                 break;
             }
             tries += 1;
@@ -521,10 +590,13 @@ impl DspWriter {
             };
             unsafe { libc::nanosleep(&ts, std::ptr::null_mut()) };
         }
-        done
+        PlaybackWrite {
+            bytes: done as ssize_t,
+            error: if done < count { error } else { None },
+        }
     }
 
-    fn write_buffered(&mut self, buf: &[u8]) -> ssize_t {
+    fn write_buffered(&mut self, buf: &[u8]) -> PlaybackWrite {
         let count = buf.len() as u32;
         if self.state == DspState::Setup {
             self.state = DspState::Running;
@@ -537,6 +609,7 @@ impl DspWriter {
         let delay = odelay(self.raw_fd());
 
         let nbytes = unsafe { libc::write(self.raw_fd(), buf.as_ptr().cast(), count as size_t) };
+        let error = (nbytes < 0).then(Errno::last);
         if nbytes > 0 {
             // frame phase of the stream: every accepted byte counts, whoever wrote it
             self.frame_off = (self.frame_off + nbytes as u32) % self.stride.max(1);
@@ -561,7 +634,10 @@ impl DspWriter {
             self.prev_ns = now;
         }
 
-        nbytes
+        PlaybackWrite {
+            bytes: nbytes,
+            error,
+        }
     }
 
     pub(crate) fn write_silence(&mut self, mut count: u32) {
@@ -570,7 +646,7 @@ impl DspWriter {
         if self.state == DspState::Setup {
             self.state = DspState::Running;
         }
-        if !self.realign_stream() {
+        if self.realign_with_silence().is_err() {
             return;
         }
         // whole frames only: callers derive `count` from byte-granular ioctls
@@ -582,23 +658,23 @@ impl DspWriter {
         // The fd is O_NONBLOCK, so a
         // short write or EAGAIN is normal; prime best-effort rather than asserting and
         // panicking out of the `extern "C"` callback (which aborts the process).
-        // An early break can leave a frame split; frame_off records it and the
-        // next write's realign closes it with the format's silence value.
+        // An early break can leave a frame split; frame_off records it. A
+        // later real write completes it from retained audio, while another
+        // synthetic fill closes it with the format's silence value.
         while count > 0 {
             let chunk = count.min(silence.len() as u32);
-            let nbytes = self.write_buffered(&silence[..chunk as usize]);
-            if nbytes < 0 {
-                let errno = Errno::last();
-                if errno != Errno::EAGAIN {
+            let result = self.write_buffered(&silence[..chunk as usize]);
+            if result.bytes < 0 {
+                if let Some(errno) = result.error.filter(|errno| *errno != Errno::EAGAIN) {
                     // EAGAIN is just a full buffer; surface anything else
                     eprintln!("{}: write_silence: {}", self.path, errno);
                 }
                 break;
             }
-            if nbytes == 0 {
+            if result.bytes == 0 {
                 break;
             }
-            count -= nbytes as u32;
+            count -= result.bytes as u32;
         }
     }
 
@@ -670,19 +746,22 @@ mod playback_tests {
         dsp.write_silence(8);
         assert_eq!(drain(r), vec![0x80; 8]);
 
-        // A short prior write can leave a frame split. Its repair bytes are
-        // silence too; 0x00 here would be a full-scale U8 sample.
+        // A synthetic fill after a short prior write repairs the open frame
+        // with biased silence; 0x00 here would be a full-scale U8 sample.
         dsp.frame_off = 1;
         dsp.write_silence(0);
         assert_eq!(drain(r), vec![0x80]);
         assert_eq!(dsp.frame_off, 0);
+
+        let data = [0x91, 0x92];
+        assert_eq!(dsp.write(&data).bytes, data.len() as isize);
+        assert_eq!(drain(r), data);
         unsafe { libc::close(r) };
     }
 
-    // The 2026-07-17 noise bug: a short write that splits a frame must never
-    // leave the device byte stream mid-sample - every sample after an
-    // unaligned boundary is stitched from two neighbors (white noise with the
-    // audio faintly underneath).
+    // A short write that splits a frame must not shift the device byte stream:
+    // every later sample would otherwise be stitched from two neighbors
+    // (white noise with the audio faintly underneath).
     #[test]
     fn short_write_keeps_stream_frame_aligned() {
         let (r, w) = pipe_pair(true, true);
@@ -697,24 +776,52 @@ mod playback_tests {
         // frame tail can't fit, and the split is recorded rather than dropped
         let a = pattern(4096, 1);
         let ret = dsp.write(&a);
-        assert_eq!(ret, 2046);
+        assert_eq!(ret.bytes, 2046);
         assert_eq!(dsp.frame_off, 6);
 
         let queued = drain(r); // remaining filler, then the accepted head
         assert_eq!(queued.len(), total_fill); // the 2046-byte hole was exactly refilled
         assert_eq!(&queued[queued.len() - 2046..], &a[..2046]);
 
-        // with space available again, the next write closes the split frame
-        // with zeros before any new data: the stream returns to a frame
-        // boundary instead of shifting every later sample
+        // With space available again, retry the untouched suffix. Its first
+        // two bytes complete the split frame, so no samples are dropped or
+        // replaced while the stream returns to a frame boundary.
+        let ret = dsp.write(&a[2046..]);
+        assert_eq!(ret.bytes, 2050);
+        assert_eq!(dsp.frame_off, 0);
+        assert_eq!(drain(r), &a[2046..]);
+
+        // The next graph buffer then starts on its natural frame boundary.
         let b = pattern(4096, 2);
         let ret = dsp.write(&b);
-        assert_eq!(ret, 4096);
+        assert_eq!(ret.bytes, 4096);
         assert_eq!(dsp.frame_off, 0);
-        let tail = drain(r);
-        assert_eq!(&tail[..2], &[0, 0]);
-        assert_eq!(&tail[2..], &b[..]);
-        assert_eq!((2046 + tail.len()) % 8, 0); // the stream is whole frames again
+        assert_eq!(drain(r), b);
+        unsafe { libc::close(r) };
+    }
+
+    #[test]
+    fn ending_a_buffer_sequence_does_not_stitch_it_to_the_next_one() {
+        let (r, w) = pipe_pair(true, true);
+        let mut dsp = super::DspWriter::test_on_fd(w, 8);
+
+        let total_fill = crate::oss::test_util::fill_pipe(w);
+        crate::oss::test_util::free_space(r, 2046);
+        let old = pattern(4096, 1);
+        assert_eq!(dsp.write(&old).bytes, 2046);
+        assert_eq!(dsp.frame_off, 6);
+        assert_eq!(drain(r).len(), total_fill);
+
+        // A buffer-pool replacement abandons old[2046..]. Close that frame
+        // with silence before bytes from the new pool reach the device.
+        dsp.end_buffer_sequence();
+        assert_eq!(dsp.frame_off, 0);
+
+        let new = pattern(4096, 2);
+        assert_eq!(dsp.write(&new).bytes, new.len() as isize);
+        let queued = drain(r);
+        assert_eq!(&queued[..2], &[0, 0]);
+        assert_eq!(&queued[2..], new);
         unsafe { libc::close(r) };
     }
 }

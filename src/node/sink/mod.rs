@@ -54,6 +54,10 @@ pub(crate) struct SinkPortExt {
     pub target_delay: u32,   // OSS buffer fill target in bytes, clamped to the granted buffer
     pub buffer_size: u32,    // granted OSS playback ring capacity in bytes
     pub period_mismatch: u32, // consecutive cycles at a different period (debounce)
+    // OSS may accept only a prefix from its nonblocking fd. Keep the host
+    // buffer until every byte is accepted, and resume at this byte offset.
+    pub pending_buffer: Option<u32>,
+    pub pending_offset: u32,
     // the rebuild-pending arm of retune_period can run every cycle; its own
     // limiter, because sharing port.warn_limit would let a persistent refusal
     // consume the dropped-bytes/underrun warnings' emission slots and fold
@@ -162,7 +166,7 @@ fn recover_or_hold(
     clock_nsec: u64,
     clock_flags: u32,
     data: &[u8],
-) -> isize {
+) -> crate::oss::PlaybackWrite {
     let size = data.len() as u32;
     if clock_nsec > port.ext.xrun_timestamp && clock_flags & SPA_IO_CLOCK_FLAG_XRUN_RECOVER == 0 {
         port.ext.xrun_timestamp = 0;
@@ -177,7 +181,7 @@ fn recover_or_hold(
 
         #[cfg(debug_assertions)]
         eprintln!(
-            "{}: re-priming with {} zeroes (odelay {})",
+            "{}: re-priming with {} bytes of silence (odelay {})",
             port.dsp.path, refill, odelay
         );
 
@@ -188,7 +192,7 @@ fn recover_or_hold(
         #[cfg(debug_assertions)]
         eprintln!("{}: skipping buffer @ {}", port.dsp.path, clock_nsec);
 
-        size as isize
+        crate::oss::PlaybackWrite::consumed(size as isize)
     }
 }
 
@@ -288,6 +292,85 @@ fn need_data(io: &mut crate::spa::IoArea<spa_io_buffers>, result: &mut c_int) {
     *result |= SPA_STATUS_NEED_DATA as i32;
 }
 
+fn clear_pending_write(ext: &mut SinkPortExt) {
+    ext.pending_buffer = None;
+    ext.pending_offset = 0;
+}
+
+fn end_input_sequence(port: &mut crate::node::Port<SinkDir>) {
+    // This buffer will no longer supply a retained suffix. Close any frame
+    // that its accepted prefix left open before a different buffer arrives.
+    let _ = port.dsp.end_buffer_sequence();
+    clear_pending_write(&mut port.ext);
+}
+
+fn release_input(port: &mut crate::node::Port<SinkDir>, result: &mut c_int) {
+    end_input_sequence(port);
+    need_data(&mut port.io, result);
+}
+
+fn consume_freewheel_input(port: &mut crate::node::Port<SinkDir>) {
+    end_input_sequence(port);
+    port.io.with(|io| io.status = SPA_STATUS_NEED_DATA as i32);
+}
+
+// Return the first byte OSS has not accepted from this host buffer. A new
+// buffer identity, or a chunk shorter than its previously accepted prefix,
+// invalidates the old offset and starts from the new slice's beginning.
+fn pending_write_offset(ext: &mut SinkPortExt, buffer_id: u32, size: usize) -> usize {
+    if ext.pending_buffer != Some(buffer_id) || ext.pending_offset as usize > size {
+        ext.pending_buffer = Some(buffer_id);
+        ext.pending_offset = 0;
+    }
+    ext.pending_offset as usize
+}
+
+fn prepare_pending_write(
+    port: &mut crate::node::Port<SinkDir>,
+    buffer_id: u32,
+    size: usize,
+) -> usize {
+    let changed = port.ext.pending_offset != 0
+        && (port.ext.pending_buffer != Some(buffer_id) || port.ext.pending_offset as usize > size);
+    if changed {
+        // HAVE_DATA normally preserves both identity and chunk size. If a
+        // host breaks that contract, close the accepted prefix before the
+        // replacement bytes can complete its open PCM frame.
+        end_input_sequence(port);
+    }
+    pending_write_offset(&mut port.ext, buffer_id, size)
+}
+
+// A positive short write is normal for FreeBSD's nonblocking chn_write: it
+// returns the bytes copied before the soft ring filled, without an errno.
+// Retain the untouched suffix; EAGAIN can accompany a prefix when a split
+// frame's bounded completion retry runs out of room.
+fn retain_partial_write(
+    ext: &mut SinkPortExt,
+    requested: u32,
+    write: crate::oss::PlaybackWrite,
+) -> bool {
+    if write.bytes > 0
+        && write.bytes < requested as isize
+        && (write.error.is_none() || write.error == Some(nix::errno::Errno::EAGAIN))
+    {
+        ext.pending_offset = ext.pending_offset.saturating_add(write.bytes as u32);
+        true
+    } else {
+        false
+    }
+}
+
+// Once OSS has accepted a prefix, the suffix is part of the same PCM byte
+// sequence. Finish it before any fill correction can skip it or insert
+// synthetic audio between the two pieces.
+fn write_retained_tail(
+    port: &mut crate::node::Port<SinkDir>,
+    data: &[u8],
+) -> Option<crate::oss::PlaybackWrite> {
+    (port.ext.pending_offset != 0).then(|| port.dsp.write(data))
+}
+
 fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
     state.ext.old_timestamp = state.ext.cur_timestamp;
     // on a failed clock read reuse the previous stamp (rate limits and the
@@ -302,7 +385,7 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
     // position is non-null on the process path (checked by on_timeout/process)
     if state.position.with_ref(|p| p.clock.flags).unwrap_or(0) & SPA_IO_CLOCK_FLAG_FREEWHEEL != 0 {
         for port in &mut state.ports {
-            port.io.with(|io| io.status = SPA_STATUS_NEED_DATA as i32);
+            consume_freewheel_input(port);
         }
         return SPA_STATUS_HAVE_DATA as i32;
     }
@@ -317,7 +400,7 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
         // still in flight skips the cycle.
         if crate::node::poll_rebuild(state, port_idx) {
             let port = &mut state.ports[port_idx];
-            need_data(&mut port.io, &mut result);
+            release_input(port, &mut result);
             continue;
         }
         let port = &mut state.ports[port_idx];
@@ -336,14 +419,14 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
             // an owned request and owns the pending claim)
             crate::node::queue_rebuild(state, port_idx);
             let port = &mut state.ports[port_idx];
-            need_data(&mut port.io, &mut result);
+            release_input(port, &mut result);
             continue;
         }
 
         if port.io.with_ref(|io| io.status) != Some(SPA_STATUS_HAVE_DATA as i32) {
             // no input this cycle (e.g. draining after stop); the clock (incl. the
             // draining delay) is published from on_timeout now, so just ask for data
-            need_data(&mut port.io, &mut result);
+            release_input(port, &mut result);
             continue;
         }
 
@@ -355,13 +438,22 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
         let Some(data_0) = (unsafe { crate::node::valid_data_block(port, buffer_id, &state.log) })
         else {
             // return status, not just io, so the host refills
-            need_data(&mut port.io, &mut result);
+            release_input(port, &mut result);
             continue;
         };
 
-        // the chunk-clamped view of the block, valid for this cycle
-        let cycle_data = data_0.input_slice();
-        let size = cycle_data.len() as u32;
+        // The chunk-clamped view remains valid for this cycle. A previous
+        // nonblocking write may have accepted only its prefix; retry exactly
+        // the untouched suffix while leaving io.status HAVE_DATA.
+        let input_data = data_0.input_slice();
+        let input_size = input_data.len() as u32;
+        let offset = prepare_pending_write(port, buffer_id, input_data.len());
+        let mut cycle_data = &input_data[offset..];
+        let mut size = cycle_data.len() as u32;
+        if size == 0 {
+            release_input(port, &mut result);
+            continue;
+        }
 
         debug_assert_eq!(data_0.chunk_stride(), stride as i32);
 
@@ -379,7 +471,12 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
 
         #[cfg(debug_assertions)]
         if state.log.log_level() >= SPA_LOG_LEVEL_TRACE {
-            crate::trace!(state.log, "chunk size: {}", size);
+            crate::trace!(
+                state.log,
+                "chunk size: {}, write offset: {}",
+                input_size,
+                offset
+            );
             // the slice head is in bounds by construction (input_slice)
             unsafe { spa_debug_mem(0, cycle_data.as_ptr().cast(), 16.min(size) as usize) };
         }
@@ -387,7 +484,7 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
         // position is non-null on the process path (checked by process); the
         // else arm is pure defense
         let Some(driver_clock) = state.position.with_ref(|p| p.clock) else {
-            need_data(&mut port.io, &mut result);
+            release_input(port, &mut result);
             continue;
         };
         let matching = state.following
@@ -398,18 +495,18 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
 
         // the resampler can legitimately hand us a few frames over a quantum; warn
         // rather than debug_assert!, which would abort the process (panic across the
-        // extern "C" boundary). The write path below caps and drops the excess.
+        // extern "C" boundary).
         // (u64 math for the same reason: a garbage host duration must not
         // overflow-panic the diagnostic that exists to report it)
         #[cfg(debug_assertions)]
         {
             let quantum_bytes = driver_clock.target_duration.saturating_mul(stride as u64);
-            if size as u64 > quantum_bytes {
+            if input_size as u64 > quantum_bytes {
                 crate::warn!(
                     state.log,
                     "{}: chunk size {} exceeds one quantum {}",
                     port.dsp.path,
-                    size,
+                    input_size,
                     quantum_bytes
                 );
             }
@@ -438,23 +535,31 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
             if pending {
                 let port = &mut state.ports[port_idx];
                 port.was_matching = false; // the gap invalidates matching history
-                need_data(&mut port.io, &mut result);
+                release_input(port, &mut result);
                 continue;
             }
-            // no main loop (unusual host): keep running at the stale size; the
-            // write path drops or underruns but nothing stalls or aborts
+            // No main loop (unusual host): continue at the stale geometry;
+            // normal backpressure and underrun handling remain available.
         }
         // re-borrow: the retune arm above may have borrowed the whole State
         let port = &mut state.ports[port_idx];
 
         if !port.dsp.is_running() {
+            // A trigger suspend or replacement discarded the accepted prefix
+            // along with the OSS queue. Replay this host buffer from byte zero
+            // after priming the fresh ring.
+            if port.ext.pending_offset != 0 {
+                port.ext.pending_offset = 0;
+                cycle_data = input_data;
+                size = input_size;
+            }
             if period_in_bytes == 0 {
                 // No usable position yet (the source's prime arm gates on the
                 // period the same way): priming now would commit setup_period
                 // == 0 and the channel would run with degenerate geometry that
                 // retune_period never corrects. Not ready this cycle; ask for
                 // data like the other not-ready paths.
-                need_data(&mut port.io, &mut result);
+                release_input(port, &mut result);
                 continue;
             }
             prime_playback(
@@ -480,7 +585,9 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
         }
 
         let mut corr: f64 = 1.0; // DLL rate correction, published through rate_match below
-        let nbytes = if port.ext.xrun_timestamp != 0 {
+        let write_result = if let Some(result) = write_retained_tail(port, cycle_data) {
+            result
+        } else if port.ext.xrun_timestamp != 0 {
             recover_or_hold(port, driver_clock.nsec, driver_clock.flags, cycle_data)
         } else {
             let mut skip_write = false;
@@ -498,7 +605,8 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
             }
 
             if skip_write {
-                size as isize // consumed; the device drains toward target meanwhile
+                // consumed; the device drains toward target meanwhile
+                crate::oss::PlaybackWrite::consumed(size as isize)
             } else {
                 port.dsp.write(cycle_data)
             }
@@ -519,17 +627,47 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
             }
         });
 
+        if write_result.would_block() {
+            crate::debug!(
+                state.log,
+                "{}: playback ring full; retaining {}-byte graph buffer at offset {}",
+                port.dsp.path,
+                input_size,
+                port.ext.pending_offset
+            );
+            // Keep io.status HAVE_DATA. The peer retains this exact input
+            // buffer and process() retries it after the device drains.
+            continue;
+        }
+
+        let nbytes = write_result.bytes;
+        if retain_partial_write(&mut port.ext, size, write_result) {
+            crate::debug!(
+                state.log,
+                "{}: playback accepted {} of {} bytes; retaining {}-byte tail",
+                port.dsp.path,
+                nbytes,
+                size,
+                size - nbytes as u32
+            );
+            // Keep io.status HAVE_DATA. The peer retains this exact input
+            // buffer, and pending_offset advances the next write to its tail.
+            continue;
+        }
+
         if nbytes < size as isize {
             if let Some(suppressed) = port.warn_limit.check(state.ext.cur_timestamp) {
                 crate::warn!(
                     state.log,
-                    "{}: dropped {} bytes (+{} warnings suppressed)",
+                    "{}: dropped {} bytes (write returned {}, error {:?}) (+{} warnings suppressed)",
                     port.dsp.path,
                     if nbytes > 0 {
                         size - nbytes as u32
                     } else {
                         size
                     },
+                    nbytes,
+                    write_result.error,
                     suppressed
                 );
             }
@@ -537,7 +675,7 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
 
         // a sink has no output, so the return bit is NEED_DATA ("can accept input
         // next cycle"), matching the port io status, not HAVE_DATA.
-        need_data(&mut port.io, &mut result);
+        release_input(port, &mut result);
     }
 
     result
@@ -667,10 +805,16 @@ impl Direction for SinkDir {
     }
 
     fn on_device_swapped(state: &mut DataState<SinkDir>, port_idx: usize) {
-        state.ports[port_idx].ext.xrun_timestamp = 0;
+        let ext = &mut state.ports[port_idx].ext;
+        ext.xrun_timestamp = 0;
+        clear_pending_write(ext);
     }
 
-    fn on_buffers_swapped(_state: &mut DataState<SinkDir>, _port_idx: usize) {}
+    fn on_buffers_swapped(state: &mut DataState<SinkDir>, port_idx: usize) {
+        let port = &mut state.ports[port_idx];
+        port.dsp.end_buffer_sequence();
+        clear_pending_write(&mut port.ext);
+    }
 
     fn on_start_loop(state: &mut DataState<SinkDir>) {
         for port in &mut state.ports {
@@ -689,7 +833,11 @@ impl Direction for SinkDir {
         state.ext.old_timestamp = 0;
     }
 
-    fn on_suspend_loop(_state: &mut DataState<SinkDir>) {}
+    fn on_suspend_loop(state: &mut DataState<SinkDir>) {
+        for port in &mut state.ports {
+            clear_pending_write(&mut port.ext);
+        }
+    }
 
     fn on_role_flip(state: &mut DataState<SinkDir>) {
         // a role flip shifts the servo's measurement phase, not the fill:

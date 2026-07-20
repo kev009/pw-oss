@@ -487,8 +487,8 @@ mod tests {
         let mut placeholders = replace_port_devices(&mut ports, devices);
 
         assert!(!ports[0].rebuild_pending);
-        assert_eq!(ports[0].dsp.write(&[2; 8]), 8);
-        assert_eq!(placeholders[0].write(&[1; 8]), 8);
+        assert_eq!(ports[0].dsp.write(&[2; 8]).bytes, 8);
+        assert_eq!(placeholders[0].write(&[1; 8]).bytes, 8);
         assert_eq!(crate::oss::test_util::drain(new_read), [2; 8]);
         assert_eq!(crate::oss::test_util::drain(old_read), [1; 8]);
 
