@@ -104,7 +104,7 @@ fn oversized_delay_is_capped_and_reported() {
 fn recovery_reprimes_then_writes_into_a_near_full_ring() {
     let (r, w) = pipe_pair(true, true);
     let mut port = test_port(w, 4096, 2048);
-    port.dsp.write_zeroes(0); // a recovering channel is already running
+    port.dsp.write_silence(0); // a recovering channel is already running
     port.ext.xrun_timestamp = 1_000;
 
     // near-full ring: room for the full re-prime (odelay reads 0 on a pipe,
@@ -137,7 +137,7 @@ fn recovery_reprimes_then_writes_into_a_near_full_ring() {
 fn recovery_holds_buffers_until_the_clock_passes_the_event() {
     let (r, w) = pipe_pair(true, true);
     let mut port = test_port(w, 4096, 2048);
-    port.dsp.write_zeroes(0);
+    port.dsp.write_silence(0);
     port.ext.xrun_timestamp = 5_000;
 
     let data = pattern(2048, 2);
@@ -193,7 +193,7 @@ fn underrun_threshold_tracks_lateness() {
 fn underrun_detection_arms_the_hold_once() {
     let (r, w) = pipe_pair(true, true);
     let mut port = test_port(w, 4096, 2048);
-    port.dsp.write_zeroes(0); // the gate runs on a running channel
+    port.dsp.write_silence(0); // the gate runs on a running channel
     port.config = Some(PortConfig {
         format: libspa::param::audio::AudioFormat::S16LE,
         rate: 48000,
@@ -289,7 +289,7 @@ fn same_device_level_correct_snaps_the_fill() {
 fn retune_recommits_in_place_and_snaps_the_fill() {
     let (r, w) = pipe_pair(true, true);
     let mut port = test_port(w, 4096, 2048);
-    port.dsp.write_zeroes(0); // a retuning channel is running
+    port.dsp.write_silence(0); // a retuning channel is running
     port.ext.buffer_size = 16384;
     let log = crate::spa::Log::test_null();
 
@@ -321,7 +321,7 @@ fn retune_recommits_in_place_and_snaps_the_fill() {
 fn retune_snap_then_data_drops_whole_frames_on_a_near_full_ring() {
     let (r, w) = pipe_pair(true, true);
     let mut port = test_port(w, 4096, 2048);
-    port.dsp.write_zeroes(0); // a retuning channel is running
+    port.dsp.write_silence(0); // a retuning channel is running
     port.ext.buffer_size = 16384;
     let log = crate::spa::Log::test_null();
 
@@ -362,7 +362,7 @@ fn retune_snap_then_data_drops_whole_frames_on_a_near_full_ring() {
 fn retune_requests_rebuild_when_the_suspend_is_refused() {
     let (r, w) = pipe_pair(true, true);
     let mut port = test_port(w, 4096, 2048);
-    port.dsp.write_zeroes(0);
+    port.dsp.write_silence(0);
     let log = crate::spa::Log::test_null();
 
     assert!(!retune_period(&mut port, 4096, 8, 0, 0, &log));

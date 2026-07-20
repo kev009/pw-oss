@@ -55,6 +55,24 @@ fn bounded_read_caps_catchup_and_pads_late_cycles() {
 }
 
 #[test]
+fn bounded_read_uses_biased_u8_silence() {
+    let (r, w) = pipe_pair(false, false);
+    let mut port = test_port(r, 16, 32);
+    port.config = Some(crate::node::PortConfig {
+        format: libspa::param::audio::AudioFormat::U8,
+        rate: 48000,
+        channels: 8,
+        positions: vec![],
+        flags: 0,
+        stride: 8,
+    });
+    let mut buf = [0u8; 16];
+    assert_eq!(bounded_read(&mut port, 0, &mut buf, 8), 16);
+    assert_eq!(buf, [0x80; 16]);
+    unsafe { libc::close(w) };
+}
+
+#[test]
 fn fill_targets_track_arrival_granularity() {
     for period in [1024u32, 4096, 16384, 65536] {
         for blocksize in [512u32, 1024, 2047, 2048, 16384, 65536] {

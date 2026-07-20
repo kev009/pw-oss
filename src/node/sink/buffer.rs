@@ -201,7 +201,7 @@ pub(super) fn retune_period(
         // the servo (or follower_servo's fill snap).
         let odelay = port.dsp.odelay();
         port.dsp
-            .write_zeroes(port.ext.target_delay.saturating_sub(odelay));
+            .write_silence(port.ext.target_delay.saturating_sub(odelay));
 
         crate::info!(
             log,
@@ -388,5 +388,5 @@ pub(super) fn prime_playback(
         );
     }
 
-    port.dsp.write_zeroes(port.ext.target_delay);
+    port.dsp.write_silence(port.ext.target_delay);
 }

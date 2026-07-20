@@ -228,6 +228,6 @@ pub(super) fn prime_capture(
     }
 
     let len = period_in_bytes.min(maxsize);
-    data[..len as usize].fill(0);
+    data[..len as usize].fill(silence_byte(port));
     len as isize
 }

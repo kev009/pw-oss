@@ -181,7 +181,7 @@ fn recover_or_hold(
             port.dsp.path, refill, odelay
         );
 
-        port.dsp.write_zeroes(refill);
+        port.dsp.write_silence(refill);
         // write the slice, not the period: only these bytes at the offset are owned
         port.dsp.write(data)
     } else {
@@ -221,7 +221,7 @@ fn follower_servo(
         port.bw_adapt.reset();
         if err_raw < 0.0 {
             port.dsp
-                .write_zeroes(port.ext.target_delay.saturating_sub(odelay));
+                .write_silence(port.ext.target_delay.saturating_sub(odelay));
         } else {
             skip_write = true;
         }
@@ -245,7 +245,7 @@ fn level_correct(port: &mut crate::node::Port<SinkDir>, odelay: u32) -> bool {
     let err_raw = odelay as f64 - port.ext.target_delay as f64;
     if err_raw < -(port.setup_period as f64) {
         port.dsp
-            .write_zeroes(port.ext.target_delay.saturating_sub(odelay));
+            .write_silence(port.ext.target_delay.saturating_sub(odelay));
     } else if err_raw > port.setup_period as f64 {
         return true;
     }
@@ -264,7 +264,12 @@ fn try_open_configure(
         return -(err as c_int);
     }
     // ditto for a device that won't take the format exactly
-    if let Err(err) = dsp.configure(config.oss_format(), config.channels, config.rate) {
+    if let Err(err) = dsp.configure(
+        config.oss_format(),
+        config.channels,
+        config.rate,
+        config.silence_byte(),
+    ) {
         crate::warn!(log, "{}: device rejected {:?}: {}", dsp.path, config, err);
         dsp.close();
         return -(err as c_int);

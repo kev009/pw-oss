@@ -99,6 +99,16 @@ impl PortConfig {
             .map(|(m, _)| m)
             .unwrap_or(0)
     }
+
+    pub(crate) fn silence_byte(&self) -> u8 {
+        // Every supported signed integer and float format represents silence
+        // with all-zero bits. Unsigned 8-bit PCM is biased around 0x80.
+        if self.format.0 == SPA_AUDIO_FORMAT_U8 {
+            0x80
+        } else {
+            0
+        }
+    }
 }
 
 // outcome of a per-(id, index) node param build (the enum_params hook)

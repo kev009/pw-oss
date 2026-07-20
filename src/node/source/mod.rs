@@ -41,6 +41,13 @@ pub(crate) struct SourcePortExt {
     pub was_freewheeling: bool, // freewheel active last cycle (re-prime on exit)
 }
 
+pub(super) fn silence_byte(port: &crate::node::Port<SourceDir>) -> u8 {
+    port.config
+        .as_ref()
+        .map(PortConfig::silence_byte)
+        .unwrap_or(0)
+}
+
 // The follower-servo phase, matching a foreign clock: the DLL serves rate
 // matching only (when driving, the servo runs in on_timeout where the clock
 // is published; a same-device follower has nothing to correct). `queued` is
@@ -90,7 +97,7 @@ fn follower_servo(
 // latency (an oversized chunk holds io.status HAVE_DATA, we skip the device
 // next cycle, it queues 2 periods, repeat) and pollutes the servo error. If
 // the device is late, keep the graph timeline stable: read only queued
-// bytes from the blocking fd and zero-pad the rest of the period instead of
+// bytes from the blocking fd and silence-pad the rest of the period instead of
 // returning an empty or short cycle.
 fn bounded_read(
     port: &mut crate::node::Port<SourceDir>,
@@ -121,7 +128,7 @@ fn bounded_read(
     let period = port.setup_period.min(maxsize);
     let out = if period > 0 { nread.max(period) } else { nread };
     if out > nread {
-        data[nread as usize..out as usize].fill(0);
+        data[nread as usize..out as usize].fill(silence_byte(port));
     }
     out as isize
 }
@@ -357,7 +364,7 @@ fn process_ports(state: &mut DataState<SourceDir>) -> c_int {
             // skips its reads); the ring overflows meanwhile and the exit edge
             // above re-primes when realtime resumes
             let len = period_in_bytes.min(cycle_data.len() as u32);
-            cycle_data[..len as usize].fill(0);
+            cycle_data[..len as usize].fill(silence_byte(port));
             len as isize
         } else if !port.ext.primed && period_in_bytes > 0 {
             prime_capture(

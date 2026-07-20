@@ -284,12 +284,14 @@ pub(crate) struct DspWriter {
     state: DspState,
     needs_trigger: bool, // trigger-suspended: writes buffer until armed
     stride: u32,         // negotiated frame bytes; the byte stream must stay frame-aligned
+    silence_byte: u8,    // 0x80 for biased U8 PCM; zero for every other supported format
     frame_off: u32,      // bytes into a frame a short write left the stream at (0 = aligned)
     #[cfg(debug_assertions)]
     prev_ns: u64,
 }
 
-static ZEROES: [u8; CHN_2NDBUFMAXSIZE] = [0u8; CHN_2NDBUFMAXSIZE];
+static ZERO_SILENCE: [u8; CHN_2NDBUFMAXSIZE] = [0; CHN_2NDBUFMAXSIZE];
+static U8_SILENCE: [u8; CHN_2NDBUFMAXSIZE] = [0x80; CHN_2NDBUFMAXSIZE];
 
 impl DspWriter {
     pub(crate) fn new(path: &str) -> Self {
@@ -300,6 +302,7 @@ impl DspWriter {
             state: DspState::Closed,
             needs_trigger: false,
             stride: 1,
+            silence_byte: 0,
             frame_off: 0,
             #[cfg(debug_assertions)]
             prev_ns: 0,
@@ -319,6 +322,14 @@ impl DspWriter {
             .as_ref()
             .expect("an active DSP writer state owns its descriptor")
             .raw()
+    }
+
+    fn silence_buffer(&self) -> &'static [u8; CHN_2NDBUFMAXSIZE] {
+        if self.silence_byte == 0x80 {
+            &U8_SILENCE
+        } else {
+            &ZERO_SILENCE
+        }
     }
 
     pub(crate) fn open(&mut self) -> Result<(), Errno> {
@@ -350,7 +361,7 @@ impl DspWriter {
     // (discarding queued audio, exactly like close's HALT) and sets NOTRIGGER
     // (writes only buffer until armed), and clears TRIGGERED so the next
     // prime's SETFRAGMENT is legal again; write() arms the channel once real
-    // data is buffered (write_zeroes only buffers, it never arms). false =
+    // data is buffered (write_silence only buffers, it never arms). false =
     // driver refused; the caller falls back to rebuilding.
     pub(crate) fn suspend(&mut self) -> bool {
         if self.state != DspState::Running {
@@ -378,12 +389,19 @@ impl DspWriter {
         }
     }
 
-    pub(crate) fn configure(&mut self, format: u32, channels: u32, rate: u32) -> Result<(), Errno> {
+    pub(crate) fn configure(
+        &mut self,
+        format: u32,
+        channels: u32,
+        rate: u32,
+        silence_byte: u8,
+    ) -> Result<(), Errno> {
         assert_eq!(self.state, DspState::Setup);
         // plain AFMT selector (no channel field), so this yields the sample width
         self.stride = afmt_frame_bytes(format)
             .max(1)
             .saturating_mul(channels.max(1));
+        self.silence_byte = silence_byte;
         set_value(self.raw_fd(), SNDCTL_DSP_SETFMT, format, 0)?;
         set_value(self.raw_fd(), SNDCTL_DSP_CHANNELS, channels, 0)?;
         set_value(self.raw_fd(), SNDCTL_DSP_SPEED, rate, feeder_rate_round())
@@ -461,12 +479,13 @@ impl DspWriter {
         ret
     }
 
-    // close an open frame with zeros (one corrupt sample beats a permanently
-    // misaligned stream); true = the stream is back on a frame boundary
+    // close an open frame with format silence (one corrupt sample beats a
+    // permanently misaligned stream); true = the stream is back on a frame boundary
     fn realign_stream(&mut self) -> bool {
         if self.frame_off != 0 {
             let need = self.stride - self.frame_off;
-            self.write_exact(&ZEROES[..need as usize]);
+            let silence = self.silence_buffer();
+            self.write_exact(&silence[..need as usize]);
         }
         self.frame_off == 0
     }
@@ -545,7 +564,7 @@ impl DspWriter {
         nbytes
     }
 
-    pub(crate) fn write_zeroes(&mut self, mut count: u32) {
+    pub(crate) fn write_silence(&mut self, mut count: u32) {
         // even a zero-length prime must leave the writer Running: callers assume
         // the space/underrun ioctls are usable after priming
         if self.state == DspState::Setup {
@@ -558,19 +577,21 @@ impl DspWriter {
         // (odelay through a vchan can sit mid-frame), and a split frame turns
         // every later sample into static
         count -= count % self.stride.max(1);
-        // chunk from ZEROES (`count` can exceed its len). The fd is O_NONBLOCK, so a
+        let silence = self.silence_buffer();
+        // Chunk from the static silence buffer (`count` can exceed its length).
+        // The fd is O_NONBLOCK, so a
         // short write or EAGAIN is normal; prime best-effort rather than asserting and
         // panicking out of the `extern "C"` callback (which aborts the process).
         // An early break can leave a frame split; frame_off records it and the
-        // next write's realign closes it with zeros.
+        // next write's realign closes it with the format's silence value.
         while count > 0 {
-            let chunk = count.min(ZEROES.len() as u32);
-            let nbytes = self.write_buffered(&ZEROES[..chunk as usize]);
+            let chunk = count.min(silence.len() as u32);
+            let nbytes = self.write_buffered(&silence[..chunk as usize]);
             if nbytes < 0 {
                 let errno = Errno::last();
                 if errno != Errno::EAGAIN {
                     // EAGAIN is just a full buffer; surface anything else
-                    eprintln!("{}: write_zeroes: {}", self.path, errno);
+                    eprintln!("{}: write_silence: {}", self.path, errno);
                 }
                 break;
             }
@@ -614,6 +635,7 @@ impl DspWriter {
             state: DspState::Setup,
             needs_trigger: false,
             stride,
+            silence_byte: 0,
             frame_off: 0,
             #[cfg(debug_assertions)]
             prev_ns: 0,
@@ -626,13 +648,34 @@ mod playback_tests {
     use crate::oss::test_util::{drain, pattern, pipe_pair};
 
     #[test]
-    fn write_zeroes_floors_to_frames() {
+    fn write_silence_floors_to_frames() {
         let (r, w) = pipe_pair(true, true);
         let mut dsp = super::DspWriter::test_on_fd(w, 8);
-        dsp.write_zeroes(2047); // odelay through a vchan can produce counts like this
+        dsp.write_silence(2047); // odelay through a vchan can produce counts like this
         let got = drain(r);
         assert_eq!(got.len(), 2040);
         assert!(got.iter().all(|&b| b == 0));
+        unsafe { libc::close(r) };
+    }
+
+    #[test]
+    fn u8_silence_uses_the_biased_midpoint() {
+        let (r, w) = pipe_pair(true, true);
+        let mut dsp = super::DspWriter::test_on_fd(w, 2);
+        // A pipe rejects the OSS format ioctl, but configure stores the
+        // negotiated frame geometry and silence byte before issuing it.
+        assert!(dsp.configure(super::AFMT_U8, 2, 48_000, 0x80).is_err());
+        assert_eq!(dsp.stride, 2);
+        assert_eq!(dsp.silence_byte, 0x80);
+        dsp.write_silence(8);
+        assert_eq!(drain(r), vec![0x80; 8]);
+
+        // A short prior write can leave a frame split. Its repair bytes are
+        // silence too; 0x00 here would be a full-scale U8 sample.
+        dsp.frame_off = 1;
+        dsp.write_silence(0);
+        assert_eq!(drain(r), vec![0x80]);
+        assert_eq!(dsp.frame_off, 0);
         unsafe { libc::close(r) };
     }
 
