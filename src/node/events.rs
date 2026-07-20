@@ -28,6 +28,7 @@ pub(super) struct NodeEvents<D: Direction> {
     pub(super) hooks: crate::spa::ListenerList<spa_node_events>,
     info: std::sync::Mutex<EventInfo>,
     pending: std::sync::Mutex<PendingNodeNotifications>,
+    result_target: crate::spa::LocalListenerTarget<spa_node_events>,
     // Deferred main-loop delivery upgrades this weak self-reference before it
     // invokes listeners. The resulting Rc keeps the endpoint alive if a
     // listener synchronously destroys the node.
@@ -125,6 +126,7 @@ impl<D: Direction> NodeEvents<D> {
                 queue: std::collections::VecDeque::new(),
                 dispatching: false,
             }),
+            result_target: crate::spa::LocalListenerTarget::new(),
             self_weak: self_weak.clone(),
             format_publication: FormatPublication::new(),
             _direction: std::marker::PhantomData,
@@ -231,7 +233,11 @@ impl<D: Direction> NodeEvents<D> {
             }
         };
         let hooks = deferred.as_deref().unwrap_or(&self.hooks);
-        unsafe { hooks.with_isolated_listener(listener, events, data, || initial(hooks)) }
+        unsafe {
+            hooks.with_isolated_listener(listener, events, data, || {
+                self.result_target.scoped(hooks, || initial(hooks))
+            })
+        }
     }
 
     // SAFETY: no reference into the associated State may be live. Listener
@@ -341,7 +347,9 @@ impl<D: Direction> NodeEvents<D> {
 
     // SAFETY: no associated State reference may be live.
     pub(super) unsafe fn emit_result(&self, seq: c_int, result: &spa_result_node_params) {
-        crate::spa::node_emit_result(&self.hooks, seq, 0, SPA_RESULT_TYPE_NODE_PARAMS, result);
+        self.result_target.with_current(&self.hooks, |hooks| {
+            crate::spa::node_emit_result(hooks, seq, 0, SPA_RESULT_TYPE_NODE_PARAMS, result);
+        });
     }
 }
 

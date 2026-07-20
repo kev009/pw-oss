@@ -102,6 +102,7 @@ pub(crate) fn pod_prop(key: u32, value: libspa::pod::Value) -> libspa::pod::Prop
     libspa::pod::Property::new(key, value)
 }
 
+// An Int range choice (default, min, max).
 pub(crate) fn pod_int_range(default: i32, min: i32, max: i32) -> libspa::pod::Value {
     use libspa::pod::{ChoiceValue, Value};
     use libspa::utils::{Choice, ChoiceEnum, ChoiceFlags};
@@ -111,7 +112,6 @@ pub(crate) fn pod_int_range(default: i32, min: i32, max: i32) -> libspa::pod::Va
     )))
 }
 
-// an Int range choice (default, min, max)
 pub(crate) fn latency_info_default(
     direction: libspa::sys::spa_direction,
 ) -> libspa::sys::spa_latency_info {
@@ -242,10 +242,10 @@ pub(crate) fn process_latency_info_add(
 ) {
     info.min_quantum += process.quantum;
     info.max_quantum += process.quantum;
-    info.min_rate += process.rate;
-    info.max_rate += process.rate;
-    info.min_ns += process.ns;
-    info.max_ns += process.ns;
+    info.min_rate = info.min_rate.saturating_add(process.rate);
+    info.max_rate = info.max_rate.saturating_add(process.rate);
+    info.min_ns = info.min_ns.saturating_add(process.ns);
+    info.max_ns = info.max_ns.saturating_add(process.ns);
 }
 
 pub(crate) fn build_latency_offset_prop_info() -> Vec<u8> {
@@ -329,10 +329,10 @@ pub(crate) fn build_params_prop_info(
     }))
 }
 
-// Deserialize a host-supplied pod without trusting it: libspa's
-// deserializer divides by a pod-declared child size (Choice pods) and
-// pre-allocates from declared lengths, so a hostile pod can panic it -
-// which must not unwind across our extern "C" boundaries.
+// The SPA method contract vouches for the outer pod header and the byte extent
+// it declares. Inside that slice, nested sizes remain untrusted: libspa's
+// deserializer can divide by a Choice child size or pre-allocate from declared
+// lengths, and any resulting panic must not cross our extern "C" boundary.
 pub(crate) unsafe fn deserialize_pod(
     param: *const libspa::sys::spa_pod,
 ) -> Option<libspa::pod::Value> {
@@ -358,6 +358,43 @@ pub(crate) fn parse_back(pod: &[u8]) -> libspa::pod::Value {
 
 #[cfg(test)]
 mod pod_tests {
+    #[test]
+    fn process_latency_add_saturates_host_controlled_integers() {
+        use libspa::sys::SPA_DIRECTION_OUTPUT;
+
+        let mut upper = super::latency_info_default(SPA_DIRECTION_OUTPUT);
+        upper.min_rate = 1;
+        upper.max_rate = i32::MAX;
+        upper.min_ns = 1;
+        upper.max_ns = i64::MAX;
+        super::process_latency_info_add(
+            &libspa::sys::spa_process_latency_info {
+                quantum: 0.0,
+                rate: i32::MAX,
+                ns: i64::MAX,
+            },
+            &mut upper,
+        );
+        assert_eq!((upper.min_rate, upper.max_rate), (i32::MAX, i32::MAX));
+        assert_eq!((upper.min_ns, upper.max_ns), (i64::MAX, i64::MAX));
+
+        let mut lower = super::latency_info_default(SPA_DIRECTION_OUTPUT);
+        lower.min_rate = -1;
+        lower.max_rate = i32::MIN;
+        lower.min_ns = -1;
+        lower.max_ns = i64::MIN;
+        super::process_latency_info_add(
+            &libspa::sys::spa_process_latency_info {
+                quantum: 0.0,
+                rate: i32::MIN,
+                ns: i64::MIN,
+            },
+            &mut lower,
+        );
+        assert_eq!((lower.min_rate, lower.max_rate), (i32::MIN, i32::MIN));
+        assert_eq!((lower.min_ns, lower.max_ns), (i64::MIN, i64::MIN));
+    }
+
     #[test]
     fn latency_offset_props_parse_back_with_params_struct() {
         use libspa::pod::{Object, Value};

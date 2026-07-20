@@ -137,6 +137,56 @@ pub(crate) struct ListenerList<E: HookEvents> {
     _events: std::marker::PhantomData<E>,
 }
 
+// During a new listener's synchronous initial callbacks, its hook is isolated
+// from the active list. Direct result emissions must follow that isolated
+// cohort too, including through nested listener registration.
+pub(crate) struct LocalListenerTarget<E: HookEvents> {
+    current: std::cell::Cell<Option<std::ptr::NonNull<ListenerList<E>>>>,
+}
+
+struct LocalListenerTargetGuard<'a, E: HookEvents> {
+    target: &'a LocalListenerTarget<E>,
+    previous: Option<std::ptr::NonNull<ListenerList<E>>>,
+}
+
+impl<E: HookEvents> Drop for LocalListenerTargetGuard<'_, E> {
+    fn drop(&mut self) {
+        self.target.current.set(self.previous);
+    }
+}
+
+impl<E: HookEvents> LocalListenerTarget<E> {
+    pub(crate) fn new() -> Self {
+        Self {
+            current: std::cell::Cell::new(None),
+        }
+    }
+
+    pub(crate) fn scoped<R>(&self, hooks: &ListenerList<E>, apply: impl FnOnce() -> R) -> R {
+        let previous = self.current.replace(Some(std::ptr::NonNull::from(hooks)));
+        let _guard = LocalListenerTargetGuard {
+            target: self,
+            previous,
+        };
+        apply()
+    }
+
+    pub(crate) fn with_current<R>(
+        &self,
+        fallback: &ListenerList<E>,
+        apply: impl FnOnce(&ListenerList<E>) -> R,
+    ) -> R {
+        match self.current.get() {
+            Some(hooks) => {
+                // SAFETY: scoped() keeps the referenced list live until it
+                // restores this slot, and nested scopes restore in LIFO order.
+                apply(unsafe { hooks.as_ref() })
+            }
+            None => apply(fallback),
+        }
+    }
+}
+
 impl<E: HookEvents> ListenerList<E> {
     pub(crate) fn new() -> Self {
         let list = Box::new(std::cell::UnsafeCell::new(spa_hook_list {

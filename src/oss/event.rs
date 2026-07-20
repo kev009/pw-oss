@@ -103,7 +103,7 @@ impl SoundKqueue {
     }
 
     pub(crate) fn unregister_device(&mut self) -> Result<(), Errno> {
-        let Some((fd, filter)) = self.registered.take() else {
+        let Some((fd, filter)) = self.registered else {
             return Ok(());
         };
         match self.submit_change(kevent(
@@ -115,8 +115,11 @@ impl SoundKqueue {
         )) {
             // Closing a descriptor removes its knotes. Treat an already-gone
             // registration as the requested final state.
-            Err(Errno::ENOENT | Errno::EBADF) => Ok(()),
-            result => result,
+            Ok(()) | Err(Errno::ENOENT | Errno::EBADF) => {
+                self.registered = None;
+                Ok(())
+            }
+            Err(err) => Err(err),
         }
     }
 

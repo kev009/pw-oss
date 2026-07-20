@@ -221,16 +221,12 @@ pub(super) fn probe_routes(
 pub(super) fn common_description(pcm_devices: &[crate::oss::PcmDevice]) -> String {
     let mut common_desc = pcm_devices[0].desc.clone();
     for pcm_device in &pcm_devices[1..] {
-        let mut count = 0;
-
-        for (a, b) in common_desc.bytes().zip(pcm_device.desc.bytes()) {
-            if a == b {
-                count += 1;
-            } else {
-                break;
-            }
-        }
-
+        let count = common_desc
+            .chars()
+            .zip(pcm_device.desc.chars())
+            .take_while(|(a, b)| a == b)
+            .map(|(c, _)| c.len_utf8())
+            .sum();
         common_desc.truncate(count);
     }
 
@@ -239,4 +235,27 @@ pub(super) fn common_description(pcm_devices: &[crate::oss::PcmDevice]) -> Strin
     }
 
     common_desc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pcm(desc: &str) -> crate::oss::PcmDevice {
+        crate::oss::PcmDevice {
+            index: 0,
+            desc: desc.to_string(),
+            location: String::new(),
+            play: true,
+            rec: false,
+        }
+    }
+
+    #[test]
+    fn common_description_stops_at_a_utf8_character_boundary() {
+        assert_eq!(
+            common_description(&[pcm("Beyoncé DAC"), pcm("Beyoncê ADC")]),
+            "Beyonc"
+        );
+    }
 }

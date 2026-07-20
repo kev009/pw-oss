@@ -304,14 +304,16 @@ impl NodeInfo {
         result
     }
 
+    // SPA has no separate port-limit change bit; consumers read both maxima
+    // together with the node flags when FLAGS is set.
     pub(crate) fn set_max_input_ports(&mut self, max_ports: u32) {
         self.info.max_input_ports = max_ports;
-        self.info.change_mask |= SPA_NODE_CHANGE_MASK_FLAGS as u64; // does this field count as a flag?
+        self.info.change_mask |= SPA_NODE_CHANGE_MASK_FLAGS as u64;
     }
 
     pub(crate) fn set_max_output_ports(&mut self, max_ports: u32) {
         self.info.max_output_ports = max_ports;
-        self.info.change_mask |= SPA_NODE_CHANGE_MASK_FLAGS as u64; // does this field count as a flag?
+        self.info.change_mask |= SPA_NODE_CHANGE_MASK_FLAGS as u64;
     }
 
     pub(crate) fn set_flags(&mut self, flags: u64) {

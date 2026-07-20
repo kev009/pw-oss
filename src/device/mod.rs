@@ -324,8 +324,11 @@ unsafe extern "C" fn init(
     let log =
         unsafe { spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Log.as_ptr().cast()) }
             as *mut spa_log;
-    let log =
-        unsafe { crate::spa::Log::wrap(log, std::ptr::NonNull::new(&raw mut OSS_DEVICE_TOPIC)) };
+    let Some(log) =
+        (unsafe { crate::spa::Log::wrap(log, std::ptr::NonNull::new(&raw mut OSS_DEVICE_TOPIC)) })
+    else {
+        return -libc::EINVAL;
+    };
 
     // the main loop and system drive the mixer poll timer; both are optional -
     // without them external mixer changes just go unnoticed

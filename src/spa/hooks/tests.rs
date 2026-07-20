@@ -175,3 +175,28 @@ fn listener_list_emits_after_the_handle_moves() {
     moved.emit(|_events, data| seen.push(data as usize));
     assert_eq!(seen, [7]);
 }
+
+#[test]
+fn listener_target_restores_after_nesting_and_unwind() {
+    let fallback = ListenerList::<spa_node_events>::new();
+    let outer = ListenerList::<spa_node_events>::new();
+    let inner = ListenerList::<spa_node_events>::new();
+    let target = LocalListenerTarget::new();
+    let current_is = |expected: &ListenerList<spa_node_events>| {
+        target.with_current(&fallback, |current| std::ptr::eq(current, expected))
+    };
+
+    assert!(current_is(&fallback));
+    target.scoped(&outer, || {
+        assert!(current_is(&outer));
+        target.scoped(&inner, || assert!(current_is(&inner)));
+        assert!(current_is(&outer));
+    });
+    assert!(current_is(&fallback));
+
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        target.scoped(&outer, || panic!("injected listener target panic"));
+    }));
+    assert!(panicked.is_err());
+    assert!(current_is(&fallback));
+}

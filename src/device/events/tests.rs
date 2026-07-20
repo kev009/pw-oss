@@ -139,6 +139,7 @@ fn initial_device_transaction_finishes_before_reentrant_changes() {
 
 struct LateDeviceListener {
     seen: Vec<u32>,
+    results: Vec<c_int>,
 }
 
 unsafe extern "C" fn record_late_device_object(
@@ -149,6 +150,18 @@ unsafe extern "C" fn record_late_device_object(
     unsafe { &mut *data.cast::<LateDeviceListener>() }
         .seen
         .push(id);
+}
+
+unsafe extern "C" fn record_late_device_result(
+    data: *mut c_void,
+    seq: c_int,
+    _res: c_int,
+    _type: u32,
+    _result: *const c_void,
+) {
+    unsafe { &mut *data.cast::<LateDeviceListener>() }
+        .results
+        .push(seq);
 }
 
 struct AddDeviceListenerContext {
@@ -170,8 +183,17 @@ unsafe extern "C" fn add_device_listener_during_dispatch(
         return;
     }
     let events = unsafe { &*context.events };
-    let initial = |hooks: &crate::spa::ListenerList<spa_device_events>| unsafe {
-        events.emit_object_on(hooks, &DeviceObjectEvent::Removed { id: 3 });
+    let initial = |hooks: &crate::spa::ListenerList<spa_device_events>| {
+        unsafe { events.emit_object_on(hooks, &DeviceObjectEvent::Removed { id: 3 }) };
+        let result = spa_result_device_params {
+            id: SPA_PARAM_Profile,
+            index: 0,
+            next: 1,
+            param: std::ptr::null_mut(),
+        };
+        // A synchronous enum_params from this initial callback emits through
+        // the endpoint, not the cohort passed to the callback.
+        unsafe { events.emit_result(41, &result) };
     };
     unsafe {
         events.with_new_listener(
@@ -189,10 +211,14 @@ unsafe extern "C" fn add_device_listener_during_dispatch(
 #[test]
 fn device_listener_added_during_dispatch_starts_at_its_barrier() {
     let events = DeviceEvents::new();
-    let mut late = LateDeviceListener { seen: Vec::new() };
+    let mut late = LateDeviceListener {
+        seen: Vec::new(),
+        results: Vec::new(),
+    };
     let mut late_table: spa_device_events = unsafe { std::mem::zeroed() };
     late_table.version = SPA_VERSION_DEVICE_EVENTS;
     late_table.object_info = Some(record_late_device_object);
+    late_table.result = Some(record_late_device_result);
     let mut late_hook: spa_hook = unsafe { std::mem::zeroed() };
     let mut context = AddDeviceListenerContext {
         events: &events,
@@ -223,6 +249,7 @@ fn device_listener_added_during_dispatch_starts_at_its_barrier() {
 
     assert_eq!(context.seen, [1, 2, 4, 5]);
     assert_eq!(late.seen, [3, 4, 5]);
+    assert_eq!(late.results, [41]);
 }
 
 struct DoneBarrierContext {

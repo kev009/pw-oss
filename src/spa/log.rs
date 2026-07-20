@@ -22,21 +22,20 @@ impl Log {
     pub(crate) unsafe fn wrap(
         log: *mut spa_log,
         topic: Option<std::ptr::NonNull<spa_log_topic>>,
-    ) -> Self {
-        let logger = std::ptr::NonNull::new(log).expect("log should be initialized");
+    ) -> Option<Self> {
+        let logger = std::ptr::NonNull::new(log)?;
         // the vtable pointer is read once here; the vtable fields are read
         // per call through the raw pointer
         let funcs = unsafe { (*log).iface.cb.funcs };
-        let methods = std::ptr::NonNull::new(funcs.cast::<spa_log_methods>().cast_mut())
-            .expect("log methods should be initialized");
+        let methods = std::ptr::NonNull::new(funcs.cast::<spa_log_methods>().cast_mut())?;
         // no minimum-version assert: version 0 (predating the logt slot) is
         // accepted - log() gates every logt read on the vtable being v1+,
         // and the v0 `log` method covers the rest
-        Self {
+        Some(Self {
             logger,
             methods,
             topic,
-        }
+        })
     }
 
     pub(crate) fn log_level(&self) -> spa_log_level {
@@ -183,4 +182,17 @@ macro_rules! trace {
     ($log:expr, $($arg:tt)*) => {
         $crate::log!($log, SPA_LOG_LEVEL_TRACE, $($arg)*)
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_or_incomplete_log_support_is_rejected() {
+        assert!(unsafe { Log::wrap(std::ptr::null_mut(), None) }.is_none());
+
+        let mut logger = unsafe { std::mem::zeroed::<spa_log>() };
+        assert!(unsafe { Log::wrap(&raw mut logger, None) }.is_none());
+    }
 }

@@ -196,7 +196,9 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
     let log =
         unsafe { spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Log.as_ptr().cast()) }
             as *mut spa_log;
-    let log = unsafe { crate::spa::Log::wrap(log, Some(D::log_topic())) };
+    let Some(log) = (unsafe { crate::spa::Log::wrap(log, Some(D::log_topic())) }) else {
+        return -libc::EINVAL;
+    };
 
     let data_loop = unsafe {
         spa_support_find(

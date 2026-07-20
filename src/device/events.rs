@@ -11,6 +11,7 @@ pub(super) struct DeviceEvents {
     pub(super) hooks: crate::spa::ListenerList<spa_device_events>,
     pub(super) info: std::cell::RefCell<crate::spa::DeviceInfo>,
     pub(super) pending: crate::spa::LocalNotificationQueue<DeviceNotification>,
+    result_target: crate::spa::LocalListenerTarget<spa_device_events>,
 }
 
 pub(super) enum DeviceObjectEvent {
@@ -39,6 +40,7 @@ impl DeviceEvents {
             hooks: crate::spa::ListenerList::new(),
             info: std::cell::RefCell::new(crate::spa::DeviceInfo::new()),
             pending: crate::spa::LocalNotificationQueue::new(),
+            result_target: crate::spa::LocalListenerTarget::new(),
         }
     }
 
@@ -92,7 +94,9 @@ impl DeviceEvents {
 
     // SAFETY: as emit_info().
     pub(super) unsafe fn emit_result(&self, seq: c_int, result: &spa_result_device_params) {
-        crate::spa::dev_emit_result(&self.hooks, seq, 0, SPA_RESULT_TYPE_DEVICE_PARAMS, result);
+        self.result_target.with_current(&self.hooks, |hooks| {
+            crate::spa::dev_emit_result(hooks, seq, 0, SPA_RESULT_TYPE_DEVICE_PARAMS, result);
+        });
     }
 
     // SAFETY: as emit_info().
@@ -192,7 +196,11 @@ impl DeviceEvents {
             (DeviceNotification::ActivateListeners(hooks.clone()), hooks)
         });
         let hooks = deferred.as_deref().unwrap_or(&self.hooks);
-        unsafe { hooks.with_isolated_listener(listener, events, data, || initial(hooks)) }
+        unsafe {
+            hooks.with_isolated_listener(listener, events, data, || {
+                self.result_target.scoped(hooks, || initial(hooks))
+            })
+        }
     }
 
     // Claim the main-loop endpoint's dispatch turn. Reentrant methods append

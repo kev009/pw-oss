@@ -10,7 +10,8 @@ mod loop_api;
 mod params;
 
 pub(crate) use hooks::{
-    ListenerList, LocalDispatchGuard, LocalNotificationQueue, dev_emit_result, node_emit_result,
+    ListenerList, LocalDispatchGuard, LocalListenerTarget, LocalNotificationQueue, dev_emit_result,
+    node_emit_result,
 };
 #[cfg(debug_assertions)]
 pub(crate) use info::dump_spa_dict;

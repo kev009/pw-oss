@@ -57,12 +57,25 @@ fn node_notifications_preserve_fifo_order_under_reentrant_flush() {
 
 struct LateNodeListener {
     seen: Vec<u32>,
+    results: Vec<c_int>,
 }
 
 unsafe extern "C" fn record_late_node_info(data: *mut c_void, info: *const spa_node_info) {
     unsafe { &mut *data.cast::<LateNodeListener>() }
         .seen
         .push(unsafe { (*info).max_input_ports });
+}
+
+unsafe extern "C" fn record_late_node_result(
+    data: *mut c_void,
+    seq: c_int,
+    _res: c_int,
+    _type: u32,
+    _result: *const c_void,
+) {
+    unsafe { &mut *data.cast::<LateNodeListener>() }
+        .results
+        .push(seq);
 }
 
 struct AddNodeListenerContext {
@@ -91,6 +104,15 @@ unsafe extern "C" fn add_node_listener_during_dispatch(
                 unsafe { info(data, node.raw()) };
             }
         });
+        let result = spa_result_node_params {
+            id: SPA_PARAM_Props,
+            index: 0,
+            next: 1,
+            param: std::ptr::null_mut(),
+        };
+        // A synchronous enum_params from this initial callback emits through
+        // the endpoint, not the cohort passed to the callback.
+        unsafe { events.emit_result(42, &result) };
     };
     unsafe {
         events.with_new_listener(
@@ -113,10 +135,14 @@ fn node_listener_added_during_dispatch_starts_at_its_barrier() {
         node.fix_pointers();
         port.fix_pointers();
     });
-    let mut late = LateNodeListener { seen: Vec::new() };
+    let mut late = LateNodeListener {
+        seen: Vec::new(),
+        results: Vec::new(),
+    };
     let mut late_table: spa_node_events = unsafe { std::mem::zeroed() };
     late_table.version = SPA_VERSION_NODE_EVENTS;
     late_table.info = Some(record_late_node_info);
+    late_table.result = Some(record_late_node_result);
     let mut late_hook: spa_hook = unsafe { std::mem::zeroed() };
     let mut context = AddNodeListenerContext {
         events: std::rc::Rc::as_ptr(&events),
@@ -153,6 +179,7 @@ fn node_listener_added_during_dispatch_starts_at_its_barrier() {
         [3, 4, 5],
         "initial state, post-barrier change, then later change"
     );
+    assert_eq!(late.results, [42]);
 }
 
 struct ReentrantDoneContext {
