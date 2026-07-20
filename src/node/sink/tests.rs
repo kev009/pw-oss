@@ -1,7 +1,7 @@
 use super::{
     RetuneOutcome, SinkDir, SinkPortExt, consume_freewheel_input, detect_underrun, follower_servo,
     level_correct, pending_write_offset, prepare_pending_write, recover_or_hold, release_input,
-    retain_partial_write, retune_period, settle_target, write_retained_tail,
+    resume_playback, retain_partial_write, retune_period, settle_target, write_retained_tail,
 };
 use super::{
     buffer_request, buffer_required, desired_delay, fill_floor, predicted_next_fill, retune_seed,
@@ -209,6 +209,79 @@ fn steady_recovery_restores_the_full_live_target() {
 }
 
 #[test]
+fn resume_writes_the_first_buffer_without_an_xrun_hold() {
+    let (r, w) = pipe_pair(true, true);
+    let mut port = test_port(w, 4096, 2048);
+    port.dsp.write_silence(0);
+    port.ext.resuming = true;
+    let data = pattern(2048, 6);
+
+    // SKIP restored queued audio from the kernel shadow: append only real data,
+    // even if GETERROR counted the silence buffer draining while paused.
+    assert_eq!(
+        resume_playback(&mut port, 1024, 3, &data, &crate::spa::Log::test_null()).bytes,
+        data.len() as isize
+    );
+    assert!(!port.ext.resuming);
+    assert_eq!(port.ext.target_delay, 1024);
+    assert_eq!(drain(r), data);
+
+    // GETODELAY does not include the hardware buffer. With no driver xrun,
+    // zero soft fill still continues directly rather than inserting silence.
+    port.ext.resuming = true;
+    assert_eq!(
+        resume_playback(&mut port, 0, 0, &data, &crate::spa::Log::test_null()).bytes,
+        data.len() as isize
+    );
+    assert_eq!(port.ext.target_delay, 0);
+    assert_eq!(drain(r), data);
+    unsafe { libc::close(r) };
+}
+
+#[test]
+fn full_resume_write_remains_retryable() {
+    let (r, w) = pipe_pair(true, true);
+    let mut port = test_port(w, 4096, 2048);
+    port.dsp.write_silence(0);
+    let capacity = fill_pipe(w);
+    let data = pattern(2048, 10);
+    let log = crate::spa::Log::test_null();
+
+    port.ext.resuming = true;
+    let blocked = resume_playback(&mut port, 1024, 0, &data, &log);
+    assert!(blocked.would_block());
+    assert!(port.ext.resuming);
+    assert_eq!(port.ext.target_delay, 4096);
+
+    free_space(r, data.len());
+    let written = resume_playback(&mut port, 1024, 0, &data, &log);
+    assert_eq!(written.bytes, data.len() as isize);
+    assert_eq!(written.error, None);
+    assert!(!port.ext.resuming);
+    let queued = drain(r);
+    assert_eq!(queued.len(), capacity);
+    assert_eq!(&queued[queued.len() - data.len()..], data);
+    unsafe { libc::close(r) };
+}
+
+#[test]
+fn short_resume_seeds_from_bytes_the_device_accepted() {
+    let (r, w) = pipe_pair(true, true);
+    let mut port = test_port(w, 4096, 2048);
+    port.dsp.write_silence(0);
+    fill_pipe(w);
+    free_space(r, 1024);
+    let data = pattern(2048, 18);
+
+    port.ext.resuming = true;
+    let written = resume_playback(&mut port, 2048, 0, &data, &crate::spa::Log::test_null());
+    assert_eq!(written.bytes, 1024);
+    assert_eq!(port.ext.target_delay, 1024);
+    assert!(!port.ext.resuming);
+    unsafe { libc::close(r) };
+}
+
+#[test]
 fn partial_writes_advance_only_within_the_same_host_buffer() {
     let mut ext = SinkPortExt::default();
 
@@ -372,6 +445,26 @@ fn freewheel_closes_an_abandoned_partial_frame() {
     assert_eq!(port.ext.pending_offset, 0);
     let queued = drain(r);
     assert_eq!(&queued[queued.len() - 2..], &[0, 0]);
+    unsafe { libc::close(r) };
+}
+
+#[test]
+fn drained_resume_reprimes_and_writes_in_the_same_cycle() {
+    let (r, w) = pipe_pair(true, true);
+    let mut port = test_port(w, 4096, 2048);
+    port.dsp.write_silence(0);
+    port.ext.resuming = true;
+    let data = pattern(2048, 7);
+
+    assert_eq!(
+        resume_playback(&mut port, 0, 1, &data, &crate::spa::Log::test_null()).bytes,
+        data.len() as isize
+    );
+    assert!(!port.ext.resuming);
+    let out = drain(r);
+    assert_eq!(out.len(), 4096 + data.len());
+    assert!(out[..4096].iter().all(|&b| b == 0));
+    assert_eq!(&out[4096..], data);
     unsafe { libc::close(r) };
 }
 

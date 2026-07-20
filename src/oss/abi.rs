@@ -38,6 +38,8 @@ pub(super) const SNDCTL_DSP_GETODELAY: c_ulong =
 pub(super) const SNDCTL_DSP_GETERROR: c_ulong =
     nix::request_code_read!(b'P', 25, std::mem::size_of::<audio_errinfo>());
 pub(super) const SNDCTL_DSP_HALT: c_ulong = nix::request_code_none!(b'P', 0); // aka SNDCTL_DSP_RESET
+pub(super) const SNDCTL_DSP_SILENCE: c_ulong = nix::request_code_none!(b'P', 31);
+pub(super) const SNDCTL_DSP_SKIP: c_ulong = nix::request_code_none!(b'P', 32);
 pub(super) const SNDCTL_ENGINEINFO: c_ulong =
     nix::request_code_readwrite!(b'X', 12, std::mem::size_of::<oss_audioinfo>());
 
@@ -163,7 +165,11 @@ pub(super) fn set_trigger(fd: c_int, mask: c_int) -> bool {
 
 pub(super) fn odelay(fd: c_int) -> c_int {
     // e.g. the device was unplugged mid-stream
-    ioctl_int(fd, SNDCTL_DSP_GETODELAY, -1).unwrap_or(0)
+    try_odelay(fd).unwrap_or(0)
+}
+
+pub(super) fn try_odelay(fd: c_int) -> Result<c_int, Errno> {
+    ioctl_int(fd, SNDCTL_DSP_GETODELAY, -1).ok_or_else(Errno::last)
 }
 
 // The fragment size the driver actually granted, which need not match the
@@ -179,6 +185,19 @@ pub(super) fn get_error(fd: c_int) -> audio_errinfo {
     unsafe {
         ioctl_read::<audio_errinfo>(fd, SNDCTL_DSP_GETERROR).unwrap_or_else(|| std::mem::zeroed())
     }
+}
+
+// FreeBSD's paired pause operations: SILENCE saves the ready part of bufsoft
+// in its shadow buffer and substitutes format-correct silence; SKIP discards
+// the remaining pause silence and restores those saved samples. Keep the raw
+// no-argument ioctls here so callers cannot accidentally use generic OSS
+// SKIP's otherwise surprising "discard queued output" meaning on its own.
+pub(super) fn shadow_pause(fd: c_int) -> bool {
+    unsafe { libc::ioctl(fd, SNDCTL_DSP_SILENCE) != -1 }
+}
+
+pub(super) fn restore_shadow(fd: c_int) -> bool {
+    unsafe { libc::ioctl(fd, SNDCTL_DSP_SKIP) != -1 }
 }
 
 // frame bytes for a sound4 AFMT value (width by encoding bit, channels from

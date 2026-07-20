@@ -239,7 +239,11 @@ pub(super) unsafe extern "C" fn send_command<D: Direction>(
                 .swap(false, std::sync::atomic::Ordering::AcqRel);
             let data_stopped = std::sync::atomic::AtomicBool::new(false);
             let Some(deferred) = control.query(|state| {
+                let data_was_started = state.started;
                 state.started = false;
+                if data_was_started {
+                    D::on_pause_loop(state);
+                }
                 data_stopped.store(true, std::sync::atomic::Ordering::Release);
                 update_timers(state);
                 state.rebuild_takeover = true;

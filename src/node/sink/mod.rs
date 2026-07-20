@@ -55,6 +55,8 @@ pub(crate) struct SinkPortExt {
     pub target_goal: u32, // geometry target retained for rate-controlled settling and future primes
     pub buffer_size: u32, // granted OSS playback ring capacity in bytes
     pub period_mismatch: u32, // consecutive cycles at a different period (debounce)
+    pub resuming: bool,   // first real buffer after Pause must bypass generic xrun hold
+    pub rebuild_after_start: bool, // Pause could neither preserve nor reset this device
     // OSS may accept only a prefix from its nonblocking fd. Keep the host
     // buffer until every byte is accepted, and resume at this byte offset.
     pub pending_buffer: Option<u32>,
@@ -205,6 +207,53 @@ fn recover_or_hold(
 
         crate::oss::PlaybackWrite::consumed(size as isize)
     }
+}
+
+// The first real buffer after Pause is not an unexpected xrun. SKIP has already
+// restored the real audio that SILENCE moved into FreeBSD's shadow buffer; seed
+// the live target from that restored queue and write the current graph buffer
+// immediately instead of consuming it with the generic one-cycle xrun hold.
+// An empty queue plus a real driver underrun is the fallback for a Pause that
+// found no soft-buffer audio to shadow.
+fn resume_playback(
+    port: &mut crate::node::Port<SinkDir>,
+    queued: u32,
+    paused_underruns: u32,
+    data: &[u8],
+    log: &crate::spa::Log,
+) -> crate::oss::PlaybackWrite {
+    // GETODELAY excludes the hardware buffer, so zero soft fill by itself does
+    // not prove playback stopped. Require the driver's underrun count too;
+    // otherwise appending real data is the only gap-free choice.
+    let drained = queued == 0 && paused_underruns > 0;
+    if drained {
+        // A deliberate pause that lost its saved queue is a cold restart:
+        // restore the full configured goal before appending real audio.
+        port.ext.target_delay = port.ext.target_goal;
+        port.dll.init();
+        port.bw_adapt.reset();
+        crate::info!(
+            log,
+            "{}: playback queue drained while paused; re-priming",
+            port.dsp.path
+        );
+        port.dsp.write_silence(port.ext.target_delay);
+    }
+    let result = port.dsp.write(data);
+    if !drained && result.bytes > 0 {
+        // Preserve whatever real audio survived the pause as the live target.
+        // Seed from bytes OSS actually accepted: a blocked or short write must
+        // not claim that its unaccepted suffix is already queued.
+        port.ext.target_delay = port.ext.target_goal.min(predicted_next_fill(
+            queued,
+            result.bytes as u32,
+            port.setup_period,
+        ));
+    }
+    if !result.would_block() {
+        port.ext.resuming = false;
+    }
+    result
 }
 
 // Move a live-retuned fill target toward its geometry goal without splicing
@@ -450,6 +499,18 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
             continue;
         }
 
+        if port.ext.rebuild_after_start {
+            // Pause could neither preserve nor reset the old queue. Do not
+            // append audio behind unknown contents; replace the device first.
+            let queued = crate::node::queue_rebuild(state, port_idx);
+            let port = &mut state.ports[port_idx];
+            if queued {
+                port.ext.rebuild_after_start = false;
+            }
+            release_input(port, &mut result);
+            continue;
+        }
+
         if port.io.with_ref(|io| io.status) != Some(SPA_STATUS_HAVE_DATA as i32) {
             // no input this cycle (e.g. draining after stop); the clock (incl. the
             // draining delay) is published from on_timeout now, so just ask for data
@@ -574,6 +635,7 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
         // re-borrow: the retune arm above may have borrowed the whole State
         let port = &mut state.ports[port_idx];
 
+        let mut resumed_write = None;
         if !port.dsp.is_running() {
             // A trigger suspend or replacement discarded the accepted prefix
             // along with the OSS queue. Replay this host buffer from byte zero
@@ -592,6 +654,7 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
                 release_input(port, &mut result);
                 continue;
             }
+            port.ext.resuming = false;
             prime_playback(
                 port,
                 period_in_bytes,
@@ -600,6 +663,29 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
                 state.oss_fragment,
                 &state.log,
             );
+        } else if port.ext.resuming {
+            // GETERROR consumes any count accrued while deliberately paused.
+            // Do not turn it into a host xrun or discard this first resumed
+            // buffer.
+            let paused_underruns = port.dsp.underruns();
+            if paused_underruns > 0 {
+                crate::debug!(
+                    state.log,
+                    "{}: {} underruns accrued while paused",
+                    port.dsp.path,
+                    paused_underruns
+                );
+            }
+            if port.ext.pending_offset == 0 {
+                let queued = port.dsp.odelay();
+                resumed_write = Some(resume_playback(
+                    port,
+                    queued,
+                    paused_underruns,
+                    cycle_data,
+                    &state.log,
+                ));
+            }
         } else {
             let underruns = port.dsp.underruns();
             if underruns > 0 {
@@ -616,6 +702,8 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
 
         let mut corr: f64 = 1.0; // DLL rate correction, published through rate_match below
         let write_result = if let Some(result) = write_retained_tail(port, cycle_data) {
+            result
+        } else if let Some(result) = resumed_write {
             result
         } else if port.ext.xrun_timestamp != 0 {
             recover_or_hold(port, driver_clock.nsec, driver_clock.flags, cycle_data)
@@ -642,6 +730,9 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
                 port.dsp.write(cycle_data)
             }
         };
+        if port.ext.resuming && port.ext.pending_offset != 0 && !write_result.would_block() {
+            port.ext.resuming = false;
+        }
 
         // Rate-match only as a follower on a foreign clock: when driving, the
         // timer steering applies the correction, and a same-device follower ticks
@@ -838,6 +929,8 @@ impl Direction for SinkDir {
     fn on_device_swapped(state: &mut DataState<SinkDir>, port_idx: usize) {
         let ext = &mut state.ports[port_idx].ext;
         ext.xrun_timestamp = 0;
+        ext.resuming = false;
+        ext.rebuild_after_start = false;
         clear_pending_write(ext);
     }
 
@@ -848,8 +941,32 @@ impl Direction for SinkDir {
     }
 
     fn on_start_loop(state: &mut DataState<SinkDir>) {
+        let resumes_pause = !state.started;
         for port in &mut state.ports {
             port.ext.xrun_timestamp = 0;
+            let mut resume_running = resumes_pause
+                && !port.ext.rebuild_after_start
+                && port.dsp.is_running()
+                && port.setup_period != 0;
+            if resume_running {
+                if let Err(err) = port.dsp.resume() {
+                    crate::warn!(
+                        state.log,
+                        "{}: restoring paused playback: {}",
+                        port.dsp.path,
+                        err
+                    );
+                    // Do not append real audio behind a possibly full buffer
+                    // of pause silence. Reset in place so process() takes the
+                    // normal prime path; a refused reset requires replacement
+                    // before process() may write again.
+                    resume_running = false;
+                    if !port.dsp.suspend() {
+                        port.ext.rebuild_after_start = true;
+                    }
+                }
+            }
+            port.ext.resuming = resume_running;
             // Start recomputes `following`, and a role flip that happened
             // while stopped never went through on_role_flip (set_io only
             // detects flips while started): relock the same way, so e.g. a
@@ -864,8 +981,31 @@ impl Direction for SinkDir {
         state.ext.old_timestamp = 0;
     }
 
+    fn on_pause_loop(state: &mut DataState<SinkDir>) {
+        for port in &mut state.ports {
+            // A soft Pause preserves a partially accepted host buffer: SKIP
+            // restores its accepted prefix, and Start continues the suffix.
+            if let Err(err) = port.dsp.pause() {
+                crate::warn!(
+                    state.log,
+                    "{}: preserving playback for Pause: {}",
+                    port.dsp.path,
+                    err
+                );
+                // A failed SILENCE cannot provide pause semantics. Reset the
+                // ring so Start primes cleanly; if the device also refuses
+                // that, force replacement before another playback write.
+                if !port.dsp.suspend() {
+                    port.ext.rebuild_after_start = true;
+                }
+            }
+        }
+    }
+
     fn on_suspend_loop(state: &mut DataState<SinkDir>) {
         for port in &mut state.ports {
+            port.ext.resuming = false;
+            port.ext.rebuild_after_start = false;
             clear_pending_write(&mut port.ext);
         }
     }

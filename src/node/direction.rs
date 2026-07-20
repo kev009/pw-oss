@@ -171,6 +171,9 @@ pub(crate) trait Direction: Sized + 'static {
 
     // send_command(Start): direction-specific resets, on the data loop
     fn on_start_loop(state: &mut DataState<Self>);
+    // send_command(Pause): snapshot direction-specific live state before the
+    // device continues independently of graph processing.
+    fn on_pause_loop(_state: &mut DataState<Self>) {}
     // send_command(Suspend): direction-specific resets, on the data loop
     fn on_suspend_loop(state: &mut DataState<Self>);
     // set_io: the driver/follower role flipped on a live node

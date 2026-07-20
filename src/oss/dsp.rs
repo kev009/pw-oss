@@ -299,10 +299,11 @@ pub(crate) struct DspWriter {
     pub hw_quantum_ns: u64, // the hardware drain quantum (sndstat); 0 = fragment-accurate
     fd: Option<LibcFd>,
     state: DspState,
-    needs_trigger: bool, // trigger-suspended: writes buffer until armed
-    stride: u32,         // negotiated frame bytes; the byte stream must stay frame-aligned
-    silence_byte: u8,    // 0x80 for biased U8 PCM; zero for every other supported format
-    frame_off: u32,      // bytes into a frame a short write left the stream at (0 = aligned)
+    needs_trigger: bool,  // trigger-suspended: writes buffer until armed
+    pause_shadowed: bool, // SILENCE saved bufsoft; Start must pair it with SKIP
+    stride: u32,          // negotiated frame bytes; the byte stream must stay frame-aligned
+    silence_byte: u8,     // 0x80 for biased U8 PCM; zero for every other supported format
+    frame_off: u32,       // bytes into a frame a short write left the stream at (0 = aligned)
     #[cfg(debug_assertions)]
     prev_ns: u64,
 }
@@ -318,6 +319,7 @@ impl DspWriter {
             fd: None,
             state: DspState::Closed,
             needs_trigger: false,
+            pause_shadowed: false,
             stride: 1,
             silence_byte: 0,
             frame_off: 0,
@@ -371,6 +373,7 @@ impl DspWriter {
         );
         self.state = DspState::Closed;
         self.needs_trigger = false;
+        self.pause_shadowed = false;
         self.frame_off = 0;
     }
 
@@ -389,8 +392,50 @@ impl DspWriter {
         }
         self.state = DspState::Setup;
         self.needs_trigger = true;
+        self.pause_shadowed = false;
         self.frame_off = 0; // the ring reset discarded any split frame with it
         true
+    }
+
+    /// Pause without losing queued playback. FreeBSD moves the ready portion
+    /// of bufsoft into its shadow buffer and substitutes silence, allowing the
+    /// hardware side to keep running while graph processing is stopped. The
+    /// ioctl may wait for an in-progress channel write, so this is called only
+    /// from the serialized Pause handoff, never from process().
+    pub(crate) fn pause(&mut self) -> Result<(), Errno> {
+        self.pause_shadowed = false;
+        if self.state != DspState::Running {
+            return Ok(());
+        }
+        // FreeBSD refreshes the shadow length only when bufsoft has ready
+        // bytes. Do not arm a later SKIP for an empty queue: there is no audio
+        // to preserve, and the kernel shadow length may still describe an
+        // older/reset buffer.
+        if try_odelay(self.raw_fd())? <= 0 {
+            return Ok(());
+        }
+        if !shadow_pause(self.raw_fd()) {
+            return Err(Errno::last());
+        }
+        // SILENCE is a successful no-op if the soft ring drained between the
+        // observation above and the ioctl. Only arm SKIP when the post-SILENCE
+        // queue shows that FreeBSD actually installed the silence shadow.
+        self.pause_shadowed = try_odelay(self.raw_fd())? > 0;
+        Ok(())
+    }
+
+    /// Restore the queued samples saved by `pause`. This intentionally pairs
+    /// FreeBSD's SILENCE/SKIP operations; issuing SKIP independently has
+    /// different semantics in the generic OSS API. Like Pause, Start invokes
+    /// this only from its serialized data-loop handoff.
+    pub(crate) fn resume(&mut self) -> Result<(), Errno> {
+        if !std::mem::take(&mut self.pause_shadowed) {
+            return Ok(());
+        }
+        if !restore_shadow(self.raw_fd()) {
+            return Err(Errno::last());
+        }
+        Ok(())
     }
 
     // start a trigger-suspended channel with whatever is buffered
@@ -550,7 +595,7 @@ impl DspWriter {
             self.frame_off = 0;
             return;
         }
-        if self.realign_with_silence().is_ok() {
+        if !self.pause_shadowed && self.realign_with_silence().is_ok() {
             return;
         }
         let _ = self.suspend();
@@ -710,6 +755,7 @@ impl DspWriter {
             fd: Some(unsafe { LibcFd::from_raw(fd) }),
             state: DspState::Setup,
             needs_trigger: false,
+            pause_shadowed: false,
             stride,
             silence_byte: 0,
             frame_off: 0,
@@ -756,6 +802,27 @@ mod playback_tests {
         let data = [0x91, 0x92];
         assert_eq!(dsp.write(&data).bytes, data.len() as isize);
         assert_eq!(drain(r), data);
+        unsafe { libc::close(r) };
+    }
+
+    #[test]
+    fn empty_or_failed_shadow_pause_does_not_leave_a_stale_resume() {
+        let (r, w) = pipe_pair(true, true);
+        let mut dsp = super::DspWriter::test_on_fd(w, 8);
+        dsp.write_silence(0); // transition the test writer to Running
+
+        // A pipe rejects GETODELAY. A failed Pause must not make a later Start
+        // issue an unrelated SKIP against the descriptor.
+        assert!(dsp.pause().is_err());
+        assert!(!dsp.pause_shadowed);
+        assert!(dsp.resume().is_ok());
+
+        // Likewise, consume the pairing token before trying SKIP so a failure
+        // cannot replay the command on every later Start.
+        dsp.pause_shadowed = true;
+        assert!(dsp.resume().is_err());
+        assert!(!dsp.pause_shadowed);
+        assert!(dsp.resume().is_ok());
         unsafe { libc::close(r) };
     }
 
