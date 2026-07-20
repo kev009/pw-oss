@@ -7,11 +7,24 @@ on:
     branches: [master]
   pull_request:
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
 jobs:
   freebsd:
+    name: FreeBSD build and test
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Build and test on FreeBSD
         uses: vmactions/freebsd-vm@v1
         with:
@@ -24,9 +37,30 @@ jobs:
           prepare: |
             pkg install -y pkgconf rust pipewire llvm19
           run: |
+            set -eu
             export LIBCLANG_PATH=/usr/local/llvm19/lib
+            export CARGO_TERM_COLOR=always
+            export RUST_BACKTRACE=1
+
+            echo "==> rustc / cargo"
+            rustc --version
+            cargo --version
+
+            # Fail fast on style before spending time on builds.
+            echo "==> cargo fmt --check"
             cargo fmt --check
-            cargo build --release
-            cargo test
-            cargo test --release --all-targets
-            cargo clippy --all-targets -- -D warnings
+
+            # Clippy before tests: same compile work, clearer signal on nits.
+            echo "==> cargo clippy --locked --all-targets -D warnings"
+            cargo clippy --locked --all-targets -- -D warnings
+
+            # Explicit release artifact (ports / SPA plugin consumers care).
+            echo "==> cargo build --locked --release"
+            cargo build --locked --release
+
+            echo "==> cargo test --locked"
+            cargo test --locked
+
+            # Optimized path: timing / DLL / wake logic can differ under -O.
+            echo "==> cargo test --locked --release --all-targets"
+            cargo test --locked --release --all-targets
