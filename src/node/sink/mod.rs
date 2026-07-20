@@ -68,6 +68,19 @@ pub(crate) struct SinkPortExt {
     pub retune_limit: crate::node::RateLimit,
 }
 
+fn measured_fill(port: &crate::node::Port<SinkDir>) -> u32 {
+    crate::node::device_event_fill(port).unwrap_or_else(|| port.dsp.odelay())
+}
+
+fn measured_underruns(port: &mut crate::node::Port<SinkDir>) -> u32 {
+    if let Some(count) = crate::node::take_device_event_xruns(port) {
+        count
+    } else {
+        let total = port.dsp.underruns();
+        crate::node::take_fallback_xruns(port, total)
+    }
+}
+
 // The xrun-detection phase, on a running channel. The vchan mixer counts a
 // momentarily-short child as an xrun and pads it with silence
 // (feeder_mixer.c); with the fill still healthy that's accounting noise, not
@@ -116,7 +129,7 @@ fn detect_underrun(
         period_in_bytes,
         drained,
     );
-    let odelay_now = port.dsp.odelay();
+    let odelay_now = measured_fill(port);
     if odelay_now < low {
         if let Some(suppressed) = port.warn_limit.check(cur_timestamp) {
             crate::warn!(
@@ -189,7 +202,7 @@ fn recover_or_hold(
 
         // buffer's already sized; re-prime only up to target, accounting for what's
         // still queued (a full target_delay would push odelay past the buffer)
-        let odelay = port.dsp.odelay();
+        let odelay = measured_fill(port);
         let refill = port.ext.target_delay.saturating_sub(odelay);
 
         #[cfg(debug_assertions)]
@@ -270,7 +283,7 @@ fn settle_target(port: &mut crate::node::Port<SinkDir>, fill: u32, stride: u32) 
 }
 
 // The follower-servo phase, matching a foreign clock: the DLL serves rate
-// matching only (when driving, the servo runs in on_timeout where the clock
+// matching only (when driving, the servo runs at the device wake where the clock
 // is published, and a same-device follower has nothing to correct - updating
 // anyway would wind the integrator; ALSA gates the same way). `odelay` is
 // the fill the caller measured this cycle. Returns the rate correction and
@@ -307,7 +320,7 @@ fn follower_servo(
         let max_err = (port.setup_period as f64 / 2.0).max(256.0 * stride as f64);
         let err = err_raw.clamp(-max_err, max_err);
         corr = port.dll.update(err);
-        port.bw_adapt.update(&mut port.dll, err, nsec);
+        port.bw_adapt.update_fill(&mut port.dll, err, nsec);
     }
 
     #[cfg(debug_assertions)]
@@ -376,7 +389,9 @@ fn clear_pending_write(ext: &mut SinkPortExt) {
 fn end_input_sequence(port: &mut crate::node::Port<SinkDir>) {
     // This buffer will no longer supply a retained suffix. Close any frame
     // that its accepted prefix left open before a different buffer arrives.
-    let _ = port.dsp.end_buffer_sequence();
+    if port.dsp.end_buffer_sequence() {
+        crate::node::reset_device_event(port);
+    }
     clear_pending_write(&mut port.ext);
 }
 
@@ -458,7 +473,7 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
     // without touching the device. The io NEED_DATA + return HAVE_DATA pair
     // looks odd for a sink but matches alsa-pcm-sink.c:788-791; it is what
     // keeps the freewheel pump running.
-    // position is non-null on the process path (checked by on_timeout/process)
+    // position is non-null on the process path (checked by on_wake/process)
     if state.position.with_ref(|p| p.clock.flags).unwrap_or(0) & SPA_IO_CLOCK_FLAG_FREEWHEEL != 0 {
         for port in &mut state.ports {
             consume_freewheel_input(port);
@@ -513,7 +528,7 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
 
         if port.io.with_ref(|io| io.status) != Some(SPA_STATUS_HAVE_DATA as i32) {
             // no input this cycle (e.g. draining after stop); the clock (incl. the
-            // draining delay) is published from on_timeout now, so just ask for data
+            // draining delay) is published from on_wake now, so just ask for data
             release_input(port, &mut result);
             continue;
         }
@@ -664,10 +679,10 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
                 &state.log,
             );
         } else if port.ext.resuming {
-            // GETERROR consumes any count accrued while deliberately paused.
-            // Do not turn it into a host xrun or discard this first resumed
-            // buffer.
-            let paused_underruns = port.dsp.underruns();
+            // Consume the event-count delta accrued while deliberately
+            // paused. Do not turn it into a host xrun or discard this first
+            // resumed buffer.
+            let paused_underruns = measured_underruns(port);
             if paused_underruns > 0 {
                 crate::debug!(
                     state.log,
@@ -677,7 +692,7 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
                 );
             }
             if port.ext.pending_offset == 0 {
-                let queued = port.dsp.odelay();
+                let queued = measured_fill(port);
                 resumed_write = Some(resume_playback(
                     port,
                     queued,
@@ -687,7 +702,7 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
                 ));
             }
         } else {
-            let underruns = port.dsp.underruns();
+            let underruns = measured_underruns(port);
             if underruns > 0 {
                 detect_underrun(
                     port,
@@ -711,7 +726,7 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
             let mut skip_write = false;
             if !retuned && matching && port.setup_period != 0 && port.ext.period_mismatch == 0 {
                 (corr, skip_write) =
-                    follower_servo(port, port.dsp.odelay(), stride, state.ext.cur_timestamp);
+                    follower_servo(port, measured_fill(port), stride, state.ext.cur_timestamp);
             }
 
             if !retuned
@@ -720,7 +735,7 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
                 && port.setup_period != 0
                 && port.ext.period_mismatch == 0
             {
-                skip_write = level_correct(port, port.dsp.odelay());
+                skip_write = level_correct(port, measured_fill(port));
             }
 
             if skip_write {
@@ -927,6 +942,7 @@ impl Direction for SinkDir {
     }
 
     fn on_device_swapped(state: &mut DataState<SinkDir>, port_idx: usize) {
+        crate::node::reset_device_event(&mut state.ports[port_idx]);
         let ext = &mut state.ports[port_idx].ext;
         ext.xrun_timestamp = 0;
         ext.resuming = false;
@@ -936,7 +952,9 @@ impl Direction for SinkDir {
 
     fn on_buffers_swapped(state: &mut DataState<SinkDir>, port_idx: usize) {
         let port = &mut state.ports[port_idx];
-        port.dsp.end_buffer_sequence();
+        if port.dsp.end_buffer_sequence() {
+            crate::node::reset_device_event(port);
+        }
         clear_pending_write(&mut port.ext);
     }
 
@@ -961,7 +979,9 @@ impl Direction for SinkDir {
                     // normal prime path; a refused reset requires replacement
                     // before process() may write again.
                     resume_running = false;
-                    if !port.dsp.suspend() {
+                    if port.dsp.suspend() {
+                        crate::node::reset_device_event(port);
+                    } else {
                         port.ext.rebuild_after_start = true;
                     }
                 }
@@ -995,7 +1015,9 @@ impl Direction for SinkDir {
                 // A failed SILENCE cannot provide pause semantics. Reset the
                 // ring so Start primes cleanly; if the device also refuses
                 // that, force replacement before another playback write.
-                if !port.dsp.suspend() {
+                if port.dsp.suspend() {
+                    crate::node::reset_device_event(port);
+                } else {
                     port.ext.rebuild_after_start = true;
                 }
             }
@@ -1042,7 +1064,7 @@ impl Direction for SinkDir {
     // absolute delay is understated by bufhard; the servo only needs
     // cycle-to-cycle consistency and is unaffected.
     fn servo_fill(port: &mut crate::node::Port<SinkDir>) -> u32 {
-        let fill = port.dsp.odelay();
+        let fill = measured_fill(port);
         let stride = port.stride_rate().map(|(stride, _)| stride).unwrap_or(1);
         settle_target(port, fill, stride);
         fill
@@ -1054,6 +1076,16 @@ impl Direction for SinkDir {
 
     fn servo_err(port: &crate::node::Port<SinkDir>, fill: u32) -> f64 {
         fill as f64 - port.ext.target_delay as f64
+    }
+
+    fn wake_threshold(port: &crate::node::Port<SinkDir>) -> u32 {
+        // EVFILT_WRITE fires when free >= LOW_WATER. A healthy cycle wakes
+        // with target_delay queued, writes one period, then goes inactive
+        // until that period drains and the queue returns to the live target.
+        port.ext
+            .buffer_size
+            .saturating_sub(port.ext.target_delay)
+            .max(1)
     }
 
     fn process_ports(state: &mut DataState<SinkDir>) -> c_int {

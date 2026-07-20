@@ -41,6 +41,19 @@ pub(crate) struct SourcePortExt {
     pub was_freewheeling: bool, // freewheel active last cycle (re-prime on exit)
 }
 
+fn measured_fill(port: &crate::node::Port<SourceDir>) -> u32 {
+    crate::node::device_event_fill(port).unwrap_or_else(|| port.dsp.ispace_in_bytes().max(0) as u32)
+}
+
+fn measured_overruns(port: &mut crate::node::Port<SourceDir>) -> u32 {
+    if let Some(count) = crate::node::take_device_event_xruns(port) {
+        count
+    } else {
+        let total = port.dsp.overruns();
+        crate::node::take_fallback_xruns(port, total)
+    }
+}
+
 pub(super) fn silence_byte(port: &crate::node::Port<SourceDir>) -> u8 {
     port.config
         .as_ref()
@@ -49,7 +62,7 @@ pub(super) fn silence_byte(port: &crate::node::Port<SourceDir>) -> u8 {
 }
 
 // The follower-servo phase, matching a foreign clock: the DLL serves rate
-// matching only (when driving, the servo runs in on_timeout where the clock
+// matching only (when driving, the servo runs at the device wake where the clock
 // is published; a same-device follower has nothing to correct). `queued` is
 // the pre-read fill the caller measured this cycle. Returns the rate
 // correction.
@@ -82,7 +95,7 @@ fn follower_servo(
         let max_err = (port.setup_period as f64 / 2.0).max(256.0 * stride as f64);
         let err = err_raw.clamp(-max_err, max_err);
         corr = port.dll.update(err);
-        port.bw_adapt.update(&mut port.dll, err, now);
+        port.bw_adapt.update_fill(&mut port.dll, err, now);
     }
 
     #[cfg(debug_assertions)]
@@ -194,7 +207,11 @@ fn recover_overrun(
         // RESIZE the ring: a pinned ring may be one the current quantum
         // outgrew, and a Running channel silently skips the layout
         // re-application (a refused suspend just re-primes at the old size).
-        let _ = port.dsp.suspend();
+        if port.dsp.suspend() {
+            // The successful trigger reset starts a new kernel xrun epoch;
+            // the re-prime also reapplies SETFRAGMENT and LOW_WATER.
+            crate::node::reset_device_event(port);
+        }
         port.ext.primed = false;
         port.bw_adapt.reset();
         port.dll.init();
@@ -385,7 +402,7 @@ fn process_ports(state: &mut DataState<SourceDir>) -> c_int {
             // read (and the servo error) would then be biased by a fragment. The
             // priming pass already triggered the channel; GETISPACE doesn't need
             // the trigger.
-            let queued = port.dsp.ispace_in_bytes().max(0) as u32;
+            let queued = measured_fill(port);
             pre_read_fill = Some(queued);
             if queued == 0 {
                 crate::debug!(state.log, "capture: empty cycle (no data queued at wakeup)");
@@ -431,7 +448,7 @@ fn process_ports(state: &mut DataState<SourceDir>) -> c_int {
         }
 
         let overruns = if port.dsp.is_running() && !freewheel {
-            port.dsp.overruns()
+            measured_overruns(port)
         } else {
             0
         };
@@ -559,6 +576,7 @@ impl Direction for SourceDir {
 
     fn on_device_swapped(state: &mut DataState<SourceDir>, port_idx: usize) {
         let port = &mut state.ports[port_idx];
+        crate::node::reset_device_event(port);
         port.dll.init(); // fresh device, fresh servo
         port.ext.primed = false;
         port.ext.active_buffers = 0;
@@ -605,7 +623,7 @@ impl Direction for SourceDir {
     // same signal: we drain the ring every cycle, so what's queued is one
     // period's accumulation
     fn servo_fill(port: &mut crate::node::Port<SourceDir>) -> u32 {
-        port.dsp.ispace_in_bytes().max(0) as u32
+        measured_fill(port)
     }
 
     fn servo_hold(_port: &crate::node::Port<SourceDir>) -> bool {
@@ -616,6 +634,10 @@ impl Direction for SourceDir {
     // a period
     fn servo_err(port: &crate::node::Port<SourceDir>, fill: u32) -> f64 {
         port.ext.target_fill as f64 - fill as f64
+    }
+
+    fn wake_threshold(port: &crate::node::Port<SourceDir>) -> u32 {
+        port.ext.target_fill.max(port.setup_period).max(1)
     }
 
     fn process_ports(state: &mut DataState<SourceDir>) -> c_int {

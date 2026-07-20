@@ -23,6 +23,10 @@ fn test_port(read_fd: libc::c_int, period: u32, read_peak: u32) -> crate::node::
         was_matching: false,
         warn_limit: crate::node::RateLimit::new(),
         pending_xrun: None,
+        device_event: None,
+        device_eof: false,
+        event_xruns_seen: 0,
+        wake_threshold: 0,
         ext: SourcePortExt {
             read_peak,
             ..Default::default()
@@ -51,6 +55,21 @@ fn bounded_read_caps_catchup_and_pads_late_cycles() {
     let n = bounded_read(&mut port, 0, &mut buf, 8);
     assert_eq!(n, 1024);
     assert!(buf[..1024].iter().all(|&b| b == 0));
+    unsafe { libc::close(w) };
+}
+
+#[test]
+fn capture_kevent_uses_ready_bytes_without_rounding_to_frames() {
+    let (r, w) = pipe_pair(false, false);
+    let mut port = test_port(r, 1024, 2048);
+    port.device_event = Some(crate::oss::DeviceEvent {
+        fd: port.dsp.fd().unwrap(),
+        available_bytes: 1027,
+        ready_frames: 128,
+        xruns: 0,
+        eof: false,
+    });
+    assert_eq!(crate::node::device_event_fill(&port), Some(1027));
     unsafe { libc::close(w) };
 }
 

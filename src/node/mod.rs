@@ -42,7 +42,7 @@ use timing::{
     RateLimit, device_period_bytes, ns_to_bytes, ns_to_frame_bytes, same_clock, set_clock_name,
     try_now_ns,
 };
-use timing::{on_timeout, update_timers};
+use timing::{on_wake, update_driver_wake};
 
 use factory::{enum_interface_info, get_size, init};
 use rebuild::{

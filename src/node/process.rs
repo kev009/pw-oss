@@ -9,7 +9,7 @@ pub(super) fn check_loop_identity(gate: &DataThreadGate) -> bool {
     let tid = unsafe { libc::pthread_self() } as usize;
     // Seed the expected id from a closure run on the data loop at init,
     // not claimed by whoever calls first: a pure follower never runs
-    // on_timeout, so a process() arriving on a divergent host loop would
+    // on_wake, so a process() arriving on a divergent host loop would
     // otherwise install itself as the expected thread and undo the
     // block_on_loop serialization.
     let seen = gate.thread.load(Ordering::Acquire);
@@ -24,6 +24,25 @@ pub(super) fn check_loop_identity(gate: &DataThreadGate) -> bool {
         );
     }
     false
+}
+
+// Submit a dead-channel rebuild before device I/O. wake_cycle calls this as
+// soon as EV_EOF arrives. The sticky EOF survives timer wakes, and process()
+// retries whenever an earlier submission did not become pending; an in-flight
+// rebuild owns the pending bit and must never be duplicated.
+pub(super) fn queue_device_eof_rebuilds<D: Direction>(state: &mut DataState<D>) {
+    for port_idx in 0..state.ports.len() {
+        let port = &state.ports[port_idx];
+        if port.device_eof && !port.rebuild_pending {
+            crate::node::queue_rebuild(state, port_idx);
+        }
+    }
+}
+
+fn discard_device_snapshots<D: Direction>(state: &mut DataState<D>) {
+    for port in &mut state.ports {
+        port.device_event = None;
+    }
 }
 
 pub(super) unsafe extern "C" fn process<D: Direction>(object: *mut c_void) -> c_int {
@@ -46,10 +65,28 @@ pub(super) unsafe extern "C" fn process<D: Direction>(object: *mut c_void) -> c_
             // drop it instead of assert!()ing, which aborts the daemon across
             // extern "C"
             if !state.started || state.position.is_null() {
+                // Keep sticky EOF/rebuild state, but never carry this wake's
+                // fill/xrun snapshot into a later Start or IO configuration.
+                discard_device_snapshots(state);
                 return None;
             }
 
+            // Usually already queued by wake_cycle; retry here if its earlier
+            // submission did not become pending.
+            queue_device_eof_rebuilds(state);
+
             let result = D::process_ports(state);
+            // The event is one pre-I/O snapshot shared by the servo and this
+            // process pass. Never let a host-initiated second process() reuse
+            // it after the device has moved on.
+            discard_device_snapshots(state);
+            // process() normally runs inline from ready(), whose return path
+            // also selects the next wake. Do it here as well for hosts that
+            // defer process(), including the fallback-timer arm when this
+            // cycle suspended or replaced the registered device.
+            if !state.ready_dispatching {
+                super::timing::select_next_wake(state);
+            }
             // collect-then-notify: drain the deposited xrun stamp with the hook copy
             let pending = state.ports.iter_mut().find_map(|p| p.pending_xrun.take());
             let main_event = state.pending_main_event.take().map(|event| {

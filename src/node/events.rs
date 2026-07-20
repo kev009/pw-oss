@@ -450,7 +450,7 @@ pub(super) unsafe extern "C" fn set_callbacks<D: Direction>(
     let mut new_callbacks = NodeCallbacks::none();
     unsafe { new_callbacks.set(callbacks, data) };
 
-    // on_timeout/process call the table from the data loop; store it there.
+    // on_wake/process call the table from the data loop; store it there.
     // SAFETY: a by-value table copy plus the host data pointer, which stays
     // valid while set (the same contract)
     let new_callbacks = unsafe { crate::spa::SendWrap::new(new_callbacks) };

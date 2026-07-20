@@ -31,6 +31,10 @@ fn test_port(write_fd: libc::c_int, target_delay: u32, period: u32) -> crate::no
         was_matching: false,
         warn_limit: crate::node::RateLimit::new(),
         pending_xrun: None,
+        device_event: None,
+        device_eof: false,
+        event_xruns_seen: 0,
+        wake_threshold: 0,
         ext: SinkPortExt {
             target_delay,
             target_goal: target_delay,
@@ -46,6 +50,68 @@ fn target_matches_live_geometry() {
     assert_eq!(target_delay(65536, 16384, 2048, 16384, 0), (20480, false));
     // a fragment wider than the jitter margin takes over the floor
     assert_eq!(fill_floor(16384, 8192), 16384 + 8192);
+}
+
+#[test]
+fn playback_kevent_supplies_fill_and_xrun_deltas() {
+    let (r, w) = pipe_pair(true, true);
+    let mut port = test_port(w, 4096, 2048);
+    port.config = Some(PortConfig {
+        format: libspa::param::audio::AudioFormat::S16LE,
+        rate: 48000,
+        channels: 4,
+        positions: vec![],
+        flags: 0,
+        stride: 8,
+    });
+    port.device_event = Some(crate::oss::DeviceEvent {
+        fd: port.dsp.fd().unwrap(),
+        available_bytes: 1234,
+        ready_frames: 512,
+        xruns: 3,
+        eof: false,
+    });
+
+    assert_eq!(crate::node::device_event_fill(&port), Some(4096));
+    assert_eq!(crate::node::take_device_event_xruns(&mut port), Some(3));
+    assert_eq!(crate::node::take_device_event_xruns(&mut port), Some(0));
+    assert_eq!(crate::node::take_fallback_xruns(&mut port, 5), 2);
+    assert_eq!(port.event_xruns_seen, 0);
+    port.device_event.as_mut().unwrap().xruns = 1; // a new kernel counter epoch
+    assert_eq!(crate::node::take_device_event_xruns(&mut port), Some(1));
+    port.wake_threshold = 4096;
+    port.device_eof = true;
+    crate::node::reset_device_event(&mut port);
+    assert!(port.device_event.is_none());
+    assert!(!port.device_eof);
+    assert_eq!(port.event_xruns_seen, 0);
+    assert_eq!(port.wake_threshold, 0);
+    unsafe { libc::close(r) };
+}
+
+#[test]
+fn playback_kevent_wakes_at_the_live_fill_target() {
+    let (r, w) = pipe_pair(true, true);
+    let mut port = test_port(w, 20_480, 16_384);
+    port.ext.buffer_size = 65_536;
+    assert_eq!(
+        <SinkDir as crate::node::Direction>::wake_threshold(&port),
+        45_056
+    );
+
+    // LOW_WATER is clamped away from zero, and otherwise follows the live
+    // target directly even while an in-place retune settles it.
+    port.ext.target_delay = 65_536;
+    assert_eq!(
+        <SinkDir as crate::node::Direction>::wake_threshold(&port),
+        1
+    );
+    port.ext.target_delay = 8_192;
+    assert_eq!(
+        <SinkDir as crate::node::Direction>::wake_threshold(&port),
+        57_344
+    );
+    unsafe { libc::close(r) };
 }
 
 // "buffer_required() and target_delay() must derive this identically": any

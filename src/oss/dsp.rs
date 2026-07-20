@@ -58,6 +58,21 @@ impl Dsp {
             .raw()
     }
 
+    pub(crate) fn fd(&self) -> Option<c_int> {
+        self.fd.as_ref().map(LibcFd::raw)
+    }
+
+    pub(crate) fn set_low_water(&self, bytes: u32) -> bool {
+        self.fd.as_ref().is_some_and(|fd| {
+            ioctl_int(
+                fd.raw(),
+                SNDCTL_DSP_LOW_WATER,
+                bytes.clamp(1, c_int::MAX as u32) as c_int,
+            )
+            .is_some()
+        })
+    }
+
     pub(crate) fn open(&mut self) -> Result<(), Errno> {
         assert_eq!(self.state, DspState::Closed);
 
@@ -192,6 +207,9 @@ impl Dsp {
 
         assert_eq!(self.state, DspState::Running);
 
+        // Capture must be started before its first sound kevent can arrive.
+        // The enriched event backend takes over after this prime-time poll;
+        // older kernels continue on the timer/ioctl path.
         // poll(2), not select(2): FD_SET writes out of bounds past FD_SETSIZE
         // (1024) fds, which a busy daemon can reach; poll also triggers the
         // capture channel just like select/read do (dsp_poll -> chn_poll)
@@ -210,7 +228,7 @@ impl Dsp {
         n > 0 && (pfd.revents & libc::POLLIN) != 0
     }
 
-    pub(crate) fn ispace_in_bytes(&mut self) -> c_int {
+    pub(crate) fn ispace_in_bytes(&self) -> c_int {
         assert_eq!(self.state, DspState::Running);
         unsafe { ioctl_read::<audio_buf_info>(self.raw_fd(), SNDCTL_DSP_GETISPACE) }
             .map_or(0, |info| info.bytes)
@@ -341,6 +359,21 @@ impl DspWriter {
             .as_ref()
             .expect("an active DSP writer state owns its descriptor")
             .raw()
+    }
+
+    pub(crate) fn fd(&self) -> Option<c_int> {
+        self.fd.as_ref().map(LibcFd::raw)
+    }
+
+    pub(crate) fn set_low_water(&self, bytes: u32) -> bool {
+        self.fd.as_ref().is_some_and(|fd| {
+            ioctl_int(
+                fd.raw(),
+                SNDCTL_DSP_LOW_WATER,
+                bytes.clamp(1, c_int::MAX as u32) as c_int,
+            )
+            .is_some()
+        })
     }
 
     fn silence_buffer(&self) -> &'static [u8; CHN_2NDBUFMAXSIZE] {
@@ -583,22 +616,23 @@ impl DspWriter {
     /// End a retained input sequence before its backing buffer disappears.
     /// Complete an open PCM frame with format silence so the next sequence
     /// starts on a frame boundary. If the channel cannot accept that small
-    /// tail, reset its ring instead.
-    pub(crate) fn end_buffer_sequence(&mut self) {
+    /// tail, reset its ring instead; `true` tells the caller that device event
+    /// state was invalidated by the reset.
+    pub(crate) fn end_buffer_sequence(&mut self) -> bool {
         if self.frame_off == 0 {
-            return;
+            return false;
         }
         if self.state != DspState::Running {
             // Setup and Closed own no accepted stream bytes. Their normal
             // transitions also clear frame_off; keep this boundary robust if
             // a future path reaches it with stale bookkeeping.
             self.frame_off = 0;
-            return;
+            return false;
         }
         if !self.pause_shadowed && self.realign_with_silence().is_ok() {
-            return;
+            return false;
         }
-        let _ = self.suspend();
+        self.suspend()
     }
 
     // push exactly `count` bytes (a partial frame's tail), waiting out EAGAIN
@@ -736,6 +770,8 @@ impl DspWriter {
 
     pub(crate) fn underruns(&self) -> u32 {
         assert_eq!(self.state, DspState::Running);
+        // Timer-driven and follower fallback. Enriched driver wakes consume
+        // the xrun count from the same kevent snapshot as their queued fill.
         get_error(self.raw_fd()).play_underruns.max(0) as u32
     }
 }
@@ -881,7 +917,7 @@ mod playback_tests {
 
         // A buffer-pool replacement abandons old[2046..]. Close that frame
         // with silence before bytes from the new pool reach the device.
-        dsp.end_buffer_sequence();
+        assert!(!dsp.end_buffer_sequence());
         assert_eq!(dsp.frame_off, 0);
 
         let new = pattern(4096, 2);

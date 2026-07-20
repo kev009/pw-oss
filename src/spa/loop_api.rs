@@ -295,7 +295,7 @@ impl<T> SendWrap<T> {
 }
 
 // Run `f` on the data loop and wait for it; serializes main-thread
-// reconfiguration against process()/on_timeout() (runs inline when already on
+// reconfiguration against process()/on_wake() (runs inline when already on
 // the loop thread). The closure and target cross a thread boundary; callers
 // only capture raw pointers and plain data (F: Send; the blocking call keeps
 // stack borrows sound, so no 'static is needed). Returns false when the

@@ -28,7 +28,7 @@ pub(super) unsafe extern "C" fn clear<D: Direction>(handle: *mut spa_handle) -> 
     // already running holds its own main-thread Rc through listener callbacks.
     // The host must still stop driving the node before clear (Suspend/Pause and
     // io teardown precede it in the SPA lifecycle). A host that calls
-    // process()/on_timeout() afterward frees the ground under the data loop;
+    // process()/on_wake() afterward frees the ground under the data loop;
     // timer detachment below is our side of the contract.
     {
         let main = unsafe { main_mut(state) };
@@ -45,22 +45,23 @@ pub(super) unsafe extern "C" fn clear<D: Direction>(handle: *mut spa_handle) -> 
         main.shared.discard_swap();
     }
 
-    // the data loop still holds the timer source; detach it there before the
-    // state is freed, then close the timerfd
+    // The data loop still holds the wake source; detach it there before the
+    // state is freed, then close its timerfd or kqueue descriptor.
     let control = unsafe { DataControl::from_raw(state) };
     let detached = control.query(|state| {
         // SAFETY: this closure runs on the source's registered data loop.
-        let err = unsafe { state.timer_source.unregister() };
+        let err = unsafe { state.wake_source.unregister() };
         if err >= 0 {
             drop(state.timer_fd.take());
-            state.timer_source.set_fd(-1);
+            drop(state.sound_queue.take());
+            state.wake_source.set_fd(-1);
         }
         err
     });
     if !matches!(detached, Some(err) if err >= 0) {
         // freeing the state now would leave the loop a dangling source; a clean
         // abort beats a use-after-free on the next timer tick
-        eprintln!("freebsd-oss: can't detach the timer source; aborting");
+        eprintln!("freebsd-oss: can't detach the audio wake source; aborting");
         std::process::abort();
     }
     // the host frees the memory after clear; drop the fields exactly once here
@@ -187,14 +188,40 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
     let data_loop = unsafe { crate::spa::Loop::wrap(data_loop) };
     let data_system = unsafe { crate::spa::System::wrap(data_system) };
 
-    let timer_fd = match data_system.timerfd_create(
-        libc::CLOCK_MONOTONIC,
-        (SPA_FD_CLOEXEC | SPA_FD_NONBLOCK) as i32,
-    ) {
-        Ok(timer_fd) => timer_fd,
-        Err(err) => return err, // fd exhaustion fails node creation, not the daemon
+    let sound_queue = if crate::oss::enriched_sound_kqueue_available() {
+        match crate::oss::SoundKqueue::new() {
+            Ok(queue) => {
+                crate::debug!(log, "using enriched OSS kqueue device wakeups");
+                Some(queue)
+            }
+            Err(err) => {
+                crate::warn!(
+                    log,
+                    "can't create the OSS kqueue wake source: {}; using the timer",
+                    err
+                );
+                None
+            }
+        }
+    } else {
+        None
     };
-    let timer_fd_raw = timer_fd.raw();
+    let timer_fd = if sound_queue.is_none() {
+        match data_system.timerfd_create(
+            libc::CLOCK_MONOTONIC,
+            (SPA_FD_CLOEXEC | SPA_FD_NONBLOCK) as i32,
+        ) {
+            Ok(timer_fd) => Some(timer_fd),
+            Err(err) => return err, // fd exhaustion fails node creation, not the daemon
+        }
+    } else {
+        None
+    };
+    let wake_fd_raw = sound_queue
+        .as_ref()
+        .map(crate::oss::SoundKqueue::raw)
+        .or_else(|| timer_fd.as_ref().map(crate::spa::TimerFd::raw))
+        .expect("one wake descriptor is always constructed");
 
     let (dsp_path, oss_fragment, ext) = unsafe { parse_init_dict::<D>(info) };
 
@@ -297,16 +324,19 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
                     .unwrap_or_default(),
                     main_loop,
                     dsp_path: dsp_path.clone(),
-                    timer_fd: Some(timer_fd),
-                    timer_source: crate::spa::LoopSource::new(spa_source {
+                    timer_fd,
+                    sound_queue,
+                    sound_failed_fd: None,
+                    wake_source: crate::spa::LoopSource::new(spa_source {
                         loop_: std::ptr::null_mut(),
-                        func: Some(on_timeout::<D>),
+                        func: Some(on_wake::<D>),
                         data: state.cast::<c_void>(),
-                        fd: timer_fd_raw,
+                        fd: wake_fd_raw,
                         mask: SPA_IO_IN,
                         rmask: 0,
                         priv_: std::ptr::null_mut(),
                     }),
+                    ready_dispatching: false,
                     next_time: 0,
                     callbacks: NodeCallbacks::none(),
                     ports: [Port {
@@ -324,6 +354,10 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
                         was_matching: false,
                         warn_limit: crate::node::RateLimit::new(),
                         pending_xrun: None,
+                        device_event: None,
+                        device_eof: false,
+                        event_xruns_seen: 0,
+                        wake_threshold: 0,
                         ext: std::default::Default::default(),
                     }; MAX_PORTS],
                     oss_fragment,
@@ -350,14 +384,15 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
             let data_loop = data.data_loop;
             // SAFETY: init performs registration on the data loop endpoint; the
             // pinned source and its State data pointer live until clear.
-            data.timer_source.register(&data_loop)
+            data.wake_source.register(&data_loop)
         })
     };
     if err < 0 {
         unsafe {
             with_data_mut(state, |data| {
                 drop(data.timer_fd.take());
-                data.timer_source.set_fd(-1);
+                drop(data.sound_queue.take());
+                data.wake_source.set_fd(-1);
             });
         };
         // the host won't call clear() after a failed init; free what we built

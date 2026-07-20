@@ -20,7 +20,6 @@ impl LibcFd {
     ///
     /// # Safety
     /// `fd` must be open and exclusively transferred to the returned owner.
-    #[cfg(test)]
     pub(crate) unsafe fn from_raw(fd: c_int) -> Self {
         assert!(fd >= 0);
         Self(fd)

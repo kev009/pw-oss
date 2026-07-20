@@ -204,7 +204,7 @@ pub(super) fn retune_period(
         // The live target below predicts what remains at the next wake after
         // this cycle's write; advancing immediately to the larger goal with
         // silence creates an audible hole in a continuous stream.
-        let odelay = port.dsp.odelay();
+        let odelay = measured_fill(port);
         let delay_capped = commit_geometry(
             port,
             port.ext.buffer_size,
@@ -255,6 +255,9 @@ pub(super) fn retune_period(
         port.ext.period_mismatch = 0;
         port.ext.xrun_timestamp = 0; // a stale recovery hold must not defer the re-arm
         port.was_matching = false;
+        // SETTRIGGER starts a new kernel xrun epoch; SETFRAGMENT also resets
+        // the low-water mark during the prime that follows.
+        crate::node::reset_device_event(port);
         RetuneOutcome::Retuned
     } else {
         // period_mismatch stays >= 2 on purpose: if the caller can't queue the

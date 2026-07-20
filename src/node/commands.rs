@@ -118,7 +118,7 @@ pub(super) unsafe extern "C" fn set_io<D: Direction>(
             // rearm/park only on a real transition (io presence or role); resetting
             // the timer phase on every re-point causes cycle bunching
             if flipped || was_armed != armed {
-                update_timers(state);
+                update_driver_wake(state);
             }
         }
     });
@@ -137,6 +137,7 @@ pub(super) fn replace_port_devices<D: Direction>(
 ) -> [D::Device; MAX_PORTS] {
     devices.map(|(index, device)| {
         ports[index].rebuild_pending = false;
+        crate::node::reset_device_event(&mut ports[index]);
         std::mem::replace(&mut ports[index].dsp, device)
     })
 }
@@ -209,7 +210,7 @@ pub(super) unsafe extern "C" fn send_command<D: Direction>(
                 D::on_start_loop(state);
                 state.started = true;
                 state.following = state.node_is_follower();
-                update_timers(state);
+                update_driver_wake(state);
                 true
             });
             match started {
@@ -245,7 +246,7 @@ pub(super) unsafe extern "C" fn send_command<D: Direction>(
                     D::on_pause_loop(state);
                 }
                 data_stopped.store(true, std::sync::atomic::Ordering::Release);
-                update_timers(state);
+                update_driver_wake(state);
                 state.rebuild_takeover = true;
                 let deferred = state.deferred_work.take();
                 for port in &mut state.ports {
@@ -293,7 +294,7 @@ pub(super) unsafe extern "C" fn send_command<D: Direction>(
             let Some((devices, deferred)) = control.query(move |state| {
                 state.started = false;
                 data_stopped_ref.store(true, std::sync::atomic::Ordering::Release);
-                update_timers(state);
+                update_driver_wake(state);
                 D::on_suspend_loop(state);
                 state.rebuild_takeover = true;
                 let deferred = state.deferred_work.take();
@@ -301,6 +302,7 @@ pub(super) unsafe extern "C" fn send_command<D: Direction>(
                 let devices: [(usize, D::Device); MAX_PORTS] = std::array::from_fn(|index| {
                     let port = &mut state.ports[index];
                     port.rebuild_pending = true;
+                    crate::node::reset_device_event(port);
                     port.generation = port.generation.wrapping_add(1);
                     state
                         .shared
@@ -458,6 +460,10 @@ mod tests {
             was_matching: false,
             warn_limit: crate::node::RateLimit::new(),
             pending_xrun: None,
+            device_event: None,
+            device_eof: false,
+            event_xruns_seen: 0,
+            wake_threshold: 0,
             ext: Default::default(),
         }
     }

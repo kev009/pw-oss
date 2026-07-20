@@ -316,9 +316,11 @@ pub(super) fn release_format<D: Direction>(
     let Some((retired, deferred)) = data.query(move |state| {
         debug_assert!(!state.rebuild_takeover, "format releases serialize");
         state.rebuild_takeover = true;
+        crate::node::timing::invalidate_device_wake(state);
         let deferred = state.deferred_work.take();
         let port = &mut state.ports[port_idx];
         let retired = std::mem::replace(&mut port.dsp, placeholder);
+        crate::node::reset_device_event(port);
         port.buffers.clear();
         port.config = None;
         // retire any in-flight background rebuild, and drop its pending
@@ -330,6 +332,9 @@ pub(super) fn release_format<D: Direction>(
             .generation
             .store(port.generation, std::sync::atomic::Ordering::Release);
         port.rebuild_pending = true;
+        if state.started {
+            update_driver_wake(state);
+        }
         (retired, deferred)
     }) else {
         return -libc::EIO; // the loop still holds the buffers; freeing them would dangle

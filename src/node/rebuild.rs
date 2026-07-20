@@ -109,6 +109,9 @@ pub(in crate::node) fn install_device<D: Direction>(
         data.shared
             .generation
             .store(port.generation, std::sync::atomic::Ordering::Release);
+        if data.started {
+            update_driver_wake(data);
+        }
         deferred
     }) else {
         return -libc::EIO;
@@ -146,6 +149,7 @@ pub(in crate::node) fn install_device<D: Direction>(
     let ok = res == 0;
     let cap_config = config.clone();
     let old_dsp = data.query(move |state| {
+        crate::node::timing::invalidate_device_wake(state);
         let port = &mut state.ports[port_idx];
         // new_dsp is a closed writer/reader when negotiation failed above
         let old = std::mem::replace(&mut port.dsp, new_dsp);
@@ -159,6 +163,9 @@ pub(in crate::node) fn install_device<D: Direction>(
         port.rebuild_pending = false;
         port.was_matching = false; // force a relock when matching resumes
         D::on_device_swapped(state, port_idx);
+        if state.started {
+            update_driver_wake(state);
+        }
         state.rebuild_takeover = false;
         old
     });
@@ -304,6 +311,7 @@ fn poll_rebuild_completion<D: Direction>(state: &mut DataState<D>, port_idx: usi
     }
     match swap.outcome {
         SwapOutcome::Installed { dsp, config } => {
+            crate::node::timing::invalidate_device_wake(state);
             let port = &mut state.ports[port_idx];
             let old = std::mem::replace(&mut port.dsp, dsp);
             port.config = Some(config);
@@ -315,6 +323,9 @@ fn poll_rebuild_completion<D: Direction>(state: &mut DataState<D>, port_idx: usi
             port.rebuild_pending = false;
             port.was_matching = false; // force a relock when matching resumes
             D::on_device_swapped(state, port_idx);
+            if state.started {
+                update_driver_wake(state);
+            }
             crate::info!(
                 state.log,
                 "{}: background device rebuild applied",
@@ -338,8 +349,12 @@ fn poll_rebuild_completion<D: Direction>(state: &mut DataState<D>, port_idx: usi
             // request as retire_first, so close-then-retry runs as one
             // worker command (ordering holds) under the task's unwind guard
             let port = &mut state.ports[port_idx];
+            crate::node::reset_device_event(port);
             let old = std::mem::replace(&mut port.dsp, placeholder);
             request.retire_first = Some(old);
+            if state.started {
+                update_driver_wake(state);
+            }
             submit_or_defer(state, RebuildWork::Rebuild(request));
             true
         }
@@ -347,6 +362,7 @@ fn poll_rebuild_completion<D: Direction>(state: &mut DataState<D>, port_idx: usi
             // mirror install_device's failure shape: closed device, cleared
             // config, and a re-announce so the host renegotiates instead of
             // believing a format is set on a dead port
+            crate::node::timing::invalidate_device_wake(state);
             let port = &mut state.ports[port_idx];
             let old = std::mem::replace(&mut port.dsp, placeholder);
             port.config = None;
@@ -358,6 +374,9 @@ fn poll_rebuild_completion<D: Direction>(state: &mut DataState<D>, port_idx: usi
             port.rebuild_pending = false;
             port.was_matching = false;
             D::on_device_swapped(state, port_idx);
+            if state.started {
+                update_driver_wake(state);
+            }
             submit_or_defer(state, RebuildWork::RetireDevice(old));
             // process() extracts and queues this only after its &mut DataState
             // phase ends. The endpoint epoch prevents an old loss from

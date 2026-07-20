@@ -1,6 +1,7 @@
 mod abi;
 mod devices;
 mod dsp;
+mod event;
 mod mixer;
 
 pub(crate) use abi::{
@@ -12,6 +13,7 @@ pub(crate) use devices::{
     list_pcm_devices, probe_caps, read_sndstat, ring_byte_cap,
 };
 pub(crate) use dsp::{Dsp, DspWriter, PlaybackWrite};
+pub(crate) use event::{DeviceEvent, SoundKqueue, WakeEvent, enriched_sound_kqueue_available};
 pub(crate) use mixer::{
     Mixer, SOUND_DEVICE_NAMES, SOUND_MIXER_LINE, SOUND_MIXER_MIC, SOUND_MIXER_NRDEVICES,
 };

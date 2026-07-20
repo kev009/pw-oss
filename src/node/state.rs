@@ -79,8 +79,19 @@ pub(crate) struct DataState<D: Direction> {
     pub clock_name: std::ffi::CString, // stamped into spa_io_clock.name
     pub main_loop: Option<crate::spa::Loop>, // for endpoint-only notifications
     pub dsp_path: String,
-    pub(super) timer_fd: Option<crate::spa::TimerFd>, // owns the LoopSource fd mirror
-    pub(super) timer_source: crate::spa::LoopSource,
+    // Exactly one wake descriptor owns wake_source.fd: the portable SPA
+    // timer, or the enriched OSS kqueue on sufficiently new kernels.
+    pub(super) timer_fd: Option<crate::spa::TimerFd>,
+    pub(super) sound_queue: Option<crate::oss::SoundKqueue>,
+    // Registration/LOW_WATER failed for this descriptor. Audio cycles stay
+    // on the kqueue's timer filter; an explicit driver update gives the same
+    // fd one bounded retry without repeating the warning until one succeeds.
+    pub(super) sound_failed_fd: Option<c_int>,
+    pub(super) wake_source: crate::spa::LoopSource,
+    // True only while on_wake is inside the host's ready callback. An inline
+    // process() leaves next-wake selection to the callback epilogue; a
+    // deferred process() performs it itself.
+    pub(super) ready_dispatching: bool,
     pub next_time: u64,
     pub callbacks: NodeCallbacks,
     pub ports: [Port<D>; MAX_PORTS],
@@ -176,7 +187,73 @@ pub(crate) struct Port<D: Direction> {
     // host back mid-cycle; process() drains it and invokes the copied xrun
     // hook only after the DataState/port borrows end (collect-then-notify).
     pub pending_xrun: Option<u64>,
+    // Latest enriched sound kevent, valid until this cycle's device I/O.
+    // Timer-driven/follower paths leave it empty and use the ioctl fallback.
+    pub device_event: Option<crate::oss::DeviceEvent>,
+    // EV_EOF is ownership state, not a cycle measurement. Keep it latched
+    // across timer wakes and failed rebuild submissions until the device or
+    // trigger epoch is reset.
+    pub device_eof: bool,
+    pub event_xruns_seen: u32,
+    // Last SNDCTL_DSP_LOW_WATER value installed for the registered device.
+    pub wake_threshold: u32,
     pub ext: D::PortExt, // direction-specific fields (see sink/source)
+}
+
+pub(crate) fn device_event_fill<D: Direction>(port: &Port<D>) -> Option<u32> {
+    let event = port.device_event?;
+    if Some(event.fd) != port.dsp.fd() {
+        return None;
+    }
+    if D::PLAYBACK {
+        let stride = port.stride_rate().map(|(stride, _)| stride).unwrap_or(1);
+        Some(
+            event
+                .ready_frames
+                .saturating_mul(stride as u64)
+                .min(u32::MAX as u64) as u32,
+        )
+    } else {
+        Some(event.available_bytes)
+    }
+}
+
+pub(crate) fn take_device_event_xruns<D: Direction>(port: &mut Port<D>) -> Option<u32> {
+    let event = port.device_event?;
+    if Some(event.fd) != port.dsp.fd() {
+        return None;
+    }
+    let previous = port.event_xruns_seen;
+    port.event_xruns_seen = event.xruns;
+    Some(if event.xruns >= previous {
+        event.xruns - previous
+    } else {
+        // The channel reset its statistics (new trigger epoch or an external
+        // GETERROR). Start the new epoch at the value in this snapshot.
+        event.xruns
+    })
+}
+
+// GETERROR clears pcm_channel::xruns, while dsp_kqevent() snapshots that same
+// counter without clearing it (FreeBSD sys/dev/sound/pcm/dsp.c).
+// On a device-event -> timer/follower transition, remove the portion already
+// reported from snapshots before resetting our event-side baseline.
+pub(crate) fn take_fallback_xruns<D: Direction>(port: &mut Port<D>, total: u32) -> u32 {
+    let reported = std::mem::take(&mut port.event_xruns_seen);
+    if total >= reported {
+        total - reported
+    } else {
+        // A trigger/reset began a new kernel epoch without passing through
+        // reset_device_event. Fail toward reporting the new errors.
+        total
+    }
+}
+
+pub(crate) fn reset_device_event<D: Direction>(port: &mut Port<D>) {
+    port.device_event = None;
+    port.device_eof = false;
+    port.event_xruns_seen = 0;
+    port.wake_threshold = 0;
 }
 
 // Validated view of one host-owned buffer block. valid_data_block is the only
@@ -391,6 +468,10 @@ mod tests {
             was_matching: false,
             warn_limit: crate::node::RateLimit::new(),
             pending_xrun: None,
+            device_event: None,
+            device_eof: false,
+            event_xruns_seen: 0,
+            wake_threshold: 0,
             ext: Default::default(),
         }
     }

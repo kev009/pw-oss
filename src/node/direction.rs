@@ -31,8 +31,10 @@ impl<T> MutexExt<T> for std::sync::Mutex<T> {
 pub(crate) trait DeviceOps {
     fn new(path: &str) -> Self;
     fn path(&self) -> &str;
+    fn fd(&self) -> Option<c_int>;
     fn is_closed(&self) -> bool;
     fn is_running(&self) -> bool;
+    fn set_low_water(&self, bytes: u32) -> bool;
     fn close(&mut self);
     fn suspend(&mut self) -> bool;
 }
@@ -44,11 +46,17 @@ impl DeviceOps for crate::oss::Dsp {
     fn path(&self) -> &str {
         crate::oss::Dsp::path(self)
     }
+    fn fd(&self) -> Option<c_int> {
+        crate::oss::Dsp::fd(self)
+    }
     fn is_closed(&self) -> bool {
         crate::oss::Dsp::is_closed(self)
     }
     fn is_running(&self) -> bool {
         crate::oss::Dsp::is_running(self)
+    }
+    fn set_low_water(&self, bytes: u32) -> bool {
+        crate::oss::Dsp::set_low_water(self, bytes)
     }
     fn close(&mut self) {
         crate::oss::Dsp::close(self);
@@ -65,11 +73,17 @@ impl DeviceOps for crate::oss::DspWriter {
     fn path(&self) -> &str {
         &self.path
     }
+    fn fd(&self) -> Option<c_int> {
+        crate::oss::DspWriter::fd(self)
+    }
     fn is_closed(&self) -> bool {
         crate::oss::DspWriter::is_closed(self)
     }
     fn is_running(&self) -> bool {
         crate::oss::DspWriter::is_running(self)
+    }
+    fn set_low_water(&self, bytes: u32) -> bool {
+        crate::oss::DspWriter::set_low_water(self, bytes)
     }
     fn close(&mut self) {
         crate::oss::DspWriter::close(self);
@@ -179,15 +193,18 @@ pub(crate) trait Direction: Sized + 'static {
     // set_io: the driver/follower role flipped on a live node
     fn on_role_flip(state: &mut DataState<Self>);
 
-    // on_timeout: debug-build cycle tracing (the sink prints one line)
+    // driver wake: debug-build cycle tracing (the sink prints one line)
     fn debug_cycle(state: &DataState<Self>, now: u64, nsec: u64);
-    // on_timeout servo hooks (see node::timeout_servo): the extra readiness
+    // driver-servo hooks (see node::driver_servo): the extra readiness
     // gate (the source's primed flag), the fill measurement, the recovery
     // hold (the sink's xrun window) and the signed servo error for a fill
     fn servo_ready(port: &Port<Self>) -> bool;
     fn servo_fill(port: &mut Port<Self>) -> u32;
     fn servo_hold(port: &Port<Self>) -> bool;
     fn servo_err(port: &Port<Self>, fill: u32) -> f64;
+    // Byte threshold that makes a sound kevent correspond to the next graph
+    // cycle: queued capture data, or playback free space at the live target.
+    fn wake_threshold(port: &Port<Self>) -> u32;
 
     // process(): the direction-specific data path over the ports
     fn process_ports(state: &mut DataState<Self>) -> c_int;

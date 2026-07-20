@@ -131,6 +131,9 @@ pub(super) fn retune_period(
         );
         port.ext.period_mismatch = 0;
         port.ext.primed = false;
+        // SETTRIGGER starts a new kernel xrun epoch; SETFRAGMENT also resets
+        // the low-water mark during the prime that follows.
+        crate::node::reset_device_event(port);
         false
     } else {
         // period_mismatch stays >= 2 on purpose: if the caller can't queue the
