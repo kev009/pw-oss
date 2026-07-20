@@ -1,7 +1,7 @@
 use nix::errno::Errno;
 use std::os::raw::{c_char, c_int, c_long, c_uint, c_ulong};
 
-use crate::freebsd::{ioctl_int, ioctl_read};
+use crate::freebsd::{IoctlPod, ioctl_int, ioctl_read, ioctl_value};
 
 pub(crate) const AFMT_U8: u32 = 0x00000008;
 pub(crate) const AFMT_S16_LE: u32 = 0x00000010;
@@ -31,12 +31,14 @@ pub(super) const SNDCTL_DSP_GETISPACE: c_ulong =
     nix::request_code_read!(b'P', 13, std::mem::size_of::<audio_buf_info>());
 pub(super) const SNDCTL_DSP_SETTRIGGER: c_ulong =
     nix::request_code_write!(b'P', 16, std::mem::size_of::<c_int>());
-//const SNDCTL_DSP_GETPLAYVOL:  c_ulong = nix::request_code_read!     (b'P', 24, std::mem::size_of::<c_int>());
-//const SNDCTL_DSP_SETPLAYVOL:  c_ulong = nix::request_code_readwrite!(b'P', 24, std::mem::size_of::<c_int>());
 pub(super) const SNDCTL_DSP_GETODELAY: c_ulong =
     nix::request_code_read!(b'P', 23, std::mem::size_of::<c_int>());
 pub(super) const SNDCTL_DSP_GETERROR: c_ulong =
     nix::request_code_read!(b'P', 25, std::mem::size_of::<audio_errinfo>());
+const SNDCTL_DSP_GET_CHNORDER: c_ulong =
+    nix::request_code_read!(b'P', 42, std::mem::size_of::<OssChannelOrder>());
+const SNDCTL_DSP_SET_CHNORDER: c_ulong =
+    nix::request_code_readwrite!(b'P', 42, std::mem::size_of::<OssChannelOrder>());
 pub(super) const SNDCTL_DSP_HALT: c_ulong = nix::request_code_none!(b'P', 0); // aka SNDCTL_DSP_RESET
 pub(super) const SNDCTL_DSP_SILENCE: c_ulong = nix::request_code_none!(b'P', 31);
 pub(super) const SNDCTL_DSP_SKIP: c_ulong = nix::request_code_none!(b'P', 32);
@@ -113,6 +115,15 @@ pub(super) struct audio_errinfo {
     pub(super) filler: [c_int; 16],
 }
 
+// sys/soundcard.h uses unsigned long long for channel-order maps.
+// Keep a distinct type so the ioctl size and the value being verified cannot
+// accidentally drift apart.
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct OssChannelOrder(u64);
+
+unsafe impl IoctlPod for OssChannelOrder {}
+
 unsafe impl crate::freebsd::IoctlPod for audio_buf_info {}
 unsafe impl crate::freebsd::IoctlPod for audio_errinfo {}
 
@@ -161,6 +172,25 @@ pub(super) fn set_fragment(fd: c_int, n_frags: u16, frag_size_selector: u16) {
 
 pub(super) fn set_trigger(fd: c_int, mask: c_int) -> bool {
     ioctl_int(fd, SNDCTL_DSP_SETTRIGGER, mask).is_some()
+}
+
+// Reorder the application-side PCM interleave, then verify what the channel
+// exposes. FreeBSD implements this for convertible PCM formats; direct or
+// alternate OSS implementations may reject it, which must fail negotiation
+// rather than leave the SPA channel labels disagreeing with the byte stream.
+pub(super) fn set_channel_order(fd: c_int, order: u64) -> Result<(), Errno> {
+    let requested = OssChannelOrder(order);
+    if unsafe { ioctl_value(fd, SNDCTL_DSP_SET_CHNORDER, requested) }.is_none() {
+        return Err(Errno::last());
+    }
+    let Some(actual) = (unsafe { ioctl_read::<OssChannelOrder>(fd, SNDCTL_DSP_GET_CHNORDER) })
+    else {
+        return Err(Errno::last());
+    };
+    if actual.0 != order {
+        return Err(Errno::EINVAL);
+    }
+    Ok(())
 }
 
 pub(super) fn odelay(fd: c_int) -> c_int {

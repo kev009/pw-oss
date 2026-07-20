@@ -35,6 +35,144 @@ fn fallback_formats_cover_the_supported_surface() {
     assert_eq!(crate::oss::DspCaps::fallback().formats, mapped);
 }
 
+#[test]
+fn default_channel_orders_need_no_ioctl() {
+    use libspa::sys::*;
+
+    for positions in [
+        &[SPA_AUDIO_CHANNEL_MONO][..],
+        &[SPA_AUDIO_CHANNEL_FL],
+        &[SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR],
+        &[
+            SPA_AUDIO_CHANNEL_FL,
+            SPA_AUDIO_CHANNEL_FR,
+            SPA_AUDIO_CHANNEL_RL,
+            SPA_AUDIO_CHANNEL_RR,
+        ],
+        &[
+            SPA_AUDIO_CHANNEL_FL,
+            SPA_AUDIO_CHANNEL_FR,
+            SPA_AUDIO_CHANNEL_RL,
+            SPA_AUDIO_CHANNEL_RR,
+            SPA_AUDIO_CHANNEL_FC,
+            SPA_AUDIO_CHANNEL_LFE,
+        ],
+        &[
+            SPA_AUDIO_CHANNEL_FL,
+            SPA_AUDIO_CHANNEL_FR,
+            SPA_AUDIO_CHANNEL_RL,
+            SPA_AUDIO_CHANNEL_RR,
+            SPA_AUDIO_CHANNEL_FC,
+            SPA_AUDIO_CHANNEL_LFE,
+            SPA_AUDIO_CHANNEL_SL,
+            SPA_AUDIO_CHANNEL_SR,
+        ],
+    ] {
+        assert_eq!(super::oss_channel_order(0, positions), Ok(None));
+    }
+}
+
+#[test]
+fn alternate_named_channel_orders_encode_oss_chid_nibbles() {
+    use libspa::sys::*;
+
+    // Reversed stereo: CHID_R, CHID_L.
+    assert_eq!(
+        super::oss_channel_order(0, &[SPA_AUDIO_CHANNEL_FR, SPA_AUDIO_CHANNEL_FL]),
+        Ok(Some(0x12))
+    );
+    // Conventional WAV/ALSA 5.1: FL, FR, FC, LFE, RL, RR.
+    assert_eq!(
+        super::oss_channel_order(
+            0,
+            &[
+                SPA_AUDIO_CHANNEL_FL,
+                SPA_AUDIO_CHANNEL_FR,
+                SPA_AUDIO_CHANNEL_FC,
+                SPA_AUDIO_CHANNEL_LFE,
+                SPA_AUDIO_CHANNEL_RL,
+                SPA_AUDIO_CHANNEL_RR,
+            ],
+        ),
+        Ok(Some(0x87_4321))
+    );
+    // Conventional 7.1 extends that order with side left/right.
+    assert_eq!(
+        super::oss_channel_order(
+            0,
+            &[
+                SPA_AUDIO_CHANNEL_FL,
+                SPA_AUDIO_CHANNEL_FR,
+                SPA_AUDIO_CHANNEL_FC,
+                SPA_AUDIO_CHANNEL_LFE,
+                SPA_AUDIO_CHANNEL_RL,
+                SPA_AUDIO_CHANNEL_RR,
+                SPA_AUDIO_CHANNEL_SL,
+                SPA_AUDIO_CHANNEL_SR,
+            ],
+        ),
+        Ok(Some(0x6587_4321))
+    );
+}
+
+#[test]
+fn opaque_and_unpositioned_channel_orders_stay_opaque() {
+    use libspa::sys::*;
+
+    assert_eq!(
+        super::oss_channel_order(
+            0,
+            &[
+                SPA_AUDIO_CHANNEL_AUX0,
+                SPA_AUDIO_CHANNEL_AUX0 + 1,
+                SPA_AUDIO_CHANNEL_AUX0 + 2,
+            ],
+        ),
+        Ok(None)
+    );
+    assert_eq!(
+        super::oss_channel_order(
+            SPA_AUDIO_FLAG_UNPOSITIONED,
+            &[SPA_AUDIO_CHANNEL_FR, SPA_AUDIO_CHANNEL_FL],
+        ),
+        Ok(None)
+    );
+}
+
+#[test]
+fn malformed_channel_orders_are_rejected() {
+    use libspa::sys::*;
+
+    for positions in [
+        &[SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FL][..],
+        &[SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_AUX0],
+        &[SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FLC],
+        // Named and unique, but not FreeBSD's four-channel speaker set.
+        &[
+            SPA_AUDIO_CHANNEL_FL,
+            SPA_AUDIO_CHANNEL_FR,
+            SPA_AUDIO_CHANNEL_FC,
+            SPA_AUDIO_CHANNEL_LFE,
+        ],
+        &[
+            SPA_AUDIO_CHANNEL_FL,
+            SPA_AUDIO_CHANNEL_FR,
+            SPA_AUDIO_CHANNEL_FC,
+            SPA_AUDIO_CHANNEL_LFE,
+            SPA_AUDIO_CHANNEL_RL,
+            SPA_AUDIO_CHANNEL_RR,
+            SPA_AUDIO_CHANNEL_SL,
+            SPA_AUDIO_CHANNEL_SR,
+            SPA_AUDIO_CHANNEL_BC,
+        ],
+    ] {
+        assert_eq!(
+            super::oss_channel_order(0, positions),
+            Err(super::UnsupportedChannelOrder)
+        );
+    }
+}
+
 fn caps(
     formats: u32,
     channels: (u32, u32),

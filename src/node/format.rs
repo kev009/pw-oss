@@ -69,6 +69,107 @@ pub(crate) fn channel_positions(channels: u32) -> Option<&'static [u32]> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct UnsupportedChannelOrder;
+
+// FreeBSD's default application-side CHID_* interleave. Three- and
+// seven-channel defaults contain rear-center, which OSS channel-order maps
+// cannot represent; those widths stay opaque unless the kernel grows a wider
+// map. Kept encoded here so equivalent SPA names (MONO and FL) compare by
+// what the ioctl actually means.
+fn default_oss_channel_order(channels: usize) -> Option<u64> {
+    match channels {
+        1 => Some(0x1),
+        2 => Some(0x21),
+        4 => Some(0x8721),
+        5 => Some(0x3_8721),
+        6 => Some(0x43_8721),
+        8 => Some(0x6543_8721),
+        _ => None,
+    }
+}
+
+// Translate a positioned SPA interleave into sys/soundcard.h CHID_* nibbles.
+// None means the kernel's default order needs no change, or the stream is
+// explicitly opaque (unpositioned/AUX). A meaningful named map must be wholly
+// representable and unique: silently ignoring only part of it would attach
+// the wrong speaker labels to the PCM byte stream.
+pub(crate) fn oss_channel_order(
+    flags: u32,
+    positions: &[u32],
+) -> Result<Option<u64>, UnsupportedChannelOrder> {
+    use libspa::sys::*;
+
+    if flags & SPA_AUDIO_FLAG_UNPOSITIONED != 0 {
+        return Ok(None);
+    }
+
+    let channel_id = |position| match position {
+        SPA_AUDIO_CHANNEL_MONO | SPA_AUDIO_CHANNEL_FL => Some(1u64),
+        SPA_AUDIO_CHANNEL_FR => Some(2),
+        SPA_AUDIO_CHANNEL_FC => Some(3),
+        SPA_AUDIO_CHANNEL_LFE => Some(4),
+        SPA_AUDIO_CHANNEL_SL => Some(5),
+        SPA_AUDIO_CHANNEL_SR => Some(6),
+        SPA_AUDIO_CHANNEL_RL => Some(7),
+        SPA_AUDIO_CHANNEL_RR => Some(8),
+        _ => None,
+    };
+    let opaque = |position| {
+        position == SPA_AUDIO_CHANNEL_UNKNOWN
+            || position == SPA_AUDIO_CHANNEL_NA
+            || position >= SPA_AUDIO_CHANNEL_AUX0
+    };
+
+    let any_named = positions
+        .iter()
+        .any(|&position| channel_id(position).is_some());
+    if !any_named {
+        return positions
+            .iter()
+            .all(|&position| opaque(position))
+            .then_some(None)
+            .ok_or(UnsupportedChannelOrder);
+    }
+    if positions.len() > 8 {
+        return Err(UnsupportedChannelOrder);
+    }
+
+    let mut order = 0u64;
+    let mut seen = 0u16;
+    for (index, &position) in positions.iter().enumerate() {
+        let Some(id) = channel_id(position) else {
+            return Err(UnsupportedChannelOrder);
+        };
+        let bit = 1u16 << id;
+        if seen & bit != 0 {
+            return Err(UnsupportedChannelOrder);
+        }
+        seen |= bit;
+        order |= id << (index * 4);
+    }
+
+    let Some(default) = default_oss_channel_order(positions.len()) else {
+        return Err(UnsupportedChannelOrder);
+    };
+    let default_set = (0..positions.len()).fold(0u16, |set, index| {
+        set | 1u16 << ((default >> (index * 4)) & 0xf)
+    });
+    if seen != default_set {
+        return Err(UnsupportedChannelOrder);
+    }
+
+    // Avoid an ioctl when the encoded order already matches FreeBSD's
+    // default, including equivalent SPA spellings such as mono FL vs MONO.
+    // This also preserves virtual OSS endpoints that expose the default but
+    // implement only GET_CHNORDER.
+    if order == default {
+        Ok(None)
+    } else {
+        Ok(Some(order))
+    }
+}
+
 // (OSS AFMT, SPA audio format, bytes per sample) triples we can produce,
 // ordered by preference: wide integer, float, 3-byte 24-bit, 16-bit, then U8.
 // This is the single source of truth for EnumFormat, negotiation snapping and

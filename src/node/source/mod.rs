@@ -234,13 +234,26 @@ fn try_open_configure(
     fragment: u32,
     log: &crate::spa::Log,
 ) -> c_int {
+    let Ok(channel_order) = config.oss_channel_order() else {
+        crate::warn!(
+            log,
+            "rejecting unsupported channel map: {:?}",
+            config.positions
+        );
+        return -libc::EINVAL;
+    };
     // a busy or vanished device must fail negotiation, not abort
     if let Err(err) = dsp.open() {
         crate::warn!(log, "dsp open: {}", err);
         return -(err as c_int);
     }
     // ditto for a device that won't take the format exactly
-    if let Err(err) = dsp.configure(config.oss_format(), config.channels, config.rate) {
+    if let Err(err) = dsp.configure(
+        config.oss_format(),
+        config.channels,
+        config.rate,
+        channel_order,
+    ) {
         crate::warn!(log, "device rejected {:?}: {}", config, err);
         dsp.close();
         return -(err as c_int);

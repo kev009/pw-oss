@@ -351,6 +351,15 @@ fn try_open_configure(
     config: &PortConfig,
     log: &crate::spa::Log,
 ) -> c_int {
+    let Ok(channel_order) = config.oss_channel_order() else {
+        crate::warn!(
+            log,
+            "{}: unsupported channel map: {:?}",
+            dsp.path,
+            config.positions
+        );
+        return -libc::EINVAL;
+    };
     // a busy or vanished device must fail negotiation, not abort
     if let Err(err) = dsp.open() {
         crate::warn!(log, "{}: open: {}", dsp.path, err);
@@ -362,6 +371,7 @@ fn try_open_configure(
         config.channels,
         config.rate,
         config.silence_byte(),
+        channel_order,
     ) {
         crate::warn!(log, "{}: device rejected {:?}: {}", dsp.path, config, err);
         dsp.close();

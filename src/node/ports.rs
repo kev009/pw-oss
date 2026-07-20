@@ -165,6 +165,28 @@ pub(super) fn parse_config<D: Direction>(
         stride: bytes_per_sample * raw.channels, // bytes per interleaved frame
     };
 
+    match config.oss_channel_order() {
+        Err(_) => {
+            crate::warn!(
+                state.log,
+                "rejecting unsupported channel map: {:?}",
+                config.positions
+            );
+            return Err(-libc::EINVAL);
+        }
+        Ok(Some(_)) if state.caps.convertless => {
+            // Bitperfect skips the matrix feeder: SET_CHNORDER would update
+            // only the reported matrix while hardware kept its native order.
+            crate::warn!(
+                state.log,
+                "rejecting channel reorder on a bitperfect device: {:?}",
+                config.positions
+            );
+            return Err(-libc::EINVAL);
+        }
+        _ => (),
+    }
+
     crate::debug!(state.log, "reconfiguring with {:?}", config);
 
     Ok(config)

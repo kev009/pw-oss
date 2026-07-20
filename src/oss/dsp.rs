@@ -99,7 +99,13 @@ impl Dsp {
         self.skip = 0;
     }
 
-    pub(crate) fn configure(&mut self, format: u32, channels: u32, rate: u32) -> Result<(), Errno> {
+    pub(crate) fn configure(
+        &mut self,
+        format: u32,
+        channels: u32,
+        rate: u32,
+        channel_order: Option<u64>,
+    ) -> Result<(), Errno> {
         assert_eq!(self.state, DspState::Setup);
         // plain AFMT selector (no channel field), so this yields the sample width
         self.stride = afmt_frame_bytes(format)
@@ -107,6 +113,9 @@ impl Dsp {
             .saturating_mul(channels.max(1));
         set_value(self.raw_fd(), SNDCTL_DSP_SETFMT, format, 0)?;
         set_value(self.raw_fd(), SNDCTL_DSP_CHANNELS, channels, 0)?;
+        if let Some(order) = channel_order {
+            set_channel_order(self.raw_fd(), order)?;
+        }
         set_value(self.raw_fd(), SNDCTL_DSP_SPEED, rate, feeder_rate_round())
     }
 
@@ -490,6 +499,7 @@ impl DspWriter {
         channels: u32,
         rate: u32,
         silence_byte: u8,
+        channel_order: Option<u64>,
     ) -> Result<(), Errno> {
         assert_eq!(self.state, DspState::Setup);
         // plain AFMT selector (no channel field), so this yields the sample width
@@ -499,6 +509,9 @@ impl DspWriter {
         self.silence_byte = silence_byte;
         set_value(self.raw_fd(), SNDCTL_DSP_SETFMT, format, 0)?;
         set_value(self.raw_fd(), SNDCTL_DSP_CHANNELS, channels, 0)?;
+        if let Some(order) = channel_order {
+            set_channel_order(self.raw_fd(), order)?;
+        }
         set_value(self.raw_fd(), SNDCTL_DSP_SPEED, rate, feeder_rate_round())
     }
 
@@ -822,7 +835,10 @@ mod playback_tests {
         let mut dsp = super::DspWriter::test_on_fd(w, 2);
         // A pipe rejects the OSS format ioctl, but configure stores the
         // negotiated frame geometry and silence byte before issuing it.
-        assert!(dsp.configure(super::AFMT_U8, 2, 48_000, 0x80).is_err());
+        assert!(
+            dsp.configure(super::AFMT_U8, 2, 48_000, 0x80, None)
+                .is_err()
+        );
         assert_eq!(dsp.stride, 2);
         assert_eq!(dsp.silence_byte, 0x80);
         dsp.write_silence(8);

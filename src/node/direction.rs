@@ -123,6 +123,12 @@ impl PortConfig {
             0
         }
     }
+
+    pub(crate) fn oss_channel_order(
+        &self,
+    ) -> Result<Option<u64>, super::format::UnsupportedChannelOrder> {
+        super::format::oss_channel_order(self.flags, &self.positions)
+    }
 }
 
 // outcome of a per-(id, index) node param build (the enum_params hook)
