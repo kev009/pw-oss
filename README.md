@@ -42,14 +42,20 @@ silent by design.
 
 ## Tunables
 
-Per-device properties can be set from WirePlumber rules
-(`wireplumber.conf.d`), matched against the monitor's device objects:
+Per-node properties can be set from WirePlumber rules
+(`wireplumber.conf.d`), matched against the properties emitted for each OSS
+node:
 
 ```
 monitor.oss.rules = [
   {
-    matches = [ { device.name = "~oss_card.*" } ]
-    actions = { update-props = { oss.delay = 16 } }
+    matches = [ { node.name = "pcm0.play" } ]
+    actions = {
+      update-props = {
+        oss.delay = 16
+        api.freebsd-oss.force-timer = true
+      }
+    }
   }
 ]
 ```
@@ -71,6 +77,13 @@ cadence from sndstat(4), which can be coarser than any fragment (USB
 transfer chunks, vchan parents) - and the rate servo's measurement
 granularity and noise model follow the real quantum automatically. Live:
 `pw-cli set-param <node> Props '{ params: [ "oss.fragment", 4096 ] }'`.
+
+`api.freebsd-oss.force-timer = true` forces a node to use the portable SPA
+timer wakeup path instead of enriched OSS kqueue events, including on kernels
+that support them. This is a creation-time setting for `monitor.oss.rules`;
+restart or recreate the node after changing it. It accepts `true`, `yes`, `on`
+or `1` (and the corresponding `false`, `no`, `off` or `0` forms), and is not
+available through the runtime Props parameter.
 
 ### Routes / hardware volume
 

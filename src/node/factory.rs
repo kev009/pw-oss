@@ -76,12 +76,36 @@ pub(crate) extern "C" fn get_size<D: Direction>(
     std::mem::size_of::<State<D>>()
 }
 
-// the init-dict node properties: the device path, the shared oss.fragment
-// default and whatever direction-specific keys D::info_item consumes
+fn property_bool(value: &str) -> Option<bool> {
+    if value == "1"
+        || value.eq_ignore_ascii_case("true")
+        || value.eq_ignore_ascii_case("yes")
+        || value.eq_ignore_ascii_case("on")
+    {
+        Some(true)
+    } else if value == "0"
+        || value.eq_ignore_ascii_case("false")
+        || value.eq_ignore_ascii_case("no")
+        || value.eq_ignore_ascii_case("off")
+    {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn sound_kqueue_enabled(force_timer: bool, enriched_available: bool) -> bool {
+    enriched_available && !force_timer
+}
+
+// the init-dict node properties: the device path, wake backend, shared
+// oss.fragment default and whatever direction-specific keys D::info_item consumes
 pub(super) unsafe fn parse_init_dict<D: Direction>(
     info: *const spa_dict,
-) -> (Option<String>, u32, D::MainExt) {
+    log: &crate::spa::Log,
+) -> (Option<String>, bool, u32, D::MainExt) {
     let mut dsp_path = None;
+    let mut force_timer = false;
     let mut oss_fragment = 0u32; // automatic (today's layout) unless the dict says otherwise
     let mut ext = D::MainExt::default();
 
@@ -95,6 +119,17 @@ pub(super) unsafe fn parse_init_dict<D: Direction>(
             crate::spa::for_each_dict_item(info, |key, value| {
                 if key == crate::keys::OSS_DSP_PATH {
                     dsp_path = Some(value.to_string());
+                } else if key == crate::keys::OSS_FORCE_TIMER {
+                    if let Some(enabled) = property_bool(value) {
+                        force_timer = enabled;
+                    } else {
+                        crate::warn!(
+                            log,
+                            "ignoring invalid {} value {:?}",
+                            crate::keys::OSS_FORCE_TIMER,
+                            value
+                        );
+                    }
                 } else if key == crate::keys::OSS_FRAGMENT {
                     // direction-shared per-device default, e.g. from a wireplumber node
                     // rule; stored normalized so readback reports the effective value
@@ -109,7 +144,7 @@ pub(super) unsafe fn parse_init_dict<D: Direction>(
     }
     D::ext_ready(&mut ext);
 
-    (dsp_path, oss_fragment, ext)
+    (dsp_path, force_timer, oss_fragment, ext)
 }
 
 // the static node/port info published at init: flags, props and the param
@@ -188,7 +223,20 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
     let data_loop = unsafe { crate::spa::Loop::wrap(data_loop) };
     let data_system = unsafe { crate::spa::System::wrap(data_system) };
 
-    let sound_queue = if crate::oss::enriched_sound_kqueue_available() {
+    let (dsp_path, force_timer, oss_fragment, ext) = unsafe { parse_init_dict::<D>(info, &log) };
+
+    let Some(dsp_path) = dsp_path else {
+        crate::error!(
+            log,
+            "{} missing from the node properties",
+            crate::keys::OSS_DSP_PATH
+        );
+        return -libc::EINVAL;
+    };
+
+    let use_sound_kqueue =
+        sound_kqueue_enabled(force_timer, crate::oss::enriched_sound_kqueue_available());
+    let sound_queue = if use_sound_kqueue {
         match crate::oss::SoundKqueue::new() {
             Ok(queue) => {
                 crate::debug!(log, "using enriched OSS kqueue device wakeups");
@@ -204,6 +252,14 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
             }
         }
     } else {
+        if force_timer {
+            crate::debug!(
+                log,
+                "{}: timer wakeups selected by {}",
+                dsp_path,
+                crate::keys::OSS_FORCE_TIMER
+            );
+        }
         None
     };
     let timer_fd = if sound_queue.is_none() {
@@ -222,17 +278,6 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
         .map(crate::oss::SoundKqueue::raw)
         .or_else(|| timer_fd.as_ref().map(crate::spa::TimerFd::raw))
         .expect("one wake descriptor is always constructed");
-
-    let (dsp_path, oss_fragment, ext) = unsafe { parse_init_dict::<D>(info) };
-
-    let Some(dsp_path) = dsp_path else {
-        crate::error!(
-            log,
-            "{} missing from the node properties",
-            crate::keys::OSS_DSP_PATH
-        );
-        return -libc::EINVAL;
-    };
 
     let mut caps_fallback = false;
     let caps = crate::oss::probe_caps(&dsp_path, D::PLAYBACK).unwrap_or_else(|| {
@@ -451,5 +496,50 @@ pub(crate) unsafe extern "C" fn enum_interface_info(
             }
             _ => 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_init_dict, property_bool, sound_kqueue_enabled};
+
+    #[test]
+    fn force_timer_disables_enriched_kqueue_selection() {
+        assert!(sound_kqueue_enabled(false, true));
+        assert!(!sound_kqueue_enabled(true, true));
+        assert!(!sound_kqueue_enabled(false, false));
+        assert!(!sound_kqueue_enabled(true, false));
+
+        for value in ["1", "true", "TRUE", "yes", "on"] {
+            assert_eq!(property_bool(value), Some(true), "{value}");
+        }
+        for value in ["0", "false", "FALSE", "no", "off"] {
+            assert_eq!(property_bool(value), Some(false), "{value}");
+        }
+        for value in ["", "2", "maybe", "true "] {
+            assert_eq!(property_bool(value), None, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn init_dict_matches_the_exact_force_timer_key() {
+        let log = crate::spa::Log::test_null();
+        let mut dict = crate::spa::Dictionary::new();
+        dict.add_item(crate::keys::OSS_FORCE_TIMER, "true");
+        let (_, force_timer, _, _) =
+            unsafe { parse_init_dict::<crate::node::sink::SinkDir>(dict.raw(), &log) };
+        assert!(force_timer);
+
+        let mut wrong_key = crate::spa::Dictionary::new();
+        wrong_key.add_item("api.freebsd-oss.force_timer", "true");
+        let (_, force_timer, _, _) =
+            unsafe { parse_init_dict::<crate::node::sink::SinkDir>(wrong_key.raw(), &log) };
+        assert!(!force_timer);
+
+        let mut invalid = crate::spa::Dictionary::new();
+        invalid.add_item(crate::keys::OSS_FORCE_TIMER, "maybe");
+        let (_, force_timer, _, _) =
+            unsafe { parse_init_dict::<crate::node::sink::SinkDir>(invalid.raw(), &log) };
+        assert!(!force_timer);
     }
 }
