@@ -1,5 +1,23 @@
 use super::*;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RetuneOutcome {
+    /// The current period remains in effect.
+    Unchanged,
+    /// Geometry changed, either live or after trigger-suspending for re-prime.
+    Retuned,
+    /// The ring cannot be retuned and the device refused trigger suspension.
+    Rebuild,
+}
+
+pub(super) fn predicted_next_fill(fill: u32, write_now: u32, period: u32) -> u32 {
+    fill.saturating_add(write_now).saturating_sub(period)
+}
+
+pub(super) fn retune_seed(target_goal: u32, fill: u32, write_now: u32, period: u32) -> u32 {
+    target_goal.min(predicted_next_fill(fill, write_now, period))
+}
+
 pub(super) fn desired_delay(period: u32, oss_delay: u32) -> u32 {
     (period / 8).saturating_mul(oss_delay)
 }
@@ -123,6 +141,7 @@ pub(super) fn commit_geometry(
     port.setup_period = period;
     port.setup_blocksize = blocksize; // the effective quantum, incl. hw chunk
     port.ext.target_delay = target;
+    port.ext.target_goal = target;
     port.dll.init();
     port.bw_adapt.reset(); // cold-starts at the granularity cap next servo cycle
     let (stride, rate) = port.stride_rate().unwrap_or((1, 0));
@@ -145,31 +164,33 @@ pub(super) fn log_delay_capped(log: &crate::spa::Log, path: &str, granted: u32) 
 // place: the triggered channel can't accept SETFRAGMENT, but it does not need
 // to when the existing grant still has the headroom the new period requires.
 // A grant too small re-primes in place via a trigger suspend (SETFRAGMENT
-// becomes legal again). Returns true when the driver refused the trigger stop
-// (dying fd) and only a main-thread rebuild remains.
+// becomes legal again). The outcome tells process() whether this cycle
+// committed new geometry, so followers do not immediately overwrite its
+// predicted live target with a pre-write fill sample.
 pub(super) fn retune_period(
     port: &mut crate::node::Port<SinkDir>,
     period_in_bytes: u32,
     stride: u32,
+    write_now: u32,
     oss_delay: u32,
     now: u64,
     log: &crate::spa::Log,
-) -> bool {
+) -> RetuneOutcome {
     if !port.dsp.is_running()
         || port.setup_period == 0
         || period_in_bytes == 0
         || period_in_bytes == port.setup_period
     {
         port.ext.period_mismatch = 0;
-        return false;
+        return RetuneOutcome::Unchanged;
     }
     // debounce BOTH paths: a single-cycle flip usually means a renegotiation is
     // in flight (which re-primes anyway); a rebuild on it costs an audible gap,
-    // and even the in-place retune relocks the servo and snaps the fill. Write
-    // at the old size for one cycle instead.
+    // and even the in-place retune relocks the servo. Keep the old geometry for
+    // one cycle instead.
     port.ext.period_mismatch += 1;
     if port.ext.period_mismatch < 2 {
-        return false;
+        return RetuneOutcome::Unchanged;
     }
     // cached blocksize: the triggered channel refuses SETFRAGMENT, so the
     // granted fragment (and the session-fixed hw cadence folded in at
@@ -179,6 +200,11 @@ pub(super) fn retune_period(
     let write_max = period_in_bytes.max(rate_match_bytes(&port.rate_match, stride));
     if port.ext.buffer_size >= buffer_required(period_in_bytes, desired, blocksize, write_max) {
         let old_period = port.setup_period;
+        // Measure the real queued audio before committing the new geometry.
+        // The live target below predicts what remains at the next wake after
+        // this cycle's write; advancing immediately to the larger goal with
+        // silence creates an audible hole in a continuous stream.
+        let odelay = port.dsp.odelay();
         let delay_capped = commit_geometry(
             port,
             port.ext.buffer_size,
@@ -187,35 +213,29 @@ pub(super) fn retune_period(
             write_max,
             desired,
         );
+        let target_goal = port.ext.target_goal;
+        // `write_now` normally equals the new period and therefore maintains
+        // the pre-write fill at the next wake. A short graph buffer can reduce
+        // it, so do not seed the live target above that predicted next fill.
+        port.ext.target_delay = retune_seed(target_goal, odelay, write_now, period_in_bytes);
         port.ext.period_mismatch = 0;
-        // no was_matching reset here: commit_geometry already cold-started the
-        // servo, and the stream continues without a gap (unlike the arms below)
-
-        // Level snap (ALSA's resync does the same): a sustained quantum
-        // change is a re-prime in place. When driving, nothing else
-        // corrects the level - the timer servo only rate-steers with a
-        // clamped error - so an under-filled ring after a quantum growth
-        // would sit one late wakeup away from an underrun for the seconds
-        // the skew needs; fill to target like the prime and xrun-recovery
-        // paths do. Overfill after a shrink is latency only and drains via
-        // the servo (or follower_servo's fill snap).
-        let odelay = port.dsp.odelay();
-        port.dsp
-            .write_silence(port.ext.target_delay.saturating_sub(odelay));
+        // commit_geometry cold-started the servo. It will now move the live
+        // target from this seed to target_goal as actual audio accumulates.
 
         crate::info!(
             log,
-            "{}: period {} -> {} bytes; retuned in place (granted {}, target delay {})",
+            "{}: period {} -> {} bytes; retuned in place (granted {}, target delay {} -> {})",
             port.dsp.path,
             old_period,
             period_in_bytes,
             port.ext.buffer_size,
-            port.ext.target_delay
+            port.ext.target_delay,
+            target_goal
         );
         if delay_capped {
             log_delay_capped(log, &port.dsp.path, port.ext.buffer_size);
         }
-        false
+        RetuneOutcome::Retuned
     } else if port.dsp.suspend() {
         // Too small for the new period: stop the channel in place.
         // SETTRIGGER(0) discards the queued audio exactly like the
@@ -235,7 +255,7 @@ pub(super) fn retune_period(
         port.ext.period_mismatch = 0;
         port.ext.xrun_timestamp = 0; // a stale recovery hold must not defer the re-arm
         port.was_matching = false;
-        false
+        RetuneOutcome::Retuned
     } else {
         // period_mismatch stays >= 2 on purpose: if the caller can't queue the
         // rebuild (no main loop), the next cycle retries this retune
@@ -252,7 +272,7 @@ pub(super) fn retune_period(
                 suppressed
             );
         }
-        true
+        RetuneOutcome::Rebuild
     }
 }
 

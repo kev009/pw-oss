@@ -1,9 +1,12 @@
 use super::{
-    SinkDir, SinkPortExt, consume_freewheel_input, detect_underrun, follower_servo, level_correct,
-    pending_write_offset, prepare_pending_write, recover_or_hold, release_input,
-    retain_partial_write, retune_period, write_retained_tail,
+    RetuneOutcome, SinkDir, SinkPortExt, consume_freewheel_input, detect_underrun, follower_servo,
+    level_correct, pending_write_offset, prepare_pending_write, recover_or_hold, release_input,
+    retain_partial_write, retune_period, settle_target, write_retained_tail,
 };
-use super::{buffer_request, buffer_required, desired_delay, fill_floor, target_delay};
+use super::{
+    buffer_request, buffer_required, desired_delay, fill_floor, predicted_next_fill, retune_seed,
+    target_delay,
+};
 use crate::node::PortConfig;
 use crate::oss::test_util::{drain, fill_pipe, free_space, pattern, pipe_pair};
 use libspa::sys::SPA_IO_CLOCK_FLAG_XRUN_RECOVER;
@@ -30,6 +33,7 @@ fn test_port(write_fd: libc::c_int, target_delay: u32, period: u32) -> crate::no
         pending_xrun: None,
         ext: SinkPortExt {
             target_delay,
+            target_goal: target_delay,
             ..Default::default()
         },
     }
@@ -164,6 +168,43 @@ fn recovery_holds_buffers_until_the_clock_passes_the_event() {
     assert_eq!(out.len(), 4096 + 2048);
     assert!(out[..4096].iter().all(|&b| b == 0));
     assert_eq!(&out[4096..], &data[..]);
+    unsafe { libc::close(r) };
+}
+
+#[test]
+fn recovery_restores_safe_headroom_without_filling_the_latency_goal() {
+    let (r, w) = pipe_pair(true, true);
+    let mut port = test_port(w, 1024, 2048);
+    port.ext.target_goal = 8192;
+    port.dsp.write_silence(0);
+    port.ext.xrun_timestamp = 1_000;
+    let data = pattern(2048, 9);
+
+    assert_eq!(recover_or_hold(&mut port, 2_000, 0, &data).bytes, 2048);
+    // fill_floor(2048, 1024) = 3072: enough safe headroom, not the 8192 goal.
+    assert_eq!(port.ext.target_delay, 3072);
+    assert_eq!(port.ext.target_goal, 8192);
+    let out = drain(r);
+    assert_eq!(out.len(), 3072 + data.len());
+    assert!(out[..3072].iter().all(|&b| b == 0));
+    assert_eq!(&out[3072..], data);
+    unsafe { libc::close(r) };
+}
+
+#[test]
+fn steady_recovery_restores_the_full_live_target() {
+    let (r, w) = pipe_pair(true, true);
+    let mut port = test_port(w, 4096, 2048);
+    port.dsp.write_silence(0);
+    port.ext.xrun_timestamp = 1_000;
+    let data = pattern(2048, 19);
+
+    assert_eq!(recover_or_hold(&mut port, 2_000, 0, &data).bytes, 2048);
+    assert_eq!(port.ext.target_delay, 4096);
+    let out = drain(r);
+    assert_eq!(out.len(), 4096 + data.len());
+    assert!(out[..4096].iter().all(|&b| b == 0));
+    assert_eq!(&out[4096..], data);
     unsafe { libc::close(r) };
 }
 
@@ -446,13 +487,23 @@ fn same_device_level_correct_snaps_the_fill() {
     let out = drain(r);
     assert_eq!(out.len(), 4096 - 1024);
     assert!(out.iter().all(|&b| b == 0));
+
+    // A retune can leave a lower reachable live target and a larger geometry
+    // goal. With no rate actuator, preserve that target instead of walking it
+    // upward and inserting silence.
+    port.ext.target_delay = 1024;
+    port.ext.target_goal = 4096;
+    assert!(!level_correct(&mut port, 1024));
+    assert_eq!(port.ext.target_delay, 1024);
+    assert!(drain(r).is_empty());
     unsafe { libc::close(r) };
 }
 
-// the in-place retune: a sustained period change with enough ring
-// headroom recommits the geometry and snaps the fill to the new target
+// A live in-place retune recommits geometry without writing silence into the
+// queued audio. The live target then approaches the geometry goal through the
+// existing rate servo.
 #[test]
-fn retune_recommits_in_place_and_snaps_the_fill() {
+fn retune_recommits_in_place_without_splicing_silence() {
     let (r, w) = pipe_pair(true, true);
     let mut port = test_port(w, 4096, 2048);
     port.dsp.write_silence(0); // a retuning channel is running
@@ -460,31 +511,89 @@ fn retune_recommits_in_place_and_snaps_the_fill() {
     let log = crate::spa::Log::test_null();
 
     // one flip is debounced: write at the old geometry for a cycle
-    assert!(!retune_period(&mut port, 4096, 8, 0, 0, &log));
+    assert_eq!(
+        retune_period(&mut port, 4096, 8, 4096, 0, 0, &log),
+        RetuneOutcome::Unchanged
+    );
     assert_eq!(port.setup_period, 2048);
     assert!(drain(r).is_empty());
 
-    // sustained: retune in place and fill to the new target (odelay
-    // reads 0 on a pipe, so the snap writes the whole target)
-    assert!(!retune_period(&mut port, 4096, 8, 0, 0, &log));
+    // Sustained: retune in place. A pipe cannot report GETODELAY, so the
+    // transition target starts at zero while the geometry goal is retained.
+    assert_eq!(
+        retune_period(&mut port, 4096, 8, 4096, 0, 0, &log),
+        RetuneOutcome::Retuned
+    );
     assert_eq!(port.setup_period, 4096);
-    assert_eq!(port.ext.target_delay, 5120); // fill_floor(4096, 1024) binds
+    assert_eq!(port.ext.target_delay, 0);
+    assert_eq!(port.ext.target_goal, 5120); // fill_floor(4096, 1024) binds
     assert_eq!(port.ext.period_mismatch, 0);
-    let out = drain(r);
-    assert_eq!(out.len(), 5120);
-    assert!(out.iter().all(|&b| b == 0));
+    assert!(
+        drain(r).is_empty(),
+        "retuning a live stream must not insert silence"
+    );
+
+    // The target advances only a bounded amount ahead of real measured fill.
+    settle_target(&mut port, 4096, 8);
+    assert_eq!(port.ext.target_delay, 5120);
     unsafe { libc::close(r) };
 }
 
-// The in-place retune against a near-full ring: the gate math (granted >=
-// target + write_max + blocksize post-snap) makes drops impossible when
-// odelay reads true, but a vchan can under-read odelay and the snap then
-// overfills - so the write path is the backstop and its drops must stay
-// frame-aligned. Model the worst case directly: a ring with room for the
-// whole snap (odelay reads 0 on a pipe, so the snap writes the full new
-// target) but only half the cycle's data behind it.
 #[test]
-fn retune_snap_then_data_drops_whole_frames_on_a_near_full_ring() {
+fn retune_target_stays_bounded_ahead_of_real_fill() {
+    let (r, w) = pipe_pair(true, true);
+    let mut port = test_port(w, 4096, 4096);
+    port.ext.target_goal = 16384;
+
+    settle_target(&mut port, 4096, 8);
+    assert_eq!(port.ext.target_delay, 5120); // one quarter-period lead
+    settle_target(&mut port, 4096, 8);
+    assert_eq!(port.ext.target_delay, 5120); // no synthetic progress
+    settle_target(&mut port, 4608, 8);
+    assert_eq!(port.ext.target_delay, 5632); // follows accumulated real fill
+    unsafe { libc::close(r) };
+}
+
+#[test]
+fn short_retune_write_keeps_its_seed_for_the_current_cycle() {
+    let period = 4096;
+    let fill = 8192;
+    let write_now = 0;
+    let seed = predicted_next_fill(fill, write_now, period);
+    assert_eq!(seed, 4096);
+    assert_eq!(retune_seed(12_288, fill, write_now, period), seed);
+    assert_eq!(retune_seed(12_288, fill, 2048, period), 6144);
+    assert_eq!(retune_seed(4096, fill, 4096, period), 4096);
+
+    // Settling from the pre-write fill in this cycle would move the target to
+    // 9216. After the short write and one new-period drain, that is more than a
+    // period above the real fill and would trigger the silence snap.
+    let premature = fill + period / 4;
+    assert!(premature - seed > period);
+
+    // Production receives this explicit outcome and skips follower correction
+    // until the next cycle can measure the real post-write fill.
+    let (r, w) = pipe_pair(true, true);
+    let mut port = test_port(w, fill, 2048);
+    port.dsp.write_silence(0);
+    port.ext.buffer_size = 16384;
+    let log = crate::spa::Log::test_null();
+    assert_eq!(
+        retune_period(&mut port, period, 8, write_now, 0, 0, &log),
+        RetuneOutcome::Unchanged
+    );
+    assert_eq!(
+        retune_period(&mut port, period, 8, write_now, 0, 0, &log),
+        RetuneOutcome::Retuned
+    );
+    assert!(drain(r).is_empty());
+    unsafe { libc::close(r) };
+}
+
+// A near-full live ring is left untouched by retune, so the current real
+// buffer gets all available capacity instead of competing with a silence snap.
+#[test]
+fn retune_preserves_capacity_for_real_audio() {
     let (r, w) = pipe_pair(true, true);
     let mut port = test_port(w, 4096, 2048);
     port.dsp.write_silence(0); // a retuning channel is running
@@ -492,32 +601,29 @@ fn retune_snap_then_data_drops_whole_frames_on_a_near_full_ring() {
     let log = crate::spa::Log::test_null();
 
     // debounce cycle: no writes yet
-    assert!(!retune_period(&mut port, 4096, 8, 0, 0, &log));
+    assert_eq!(
+        retune_period(&mut port, 4096, 8, 4096, 0, 0, &log),
+        RetuneOutcome::Unchanged
+    );
     assert!(drain(r).is_empty());
 
     let capacity = fill_pipe(w);
-    free_space(r, 5120 + 1024);
+    free_space(r, 1024);
 
-    // sustained: the retune commits and the snap fills to the new target
-    assert!(!retune_period(&mut port, 4096, 8, 0, 0, &log));
+    // Sustained: retune commits without consuming the remaining capacity.
+    assert_eq!(
+        retune_period(&mut port, 4096, 8, 4096, 0, 0, &log),
+        RetuneOutcome::Retuned
+    );
     assert_eq!(port.setup_period, 4096);
-    assert_eq!(port.ext.target_delay, 5120);
+    assert_eq!(drain(r).len(), capacity - 1024); // retune added nothing
 
-    // the cycle's data write against the 1024 bytes left: a frame-aligned
-    // short write, the tail dropped as whole frames
+    // Retuning consumed no capacity, so the real audio is accepted in full.
     let data = pattern(2048, 3);
     let n = port.dsp.write(&data);
-    assert_eq!(n.bytes, 1024);
+    assert_eq!(n.bytes, 2048);
     assert_eq!(n.bytes % 8, 0);
-
-    let out = drain(r);
-    assert_eq!(out.len(), capacity); // filler + snap zeroes + data head
-    let tail = &out[out.len() - (5120 + 1024)..];
-    assert!(
-        tail[..5120].iter().all(|&b| b == 0),
-        "the snap must precede the data"
-    );
-    assert_eq!(&tail[5120..], &data[..1024]);
+    assert_eq!(drain(r), data);
     unsafe { libc::close(r) };
 }
 
@@ -531,8 +637,14 @@ fn retune_requests_rebuild_when_the_suspend_is_refused() {
     port.dsp.write_silence(0);
     let log = crate::spa::Log::test_null();
 
-    assert!(!retune_period(&mut port, 4096, 8, 0, 0, &log));
-    assert!(retune_period(&mut port, 4096, 8, 0, 0, &log));
+    assert_eq!(
+        retune_period(&mut port, 4096, 8, 4096, 0, 0, &log),
+        RetuneOutcome::Unchanged
+    );
+    assert_eq!(
+        retune_period(&mut port, 4096, 8, 4096, 0, 0, &log),
+        RetuneOutcome::Rebuild
+    );
     assert_eq!(port.setup_period, 2048); // untouched; the rebuild replaces the device
     assert!(port.ext.period_mismatch >= 2);
     assert!(drain(r).is_empty());

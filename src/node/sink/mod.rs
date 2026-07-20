@@ -51,8 +51,9 @@ impl Default for SinkDataExt {
 #[derive(Default)]
 pub(crate) struct SinkPortExt {
     pub xrun_timestamp: u64, // the moment we noticed an underrun (which is a bit later than the start of it)
-    pub target_delay: u32,   // OSS buffer fill target in bytes, clamped to the granted buffer
-    pub buffer_size: u32,    // granted OSS playback ring capacity in bytes
+    pub target_delay: u32,   // live servo target in bytes
+    pub target_goal: u32, // geometry target retained for rate-controlled settling and future primes
+    pub buffer_size: u32, // granted OSS playback ring capacity in bytes
     pub period_mismatch: u32, // consecutive cycles at a different period (debounce)
     // OSS may accept only a prefix from its nonblocking fd. Keep the host
     // buffer until every byte is accepted, and resume at this byte offset.
@@ -173,6 +174,16 @@ fn recover_or_hold(
 
         port.dll.init();
         port.bw_adapt.reset();
+        // A real xrun has already broken continuity. Ensure the live target
+        // reaches the geometry's safe floor, but do not raise a soft-settling
+        // target toward its optional goal. A steady target already equals the
+        // goal and is therefore fully restored.
+        let safe = fill_floor(port.setup_period, port.setup_blocksize);
+        port.ext.target_delay = port
+            .ext
+            .target_delay
+            .max(safe.min(port.ext.target_goal))
+            .min(port.ext.target_goal);
 
         // buffer's already sized; re-prime only up to target, accounting for what's
         // still queued (a full target_delay would push odelay past the buffer)
@@ -196,6 +207,19 @@ fn recover_or_hold(
     }
 }
 
+// Move a live-retuned fill target toward its geometry goal without splicing
+// synthetic samples into the queued stream. The target stays at most a quarter
+// period ahead of measured fill, inside the normal DLL band; as real audio
+// accumulates under rate steering, the target follows it to the goal.
+fn settle_target(port: &mut crate::node::Port<SinkDir>, fill: u32, stride: u32) {
+    if port.ext.target_delay >= port.ext.target_goal {
+        return;
+    }
+    let lead = (port.setup_period / 4).max(stride);
+    let capped_lead = fill.saturating_add(lead).min(port.ext.target_goal);
+    port.ext.target_delay = port.ext.target_delay.max(capped_lead);
+}
+
 // The follower-servo phase, matching a foreign clock: the DLL serves rate
 // matching only (when driving, the servo runs in on_timeout where the clock
 // is published, and a same-device follower has nothing to correct - updating
@@ -210,6 +234,7 @@ fn follower_servo(
 ) -> (f64, bool) {
     let mut corr: f64 = 1.0;
     let mut skip_write = false;
+    settle_target(port, odelay, stride);
     if !port.was_matching {
         // matching just engaged; relock rather than apply stale state
         port.dll.init();
@@ -242,9 +267,11 @@ fn follower_servo(
     (corr, skip_write)
 }
 
-// same-device follower: no rate to match, but the level can still drift on
-// missed cycles; correct it directly. Returns whether this cycle's buffer
-// must be skipped (overfill drain).
+// Same-device follower: there is no rate actuator that can accumulate real
+// audio toward a larger transition goal. Keep the seeded live target instead
+// of inserting silence; correct only later drift around that reachable level.
+// A genuine underrun is the only path that raises it to the geometry floor.
+// Returns whether this cycle's buffer must be skipped (overfill drain).
 fn level_correct(port: &mut crate::node::Port<SinkDir>, odelay: u32) -> bool {
     let err_raw = odelay as f64 - port.ext.target_delay as f64;
     if err_raw < -(port.setup_period as f64) {
@@ -520,14 +547,16 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
             stride,
         );
 
-        if retune_period(
+        let retune = retune_period(
             port,
             period_in_bytes,
             stride,
+            size,
             state.ext.oss_delay,
             state.ext.cur_timestamp,
             &state.log,
-        ) {
+        );
+        if retune == RetuneOutcome::Rebuild {
             // the driver refused the trigger stop (dying fd): rebuild off-loop
             // (the &mut port borrow ends here: queue_rebuild snapshots an
             // owned request and owns the pending claim)
@@ -541,6 +570,7 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
             // No main loop (unusual host): continue at the stale geometry;
             // normal backpressure and underrun handling remain available.
         }
+        let retuned = retune == RetuneOutcome::Retuned;
         // re-borrow: the retune arm above may have borrowed the whole State
         let port = &mut state.ports[port_idx];
 
@@ -591,12 +621,13 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
             recover_or_hold(port, driver_clock.nsec, driver_clock.flags, cycle_data)
         } else {
             let mut skip_write = false;
-            if matching && port.setup_period != 0 && port.ext.period_mismatch == 0 {
+            if !retuned && matching && port.setup_period != 0 && port.ext.period_mismatch == 0 {
                 (corr, skip_write) =
                     follower_servo(port, port.dsp.odelay(), stride, state.ext.cur_timestamp);
             }
 
-            if state.following
+            if !retuned
+                && state.following
                 && !matching
                 && port.setup_period != 0
                 && port.ext.period_mismatch == 0
@@ -871,7 +902,10 @@ impl Direction for SinkDir {
     // absolute delay is understated by bufhard; the servo only needs
     // cycle-to-cycle consistency and is unaffected.
     fn servo_fill(port: &mut crate::node::Port<SinkDir>) -> u32 {
-        port.dsp.odelay()
+        let fill = port.dsp.odelay();
+        let stride = port.stride_rate().map(|(stride, _)| stride).unwrap_or(1);
+        settle_target(port, fill, stride);
+        fill
     }
 
     fn servo_hold(port: &crate::node::Port<SinkDir>) -> bool {
