@@ -1,0 +1,43 @@
+name: CodeQL
+
+# FreeBSD-only crate: do not attempt a real cargo build on the Linux runner.
+# build-mode: none extracts Rust sources + Cargo metadata without compiling.
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    # Weekly backstop for newly published queries / advisory-adjacent rules.
+    - cron: "17 5 * * 1"
+
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (rust)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: rust
+          build-mode: none
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:rust"
