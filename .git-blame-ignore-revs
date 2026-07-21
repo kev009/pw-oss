@@ -2,3 +2,6 @@
 # useful with: git config blame.ignoreRevsFile .git-blame-ignore-revs
 # (GitHub applies this file automatically)
 9f4738406ead9f784542c23a7a23ae8a67302ba0
+
+# Rust 1.96 modernization and mechanical pointer/style cleanup
+27b6a03b7d69ed03965c5941f53a5757eed235f6
