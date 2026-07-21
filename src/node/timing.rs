@@ -96,23 +96,23 @@ pub(super) unsafe extern "C" fn on_wake<D: Direction>(source: *mut spa_source) {
     let Some(hook) = notify else {
         return; // early exit; the timer was armed or parked inside
     };
-    if let Some((cb, data)) = hook {
-        if let Some(ready_fun) = cb.ready {
-            unsafe {
-                with_data_mut(root, |state| state.ready_dispatching = true);
-            };
-            // no State borrow is live here; sound per NodeCallbacks::hook
-            let err = unsafe { ready_fun(data, D::READY_STATUS) };
-            unsafe {
-                with_data_mut(root, |state| state.ready_dispatching = false);
-            };
-            #[cfg(debug_assertions)]
-            unsafe {
-                with_data_mut(root, |state| crate::trace!(state.log, "ready -> {}", err));
-            };
-            #[cfg(not(debug_assertions))]
-            let _ = err;
-        }
+    if let Some((cb, data)) = hook
+        && let Some(ready_fun) = cb.ready
+    {
+        unsafe {
+            with_data_mut(root, |state| state.ready_dispatching = true);
+        };
+        // no State borrow is live here; sound per NodeCallbacks::hook
+        let err = unsafe { ready_fun(data, D::READY_STATUS) };
+        unsafe {
+            with_data_mut(root, |state| state.ready_dispatching = false);
+        };
+        #[cfg(debug_assertions)]
+        unsafe {
+            with_data_mut(root, |state| crate::trace!(state.log, "ready -> {}", err));
+        };
+        #[cfg(not(debug_assertions))]
+        let _ = err;
     }
 
     // Phase 2: re-borrow to arm the timer for the deadline the cycle
@@ -129,7 +129,6 @@ pub(super) unsafe extern "C" fn on_wake<D: Direction>(source: *mut spa_source) {
 // early exit (the timer was armed/parked as needed); Some(hook) = the full
 // cycle ran, the clock is published, and the caller must invoke the ready
 // hook (when present) and then select the next device or timer wake.
-#[allow(clippy::type_complexity)] // the copied C (table, data) pair
 pub(super) fn wake_cycle<D: Direction>(
     state: &mut DataState<D>,
 ) -> Option<Option<(spa_node_callbacks, *mut c_void)>> {
@@ -309,10 +308,10 @@ fn drain_wake<D: Direction>(state: &mut DataState<D>) -> Option<WakeKind> {
 }
 
 fn disable_device_wake<D: Direction>(state: &mut DataState<D>) {
-    if let Some(queue) = &mut state.sound_queue {
-        if let Err(err) = queue.unregister_device() {
-            crate::warn!(state.log, "removing the OSS kqueue device: {}", err);
-        }
+    if let Some(queue) = &mut state.sound_queue
+        && let Err(err) = queue.unregister_device()
+    {
+        crate::warn!(state.log, "removing the OSS kqueue device: {}", err);
     }
     for port in &mut state.ports {
         port.device_event = None;

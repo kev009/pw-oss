@@ -46,12 +46,12 @@ pub(crate) fn store_and_rebuild<D: Direction>(
         return -libc::EIO;
     };
     for (port_idx, config) in configs.into_iter().enumerate() {
-        if let Some(config) = config {
-            if install_device(state, data, port_idx, config) != 0 {
-                // the host didn't initiate this rebuild; without a re-announce it
-                // keeps believing a format is set on a dead port
-                emit_format_lost(state);
-            }
+        if let Some(config) = config
+            && install_device(state, data, port_idx, config) != 0
+        {
+            // the host didn't initiate this rebuild; without a re-announce it
+            // keeps believing a format is set on a dead port
+            emit_format_lost(state);
         }
     }
     0

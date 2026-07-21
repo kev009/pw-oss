@@ -1,7 +1,7 @@
 // Direction-agnostic node contracts. Sink and source monomorphize these hooks;
 // shared state and FFI trampolines live in sibling modules.
 
-use std::os::raw::c_int;
+use std::ffi::c_int;
 
 use libspa::sys::*;
 

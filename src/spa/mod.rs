@@ -1,7 +1,5 @@
-use core::ffi::CStr;
 use libspa::sys::*;
-use std::ffi::CString;
-use std::os::raw::{c_char, c_int, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
 
 mod hooks;
 mod info;
@@ -75,7 +73,7 @@ impl<T> IoArea<T> {
     /// and the host keeps it valid while set (the set_io /
     /// port_set_io contract). The memory is host-shared by design; the
     /// data-loop invoke is what serializes our accesses against the swap.
-    pub(crate) unsafe fn set(&mut self, data: *mut std::os::raw::c_void) {
+    pub(crate) unsafe fn set(&mut self, data: *mut c_void) {
         self.ptr = data.cast();
     }
 

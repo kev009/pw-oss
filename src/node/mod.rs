@@ -5,7 +5,7 @@
 // is supplied through the `Direction` hooks each module implements. The
 // extern "C" vtable entries are generic and monomorphized per direction.
 
-use std::os::raw::{c_char, c_int, c_void};
+use std::ffi::{c_char, c_int, c_void};
 
 use libspa::sys::*;
 

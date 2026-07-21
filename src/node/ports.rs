@@ -83,7 +83,7 @@ pub(super) unsafe extern "C" fn port_enum_params<D: Direction>(
             filter,
             |state, index| {
                 use crate::spa::ParamStep;
-                #[allow(non_upper_case_globals)]
+                #[expect(non_upper_case_globals)]
                 match (id, index) {
                     (SPA_PARAM_EnumFormat, i) => {
                         if state.caps_fallback {
@@ -478,7 +478,7 @@ pub(super) unsafe fn port_set_param_inner<D: Direction>(
         return -libc::EINVAL;
     }
 
-    #[allow(non_upper_case_globals)]
+    #[expect(non_upper_case_globals)]
     match id {
         SPA_PARAM_Format => {
             let res = if !param.is_null() {

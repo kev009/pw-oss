@@ -141,7 +141,7 @@ macro_rules! log {
             $log.log(
                 $log_level,
                 file,
-                line as ::std::os::raw::c_int,
+                line as ::std::ffi::c_int,
                 func,
                 &format!($($arg)*),
             );

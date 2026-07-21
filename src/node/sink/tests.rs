@@ -10,12 +10,13 @@ use super::{
 use crate::node::PortConfig;
 use crate::oss::test_util::{drain, fill_pipe, free_space, pattern, pipe_pair};
 use libspa::sys::SPA_IO_CLOCK_FLAG_XRUN_RECOVER;
+use std::ffi::c_int;
 
 // a Port on a pipe-backed device: the pipe's buffer plays the OSS ring
 // (byte-exact accounting, short writes on a full ring), GETODELAY reads 0
 // (the ioctl fails on a pipe), so the phase functions get the fill level
 // passed explicitly where a decision needs it
-fn test_port(write_fd: libc::c_int, target_delay: u32, period: u32) -> crate::node::Port<SinkDir> {
+fn test_port(write_fd: c_int, target_delay: u32, period: u32) -> crate::node::Port<SinkDir> {
     crate::node::Port {
         config: None,
         buffers: vec![],

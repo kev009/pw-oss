@@ -1,5 +1,5 @@
 use nix::errno::Errno;
-use std::os::raw::{c_char, c_int, c_long, c_uint, c_ulong};
+use std::ffi::{c_char, c_int, c_long, c_uint, c_ulong};
 
 use crate::freebsd::{IoctlPod, ioctl_int, ioctl_read, ioctl_value};
 
@@ -14,36 +14,36 @@ pub(crate) const AFMT_F32_LE: u32 = 0x10000000;
 pub(crate) const AFMT_F32_BE: u32 = 0x20000000;
 
 pub(super) const SNDCTL_DSP_SPEED: c_ulong =
-    nix::request_code_readwrite!(b'P', 2, std::mem::size_of::<c_int>());
+    nix::request_code_readwrite!(b'P', 2, size_of::<c_int>());
 pub(super) const SNDCTL_DSP_SETFMT: c_ulong =
-    nix::request_code_readwrite!(b'P', 5, std::mem::size_of::<c_int>());
+    nix::request_code_readwrite!(b'P', 5, size_of::<c_int>());
 pub(super) const SNDCTL_DSP_CHANNELS: c_ulong =
-    nix::request_code_readwrite!(b'P', 6, std::mem::size_of::<c_int>());
+    nix::request_code_readwrite!(b'P', 6, size_of::<c_int>());
 pub(super) const SNDCTL_DSP_SETFRAGMENT: c_ulong =
-    nix::request_code_readwrite!(b'P', 10, std::mem::size_of::<c_int>());
+    nix::request_code_readwrite!(b'P', 10, size_of::<c_int>());
 pub(super) const SNDCTL_DSP_LOW_WATER: c_ulong =
-    nix::request_code_write!(b'P', 34, std::mem::size_of::<c_int>());
+    nix::request_code_write!(b'P', 34, size_of::<c_int>());
 pub(super) const SNDCTL_DSP_GETFMTS: c_ulong =
-    nix::request_code_read!(b'P', 11, std::mem::size_of::<c_int>());
+    nix::request_code_read!(b'P', 11, size_of::<c_int>());
 pub(super) const SNDCTL_DSP_GETOSPACE: c_ulong =
-    nix::request_code_read!(b'P', 12, std::mem::size_of::<audio_buf_info>());
+    nix::request_code_read!(b'P', 12, size_of::<audio_buf_info>());
 pub(super) const SNDCTL_DSP_GETISPACE: c_ulong =
-    nix::request_code_read!(b'P', 13, std::mem::size_of::<audio_buf_info>());
+    nix::request_code_read!(b'P', 13, size_of::<audio_buf_info>());
 pub(super) const SNDCTL_DSP_SETTRIGGER: c_ulong =
-    nix::request_code_write!(b'P', 16, std::mem::size_of::<c_int>());
+    nix::request_code_write!(b'P', 16, size_of::<c_int>());
 pub(super) const SNDCTL_DSP_GETODELAY: c_ulong =
-    nix::request_code_read!(b'P', 23, std::mem::size_of::<c_int>());
+    nix::request_code_read!(b'P', 23, size_of::<c_int>());
 pub(super) const SNDCTL_DSP_GETERROR: c_ulong =
-    nix::request_code_read!(b'P', 25, std::mem::size_of::<audio_errinfo>());
+    nix::request_code_read!(b'P', 25, size_of::<audio_errinfo>());
 const SNDCTL_DSP_GET_CHNORDER: c_ulong =
-    nix::request_code_read!(b'P', 42, std::mem::size_of::<OssChannelOrder>());
+    nix::request_code_read!(b'P', 42, size_of::<OssChannelOrder>());
 const SNDCTL_DSP_SET_CHNORDER: c_ulong =
-    nix::request_code_readwrite!(b'P', 42, std::mem::size_of::<OssChannelOrder>());
+    nix::request_code_readwrite!(b'P', 42, size_of::<OssChannelOrder>());
 pub(super) const SNDCTL_DSP_HALT: c_ulong = nix::request_code_none!(b'P', 0); // aka SNDCTL_DSP_RESET
 pub(super) const SNDCTL_DSP_SILENCE: c_ulong = nix::request_code_none!(b'P', 31);
 pub(super) const SNDCTL_DSP_SKIP: c_ulong = nix::request_code_none!(b'P', 32);
 pub(super) const SNDCTL_ENGINEINFO: c_ulong =
-    nix::request_code_readwrite!(b'X', 12, std::mem::size_of::<oss_audioinfo>());
+    nix::request_code_readwrite!(b'X', 12, size_of::<oss_audioinfo>());
 
 // sys/soundcard.h; the ioctl encodes the size, so a layout mismatch fails
 // cleanly instead of corrupting memory
@@ -90,6 +90,11 @@ pub(super) const SND_CHN_MAX: c_int = 8;
 
 pub(super) const PCM_ENABLE_INPUT: c_int = 0x00000001;
 pub(super) const PCM_ENABLE_OUTPUT: c_int = 0x00000002;
+
+// sound(4) PCM_CAP_* (sys/soundcard.h) — ENGINEINFO / sndstat channel caps
+pub(crate) const PCM_CAP_INPUT: c_int = 0x0001_0000;
+pub(crate) const PCM_CAP_OUTPUT: c_int = 0x0002_0000;
+pub(crate) const PCM_CAP_VIRTUAL: c_int = 0x0004_0000;
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub(super) struct audio_buf_info {

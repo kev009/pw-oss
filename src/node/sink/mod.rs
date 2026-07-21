@@ -1,4 +1,4 @@
-use std::os::raw::c_int;
+use std::ffi::c_int;
 
 use libspa::sys::*;
 
@@ -802,22 +802,22 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
             continue;
         }
 
-        if nbytes < size as isize {
-            if let Some(suppressed) = port.warn_limit.check(state.ext.cur_timestamp) {
-                crate::warn!(
-                    state.log,
-                    "{}: dropped {} bytes (write returned {}, error {:?}) (+{} warnings suppressed)",
-                    port.dsp.path,
-                    if nbytes > 0 {
-                        size - nbytes as u32
-                    } else {
-                        size
-                    },
-                    nbytes,
-                    write_result.error,
-                    suppressed
-                );
-            }
+        if nbytes < size as isize
+            && let Some(suppressed) = port.warn_limit.check(state.ext.cur_timestamp)
+        {
+            crate::warn!(
+                state.log,
+                "{}: dropped {} bytes (write returned {}, error {:?}) (+{} warnings suppressed)",
+                port.dsp.path,
+                if nbytes > 0 {
+                    size - nbytes as u32
+                } else {
+                    size
+                },
+                nbytes,
+                write_result.error,
+                suppressed
+            );
         }
 
         // a sink has no output, so the return bit is NEED_DATA ("can accept input
@@ -865,7 +865,7 @@ impl Direction for SinkDir {
     }
 
     fn build_node_param(state: &mut MainState<SinkDir>, id: u32, index: u32) -> ParamBuild {
-        #[allow(non_upper_case_globals)]
+        #[expect(non_upper_case_globals)]
         let pod = match (id, index) {
             (SPA_PARAM_PropInfo, 0) => crate::spa::build_latency_offset_prop_info(),
             (SPA_PARAM_PropInfo, 1) => crate::spa::build_params_prop_info(
@@ -976,24 +976,22 @@ impl Direction for SinkDir {
                 && !port.ext.rebuild_after_start
                 && port.dsp.is_running()
                 && port.setup_period != 0;
-            if resume_running {
-                if let Err(err) = port.dsp.resume() {
-                    crate::warn!(
-                        state.log,
-                        "{}: restoring paused playback: {}",
-                        port.dsp.path,
-                        err
-                    );
-                    // Do not append real audio behind a possibly full buffer
-                    // of pause silence. Reset in place so process() takes the
-                    // normal prime path; a refused reset requires replacement
-                    // before process() may write again.
-                    resume_running = false;
-                    if port.dsp.suspend() {
-                        crate::node::reset_device_event(port);
-                    } else {
-                        port.ext.rebuild_after_start = true;
-                    }
+            if resume_running && let Err(err) = port.dsp.resume() {
+                crate::warn!(
+                    state.log,
+                    "{}: restoring paused playback: {}",
+                    port.dsp.path,
+                    err
+                );
+                // Do not append real audio behind a possibly full buffer
+                // of pause silence. Reset in place so process() takes the
+                // normal prime path; a refused reset requires replacement
+                // before process() may write again.
+                resume_running = false;
+                if port.dsp.suspend() {
+                    crate::node::reset_device_event(port);
+                } else {
+                    port.ext.rebuild_after_start = true;
                 }
             }
             port.ext.resuming = resume_running;

@@ -1,7 +1,6 @@
 use libc::{size_t, ssize_t};
 use nix::errno::Errno;
-use std::ffi::CString;
-use std::os::raw::c_int;
+use std::ffi::{CString, c_int};
 
 use crate::freebsd::{LibcFd, ioctl_int, ioctl_read};
 
@@ -281,7 +280,7 @@ impl Drop for Dsp {
 impl Dsp {
     pub(crate) fn test_on_fd(fd: c_int, stride: u32) -> Self {
         Self {
-            path: CString::new("test-fd").unwrap(),
+            path: c"test-fd".to_owned(),
             hw_quantum_ns: 0,
             // The test constructor takes ownership of this pipe endpoint.
             fd: Some(unsafe { LibcFd::from_raw(fd) }),

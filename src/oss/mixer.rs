@@ -10,8 +10,7 @@
 // Every ioctl here degrades to None/false on failure: a mixer can go away
 // with its (hotpluggable) device at any time.
 
-use std::ffi::CString;
-use std::os::raw::{c_char, c_int, c_uint, c_ulong};
+use std::ffi::{CString, c_char, c_int, c_uint, c_ulong};
 
 use crate::freebsd::{LibcFd, ioctl_int, ioctl_read};
 
@@ -50,17 +49,16 @@ struct MixerInfo {
 unsafe impl crate::freebsd::IoctlPod for MixerInfo {}
 
 fn read_req(dev: c_uint) -> c_ulong {
-    nix::request_code_read!(b'M', dev, std::mem::size_of::<c_int>())
+    nix::request_code_read!(b'M', dev, size_of::<c_int>())
 }
 
 // MIXER_WRITE is _IOWR but FreeBSD does NOT echo the stored value back
 // (only the read branch writes *arg_i, mixer.c); never read the buffer after
 fn write_req(dev: c_uint) -> c_ulong {
-    nix::request_code_readwrite!(b'M', dev, std::mem::size_of::<c_int>())
+    nix::request_code_readwrite!(b'M', dev, size_of::<c_int>())
 }
 
-const SOUND_MIXER_INFO: c_ulong =
-    nix::request_code_read!(b'M', 101, std::mem::size_of::<MixerInfo>());
+const SOUND_MIXER_INFO: c_ulong = nix::request_code_read!(b'M', 101, size_of::<MixerInfo>());
 
 pub(crate) struct Mixer {
     fd: LibcFd,

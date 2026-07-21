@@ -30,7 +30,7 @@ pub(super) fn parse_props_update(
 
     let mut update = PropsUpdate::default();
     for property in properties {
-        #[allow(non_upper_case_globals)]
+        #[expect(non_upper_case_globals)]
         match property.key {
             // softvol-handled by the adapter
             SPA_PROP_volume
@@ -157,7 +157,7 @@ pub(super) unsafe extern "C" fn set_param<D: Direction>(
 
     // Reject unknown ids before reading the pod. NULL resets a known
     // parameter; malformed or mistyped pods return -EINVAL.
-    #[allow(non_upper_case_globals)]
+    #[expect(non_upper_case_globals)]
     let request = match id {
         SPA_PARAM_Props => {
             if param.is_null() {

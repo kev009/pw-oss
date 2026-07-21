@@ -3,11 +3,12 @@ use super::{
     retune_period, ring_request, ring_required,
 };
 use crate::oss::test_util::{pattern, pipe_pair};
+use std::ffi::c_int;
 
 // a Port on a pipe-backed device: the pipe plays the capture ring
 // (byte-exact accounting), GETISPACE fails on a pipe, so the phase
 // functions get the queued fill passed explicitly (as the callers do)
-fn test_port(read_fd: libc::c_int, period: u32, read_peak: u32) -> crate::node::Port<SourceDir> {
+fn test_port(read_fd: c_int, period: u32, read_peak: u32) -> crate::node::Port<SourceDir> {
     crate::node::Port {
         config: None,
         buffers: vec![],

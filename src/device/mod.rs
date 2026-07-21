@@ -1,5 +1,5 @@
 use libspa::sys::*;
-use std::os::raw::{c_char, c_int, c_uint, c_void};
+use std::ffi::{c_char, c_int, c_uint, c_void};
 
 mod events;
 mod params;
@@ -51,7 +51,7 @@ unsafe fn with_runtime_mut<R>(
     apply: impl for<'a> FnOnce(&'a mut Runtime) -> R,
 ) -> R {
     assert!(!state.is_null(), "state is not supposed to be null");
-    let runtime = unsafe { &mut *std::ptr::addr_of_mut!((*state).runtime) };
+    let runtime = unsafe { (&raw mut (*state).runtime).as_mut_unchecked() };
     apply(runtime)
 }
 
@@ -60,7 +60,7 @@ unsafe fn with_runtime_ref<R>(
     apply: impl for<'a> FnOnce(&'a Runtime) -> R,
 ) -> R {
     assert!(!state.is_null(), "state is not supposed to be null");
-    let runtime = unsafe { &*std::ptr::addr_of!((*state).runtime) };
+    let runtime = unsafe { (&raw const (*state).runtime).as_ref_unchecked() };
     apply(runtime)
 }
 
@@ -136,7 +136,7 @@ unsafe extern "C" fn enum_params(
     let state: *mut State = object.cast();
     assert!(!state.is_null(), "object is not supposed to be null");
     let events = unsafe { with_runtime_ref(state, |state| state.events.clone()) };
-    let runtime = unsafe { std::ptr::addr_of_mut!((*state).runtime) };
+    let runtime = unsafe { &raw mut (*state).runtime };
 
     unsafe {
         crate::spa::enum_params_loop(
@@ -155,7 +155,7 @@ unsafe extern "C" fn enum_params(
                     return ParamStep::Skip;
                 }
 
-                #[allow(non_upper_case_globals)]
+                #[expect(non_upper_case_globals)]
                 match (id, index) {
                     (SPA_PARAM_EnumProfile, 0 | 1) => ParamStep::Built(build_profile_info(
                         SPA_PARAM_EnumProfile,
@@ -237,7 +237,7 @@ unsafe extern "C" fn get_interface(
     if unsafe { spa_streq(type_, SPA_TYPE_INTERFACE_Device.as_ptr().cast()) } {
         // interface is non-null (asserted above) and writable per the contract
         unsafe {
-            *interface = std::ptr::addr_of_mut!((*state).device).cast::<c_void>();
+            *interface = (&raw mut (*state).device).cast::<c_void>();
         }
     } else {
         return -libc::ENOENT;
@@ -274,7 +274,7 @@ unsafe extern "C" fn clear(handle: *mut spa_handle) -> c_int {
 }
 
 extern "C" fn get_size(_factory: *const spa_handle_factory, _params: *const spa_dict) -> usize {
-    std::mem::size_of::<State>()
+    size_of::<State>()
 }
 
 // loosely mirror acp's analog input ordering: mic on top, then line, then
@@ -321,9 +321,10 @@ unsafe extern "C" fn init(
     n_support: u32,
 ) -> c_int {
     // the support array is the host's init contract: n_support valid entries
-    let log =
-        unsafe { spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Log.as_ptr().cast()) }
-            as *mut spa_log;
+    let log = unsafe {
+        spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Log.as_ptr().cast())
+            .cast::<spa_log>()
+    };
     let Some(log) =
         (unsafe { crate::spa::Log::wrap(log, std::ptr::NonNull::new(&raw mut OSS_DEVICE_TOPIC)) })
     else {
@@ -332,16 +333,18 @@ unsafe extern "C" fn init(
 
     // the main loop and system drive the mixer poll timer; both are optional -
     // without them external mixer changes just go unnoticed
-    let main_loop =
-        unsafe { spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Loop.as_ptr().cast()) }
-            as *mut spa_loop;
+    let main_loop = unsafe {
+        spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Loop.as_ptr().cast())
+            .cast::<spa_loop>()
+    };
     let system = unsafe {
         spa_support_find(
             support,
             n_support,
             SPA_TYPE_INTERFACE_System.as_ptr().cast(),
         )
-    } as *mut spa_system;
+        .cast::<spa_system>()
+    };
     let main_loop = if main_loop.is_null() {
         None
     } else {
@@ -395,8 +398,8 @@ unsafe extern "C" fn init(
                         type_: SPA_TYPE_INTERFACE_Device.as_ptr().cast(),
                         version: SPA_VERSION_DEVICE,
                         cb: spa_callbacks {
-                            funcs: &DEVICE_IMPL as *const _ as *const c_void,
-                            data: state as *mut _ as *mut c_void,
+                            funcs: std::ptr::from_ref(&DEVICE_IMPL).cast(),
+                            data: state.cast(),
                         },
                     },
                 },

@@ -21,7 +21,7 @@ fn decode_route_props(object: libspa::pod::Object) -> RouteProps {
 
     let mut props = Vec::new();
     for p in object.properties {
-        #[allow(non_upper_case_globals)]
+        #[expect(non_upper_case_globals)]
         match (p.key, p.value) {
             (SPA_PROP_mute, Value::Bool(mute)) => props.push(RouteProp::Mute(mute)),
             (SPA_PROP_channelVolumes, Value::ValueArray(ValueArray::Float(v))) if !v.is_empty() => {
@@ -113,7 +113,7 @@ pub(super) fn decode_profile_request(
         None => index = Some(1),
         Some(Value::Object(o)) if o.type_ == SPA_TYPE_OBJECT_ParamProfile => {
             for p in o.properties {
-                #[allow(non_upper_case_globals)]
+                #[expect(non_upper_case_globals)]
                 match (p.key, p.value) {
                     (SPA_PARAM_PROFILE_index, Value::Int(v)) if (0..=1).contains(&v) => {
                         index = Some(v as u32);
@@ -265,7 +265,7 @@ pub(super) fn decode_route_request(
     let mut props = None;
 
     for p in object.properties {
-        #[allow(non_upper_case_globals)]
+        #[expect(non_upper_case_globals)]
         match (p.key, p.value) {
             (SPA_PARAM_ROUTE_index, Value::Int(v)) if v >= 0 => index = Some(v as usize),
             (SPA_PARAM_ROUTE_name, Value::String(v)) => name = Some(v),
@@ -400,7 +400,7 @@ pub(super) unsafe extern "C" fn set_param(
     let state: *mut State = object.cast();
     assert!(!state.is_null(), "object is not supposed to be null");
 
-    #[allow(non_upper_case_globals)]
+    #[expect(non_upper_case_globals)]
     match id {
         SPA_PARAM_Profile | SPA_PARAM_Route => (),
         _ => return -libc::ENOENT, // unknown param id (ALSA convention)
@@ -420,7 +420,7 @@ pub(super) unsafe extern "C" fn set_param(
     let (events, result, notifications) = unsafe {
         with_runtime_mut(state, |state| {
             let mut notifications = Vec::new();
-            #[allow(non_upper_case_globals)]
+            #[expect(non_upper_case_globals)]
             let result = match id {
                 SPA_PARAM_Profile => match decode_profile_request(value) {
                     Ok(request) => set_profile_param(state, request, &mut notifications),

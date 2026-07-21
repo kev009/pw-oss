@@ -8,7 +8,6 @@ pub(crate) struct Loop {
     loop_: std::ptr::NonNull<spa_loop>,
     add_source_fn: unsafe extern "C" fn(*mut c_void, *mut spa_source) -> c_int,
     remove_source_fn: unsafe extern "C" fn(*mut c_void, *mut spa_source) -> c_int,
-    #[allow(clippy::type_complexity)] // the C slot's signature, verbatim
     invoke_fn: unsafe extern "C" fn(
         *mut c_void,
         spa_invoke_func_t,
@@ -314,10 +313,10 @@ pub(crate) unsafe fn block_on_loop<T, F: FnOnce(&mut T) + Send>(
         _loop: *mut libspa::sys::spa_loop,
         _async: bool,
         _seq: u32,
-        _data: *const std::os::raw::c_void,
+        _data: *const c_void,
         _size: usize,
-        user_data: *mut std::os::raw::c_void,
-    ) -> std::os::raw::c_int {
+        user_data: *mut c_void,
+    ) -> c_int {
         // user_data is the &mut Ctx the blocking invoke below keeps alive
         let ctx = unsafe { user_data.cast::<Ctx<T, F>>().as_mut() }
             .expect("user_data is not supposed to be null");
@@ -340,7 +339,7 @@ pub(crate) unsafe fn block_on_loop<T, F: FnOnce(&mut T) + Send>(
             std::ptr::null(),
             0,
             true,
-            &mut ctx as *mut _ as *mut std::os::raw::c_void,
+            (&raw mut ctx).cast(),
         )
     };
     err >= 0
@@ -362,10 +361,10 @@ pub(crate) unsafe fn queue_task<F: FnOnce() + Send + 'static>(
         _loop: *mut libspa::sys::spa_loop,
         _async: bool,
         _seq: u32,
-        _data: *const std::os::raw::c_void,
+        _data: *const c_void,
         _size: usize,
-        user_data: *mut std::os::raw::c_void,
-    ) -> std::os::raw::c_int {
+        user_data: *mut c_void,
+    ) -> c_int {
         // user_data is the Box::into_raw'd closure below; the loop runs each
         // queued item exactly once, so this is the sole owner
         let f = unsafe { Box::from_raw(user_data.cast::<F>()) };
@@ -386,7 +385,7 @@ pub(crate) unsafe fn queue_task<F: FnOnce() + Send + 'static>(
             std::ptr::null(),
             0,
             false,
-            ctx as *mut std::os::raw::c_void,
+            ctx.cast(),
         )
     };
     if err < 0 {

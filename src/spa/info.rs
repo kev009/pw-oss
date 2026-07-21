@@ -97,11 +97,11 @@ impl Dictionary {
     }
 
     pub(crate) fn raw(&self) -> *const spa_dict {
-        &self.dict as *const spa_dict
+        std::ptr::from_ref(&self.dict)
     }
 
     fn raw_mut(&mut self) -> *mut spa_dict {
-        &mut self.dict as *mut spa_dict
+        std::ptr::from_mut(&mut self.dict)
     }
 
     pub(crate) fn add_item<K: Into<DictionaryString>, V: Into<DictionaryString>>(
@@ -196,7 +196,7 @@ impl DeviceInfo {
     }
 
     pub(crate) fn raw(&self) -> *const spa_device_info {
-        &self.info as *const spa_device_info
+        std::ptr::from_ref(&self.info)
     }
 
     // Stable, self-contained payload for a potentially reentrant device-info
@@ -287,7 +287,7 @@ impl NodeInfo {
     }
 
     pub(crate) fn raw(&self) -> *const spa_node_info {
-        &self.info as *const spa_node_info
+        std::ptr::from_ref(&self.info)
     }
 
     // See PortInfo::snapshot: event callbacks receive an owned payload so
@@ -396,7 +396,7 @@ impl PortInfo {
     }
 
     pub(crate) fn raw(&self) -> *const spa_port_info {
-        &self.info as *const spa_port_info
+        std::ptr::from_ref(&self.info)
     }
 
     // A self-contained callback payload: the scalar info and fixed params
@@ -492,10 +492,7 @@ mod tests {
         let node = node.snapshot();
         let node_raw = unsafe { &*node.raw() };
         assert_eq!(node_raw.params, node.params.as_ptr().cast_mut());
-        assert_eq!(
-            node_raw.props,
-            std::ptr::addr_of!(node.props.dict).cast_mut()
-        );
+        assert_eq!(node_raw.props, (&raw const node.props.dict).cast_mut());
 
         let mut port = PortInfo::new();
         port.add_param(SPA_PARAM_Format, SPA_PARAM_INFO_WRITE);
@@ -503,10 +500,7 @@ mod tests {
         let port = port.snapshot();
         let port_raw = unsafe { &*port.raw() };
         assert_eq!(port_raw.params, port.params.as_ptr().cast_mut());
-        assert_eq!(
-            port_raw.props,
-            std::ptr::addr_of!(port.props.dict).cast_mut()
-        );
+        assert_eq!(port_raw.props, (&raw const port.props.dict).cast_mut());
 
         let mut device = DeviceInfo::new();
         device.add_prop("snapshot.key", "snapshot.value");
@@ -515,9 +509,6 @@ mod tests {
         let device = device.snapshot();
         let device_raw = unsafe { &*device.raw() };
         assert_eq!(device_raw.params, device.params.as_ptr().cast_mut());
-        assert_eq!(
-            device_raw.props,
-            std::ptr::addr_of!(device.props.dict).cast_mut()
-        );
+        assert_eq!(device_raw.props, (&raw const device.props.dict).cast_mut());
     }
 }

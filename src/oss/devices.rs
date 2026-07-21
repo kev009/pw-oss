@@ -1,7 +1,6 @@
 use nix::errno::Errno;
 use std::collections::BTreeMap;
-use std::ffi::CString;
-use std::os::raw::{c_int, c_ulong, c_void};
+use std::ffi::{CString, c_int, c_ulong, c_void};
 
 use crate::freebsd::{LibcFd, ioctl_int, ioctl_value, ioctl_zeroed};
 
@@ -95,7 +94,7 @@ struct SndstiocNvArg {
 
 const SNDSTIOC_REFRESH_DEVS: c_ulong = nix::request_code_none!(b'D', 100);
 const SNDSTIOC_GET_DEVS: c_ulong =
-    nix::request_code_readwrite!(b'D', 101, std::mem::size_of::<SndstiocNvArg>());
+    nix::request_code_readwrite!(b'D', 101, size_of::<SndstiocNvArg>());
 
 // native per-direction device info from the sndstat(4) nvlist interface -
 // no dsp open, so an exclusive device's only channel stays unclaimed
@@ -257,18 +256,18 @@ pub(crate) fn probe_caps(path: &str, play: bool) -> Option<DspCaps> {
     // An exclusive channel (bitperfect or vchans off) negotiates the native
     // values verbatim, and a probe open would briefly claim the only channel;
     // build the caps from sndstat without opening at all.
-    if let Some(nv) = &native {
-        if nv.bitperfect || nv.exclusive == Some(true) {
-            let mut rates = native_rates(path, play);
-            // native_rates opens the device briefly; if that failed (busy) on a
-            // bitperfect device, fall back to the native EXTREMES - they are
-            // themselves native, while a dense min..max range would admit
-            // pitch-shifting non-native rates (playback echoes the request back)
-            if nv.bitperfect && rates.is_empty() && nv.min_rate != nv.max_rate {
-                rates = vec![nv.min_rate.max(1), nv.max_rate.max(nv.min_rate).max(1)];
-            }
-            return Some(caps_from_sndstat(nv, rates));
+    if let Some(nv) = &native
+        && (nv.bitperfect || nv.exclusive == Some(true))
+    {
+        let mut rates = native_rates(path, play);
+        // native_rates opens the device briefly; if that failed (busy) on a
+        // bitperfect device, fall back to the native EXTREMES - they are
+        // themselves native, while a dense min..max range would admit
+        // pitch-shifting non-native rates (playback echoes the request back)
+        if nv.bitperfect && rates.is_empty() && nv.min_rate != nv.max_rate {
+            rates = vec![nv.min_rate.max(1), nv.max_rate.max(nv.min_rate).max(1)];
         }
+        return Some(caps_from_sndstat(nv, rates));
     }
 
     let cpath = CString::new(path).ok()?;
@@ -299,8 +298,6 @@ pub(crate) fn probe_caps(path: &str, play: bool) -> Option<DspCaps> {
                 ai.caps,
             )
         });
-    const PCM_CAP_VIRTUAL: c_int = 0x0004_0000;
-
     // a failed or degenerate probe defers to the audioinfo limits
     let pick = |probed: Option<c_int>, ai_val: c_int| probed.filter(|&v| v >= 1).unwrap_or(ai_val);
 
@@ -360,7 +357,11 @@ pub(crate) fn probe_caps(path: &str, play: bool) -> Option<DspCaps> {
 // shifts a floor. 0 = unknown, use the soft fragsize alone.
 pub(crate) fn drain_quantum_ns(devnode: &str, play: bool) -> u64 {
     let devnode = devnode.trim_start_matches("/dev/"); // sndstat devnodes are bare
-    let want_dir = if play { 0x00020000u64 } else { 0x00010000 }; // PCM_CAP_OUTPUT/INPUT
+    let want_dir = if play {
+        PCM_CAP_OUTPUT as u64
+    } else {
+        PCM_CAP_INPUT as u64
+    };
     let mut quantum: u64 = 0;
     let Some(nvl) = sndstat_snapshot() else {
         return 0;
@@ -374,8 +375,7 @@ pub(crate) fn drain_quantum_ns(devnode: &str, play: bool) -> u64 {
         };
         for chan in p.nvlist_array(c"channel_info") {
             let caps = chan.number(c"caps").unwrap_or(0);
-            if caps & 0x00040000 != 0 || caps & want_dir == 0 {
-                // PCM_CAP_VIRTUAL
+            if caps & PCM_CAP_VIRTUAL as u64 != 0 || caps & want_dir == 0 {
                 continue;
             }
             let blksz = chan.number(c"hwbuf_blksz").unwrap_or(0);
@@ -412,23 +412,20 @@ pub(crate) fn read_pcm_device_description(
     let parent = sysctl
         .read_string(format!("dev.pcm.{index}.%parent"), 1024)
         .ok()?; // the device can detach mid-enumeration
-    if let Some(str) = parent.strip_prefix("uaudio") {
-        if let Ok(idx) = str.parse::<u32>() {
-            if let Ok(desc) = sysctl.read_string(format!("dev.uaudio.{idx}.%desc"), 1024) {
-                // let's get rid of ", class %d/%d, rev %x.%02x/%x.%02x, addr %d" suffix
-                static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-                let re = RE.get_or_init(|| {
-                    regex::Regex::new(r"^(.*?), class \d+/\d+, rev [^\s]+, addr \d$").unwrap()
-                });
-                if let Some(groups) = re.captures(&desc) {
-                    if let Some(str) = groups.get(1) {
-                        return Some(str.as_str().to_string());
-                    }
-                } else {
-                    return Some(desc);
-                }
-            }
+    if let Some(unit_str) = parent.strip_prefix("uaudio")
+        && let Ok(unit) = unit_str.parse::<u32>()
+        && let Ok(desc) = sysctl.read_string(format!("dev.uaudio.{unit}.%desc"), 1024)
+    {
+        // let's get rid of ", class %d/%d, rev %x.%02x/%x.%02x, addr %d" suffix
+        static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+            regex::Regex::new(r"^(.*?), class \d+/\d+, rev [^\s]+, addr \d$").unwrap()
+        });
+        if let Some(groups) = RE.captures(&desc)
+            && let Some(prefix) = groups.get(1)
+        {
+            return Some(prefix.as_str().to_string());
         }
+        return Some(desc);
     }
 
     sysctl
@@ -457,28 +454,28 @@ pub(crate) fn list_pcm_devices(indexes: &[u32]) -> Vec<PcmDevice> {
     let chans = sndstat_pcm_devices();
 
     for index in indexes {
-        if let Some(desc) = read_pcm_device_description(&mut sysctl, *index) {
-            if let Ok(location) = sysctl.read_string(format!("dev.pcm.{index}.%location"), 1024) {
-                let from_nv = chans.as_ref().and_then(|c| {
-                    c.iter()
-                        .find(|(unit, _, _)| unit == index)
-                        .map(|&(_, play, rec)| (play, rec))
-                });
-                let (play, rec) = match from_nv {
-                    Some(dirs) => dirs,
-                    None => match sysctl.read_u32(format!("dev.pcm.{index}.mode")) {
-                        Ok(mode) => (mode & 2 != 0, mode & 4 != 0),
-                        Err(_) => (false, false),
-                    },
-                };
-                result.push(PcmDevice {
-                    index: *index,
-                    desc,
-                    location,
-                    play,
-                    rec,
-                });
-            }
+        if let Some(desc) = read_pcm_device_description(&mut sysctl, *index)
+            && let Ok(location) = sysctl.read_string(format!("dev.pcm.{index}.%location"), 1024)
+        {
+            let from_nv = chans.as_ref().and_then(|c| {
+                c.iter()
+                    .find(|(unit, _, _)| unit == index)
+                    .map(|&(_, play, rec)| (play, rec))
+            });
+            let (play, rec) = match from_nv {
+                Some(dirs) => dirs,
+                None => match sysctl.read_u32(format!("dev.pcm.{index}.mode")) {
+                    Ok(mode) => (mode & 2 != 0, mode & 4 != 0),
+                    Err(_) => (false, false),
+                },
+            };
+            result.push(PcmDevice {
+                index: *index,
+                desc,
+                location,
+                play,
+                rec,
+            });
         }
     }
 

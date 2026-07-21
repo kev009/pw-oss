@@ -222,7 +222,7 @@ impl<D: Direction> NodeEvents<D> {
                 // the synchronous initial callback still uses this cohort.
                 // Keep a local owner through that callback; listener access
                 // itself remains main-loop-only.
-                #[allow(clippy::arc_with_non_send_sync)]
+                #[expect(clippy::arc_with_non_send_sync)]
                 let hooks = std::sync::Arc::new(crate::spa::ListenerList::new());
                 pending
                     .queue

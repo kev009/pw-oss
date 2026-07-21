@@ -1,6 +1,6 @@
 use libspa::sys::*;
 use std::collections::BTreeMap;
-use std::os::raw::{c_char, c_int, c_void};
+use std::ffi::{c_char, c_int, c_void};
 use std::string::String;
 use std::vec::Vec;
 
@@ -187,7 +187,7 @@ unsafe fn with_runtime_mut<R>(
     apply: impl for<'a> FnOnce(&'a mut Runtime) -> R,
 ) -> R {
     assert!(!state.is_null(), "state is not supposed to be null");
-    let runtime = unsafe { &mut *std::ptr::addr_of_mut!((*state).runtime) };
+    let runtime = unsafe { (&raw mut (*state).runtime).as_mut_unchecked() };
     apply(runtime)
 }
 
@@ -196,7 +196,7 @@ unsafe fn with_runtime_ref<R>(
     apply: impl for<'a> FnOnce(&'a Runtime) -> R,
 ) -> R {
     assert!(!state.is_null(), "state is not supposed to be null");
-    let runtime = unsafe { &*std::ptr::addr_of!((*state).runtime) };
+    let runtime = unsafe { (&raw const (*state).runtime).as_ref_unchecked() };
     apply(runtime)
 }
 
@@ -271,7 +271,7 @@ unsafe extern "C" fn get_interface(
     if unsafe { spa_streq(type_, SPA_TYPE_INTERFACE_Device.as_ptr().cast()) } {
         // interface is non-null (asserted above) and writable per the contract
         unsafe {
-            *interface = std::ptr::addr_of_mut!((*state).device).cast::<c_void>();
+            *interface = (&raw mut (*state).device).cast::<c_void>();
         }
     } else {
         return -libc::ENOENT;
@@ -301,7 +301,7 @@ unsafe extern "C" fn clear(handle: *mut spa_handle) -> c_int {
 }
 
 extern "C" fn get_size(_factory: *const spa_handle_factory, _params: *const spa_dict) -> usize {
-    std::mem::size_of::<State>()
+    size_of::<State>()
 }
 
 const DEV_INFO_PROPS: spa_dict = spa_dict {
@@ -327,10 +327,10 @@ unsafe extern "C" fn on_devd_event(source: *mut spa_source) {
                 let mut resync = false;
                 let mut detached: Vec<String> = Vec::new();
                 let alive = devd_socket.read_event(|line| {
-                    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-                    let re = RE
-                        .get_or_init(|| regex::Regex::new(r"^([\+-])((?:pcm|uaudio)\d+)").unwrap());
-                    if let Some(groups) = re.captures(line) {
+                    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+                        regex::Regex::new(r"^([\+-])((?:pcm|uaudio)\d+)").unwrap()
+                    });
+                    if let Some(groups) = RE.captures(line) {
                         resync = true;
                         if groups.get(1).unwrap().as_str() == "-" {
                             detached.push(groups.get(2).unwrap().as_str().to_string());
@@ -391,12 +391,12 @@ fn resync_devices(state: &mut Runtime, detached: &[String]) -> Vec<MonitorObject
         } else {
             None
         };
-        if let Some(key) = key {
-            if let Some(indexes) = state.pcm_indexes.remove(&key) {
-                crate::info!(state.log, "removing {} ({:?}) on detach", key, indexes);
-                if let Some(&id) = indexes.first() {
-                    notifications.push(MonitorObjectEvent::Removed { id });
-                }
+        if let Some(key) = key
+            && let Some(indexes) = state.pcm_indexes.remove(&key)
+        {
+            crate::info!(state.log, "removing {} ({:?}) on detach", key, indexes);
+            if let Some(&id) = indexes.first() {
+                notifications.push(MonitorObjectEvent::Removed { id });
             }
         }
     }
@@ -441,18 +441,20 @@ unsafe extern "C" fn init(
     support: *const spa_support,
     n_support: u32,
 ) -> c_int {
-    let log =
-        unsafe { spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Log.as_ptr().cast()) }
-            as *mut spa_log;
+    let log = unsafe {
+        spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Log.as_ptr().cast())
+            .cast::<spa_log>()
+    };
     let Some(log) =
         (unsafe { crate::spa::Log::wrap(log, std::ptr::NonNull::new(&raw mut OSS_MONITOR_TOPIC)) })
     else {
         return -libc::EINVAL;
     };
 
-    let main_loop =
-        unsafe { spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Loop.as_ptr().cast()) }
-            as *mut spa_loop;
+    let main_loop = unsafe {
+        spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Loop.as_ptr().cast())
+            .cast::<spa_loop>()
+    };
 
     if main_loop.is_null() {
         return -libc::EINVAL;
@@ -508,8 +510,8 @@ unsafe extern "C" fn init(
                         type_: SPA_TYPE_INTERFACE_Device.as_ptr().cast(),
                         version: SPA_VERSION_DEVICE,
                         cb: spa_callbacks {
-                            funcs: &DEVICE_IMPL as *const _ as *const c_void,
-                            data: state as *mut _ as *mut c_void,
+                            funcs: std::ptr::from_ref(&DEVICE_IMPL).cast(),
+                            data: state.cast(),
                         },
                     },
                 },

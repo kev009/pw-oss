@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::os::raw::c_int;
+use std::ffi::c_int;
 
 use nix::errno::Errno;
 

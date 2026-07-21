@@ -108,13 +108,13 @@ pub(super) unsafe extern "C" fn process<D: Direction>(object: *mut c_void) -> c_
         return SPA_STATUS_OK as i32;
     };
 
-    if let Some((trigger_us, Some((cb, data)))) = xrun {
-        if let Some(xrun_fun) = cb.xrun {
-            // the xrun event for pw-top's counter; the length isn't known at
-            // detection, so 0 delay. No State borrow is live here; sound per
-            // NodeCallbacks::hook (validated copy, data valid while set).
-            unsafe { xrun_fun(data, trigger_us, 0, std::ptr::null_mut()) };
-        }
+    if let Some((trigger_us, Some((cb, data)))) = xrun
+        && let Some(xrun_fun) = cb.xrun
+    {
+        // the xrun event for pw-top's counter; the length isn't known at
+        // detection, so 0 delay. No State borrow is live here; sound per
+        // NodeCallbacks::hook (validated copy, data valid while set).
+        unsafe { xrun_fun(data, trigger_us, 0, std::ptr::null_mut()) };
     }
 
     if let Some((main_loop, target, log, event)) = main_event {
@@ -200,7 +200,7 @@ pub(super) unsafe extern "C" fn port_set_io<D: Direction>(
         let data = data.into_inner();
         // SAFETY (both arms): size/alignment validated above; the host
         // keeps the area valid while set (the port_set_io contract)
-        #[allow(non_upper_case_globals)]
+        #[expect(non_upper_case_globals)]
         match id {
             SPA_IO_Buffers => unsafe { state.ports[port_id as usize].io.set(data) }, // null clears
             // ACTIVE is managed per cycle in process() and set only while

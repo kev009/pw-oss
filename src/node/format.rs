@@ -229,12 +229,14 @@ pub(crate) fn snap_raw_to_caps(
     let mut changed = false;
 
     let offered = offered_formats(caps);
-    if !offered.contains(&raw.format) {
-        if let Some(&best) = offered.first() {
-            raw.format = best;
-            changed = true;
-        } // else: convertless with no native format; the exact path rejects it
+    if !offered.contains(&raw.format)
+        && let Some(&best) = offered.first()
+    {
+        raw.format = best;
+        changed = true;
     }
+    // A convertless device with no native format stays unchanged here; the
+    // exact-format path rejects it.
 
     // the position array is 64 wide; garbage caps must not push past it
     let channels = raw

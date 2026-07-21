@@ -1,3 +1,5 @@
+use std::mem::offset_of;
+
 use super::*;
 
 #[repr(C)]
@@ -17,11 +19,11 @@ pub(crate) struct State<D: Direction> {
 // one field at a time so callers cannot accidentally borrow the whole shell.
 // A MainState borrow may coexist with DataControl; a DataState borrow may not.
 pub(super) unsafe fn main_ref<'a, D: Direction>(state: *const State<D>) -> &'a MainState<D> {
-    unsafe { &*std::ptr::addr_of!((*state).main) }
+    unsafe { (&raw const (*state).main).as_ref_unchecked() }
 }
 
 pub(super) unsafe fn main_mut<'a, D: Direction>(state: *mut State<D>) -> &'a mut MainState<D> {
-    unsafe { &mut *std::ptr::addr_of_mut!((*state).main) }
+    unsafe { (&raw mut (*state).main).as_mut_unchecked() }
 }
 
 // Keep direct data-loop borrows inside a lexical callback. Unlike a helper
@@ -31,16 +33,16 @@ pub(super) unsafe fn with_data_mut<D: Direction, R>(
     state: *mut State<D>,
     apply: impl for<'a> FnOnce(&'a mut DataState<D>) -> R,
 ) -> R {
-    let data = unsafe { &mut *std::ptr::addr_of_mut!((*state).data) };
+    let data = unsafe { (&raw mut (*state).data).as_mut_unchecked() };
     apply(data)
 }
 
 pub(super) unsafe fn gate_ref<'a, D: Direction>(state: *const State<D>) -> &'a DataThreadGate {
-    unsafe { &*std::ptr::addr_of!((*state).gate) }
+    unsafe { (&raw const (*state).gate).as_ref_unchecked() }
 }
 
 pub(super) unsafe fn main_ptr<D: Direction>(state: *mut State<D>) -> *mut MainState<D> {
-    unsafe { std::ptr::addr_of_mut!((*state).main) }
+    unsafe { &raw mut (*state).main }
 }
 
 pub(super) struct DataThreadGate {
@@ -139,7 +141,7 @@ impl<D: Direction> DataControl<D> {
     pub(super) unsafe fn from_raw(state: *mut State<D>) -> Self {
         Self {
             loop_: unsafe { main_ref(state).data_loop },
-            data: unsafe { std::ptr::addr_of_mut!((*state).data) },
+            data: unsafe { &raw mut (*state).data },
         }
     }
 
@@ -405,7 +407,7 @@ pub(crate) struct NodeCallbacks {
 
 // spa_node_callbacks leads with `version: u32` (the SPA vtable convention,
 // spa/node/node.h); NodeCallbacks::set's prefix read below depends on it.
-const _: () = assert!(std::mem::offset_of!(spa_node_callbacks, version) == 0);
+const _: () = assert!(offset_of!(spa_node_callbacks, version) == 0);
 
 impl NodeCallbacks {
     pub(crate) const fn none() -> Self {
@@ -452,7 +454,7 @@ impl NodeCallbacks {
 mod tests {
     use super::*;
     use crate::node::sink::SinkDir;
-    fn test_port(fd: std::os::raw::c_int) -> Port<SinkDir> {
+    fn test_port(fd: c_int) -> Port<SinkDir> {
         Port {
             config: None,
             buffers: vec![],

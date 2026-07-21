@@ -283,7 +283,7 @@ pub(super) fn retune_period(
 // actually runs at (RT setup problems show up here first)
 #[cfg(debug_assertions)]
 pub(super) fn debug_log_priorities(log: &crate::spa::Log) {
-    fn prio_type(type_: libc::c_ushort) -> &'static str {
+    fn prio_type(type_: std::ffi::c_ushort) -> &'static str {
         match type_ {
             libc::RTP_PRIO_REALTIME => "realtime",
             libc::RTP_PRIO_NORMAL => "normal",

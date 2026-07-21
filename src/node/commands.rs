@@ -1,6 +1,6 @@
 pub(crate) fn spa_command_to_str(body: &libspa::sys::spa_pod_object_body) -> &'static str {
     use libspa::sys::*;
-    #[allow(non_upper_case_globals)]
+    #[expect(non_upper_case_globals)]
     match (body.type_, body.id) {
         (SPA_TYPE_COMMAND_Node, SPA_NODE_COMMAND_Start) => "SPA_NODE_COMMAND_Start",
         (SPA_TYPE_COMMAND_Node, SPA_NODE_COMMAND_Suspend) => "SPA_NODE_COMMAND_Suspend",
@@ -18,13 +18,13 @@ use super::*;
 pub(super) const NODE_IO_AREAS: [(u32, usize, usize); 2] = [
     (
         SPA_IO_Clock,
-        std::mem::size_of::<spa_io_clock>(),
-        std::mem::align_of::<spa_io_clock>(),
+        size_of::<spa_io_clock>(),
+        align_of::<spa_io_clock>(),
     ),
     (
         SPA_IO_Position,
-        std::mem::size_of::<spa_io_position>(),
-        std::mem::align_of::<spa_io_position>(),
+        size_of::<spa_io_position>(),
+        align_of::<spa_io_position>(),
     ),
 ];
 
@@ -32,13 +32,13 @@ pub(super) const NODE_IO_AREAS: [(u32, usize, usize); 2] = [
 pub(super) const PORT_IO_AREAS: [(u32, usize, usize); 2] = [
     (
         SPA_IO_Buffers,
-        std::mem::size_of::<spa_io_buffers>(),
-        std::mem::align_of::<spa_io_buffers>(),
+        size_of::<spa_io_buffers>(),
+        align_of::<spa_io_buffers>(),
     ),
     (
         SPA_IO_RateMatch,
-        std::mem::size_of::<spa_io_rate_match>(),
-        std::mem::align_of::<spa_io_rate_match>(),
+        size_of::<spa_io_rate_match>(),
+        align_of::<spa_io_rate_match>(),
     ),
 ];
 
@@ -61,7 +61,7 @@ pub(super) fn io_area_ok(
         if size < min_size {
             return -libc::ENOSPC;
         }
-        if data as usize % align != 0 {
+        if !data.addr().is_multiple_of(align) {
             return -libc::EINVAL;
         }
     }
@@ -90,7 +90,7 @@ pub(super) unsafe extern "C" fn set_io<D: Direction>(
         let data = data.into_inner();
         let was_armed = !state.clock.is_null() && !state.position.is_null();
 
-        #[allow(non_upper_case_globals)]
+        #[expect(non_upper_case_globals)]
         match id {
             SPA_IO_Clock => {
                 // SAFETY: size/alignment validated above; the host keeps
@@ -191,7 +191,7 @@ pub(super) unsafe extern "C" fn send_command<D: Direction>(
 
     crate::debug!(log, "received command: {}", spa_command_to_str(&body));
 
-    #[allow(non_upper_case_globals)]
+    #[expect(non_upper_case_globals)]
     match (body.type_, body.id) {
         (SPA_TYPE_COMMAND_Node, SPA_NODE_COMMAND_Start) => {
             let started = control.query(|state| {
@@ -393,7 +393,7 @@ mod tests {
     fn io_area_admission_null_short_exact_misaligned() {
         let mut area = Aligned([0; 4096]);
         let p = area.0.as_mut_ptr().cast::<c_void>();
-        let full = std::mem::size_of::<spa_io_clock>();
+        let full = size_of::<spa_io_clock>();
 
         // NULL/0 clears whatever the size says
         assert_eq!(
@@ -426,7 +426,7 @@ mod tests {
             -libc::ENOENT
         );
         // the port table's own areas admit the same policy
-        let bsize = std::mem::size_of::<spa_io_buffers>();
+        let bsize = size_of::<spa_io_buffers>();
         assert_eq!(io_area_ok(&PORT_IO_AREAS, SPA_IO_Buffers, p, bsize), 0);
         assert_eq!(
             io_area_ok(&PORT_IO_AREAS, SPA_IO_Buffers, p, bsize - 1),
@@ -444,7 +444,7 @@ mod tests {
             0
         );
     }
-    fn test_port(fd: std::os::raw::c_int) -> Port<SinkDir> {
+    fn test_port(fd: c_int) -> Port<SinkDir> {
         Port {
             config: None,
             buffers: vec![],

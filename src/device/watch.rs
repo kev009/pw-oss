@@ -143,17 +143,17 @@ pub(super) fn poll_mixers(state: &mut Runtime) -> Vec<DeviceNotification> {
             };
             let mut vol_changed = false;
             let mut mute_changed = false;
-            if let Some(levels) = state.mixers[mi].mixer.level(control) {
-                if levels != state.routes[pos].levels {
-                    state.routes[pos].levels = levels;
-                    vol_changed = true;
-                }
+            if let Some(levels) = state.mixers[mi].mixer.level(control)
+                && levels != state.routes[pos].levels
+            {
+                state.routes[pos].levels = levels;
+                vol_changed = true;
             }
-            if let Some(mute) = state.mixers[mi].mixer.muted(control) {
-                if mute != state.routes[pos].mute {
-                    state.routes[pos].mute = mute;
-                    mute_changed = true;
-                }
+            if let Some(mute) = state.mixers[mi].mixer.muted(control)
+                && mute != state.routes[pos].mute
+            {
+                state.routes[pos].mute = mute;
+                mute_changed = true;
             }
             // inactive routes still track the hardware (their level shows again on
             // the next switch), but a change there is observable in no pod
@@ -253,17 +253,16 @@ pub(super) unsafe extern "C" fn on_devd_event(source: *mut spa_source) {
                 let pcm_devices = &state.pcm_devices;
                 let mut nudged = false;
                 let alive = devd_socket.read_event(|line| {
-                    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-                    let re = RE.get_or_init(|| {
+                    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
                         regex::Regex::new(
                             r"^!system=SND subsystem=CONN type=(?:IN|OUT) cdev=dsp([0-9]+)",
                         )
                         .unwrap()
                     });
-                    if let Some(groups) = re.captures(line) {
-                        if let Ok(unit) = groups[1].parse::<u32>() {
-                            nudged |= pcm_devices.iter().any(|d| d.index == unit);
-                        }
+                    if let Some(groups) = RE.captures(line)
+                        && let Ok(unit) = groups[1].parse::<u32>()
+                    {
+                        nudged |= pcm_devices.iter().any(|d| d.index == unit);
                     }
                 });
 

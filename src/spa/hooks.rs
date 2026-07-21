@@ -1,3 +1,5 @@
+use std::mem::offset_of;
+
 use super::*;
 
 // Iterate with a cursor hook woven into the list (the C spa_hook_list_call
@@ -23,10 +25,10 @@ pub(crate) unsafe fn for_each_hook(head: *mut spa_hook_list, mut apply: impl FnM
         }
     }
 
-    let list = unsafe { std::ptr::addr_of_mut!((*head).list) };
+    let list = unsafe { &raw mut (*head).list };
     // all-zero is the C-struct cursor's valid initial state
     let mut cursor: spa_hook = unsafe { std::mem::zeroed() };
-    let cur = std::ptr::addr_of_mut!(cursor.link);
+    let cur = &raw mut cursor.link;
 
     // insert the cursor at the front
     unsafe {
@@ -84,8 +86,7 @@ impl HookEvents for spa_device_events {
 // every SPA events vtable leads with `version: u32` (the spa_interface
 // convention, spa/utils/hook.h); emit_events' prefix read depends on it
 const _: () = assert!(
-    std::mem::offset_of!(spa_node_events, version) == 0
-        && std::mem::offset_of!(spa_device_events, version) == 0
+    offset_of!(spa_node_events, version) == 0 && offset_of!(spa_device_events, version) == 0
 );
 
 // Emit ONE listener method to every hook in the list (see for_each_hook for
@@ -263,8 +264,8 @@ impl<E: HookEvents> ListenerList<E> {
         let other = other.list.get();
         assert_ne!(list, other, "a listener list cannot append itself");
         unsafe {
-            let list_head = std::ptr::addr_of_mut!((*list).list);
-            let other_head = std::ptr::addr_of_mut!((*other).list);
+            let list_head = &raw mut (*list).list;
+            let other_head = &raw mut (*other).list;
             if (*other_head).next == other_head {
                 return;
             }
@@ -304,7 +305,7 @@ pub(crate) fn dev_emit_result(
         if let Some(result_fun) = f.result {
             // one emission through the C listener vtable (the add_listener
             // contract keeps data valid for the call)
-            unsafe { result_fun(data, seq, res, type_, result as *const _ as *const c_void) };
+            unsafe { result_fun(data, seq, res, type_, std::ptr::from_ref(result).cast()) };
         }
     });
 }
@@ -319,7 +320,7 @@ pub(crate) fn node_emit_result(
         if let Some(result_fun) = f.result {
             // one emission through the C listener vtable (the add_listener
             // contract keeps data valid for the call)
-            unsafe { result_fun(data, seq, res, type_, result as *const _ as *const c_void) };
+            unsafe { result_fun(data, seq, res, type_, std::ptr::from_ref(result).cast()) };
         }
     });
 }

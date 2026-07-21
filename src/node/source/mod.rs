@@ -1,4 +1,4 @@
-use std::os::raw::c_int;
+use std::ffi::c_int;
 
 use libspa::sys::*;
 
@@ -344,16 +344,16 @@ fn process_ports(state: &mut DataState<SourceDir>) -> c_int {
         // one period in device bytes (0 while position is absent)
         let mut period_in_bytes = 0u32;
         let mut graph_rate = 0u32;
-        if let Some(driver_clock) = state.position.with_ref(|p| p.clock) {
-            if driver_clock.target_rate.denom > 0 {
-                graph_rate = driver_clock.target_rate.denom;
-                period_in_bytes = crate::node::device_period_bytes(
-                    driver_clock.target_duration,
-                    rate,
-                    graph_rate,
-                    stride,
-                );
-            }
+        if let Some(driver_clock) = state.position.with_ref(|p| p.clock)
+            && driver_clock.target_rate.denom > 0
+        {
+            graph_rate = driver_clock.target_rate.denom;
+            period_in_bytes = crate::node::device_period_bytes(
+                driver_clock.target_duration,
+                rate,
+                graph_rate,
+                stride,
+            );
         }
 
         if retune_period(port, period_in_bytes, &state.log) {
@@ -530,7 +530,7 @@ impl Direction for SourceDir {
     }
 
     fn build_node_param(state: &mut MainState<SourceDir>, id: u32, index: u32) -> ParamBuild {
-        #[allow(non_upper_case_globals)]
+        #[expect(non_upper_case_globals)]
         let pod = match (id, index) {
             (SPA_PARAM_PropInfo, 0) => crate::spa::build_latency_offset_prop_info(),
             (SPA_PARAM_PropInfo, 1) => crate::spa::build_params_prop_info(

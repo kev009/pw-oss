@@ -2,13 +2,10 @@
 // is guarded by a typed exists check: libnv aborts the process on a missing
 // or type-mismatched key, which must never happen from host data.
 
-use std::ffi::CStr;
-use std::os::raw::c_char;
-use std::os::raw::c_int;
-use std::os::raw::c_void;
+use std::ffi::{CStr, c_char, c_int, c_void};
 
 fn raw_pointer_slice_len_ok(len: usize) -> bool {
-    len <= (isize::MAX as usize) / std::mem::size_of::<*const c_void>()
+    len <= (isize::MAX as usize) / size_of::<*const c_void>()
 }
 
 // libnv exports its symbols as FreeBSD_nvlist_* (renamed to avoid clashing

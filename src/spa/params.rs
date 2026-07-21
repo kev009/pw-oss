@@ -68,7 +68,7 @@ pub(crate) unsafe fn enum_params_loop<S>(
 
         // the built pod lives in `buffer`, distinct from the filter output
         if let Some(param) =
-            unsafe { filter_pod(&mut fbuffer, buffer.as_mut_ptr() as *mut spa_pod, filter) }
+            unsafe { filter_pod(&mut fbuffer, buffer.as_mut_ptr().cast::<spa_pod>(), filter) }
         {
             emit(index, param);
             count += 1;
@@ -82,7 +82,7 @@ pub(crate) unsafe fn enum_params_loop<S>(
 // slice::from_raw_parts requires the byte size to fit in isize even when the
 // host claims the backing allocation is valid.
 pub(crate) fn raw_slice_len_ok<T>(len: usize) -> bool {
-    let size = std::mem::size_of::<T>();
+    let size = size_of::<T>();
     size == 0 || len <= (isize::MAX as usize) / size
 }
 
@@ -141,7 +141,7 @@ pub(crate) fn parse_latency_info(
         })) if *type_ == SPA_TYPE_OBJECT_ParamLatency => {
             let mut info = latency_info_default(SPA_DIRECTION_INPUT);
             for p in properties {
-                #[allow(non_upper_case_globals)]
+                #[expect(non_upper_case_globals)]
                 match (p.key, &p.value) {
                     (SPA_PARAM_LATENCY_direction, Value::Id(v)) => info.direction = v.0 & 1,
                     (SPA_PARAM_LATENCY_minQuantum, Value::Float(v)) => info.min_quantum = *v,
@@ -202,7 +202,7 @@ pub(crate) fn parse_process_latency_info(
         })) if *type_ == SPA_TYPE_OBJECT_ParamProcessLatency => {
             let mut info = process_latency_default();
             for p in properties {
-                #[allow(non_upper_case_globals)]
+                #[expect(non_upper_case_globals)]
                 match (p.key, &p.value) {
                     (SPA_PARAM_PROCESS_LATENCY_quantum, Value::Float(v)) => info.quantum = *v,
                     (SPA_PARAM_PROCESS_LATENCY_rate, Value::Int(v)) => info.rate = *v,

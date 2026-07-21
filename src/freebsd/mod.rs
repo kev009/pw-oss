@@ -1,7 +1,6 @@
 use libc::sysctlbyname;
 use nix::errno::Errno;
-use std::ffi::{CStr, CString};
-use std::os::raw::{c_int, c_ulong, c_void};
+use std::ffi::{CStr, CString, c_int, c_ulong, c_void};
 
 mod nv;
 
@@ -149,8 +148,8 @@ impl SysctlReader {
     pub(crate) fn read_u32<T: Into<SysctlName>>(&self, name: T) -> Result<u32, Errno> {
         let SysctlName(name) = name.into();
         let mut value: u32 = 0;
-        let mut len = std::mem::size_of::<u32>();
-        unsafe { sysctl_read(&name, (&mut value as *mut u32).cast(), &mut len) }?;
+        let mut len = size_of::<u32>();
+        unsafe { sysctl_read(&name, std::ptr::from_mut(&mut value).cast(), &mut len) }?;
         Ok(value)
     }
 }

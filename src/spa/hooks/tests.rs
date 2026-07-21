@@ -3,10 +3,10 @@ use super::*;
 // hand-woven intrusive list: n hooks whose cb.data carries their index
 // (boxed nodes on purpose: the links are intrusive, so growth must not
 // move them)
-#[allow(clippy::vec_box)]
+#[expect(clippy::vec_box)]
 fn hook_list(n: usize) -> (Box<spa_hook_list>, Vec<Box<spa_hook>>) {
     let mut head: Box<spa_hook_list> = Box::new(unsafe { std::mem::zeroed() });
-    let list = std::ptr::addr_of_mut!(head.list);
+    let list = &raw mut head.list;
     unsafe {
         (*list).next = list;
         (*list).prev = list;
@@ -15,8 +15,8 @@ fn hook_list(n: usize) -> (Box<spa_hook_list>, Vec<Box<spa_hook>>) {
     for i in 0..n {
         let mut h: Box<spa_hook> = Box::new(unsafe { std::mem::zeroed() });
         h.cb.funcs = std::ptr::dangling(); // non-null marks a real hook; never called
-        h.cb.data = i as *mut std::os::raw::c_void;
-        let link = std::ptr::addr_of_mut!(h.link);
+        h.cb.data = std::ptr::without_provenance_mut::<c_void>(i);
+        let link = &raw mut h.link;
         unsafe {
             // append
             (*link).prev = (*list).prev;
@@ -30,7 +30,7 @@ fn hook_list(n: usize) -> (Box<spa_hook_list>, Vec<Box<spa_hook>>) {
 }
 
 fn unlink(h: &mut spa_hook) {
-    let link = std::ptr::addr_of_mut!(h.link);
+    let link = &raw mut h.link;
     unsafe {
         (*(*link).prev).next = (*link).next;
         (*(*link).next).prev = (*link).prev;
@@ -42,12 +42,12 @@ fn unlink(h: &mut spa_hook) {
 #[test]
 fn hook_callback_may_remove_the_next_hook() {
     let (mut head, mut hooks) = hook_list(3);
-    let h1 = std::ptr::addr_of_mut!(*hooks[1]);
+    let h1 = &raw mut *hooks[1];
     let mut seen = Vec::new();
     unsafe {
         for_each_hook(&mut *head, |cb| {
-            seen.push(cb.data as usize);
-            if cb.data as usize == 0 {
+            seen.push(cb.data.addr());
+            if cb.data.addr() == 0 {
                 unlink(&mut *h1); // hook 0's callback frees hook 1
             }
         });
@@ -64,7 +64,7 @@ fn hook_cursor_is_unlinked_during_rust_unwind() {
     assert!(panicked.is_err());
 
     let mut seen = Vec::new();
-    unsafe { for_each_hook(&mut *head, |cb| seen.push(cb.data as usize)) };
+    unsafe { for_each_hook(&mut *head, |cb| seen.push(cb.data.addr())) };
     assert_eq!(seen, [0, 1], "the stack cursor must not remain linked");
 }
 
@@ -103,7 +103,7 @@ fn isolated_listener_allows_saved_hook_removal_and_unwind() {
     assert!(panicked.is_err());
 
     let mut seen = Vec::new();
-    list.emit(|_events, data| seen.push(data as usize));
+    list.emit(|_events, data| seen.push(data.addr()));
     assert_eq!(seen, [2, 3]);
 }
 
@@ -113,17 +113,17 @@ fn isolated_listener_allows_saved_hook_removal_and_unwind() {
 #[test]
 fn self_removal_hides_the_hook_from_later_traversals() {
     let (mut head, mut hooks) = hook_list(2);
-    let h0 = std::ptr::addr_of_mut!(*hooks[0]);
+    let h0 = &raw mut *hooks[0];
     let mut first = Vec::new();
     let mut second = Vec::new();
     unsafe {
         for_each_hook(&mut *head, |cb| {
-            first.push(cb.data as usize);
-            if cb.data as usize == 0 {
+            first.push(cb.data.addr());
+            if cb.data.addr() == 0 {
                 unlink(&mut *h0); // hook 0's callback removes hook 0
             }
         });
-        for_each_hook(&mut *head, |cb| second.push(cb.data as usize));
+        for_each_hook(&mut *head, |cb| second.push(cb.data.addr()));
     }
     assert_eq!(first, [0, 1]);
     assert_eq!(second, [1]);
@@ -134,14 +134,14 @@ fn self_removal_hides_the_hook_from_later_traversals() {
 #[test]
 fn nested_iteration_skips_the_outer_cursor() {
     let (mut head, _hooks) = hook_list(2);
-    let head_ptr = std::ptr::addr_of_mut!(*head);
+    let head_ptr = &raw mut *head;
     let mut outer = Vec::new();
     let mut inner = Vec::new();
     unsafe {
         for_each_hook(head_ptr, |cb| {
-            outer.push(cb.data as usize);
-            if cb.data as usize == 0 {
-                for_each_hook(head_ptr, |icb| inner.push(icb.data as usize));
+            outer.push(cb.data.addr());
+            if cb.data.addr() == 0 {
+                for_each_hook(head_ptr, |icb| inner.push(icb.data.addr()));
             }
         });
     }
@@ -165,14 +165,14 @@ fn listener_list_emits_after_the_handle_moves() {
         list.with_isolated_listener(
             &mut *hook,
             &raw const *events,
-            7 as *mut std::os::raw::c_void,
+            std::ptr::without_provenance_mut::<c_void>(7),
             || {},
         );
     }
 
     let moved = list; // move the handle; the boxed head must not move
     let mut seen = Vec::new();
-    moved.emit(|_events, data| seen.push(data as usize));
+    moved.emit(|_events, data| seen.push(data.addr()));
     assert_eq!(seen, [7]);
 }
 

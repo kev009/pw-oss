@@ -16,7 +16,7 @@
 #![warn(clippy::used_underscore_binding)]
 
 use libspa::sys::spa_handle_factory;
-use std::os::raw::c_int;
+use std::ffi::c_int;
 
 mod device;
 mod monitor;
@@ -98,8 +98,8 @@ struct TopicPointer(*mut spa_log_topic);
 
 // exactly one pointer per entry: no padding for the host's array walk
 const _: () = assert!(
-    std::mem::size_of::<TopicPointer>() == std::mem::size_of::<*mut spa_log_topic>()
-        && std::mem::align_of::<TopicPointer>() == std::mem::align_of::<*mut spa_log_topic>()
+    size_of::<TopicPointer>() == size_of::<*mut spa_log_topic>()
+        && align_of::<TopicPointer>() == align_of::<*mut spa_log_topic>()
 );
 
 // The entries are private (the host finds them through the section bounds,
@@ -107,25 +107,25 @@ const _: () = assert!(
 // keeps them in the emitted spa_log_topic section.
 #[unsafe(link_section = "spa_log_topic")]
 #[used]
-#[allow(non_upper_case_globals)]
+#[expect(non_upper_case_globals)]
 static mut spa_log_topic_export_oss_device: TopicPointer =
     TopicPointer(&raw mut device::OSS_DEVICE_TOPIC);
 
 #[unsafe(link_section = "spa_log_topic")]
 #[used]
-#[allow(non_upper_case_globals)]
+#[expect(non_upper_case_globals)]
 static mut spa_log_topic_export_oss_sink: TopicPointer =
     TopicPointer(&raw mut node::OSS_SINK_TOPIC);
 
 #[unsafe(link_section = "spa_log_topic")]
 #[used]
-#[allow(non_upper_case_globals)]
+#[expect(non_upper_case_globals)]
 static mut spa_log_topic_export_oss_source: TopicPointer =
     TopicPointer(&raw mut node::OSS_SOURCE_TOPIC);
 
 #[unsafe(link_section = "spa_log_topic")]
 #[used]
-#[allow(non_upper_case_globals)]
+#[expect(non_upper_case_globals)]
 static mut spa_log_topic_export_oss_monitor: TopicPointer =
     TopicPointer(&raw mut monitor::OSS_MONITOR_TOPIC);
 
@@ -137,7 +137,6 @@ unsafe extern "C" {
 
 #[unsafe(no_mangle)]
 #[used]
-#[allow(non_upper_case_globals)]
 static mut spa_log_topic_enum: libspa::sys::spa_log_topic_enum = libspa::sys::spa_log_topic_enum {
     version: SPA_VERSION_LOG_TOPIC_ENUM,
     topics: &raw const __start_spa_log_topic,

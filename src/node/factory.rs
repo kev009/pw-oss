@@ -11,7 +11,7 @@ pub(super) unsafe extern "C" fn get_interface<D: Direction>(
     if unsafe { spa_streq(type_, SPA_TYPE_INTERFACE_Node.as_ptr().cast()) } {
         // interface is non-null (asserted above) and writable per the contract
         unsafe {
-            *interface = std::ptr::addr_of_mut!((*state).node).cast::<c_void>();
+            *interface = (&raw mut (*state).node).cast::<c_void>();
         }
     } else {
         return -libc::ENOENT;
@@ -73,7 +73,7 @@ pub(crate) extern "C" fn get_size<D: Direction>(
     _factory: *const spa_handle_factory,
     _params: *const spa_dict,
 ) -> usize {
-    std::mem::size_of::<State<D>>()
+    size_of::<State<D>>()
 }
 
 fn property_bool(value: &str) -> Option<bool> {
@@ -193,9 +193,10 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
     n_support: u32,
 ) -> c_int {
     // the support array is the host's init contract: n_support valid entries
-    let log =
-        unsafe { spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Log.as_ptr().cast()) }
-            as *mut spa_log;
+    let log = unsafe {
+        spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Log.as_ptr().cast())
+            .cast::<spa_log>()
+    };
     let Some(log) = (unsafe { crate::spa::Log::wrap(log, Some(D::log_topic())) }) else {
         return -libc::EINVAL;
     };
@@ -206,17 +207,20 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
             n_support,
             SPA_TYPE_INTERFACE_DataLoop.as_ptr().cast(),
         )
-    } as *mut spa_loop;
+        .cast::<spa_loop>()
+    };
     let data_system = unsafe {
         spa_support_find(
             support,
             n_support,
             SPA_TYPE_INTERFACE_DataSystem.as_ptr().cast(),
         )
-    } as *mut spa_system;
-    let main_loop =
-        unsafe { spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Loop.as_ptr().cast()) }
-            as *mut spa_loop;
+        .cast::<spa_system>()
+    };
+    let main_loop = unsafe {
+        spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Loop.as_ptr().cast())
+            .cast::<spa_loop>()
+    };
 
     if data_loop.is_null() || data_system.is_null() {
         return -libc::EINVAL;
@@ -329,8 +333,8 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
                         type_: SPA_TYPE_INTERFACE_Node.as_ptr().cast(),
                         version: SPA_VERSION_NODE,
                         cb: spa_callbacks {
-                            funcs: node_methods as *const _ as *const c_void,
-                            data: state as *mut _ as *mut c_void,
+                            funcs: std::ptr::from_ref(node_methods).cast(),
+                            data: state.cast(),
                         },
                     },
                 },
@@ -452,7 +456,7 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
     // this executes on the loop thread, not inline
     let control = unsafe { DataControl::from_raw(state) };
     let gate = unsafe { gate_ref(state) };
-    let thread = std::ptr::addr_of!(gate.thread);
+    let thread = &raw const gate.thread;
     let loop_thread = unsafe { crate::spa::SendWrap::new(thread.cast_mut()) };
     let seeded = control.invoke(move |_data| {
         let thread = loop_thread.into_inner();

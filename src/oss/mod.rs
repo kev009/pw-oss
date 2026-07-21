@@ -22,7 +22,7 @@ pub(crate) use mixer::{
 // phase tests (they drive the extracted process phases on pipe fds).
 #[cfg(test)]
 pub(crate) mod test_util {
-    use libc::c_int;
+    use std::ffi::c_int;
 
     pub(crate) fn set_nonblock(fd: c_int) {
         unsafe {
