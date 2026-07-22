@@ -317,6 +317,17 @@ pub(crate) fn configure_capture(
             return Err(-(error as c_int));
         }
     };
+    crate::debug!(
+        log,
+        "{}: channel caps 0x{:08x}{}",
+        stream.path(),
+        stream.hw_caps(),
+        if stream.is_virtual_channel() {
+            " (virtual)"
+        } else {
+            ""
+        }
+    );
     stream.refresh_hw_quantum();
     stream.set_small_fragments(properties.fragment_bytes(), MIN_BUFFER_BYTES);
     match configure_outcome(config, applied, stream.delivery_quantum()) {
@@ -364,6 +375,17 @@ pub(crate) fn configure_playback(
             return Err(-(err as c_int));
         }
     };
+    crate::debug!(
+        log,
+        "{}: channel caps 0x{:08x}{}",
+        stream.path(),
+        stream.hw_caps(),
+        if stream.is_virtual_channel() {
+            " (virtual)"
+        } else {
+            ""
+        }
+    );
     stream.refresh_delivery_quantum();
     match configure_outcome(config, applied, stream.delivery_quantum()) {
         Ok(outcome) => Ok(outcome),

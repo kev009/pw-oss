@@ -107,6 +107,7 @@ pub(crate) struct Dsp {
     fd: Option<LibcFd>,
     state: DspState,
     needs_trigger: bool, // trigger-suspended: NOTRIGGER must be cleared on restart
+    hw_caps: u32,        // best-effort per-open SNDCTL_DSP_GETCAPS snapshot
     stride: u32,         // negotiated frame bytes; reads must consume whole frames
     skip: u32,           // tail bytes of a torn frame to discard before the next read
     wake_threshold: Cell<u32>,
@@ -121,6 +122,7 @@ impl Dsp {
             fd: None,
             state: DspState::Closed,
             needs_trigger: false,
+            hw_caps: 0,
             stride: 1,
             skip: 0,
             wake_threshold: Cell::new(0),
@@ -150,6 +152,14 @@ impl Dsp {
 
     pub(crate) fn is_running(&self) -> bool {
         self.state == DspState::Running
+    }
+
+    pub(crate) fn hw_caps(&self) -> u32 {
+        self.hw_caps
+    }
+
+    pub(crate) fn is_virtual_channel(&self) -> bool {
+        self.hw_caps & PCM_CAP_VIRTUAL as u32 != 0
     }
 
     fn descriptor(&self) -> &LibcFd {
@@ -205,6 +215,7 @@ impl Dsp {
         );
         self.state = DspState::Closed;
         self.needs_trigger = false;
+        self.hw_caps = 0;
         self.skip = 0;
         self.buffer = CaptureBufferState::default();
         self.wake_threshold.set(0);
@@ -292,6 +303,7 @@ impl Dsp {
             set_channel_order(self.raw_fd(), order)?;
         }
         let rate = set_rate(self.raw_fd(), rate)?;
+        self.hw_caps = channel_caps(self.raw_fd());
         Ok(AppliedNativeConfig {
             format,
             channels,
@@ -589,6 +601,7 @@ impl Dsp {
             fd: Some(unsafe { LibcFd::from_raw(fd) }),
             state: DspState::Setup,
             needs_trigger: false,
+            hw_caps: 0,
             stride,
             skip: 0,
             wake_threshold: Cell::new(0),
@@ -610,6 +623,7 @@ pub(crate) struct DspWriter {
     state: DspState,
     needs_trigger: bool,  // trigger-suspended: writes buffer until armed
     pause_shadowed: bool, // SILENCE saved bufsoft; Start must pair it with SKIP
+    hw_caps: u32,         // best-effort per-open SNDCTL_DSP_GETCAPS snapshot
     stride: u32,          // negotiated frame bytes; the byte stream must stay frame-aligned
     silence_byte: u8,     // 0x80 for biased U8 PCM; zero for every other supported format
     playback_delay_eighths: u32,
@@ -731,6 +745,7 @@ impl DspWriter {
             state: DspState::Closed,
             needs_trigger: false,
             pause_shadowed: false,
+            hw_caps: 0,
             stride: 1,
             silence_byte: 0,
             playback_delay_eighths: 10,
@@ -760,6 +775,14 @@ impl DspWriter {
 
     pub(crate) fn is_running(&self) -> bool {
         self.state == DspState::Running
+    }
+
+    pub(crate) fn hw_caps(&self) -> u32 {
+        self.hw_caps
+    }
+
+    pub(crate) fn is_virtual_channel(&self) -> bool {
+        self.hw_caps & PCM_CAP_VIRTUAL as u32 != 0
     }
 
     fn descriptor(&self) -> &LibcFd {
@@ -823,6 +846,7 @@ impl DspWriter {
         self.state = DspState::Closed;
         self.needs_trigger = false;
         self.pause_shadowed = false;
+        self.hw_caps = 0;
         self.frame_off = 0;
         self.buffer = PlaybackBufferState::default();
         self.wake_threshold.set(0);
@@ -918,6 +942,7 @@ impl DspWriter {
             set_channel_order(self.raw_fd(), order)?;
         }
         let rate = set_rate(self.raw_fd(), rate)?;
+        self.hw_caps = channel_caps(self.raw_fd());
         Ok(AppliedNativeConfig {
             format,
             channels,
@@ -1364,6 +1389,7 @@ impl DspWriter {
             state: DspState::Setup,
             needs_trigger: false,
             pause_shadowed: false,
+            hw_caps: 0,
             stride,
             silence_byte: 0,
             playback_delay_eighths: 10,

@@ -23,6 +23,7 @@ const SNDCTL_DSP_GETOSPACE: c_ulong =
     nix::request_code_read!(b'P', 12, size_of::<audio_buf_info>());
 const SNDCTL_DSP_GETISPACE: c_ulong =
     nix::request_code_read!(b'P', 13, size_of::<audio_buf_info>());
+const SNDCTL_DSP_GETCAPS: c_ulong = nix::request_code_read!(b'P', 15, size_of::<c_int>());
 const SNDCTL_DSP_SETTRIGGER: c_ulong = nix::request_code_write!(b'P', 16, size_of::<c_int>());
 const SNDCTL_DSP_GETODELAY: c_ulong = nix::request_code_read!(b'P', 23, size_of::<c_int>());
 const SNDCTL_DSP_GETERROR: c_ulong = nix::request_code_read!(b'P', 25, size_of::<audio_errinfo>());
@@ -196,6 +197,10 @@ pub(super) fn halt(fd: c_int) {
 
 pub(super) fn supported_formats(fd: c_int) -> Option<c_int> {
     ioctl_int(fd, SNDCTL_DSP_GETFMTS, 0)
+}
+
+pub(super) fn channel_caps(fd: c_int) -> u32 {
+    ioctl_int(fd, SNDCTL_DSP_GETCAPS, 0).map_or(0, |caps| caps as u32)
 }
 
 pub(super) fn engine_info(fd: c_int) -> Option<oss_audioinfo> {
@@ -498,6 +503,7 @@ mod tests {
             abi_const!(SNDCTL_DSP_GETFMTS),
             abi_const!(SNDCTL_DSP_GETOSPACE),
             abi_const!(SNDCTL_DSP_GETISPACE),
+            abi_const!(SNDCTL_DSP_GETCAPS),
             abi_const!(SNDCTL_DSP_SETTRIGGER),
             abi_const!(SNDCTL_DSP_GETODELAY),
             abi_const!(SNDCTL_DSP_GETERROR),
