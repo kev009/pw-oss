@@ -1,16 +1,18 @@
 use super::*;
 use crate::backend;
+use crate::backend::StreamLifecycle as _;
+use crate::backend::WakeDriver as _;
 use crate::spa::System;
 
 // Run the servo before the clock is published so every field below belongs
-// to this cycle (the shape of ALSA's update_time); both directions share
-// the skeleton, with the fill measurement and error sign supplied through
-// the Direction servo_* hooks. Returns (corr, delay) for the clock.
+// to this cycle. Both directions share the skeleton, with the fill
+// measurement and error sign supplied through the Direction servo_* hooks.
+// Returns (corr, delay) for the clock.
 fn driver_servo<D: Direction>(
     state: &mut DataState<D>,
     nsec: u64,
     rate: u32,
-    wake: WakeKind,
+    basis: ServoBasis,
 ) -> (f64, i64) {
     let mut corr: f64 = 1.0;
     let mut delay: i64 = 0;
@@ -23,7 +25,7 @@ fn driver_servo<D: Direction>(
         if !port.dsp.is_running()
             || port.setup_period == 0
             || port.rebuild_pending
-            || port.device_eof
+            || port.rebuild_required
             || !D::servo_ready(port)
         {
             continue;
@@ -31,7 +33,7 @@ fn driver_servo<D: Direction>(
 
         let fill = D::servo_fill(port);
         // device frames scale to the graph rate; the resampler queue is already
-        // graph-side (audioconvert reports it unscaled, like ALSA adds it)
+        // graph-side because audioconvert reports it unscaled
         let resamp = port.rate_match.with_ref(|rm| rm.delay as i64).unwrap_or(0);
         delay = (fill as i64 / stride as i64) * rate as i64 / device_rate as i64 + resamp;
 
@@ -39,25 +41,22 @@ fn driver_servo<D: Direction>(
             continue; // recovering; process() is discarding buffers, hold the servo
         }
 
-        // An enriched sound event is an IRQ-style clock observation. Its fill
-        // is fragment-quantized and can be consistently one fragment below
-        // the native wake threshold; steering from that biased level winds the
-        // DLL forever.
-        // ALSA likewise uses wake-time error in IRQ mode and buffer-level error
-        // only for timer scheduling. The timer fallback still needs the latter
-        // because it has no device-clock observation of its own.
-        let err_raw = match wake {
-            WakeKind::Device => timing_error_bytes(nsec, expected_nsec, device_rate, stride),
-            WakeKind::Timer => D::servo_err(port, fill),
+        // A timing-qualified wake is a clock observation. Its queue fill may
+        // be delivery-quantized and consistently one quantum below the wake
+        // threshold; steering from that biased level winds the DLL. Use time
+        // error for a declared timing observation and queue error otherwise.
+        let err_raw = match basis {
+            ServoBasis::Timing => timing_error_bytes(nsec, expected_nsec, device_rate, stride),
+            ServoBasis::Fill => D::servo_err(port, fill),
         };
         // Clamp the error so a wakeup-jitter spike can't wind up the integrator
-        // against an actuator that moves slowly (ALSA clamps to max_error too).
+        // against an actuator that moves slowly.
         let max_err = (port.setup_period as f64 / 2.0).max(256.0 * stride as f64);
         let err = err_raw.clamp(-max_err, max_err);
         corr = port.dll.update(err);
-        match wake {
-            WakeKind::Device => port.bw_adapt.update_timing(&mut port.dll, err, nsec),
-            WakeKind::Timer => port.bw_adapt.update_fill(&mut port.dll, err, nsec),
+        match basis {
+            ServoBasis::Timing => port.bw_adapt.update_timing(&mut port.dll, err, nsec),
+            ServoBasis::Fill => port.bw_adapt.update_fill(&mut port.dll, err, nsec),
         }
 
         // a diverged servo must not wedge the graph clock
@@ -79,11 +78,10 @@ fn driver_servo<D: Direction>(
     (corr, delay)
 }
 
-// ALSA adapts the DLL bandwidth continuously from the error variance
-// (alsa-pcm.c, BW_PERIOD); we approximate with two stages: a fast lock at
-// BW_MAX after (re)start, then the low steady-state bandwidth
+// Adapt DLL bandwidth from error variance in two stages: a fast lock at
+// BW_MAX after (re)start, then the low steady-state bandwidth.
 pub(super) unsafe extern "C" fn on_wake<D: Direction>(source: *mut spa_source) {
-    // The timer/kqueue source registered in init; its data points at State.
+    // The notification source registered in init; its data points at State.
     let root: *mut State<D> = unsafe { (*source).data.cast() };
     assert!(!root.is_null(), "(*source).data is not supposed to be null");
 
@@ -140,16 +138,16 @@ pub(super) fn wake_cycle<D: Direction>(
 
     let Some(wake) = drain_wake(state) else {
         // The loop may have observed readability just before a synchronous
-        // transition removed its event, and a failed kevent read must not
+        // transition removed its event, and a failed wake read must not
         // consume the only one-shot timer arm. Restore the current
         // device/deadline selection before returning.
         select_next_wake(state);
         return None;
     };
 
-    // A stop or role transition can land after the descriptor became ready
+    // A stop or role transition can land after the notification became ready
     // but before this callback. Do not signal ready() into a node being
-    // reconfigured; explicitly remove the device knote and park its timer.
+    // reconfigured; remove the stream registration and park its timer.
     if !state.started || state.following {
         select_next_wake(state);
         return None;
@@ -160,11 +158,11 @@ pub(super) fn wake_cycle<D: Direction>(
         return None; // ios cleared while the descriptor was ready
     }
 
-    // EV_EOF is an ownership transition, not merely an I/O hint. Claim the
-    // rebuild before ready(): a conforming host may defer process() until
+    // A disconnect is an ownership transition, not merely an I/O hint. Claim
+    // the rebuild before ready(): a conforming host may defer process() until
     // after this callback, and the deadline watchdog could otherwise replace
-    // the EOF snapshot with a timer cycle before process() observes it.
-    super::process::queue_device_eof_rebuilds(state);
+    // the wake snapshot with a timer cycle before process() observes it.
+    super::process::queue_required_rebuilds(state);
 
     // A failed clock read must not abort the data loop, but a bare return
     // would park the one-shot timer until the next external transition
@@ -184,20 +182,20 @@ pub(super) fn wake_cycle<D: Direction>(
         .with_ref(|p| (p.clock.target_duration, p.clock.target_rate.denom))
         .unwrap_or((0, 0));
     if wake_is_from_previous_cycle(now, state.next_time, duration, rate) {
-        // A timer/device pair can straddle the nonblocking kevent read by a
+        // A timer/device pair can straddle one nonblocking wake read by a
         // few microseconds. The first event already advanced next_time and
         // drove this graph cycle; consume the late half without starting a
         // second cycle while followers are still processing the first.
         for port in &mut state.ports {
-            port.device_event = None;
+            port.stream_wake = None;
         }
         select_next_wake(state);
         return None;
     }
 
-    // Both backends advance the phase accumulator from its prior deadline.
+    // Every wake path advances the phase accumulator from its prior deadline.
     // Re-anchor only after a genuine stall; replaying stale deadlines would
-    // otherwise make either backend busy-spin until the timeline caught up.
+    // otherwise make either wake mode busy-spin until the timeline caught up.
     if now.saturating_sub(state.next_time) > SPA_NSEC_PER_SEC as u64 {
         crate::warn!(
             state.log,
@@ -206,13 +204,21 @@ pub(super) fn wake_cycle<D: Direction>(
         );
         state.next_time = now;
     }
-    let nsec = match wake {
-        // As in ALSA's IRQ path, a device readiness event is the published
-        // clock observation, while the servo compares it with the accumulated
-        // deadline from the previous cycle.
-        WakeKind::Device => now,
-        // Timer wakes publish the requested deadline, not scheduling latency.
-        WakeKind::Timer => state.next_time,
+    let timing_observation = match wake {
+        WakeKind::Stream(backend::WakeTiming::NotificationTime) => Some(now),
+        WakeKind::Stream(backend::WakeTiming::ObservedTime) => {
+            observed_wake_timestamp(&state.ports)
+        }
+        WakeKind::Stream(backend::WakeTiming::Readiness) | WakeKind::Timer => None,
+    };
+    // Readiness-only and timer wakes publish the requested graph deadline,
+    // not scheduling latency. Only an explicitly declared notification or
+    // backend timestamp drives the timing-error servo.
+    let nsec = timing_observation.unwrap_or(state.next_time);
+    let servo_basis = if timing_observation.is_some() {
+        ServoBasis::Timing
+    } else {
+        ServoBasis::Fill
     };
 
     D::debug_cycle(state, now, nsec);
@@ -227,10 +233,10 @@ pub(super) fn wake_cycle<D: Direction>(
         return None;
     }
 
-    let (corr, delay) = driver_servo(state, nsec, rate, wake);
+    let (corr, delay) = driver_servo(state, nsec, rate, servo_basis);
 
-    // Keep phase error cumulative as ALSA does: advancing from the previous
-    // prediction lets a residual rate mismatch grow into a corrective signal.
+    // Keep phase error cumulative: advancing from the previous prediction
+    // lets a residual rate mismatch grow into a corrective signal.
     // Re-anchoring every device cycle would reduce it to a tiny one-period
     // interval error and effectively freeze the DLL at low bandwidth.
     state.next_time = advance_deadline(state.next_time, duration, rate, corr);
@@ -252,42 +258,46 @@ pub(super) fn wake_cycle<D: Direction>(
 }
 
 // Drain the descriptor that made wake_source readable. A timer cycle has no
-// atomic device snapshot; a sound event deposits its pre-I/O snapshot on the
+// atomic device snapshot; a stream event deposits its pre-I/O snapshot on the
 // matching port for both the servo and the inline process() call.
 #[derive(Clone, Copy)]
 enum WakeKind {
     Timer,
-    Device,
+    Stream(backend::WakeTiming),
+}
+
+#[derive(Clone, Copy)]
+enum ServoBasis {
+    Fill,
+    Timing,
 }
 
 fn drain_wake<D: Direction>(state: &mut DataState<D>) -> Option<WakeKind> {
-    if let Some(queue) = &state.sound_queue {
-        match queue.next_event() {
+    if let Some(driver) = &state.wake_driver {
+        match driver.next_event() {
             Ok(Some(backend::WakeEvent::Timer)) => {
                 for port in &mut state.ports {
-                    port.device_event = None;
+                    port.stream_wake = None;
                 }
                 Some(WakeKind::Timer)
             }
-            Ok(Some(backend::WakeEvent::Device(event))) => {
-                let Some(port) = state
-                    .ports
-                    .iter_mut()
-                    .find(|port| port.dsp.fd() == Some(event.fd))
-                else {
-                    // Device replacement normally deletes its old knote.
-                    // If an already-queued event survives, consume it and
-                    // let wake_cycle restore the current wake selection.
-                    crate::debug!(state.log, "ignoring stale OSS event for fd {}", event.fd);
+            Ok(Some(backend::WakeEvent::Stream(event))) => {
+                if !deposit_stream_wake(&mut state.ports, event) {
+                    // A queued wake from an older stream generation is
+                    // consumed but never attributed to its replacement.
+                    crate::debug!(state.log, "ignoring stale stream wake: {:?}", event.stream);
                     return None;
-                };
-                port.device_eof |= event.eof;
-                port.device_event = Some(event);
-                Some(WakeKind::Device)
+                }
+                Some(WakeKind::Stream(event.timing))
             }
             Ok(None) => None,
             Err(err) => {
-                crate::warn!(state.log, "reading the OSS kqueue event: {}", err);
+                crate::warn!(
+                    state.log,
+                    "{}: {}",
+                    D::Device::wake_diagnostic(backend::WakeDiagnostic::Read),
+                    err
+                );
                 None
             }
         }
@@ -304,135 +314,140 @@ fn drain_wake<D: Direction>(state: &mut DataState<D>) -> Option<WakeKind> {
             return None;
         }
         for port in &mut state.ports {
-            port.device_event = None;
+            port.stream_wake = None;
         }
         Some(WakeKind::Timer)
     }
 }
 
+fn deposit_stream_wake<D: Direction>(ports: &mut [Port<D>], event: backend::StreamWake) -> bool {
+    let Some(port) = ports
+        .iter_mut()
+        .find(|port| port.stream_identity() == event.stream)
+    else {
+        return false;
+    };
+    port.rebuild_required |= event.state.requires_rebuild();
+    port.stream_wake = Some(event);
+    true
+}
+
+fn observed_wake_timestamp<D: Direction>(ports: &[Port<D>]) -> Option<u64> {
+    ports.iter().find_map(|port| {
+        let event = port.stream_wake?;
+        (event.stream == port.stream_identity()).then_some(event.clock?.timestamp?.monotonic_ns)
+    })
+}
+
 fn disable_device_wake<D: Direction>(state: &mut DataState<D>) {
-    if let Some(queue) = &mut state.sound_queue
-        && let Err(err) = queue.unregister_device()
+    if let Some(driver) = &mut state.wake_driver
+        && let Err(err) = driver.unregister_stream()
     {
-        crate::warn!(state.log, "removing the OSS kqueue device: {}", err);
+        crate::warn!(
+            state.log,
+            "{}: {}",
+            D::Device::wake_diagnostic(backend::WakeDiagnostic::Remove),
+            err
+        );
     }
     for port in &mut state.ports {
-        port.device_event = None;
+        port.stream_wake = None;
     }
 }
 
-// A close/open can reuse the same integer descriptor after the kernel has
-// silently removed the old fd's knote. Clear both our registration cache and
-// its failure cache whenever device ownership changes.
+// Clear the registration and its failure cache whenever stream ownership
+// changes. The next registration carries the new port generation.
 pub(crate) fn invalidate_device_wake<D: Direction>(state: &mut DataState<D>) {
     disable_device_wake(state);
-    state.sound_failed_fd = None;
+    state.wake_failed_stream = None;
 }
 
-// Keep the sound knote aligned with the one running driver device. true means
-// the knote is registered; the independent deadline watchdog remains armed.
-// The node exposes one port; the fd match rejects stale events after device
-// replacement.
+// Keep the backend wake registration aligned with the running driver stream.
+// true means the stream is registered; the independent deadline watchdog
+// remains armed. Tokens and generations reject stale events after replacement.
 pub(crate) fn refresh_device_wake<D: Direction>(state: &mut DataState<D>) -> bool {
     refresh_device_wake_inner(state, false)
 }
 
 fn refresh_device_wake_inner<D: Direction>(state: &mut DataState<D>, retry_failed: bool) -> bool {
-    if state.sound_queue.is_none() {
+    if state.wake_driver.is_none() {
         return false;
     }
 
     let candidate =
         if state.started && !state.following && !state.position.is_null() && !state.clock.is_null()
         {
-            state.ports.iter().find_map(|port| {
+            state.ports.iter().enumerate().find_map(|(port_idx, port)| {
                 (port.dsp.is_running()
                     && !port.rebuild_pending
-                    && !port.device_eof
-                    && port.setup_period != 0
-                    && port.dsp.fd().is_some())
-                .then(|| {
-                    (
-                        port.dsp.fd().expect("checked above"),
-                        D::wake_threshold(port),
-                    )
-                })
+                    && !port.rebuild_required
+                    && port.setup_period != 0)
+                    .then(|| (port_idx, port.stream_identity(), D::wake_buffer_state(port)))
             })
         } else {
             None
         };
 
-    let Some((fd, threshold)) = candidate else {
+    let Some((port_idx, stream, buffer)) = candidate else {
         disable_device_wake(state);
         return false;
     };
 
-    if state.sound_failed_fd == Some(fd) && !retry_failed {
+    if state.wake_failed_stream == Some(stream) && !retry_failed {
         return false;
     }
-    if state.sound_failed_fd.is_some_and(|failed| failed != fd) {
-        state.sound_failed_fd = None;
-    }
-
-    let port_idx = state
-        .ports
-        .iter()
-        .position(|port| port.dsp.fd() == Some(fd))
-        .expect("the candidate came from this port set");
-    let needs_threshold = wake_threshold_changed(
-        state.ports[port_idx].wake_threshold,
-        threshold,
-        state.ports[port_idx].setup_blocksize,
-    );
-    if needs_threshold
-        && !state.ports[port_idx]
-            .dsp
-            .configure_wake_threshold(threshold)
+    if state
+        .wake_failed_stream
+        .is_some_and(|failed| failed != stream)
     {
-        if let Some(queue) = &mut state.sound_queue {
-            let _ = queue.unregister_device();
-        }
-        let first_failure = state.sound_failed_fd != Some(fd);
-        state.sound_failed_fd = Some(fd);
-        if first_failure {
-            crate::warn!(
-                state.log,
-                "{}: can't set the OSS kqueue wake threshold {}; using the timer",
-                state.ports[port_idx].dsp.path(),
-                threshold
-            );
-        }
-        return false;
-    }
-    if needs_threshold {
-        state.ports[port_idx].wake_threshold = threshold;
+        state.wake_failed_stream = None;
     }
 
-    let queue = state
-        .sound_queue
+    let driver = state
+        .wake_driver
         .as_mut()
         .expect("checked at the start of the function");
-    if let Err(err) = queue.register_device(fd, D::PLAYBACK) {
-        let first_failure = state.sound_failed_fd != Some(fd);
-        state.sound_failed_fd = Some(fd);
-        if first_failure {
+    if let Err(err) = state.ports[port_idx]
+        .dsp
+        .register_wake(driver, stream, buffer)
+    {
+        // A failed threshold update can leave the previous descriptor armed.
+        // Remove it before declaring timer fallback, otherwise both sources
+        // can drive the same graph cycle.
+        if let Err(unregister_err) = driver.unregister_stream() {
             crate::warn!(
                 state.log,
-                "{}: can't register OSS kqueue events: {}; using the timer",
-                state.ports[port_idx].dsp.path(),
-                err
+                "{}: {}",
+                D::Device::wake_diagnostic(backend::WakeDiagnostic::Remove),
+                unregister_err
             );
+        }
+        let first_failure = state.wake_failed_stream != Some(stream);
+        state.wake_failed_stream = Some(stream);
+        if first_failure {
+            if let Some(threshold) = err.threshold_value() {
+                crate::warn!(
+                    state.log,
+                    "{}: {} {}; using the timer",
+                    state.ports[port_idx].dsp.path(),
+                    D::Device::wake_diagnostic(backend::WakeDiagnostic::Threshold),
+                    threshold
+                );
+            } else {
+                crate::warn!(
+                    state.log,
+                    "{}: {}: {}; using the timer",
+                    state.ports[port_idx].dsp.path(),
+                    D::Device::wake_diagnostic(backend::WakeDiagnostic::Register),
+                    err
+                );
+            }
         }
         return false;
     }
-    // A successful explicit retry starts a new failure episode: if this fd
-    // later loses kqueue support again, report that transition once.
-    state.sound_failed_fd = None;
+    // A successful explicit retry starts a new failure episode.
+    state.wake_failed_stream = None;
     true
-}
-
-fn wake_threshold_changed(current: u32, desired: u32, blocksize: u32) -> bool {
-    current == 0 || current.abs_diff(desired) >= blocksize.max(1)
 }
 
 fn driver_wake_deadline(
@@ -494,11 +509,11 @@ fn advance_deadline(deadline: u64, duration: u64, rate: u32, corr: f64) -> u64 {
         .saturating_add((duration as f64 * SPA_NSEC_PER_SEC as f64 / (rate as f64 * corr)) as u64)
 }
 
-// Keep the enriched knote and the predicted graph deadline armed together.
-// EV_CLEAR needs a later sound-buffer transition to reactivate; when playback
-// drains empty without receiving another graph buffer, that transition stops.
-// The one-shot deadline is therefore a liveness watchdog as well as the
-// fallback for a failed knote. Re-arming it after a device cycle replaces an
+// Keep the backend notification and predicted graph deadline armed together.
+// A native edge may require a later buffer transition to reactivate; when
+// playback drains without another graph buffer, that transition can stop. The
+// one-shot deadline is therefore a liveness watchdog as well as the fallback
+// for a failed registration. Re-arming it after a device cycle replaces an
 // undelivered expiration from the preceding deadline.
 pub(crate) fn select_next_wake<D: Direction>(state: &mut DataState<D>) {
     let mut deadline = driver_wake_deadline(
@@ -524,7 +539,7 @@ pub(crate) fn select_next_wake<D: Direction>(state: &mut DataState<D>) {
 // ~10 ms one-shot without touching next_time - it re-anchors only from a
 // successful read (here or on_wake's stall resync; an absolute arm from
 // a stale next_time would busy-spin) - and let on_wake take over from
-// there; nothing aborts the data loop (the sink's former copy assert!()ed).
+// there; a clock-read failure must never abort the data loop.
 pub(crate) fn update_driver_wake<D: Direction>(state: &mut DataState<D>) {
     #[cfg(debug_assertions)]
     crate::trace!(state.log, "update_driver_wake");
@@ -574,10 +589,10 @@ pub(crate) fn set_timeout_rel<D: Direction>(state: &DataState<D>, delay_ns: u64)
 }
 
 pub(super) fn arm_timer<D: Direction>(state: &DataState<D>, value_ns: u64, flags: i32) {
-    if let Some(queue) = &state.sound_queue {
-        // EVFILT_TIMER NOTE_ABSTIME is a wall-clock epoch, unlike SPA's
-        // CLOCK_MONOTONIC deadline. Convert absolute monotonic deadlines to
-        // a relative interval; on a second clock-read failure, retain a
+    if let Some(driver) = &state.wake_driver {
+        // WakeDriver timers use relative intervals so each backend can map
+        // the graph deadline onto its native clock without exposing those
+        // clock semantics here. On a second clock-read failure, retain a
         // retry instead of turning a stale deadline into a busy loop.
         let delay_ns = if value_ns == 0 || flags == 0 {
             value_ns
@@ -586,8 +601,13 @@ pub(super) fn arm_timer<D: Direction>(state: &DataState<D>, value_ns: u64, flags
                 .map(|now| deadline_delay(value_ns, now))
                 .unwrap_or(SPA_NSEC_PER_SEC as u64 / 100)
         };
-        if let Err(err) = queue.arm_timer(delay_ns) {
-            crate::warn!(state.log, "arming the OSS kqueue timer: {}", err);
+        if let Err(err) = driver.arm_timer(delay_ns) {
+            crate::warn!(
+                state.log,
+                "{}: {}",
+                D::Device::wake_diagnostic(backend::WakeDiagnostic::Arm),
+                err
+            );
         }
         return;
     }
@@ -625,8 +645,7 @@ pub(crate) fn set_clock_name(clock: &mut libspa::sys::spa_io_clock, name: &std::
 }
 
 // does the driver's clock in `position` carry our clock name? (then we tick
-// from the same device and rate matching is pointless - ALSA does the same
-// clock-name comparison)
+// from the same device and rate matching is pointless)
 pub(crate) fn same_clock(position: &libspa::sys::spa_io_position, name: &std::ffi::CStr) -> bool {
     let theirs = &position.clock.name;
     let ours = name.to_bytes();
@@ -669,18 +688,8 @@ pub(crate) fn ns_to_bytes(ns: u64, rate: u32, stride: u32) -> u32 {
         .min(u32::MAX as u128) as u32
 }
 
-// ns_to_bytes rounded up to a whole frame (the division floors: a 2048-byte
-// hardware quantum reads as 2047); a saturated conversion stays saturated at
-// the largest frame multiple instead of overflowing the round-up
-pub(crate) fn ns_to_frame_bytes(ns: u64, rate: u32, stride: u32) -> u32 {
-    let stride = stride.max(1);
-    ns_to_bytes(ns, rate, stride)
-        .checked_next_multiple_of(stride)
-        .unwrap_or(u32::MAX - u32::MAX % stride)
-}
-
 // at most one message a second from a per-cycle warn site, with a count of
-// what went unsaid (ALSA uses spa_ratelimit for the same purpose)
+// what went unsaid
 pub(crate) struct RateLimit {
     last: u64,
     suppressed: u32,
@@ -733,19 +742,65 @@ mod clock_tests {
     use super::*;
 
     #[test]
-    fn frame_bytes_round_up_and_stay_saturated() {
-        // the floored hardware quantum comes back up to a whole frame
-        assert_eq!(ns_to_frame_bytes(5_333_333, 48000, 8), 2048);
-        assert_eq!(ns_to_frame_bytes(0, 48000, 8), 0);
-        // a saturated conversion must not overflow the round-up (debug builds
-        // would abort the data loop; release would wrap the chunk to zero) -
-        // it stays pinned at the largest frame multiple
+    fn fake_stream_wakes_obey_generation_and_feed_shared_timing() {
+        let mut port = crate::node::fake::fake_port("fake://timing", 4);
+        port.config = Some(backend::StreamConfig {
+            format: libspa::param::audio::AudioFormat::S16LE,
+            rate: 48_000,
+            channels: 2,
+            positions: vec![],
+            flags: 0,
+            stride: 4,
+        });
+        let stale = backend::StreamWake {
+            stream: backend::StreamIdentity::new(port.stream_token, 3),
+            timing: backend::WakeTiming::Readiness,
+            ready_bytes: Some(128),
+            queue: None,
+            clock: None,
+            xruns: None,
+            state: backend::StreamWakeState::Active,
+        };
+        assert!(!deposit_stream_wake(std::slice::from_mut(&mut port), stale));
+        assert!(port.stream_wake.is_none());
+
+        let current = backend::StreamWake {
+            stream: port.stream_identity(),
+            timing: backend::WakeTiming::ObservedTime,
+            ready_bytes: Some(256),
+            queue: Some(backend::QueueObservation {
+                fill_bytes: 128,
+                quality: backend::ObservationQuality::Exact,
+            }),
+            clock: Some(backend::ClockObservation {
+                position: Some(backend::PositionObservation {
+                    frames: 4_096,
+                    scope: backend::ClockScope::Device,
+                    quality: backend::ObservationQuality::Estimated,
+                }),
+                timestamp: Some(backend::TimestampObservation {
+                    monotonic_ns: 123_456,
+                    accuracy_ns: Some(1_000),
+                    quality: backend::ObservationQuality::Estimated,
+                }),
+            }),
+            xruns: Some(backend::XrunObservation::cumulative_events(2)),
+            state: backend::StreamWakeState::Disconnected,
+        };
+        assert!(deposit_stream_wake(
+            std::slice::from_mut(&mut port),
+            current
+        ));
+        assert_eq!(port.stream_wake, Some(current));
         assert_eq!(
-            ns_to_frame_bytes(u64::MAX, u32::MAX, 8),
-            u32::MAX - u32::MAX % 8
+            observed_wake_timestamp(std::slice::from_ref(&port)),
+            Some(123_456)
         );
-        assert_eq!(ns_to_frame_bytes(u64::MAX, u32::MAX, 1), u32::MAX);
+        assert!(port.rebuild_required);
+        let (stride, rate) = port.stride_rate().expect("fake applied config");
+        assert_eq!(device_period_bytes(480, rate, 48_000, stride), 1_920);
     }
+
     #[test]
     fn ns_to_bytes_floors() {
         // the production hw-quantum shape: 256 frames @ 48k S32 stereo is
@@ -827,7 +882,7 @@ mod clock_tests {
     }
 
     #[test]
-    fn device_wake_error_tracks_time_without_fragment_bias() {
+    fn device_wake_error_tracks_time_without_delivery_bias() {
         assert_eq!(
             timing_error_bytes(1_001_000_000, 1_000_000_000, 48_000, 8),
             384.0
@@ -903,14 +958,5 @@ mod clock_tests {
                 "phase error did not settle: {phase_error} bytes"
             );
         }
-    }
-
-    #[test]
-    fn wake_threshold_moves_at_fragment_granularity() {
-        assert!(wake_threshold_changed(0, 16_384, 2_048));
-        assert!(!wake_threshold_changed(16_384, 17_407, 2_048));
-        assert!(wake_threshold_changed(16_384, 18_432, 2_048));
-        assert!(wake_threshold_changed(18_432, 16_384, 2_048));
-        assert!(wake_threshold_changed(8, 9, 0));
     }
 }

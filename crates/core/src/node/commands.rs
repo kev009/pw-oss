@@ -13,6 +13,7 @@ pub(crate) fn spa_command_to_str(body: &libspa::sys::spa_pod_object_body) -> &'s
 }
 
 use super::*;
+use crate::backend::StreamLifecycle as _;
 use crate::spa::SendWrap;
 
 // the io areas set_io accepts, with the geometry a full deref needs
@@ -136,7 +137,7 @@ pub(super) fn replace_port_devices<D: Direction>(
 ) -> [D::Device; MAX_PORTS] {
     devices.map(|(index, device)| {
         ports[index].rebuild_pending = false;
-        reset_device_event(&mut ports[index]);
+        reset_stream_epoch(&mut ports[index]);
         std::mem::replace(&mut ports[index].dsp, device)
     })
 }
@@ -282,13 +283,13 @@ pub(super) unsafe extern "C" fn send_command<D: Direction>(
                 .swap(false, std::sync::atomic::Ordering::AcqRel);
             let data_stopped = std::sync::atomic::AtomicBool::new(false);
             let data_stopped_ref = &data_stopped;
-            // Device::new may probe sndstat (the sink does), so build every
-            // closed placeholder here on main rather than inside DataControl.
+            // Device::new may perform discovery, so build every closed
+            // placeholder here on main rather than inside DataControl.
             let stream_path = unsafe { &main_ref(state).stream_path };
             let placeholders: [D::Device; MAX_PORTS] =
                 std::array::from_fn(|_| D::Device::new(stream_path));
             // Quiesce and transfer device ownership out of DataState. Potentially
-            // sleeping SETTRIGGER/close operations then run on this thread while
+            // sleeping suspend/close operations then run on this thread while
             // the data loop sees only closed placeholders.
             let Some((devices, deferred)) = control.query(move |state| {
                 state.started = false;
@@ -301,7 +302,7 @@ pub(super) unsafe extern "C" fn send_command<D: Direction>(
                 let devices: [(usize, D::Device); MAX_PORTS] = std::array::from_fn(|index| {
                     let port = &mut state.ports[index];
                     port.rebuild_pending = true;
-                    reset_device_event(port);
+                    reset_stream_epoch(port);
                     port.generation = port.generation.wrapping_add(1);
                     state
                         .shared
@@ -381,10 +382,12 @@ pub(super) unsafe extern "C" fn send_command<D: Direction>(
 
 #[cfg(test)]
 mod tests {
-    use super::super::sink::SinkDir;
+    use super::super::sink::SinkDir as GenericSinkDir;
     use super::*;
-    use crate::backend;
+    use crate::backend::{self, fake::FakeBackend};
     use crate::spa::IoArea;
+
+    type SinkDir = GenericSinkDir<FakeBackend>;
     // an aligned backing store for the admission tests (every io struct's
     // alignment divides 16)
     #[repr(align(16))]
@@ -451,20 +454,20 @@ mod tests {
             buffers: vec![],
             io: IoArea::null(),
             rate_match: IoArea::null(),
-            dsp: backend::PlaybackStream::test_on_fd(fd, 8),
+            dsp: backend::fake::FakeStream::test_on_fd(fd, 8),
             dll: Default::default(),
             setup_period: 0,
             bw_adapt: Default::default(),
-            setup_blocksize: 0,
+            delivery_quantum_bytes: 0,
             rebuild_pending: false,
             generation: 0,
+            stream_token: backend::StreamToken::for_port(0),
             was_matching: false,
             warn_limit: RateLimit::new(),
             pending_xrun: None,
-            device_event: None,
-            device_eof: false,
-            event_xruns_seen: 0,
-            wake_threshold: 0,
+            stream_wake: None,
+            rebuild_required: false,
+            xrun_tracker: backend::XrunTracker::default(),
             ext: Default::default(),
         }
     }
@@ -494,7 +497,7 @@ mod tests {
         let mut ports = [test_port(old_write)];
         ports[0].rebuild_pending = true;
 
-        let devices = [(0, backend::PlaybackStream::test_on_fd(new_write, 8))];
+        let devices = [(0, backend::fake::FakeStream::test_on_fd(new_write, 8))];
         let mut placeholders = replace_port_devices(&mut ports, devices);
 
         assert!(!ports[0].rebuild_pending);

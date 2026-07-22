@@ -1,5 +1,5 @@
-// Rate-matching DLL (PipeWire spa/utils/dll.h) and ALSA-style adaptive bandwidth.
-// Used by the node servo on the data loop.
+// Rate-matching DLL (PipeWire spa/utils/dll.h) and variance-adaptive
+// bandwidth, used by the node servo on the data loop.
 
 // This code was borrowed from PipeWire's spa/include/spa/utils/dll.h that has the following header:
 
@@ -58,28 +58,30 @@ impl SpaDLL {
     }
 }
 
-// ALSA's bandwidth floor for the adaptive scheme (alsa-pcm.c); well below the
-// classic SPA_DLL_BW_MIN - a quiet servo may relax that far
-pub(crate) const SPA_ALSA_DLL_BW_MIN: f64 = 0.001;
+// The adaptive estimator and its floor follow PipeWire's reference audio
+// driver (`spa/plugins/alsa/alsa-pcm.c`, `update_time`). This provenance is
+// algorithmic, not part of the backend contract: a quiet servo may relax well
+// below the classic SPA_DLL_BW_MIN.
+pub(crate) const ADAPTIVE_DLL_BW_MIN: f64 = 0.001;
 
 const BW_PERIOD_NSEC: u64 = 3_000_000_000;
 
-// alsa-pcm.c update_time's bandwidth adaptation: an EWMA of the servo error's
-// mean and variance over ~1 s of cycles; every 3 s window the bandwidth is
-// re-tuned to (|avg| + sqrt(var)) / 1000 in frames. OSS fill measurements need
-// two extra accommodations: subtract their known fragment-quantization
-// variance, and cap the loop gain when a fragment outgrows the period. Device
-// wake timestamps use ALSA's unadjusted phase-error model instead.
+// The adaptation is an EWMA of servo error mean and variance over roughly one
+// second of cycles. Every three-second window the bandwidth is re-tuned to
+// (|avg| + sqrt(var)) / 1000 in frames. Quantized backend fill
+// measurements need two extra accommodations: subtract their known delivery
+// variance and cap loop gain when delivery granularity outgrows the period.
+// Device wake timestamps use the unadjusted phase-error model instead.
 #[derive(Default, Clone)]
 pub(crate) struct BwAdapt {
     err_avg: f64,
     err_var: f64,
     base_time: u64,
     // the committed servo geometry, latched by configure(): the device
-    // fragment (noise), byte-domain period/rate and the frame stride only
+    // delivery granularity, byte-domain period/rate, and the frame stride only
     // change when the geometry is re-committed, not per cycle
     stride: u32,
-    noise: u32,
+    granularity: u32,
     period: u32,
     rate: u32,
 }
@@ -94,18 +96,18 @@ impl BwAdapt {
     }
 
     // latch the committed geometry; update() no-ops until this ran (rate 0)
-    pub(crate) fn configure(&mut self, stride: u32, noise: u32, period: u32, rate: u32) {
+    pub(crate) fn configure(&mut self, stride: u32, granularity: u32, period: u32, rate: u32) {
         self.stride = stride;
-        self.noise = noise;
+        self.granularity = granularity;
         self.period = period;
         self.rate = rate;
     }
 
-    fn bw_cap(period: u32, noise: u32) -> f64 {
-        if noise == 0 || period == 0 {
+    fn bw_cap(period: u32, granularity: u32) -> f64 {
+        if granularity == 0 || period == 0 {
             return SPA_DLL_BW_MAX;
         }
-        (SPA_DLL_BW_MAX * period as f64 / noise as f64).clamp(SPA_DLL_BW_MIN, SPA_DLL_BW_MAX)
+        (SPA_DLL_BW_MAX * period as f64 / granularity as f64).clamp(SPA_DLL_BW_MIN, SPA_DLL_BW_MAX)
     }
 
     pub(crate) fn update_fill(&mut self, dll: &mut SpaDLL, err: f64, now: u64) {
@@ -121,13 +123,14 @@ impl BwAdapt {
     // from configure(). Cold-starts the DLL at the appropriate gain when
     // bw == 0 (i.e. after init()), making dll.init() + reset() the whole
     // relock idiom.
-    fn update(&mut self, dll: &mut SpaDLL, err: f64, now: u64, fragment_quantized: bool) {
-        let (stride, noise, period, rate) = (self.stride, self.noise, self.period, self.rate);
+    fn update(&mut self, dll: &mut SpaDLL, err: f64, now: u64, delivery_quantized: bool) {
+        let (stride, granularity, period, rate) =
+            (self.stride, self.granularity, self.period, self.rate);
         if rate == 0 {
             return; // unconfigured; nothing to steer safely
         }
-        let bw_max = if fragment_quantized {
-            Self::bw_cap(period, noise)
+        let bw_max = if delivery_quantized {
+            Self::bw_cap(period, granularity)
         } else {
             SPA_DLL_BW_MAX
         };
@@ -149,20 +152,20 @@ impl BwAdapt {
         self.err_avg = avg;
         if now.saturating_sub(self.base_time) > BW_PERIOD_NSEC {
             self.base_time = now;
-            let var = if fragment_quantized {
+            let var = if delivery_quantized {
                 // Half the uniform-quantization floor (step^2/12): a locked
                 // fill loop regulates the quantized reading, so its sampling
-                // phase correlates with the fragment sawtooth and full
-                // subtraction could mask genuine fragment-sized disturbance.
-                // On vchans the parent's mix block is the real granularity and
-                // `noise` understates it, which only errs toward higher gain.
-                let step = noise as f64 / stride;
+                // phase correlates with the delivery sawtooth and full
+                // subtraction could mask genuine quantum-sized disturbance.
+                // If the reported step understates physical delivery, the
+                // result only errs toward higher gain.
+                let step = granularity as f64 / stride;
                 (self.err_var.abs() - step * step / 24.0).max(0.0)
             } else {
                 self.err_var.abs()
             };
             let bw = (self.err_avg.abs() + var.sqrt()) / 1000.0;
-            dll.set_bw(bw.clamp(SPA_ALSA_DLL_BW_MIN, bw_max), period, rate);
+            dll.set_bw(bw.clamp(ADAPTIVE_DLL_BW_MIN, bw_max), period, rate);
         }
     }
 }
@@ -207,7 +210,7 @@ mod servo_tests {
     }
 
     #[test]
-    fn bw_cap_binds_only_when_fragments_outsize_the_period() {
+    fn bw_cap_binds_only_when_delivery_granularity_outsizes_the_period() {
         assert_eq!(BwAdapt::bw_cap(16384, 0), SPA_DLL_BW_MAX);
         assert_eq!(BwAdapt::bw_cap(0, 2048), SPA_DLL_BW_MAX);
         assert_eq!(BwAdapt::bw_cap(16384, 16384), SPA_DLL_BW_MAX);
@@ -224,11 +227,11 @@ mod servo_tests {
         bw.configure(8, 2048, 16384, 48000 * 8);
         bw.update_fill(&mut dll, 0.0, 1_000);
         assert_eq!(dll.bw(), BwAdapt::bw_cap(16384, 2048));
-        assert_eq!(dll.bw(), SPA_DLL_BW_MAX); // fragment under the period: uncapped
+        assert_eq!(dll.bw(), SPA_DLL_BW_MAX); // granularity under the period: uncapped
     }
 
     #[test]
-    fn timing_bw_cold_start_ignores_the_fragment_cap() {
+    fn timing_bw_cold_start_ignores_the_granularity_cap() {
         let mut dll = SpaDLL::default();
         dll.init();
         let mut bw = BwAdapt::default();
@@ -240,19 +243,19 @@ mod servo_tests {
     }
 
     #[test]
-    fn quiet_servo_relaxes_to_the_alsa_floor() {
+    fn quiet_servo_relaxes_to_the_adaptive_floor() {
         let mut dll = SpaDLL::default();
         dll.init();
         let mut bw = BwAdapt::default();
         bw.configure(8, 2048, 16384, 48000 * 8);
         let mut now = 1u64;
         // cold start, then over 3 s of dead-quiet errors: the retune window
-        // sees zero mean and zero variance and relaxes to the ALSA floor
+        // sees zero mean and zero variance and relaxes to the adaptive floor
         for _ in 0..50 {
             bw.update_fill(&mut dll, 0.0, now);
             now += 100_000_000;
         }
-        assert_eq!(dll.bw(), SPA_ALSA_DLL_BW_MIN);
+        assert_eq!(dll.bw(), ADAPTIVE_DLL_BW_MIN);
     }
 
     #[test]
@@ -263,18 +266,18 @@ mod servo_tests {
         bw.configure(8, 2048, 16384, 48000 * 8);
         let mut now = 1u64;
         let mut sign = 1.0;
-        // errors well above the fragment-quantization floor: the variance term
-        // must keep the loop gain off the ALSA floor
+        // errors well above the delivery-quantization floor: the variance term
+        // must keep the loop gain off the adaptive floor
         for _ in 0..50 {
             bw.update_fill(&mut dll, sign * 4.0 * 2048.0, now);
             sign = -sign;
             now += 100_000_000;
         }
-        assert!(dll.bw() > SPA_ALSA_DLL_BW_MIN);
+        assert!(dll.bw() > ADAPTIVE_DLL_BW_MIN);
     }
 
     #[test]
-    fn timing_variance_is_not_hidden_by_fragment_quantization() {
+    fn timing_variance_is_not_hidden_by_delivery_quantization() {
         let mut fill_dll = SpaDLL::default();
         let mut timing_dll = SpaDLL::default();
         let mut fill_bw = BwAdapt::default();
@@ -292,7 +295,7 @@ mod servo_tests {
             now += 10_000_000;
         }
 
-        assert_eq!(fill_dll.bw(), SPA_ALSA_DLL_BW_MIN);
-        assert!(timing_dll.bw() > SPA_ALSA_DLL_BW_MIN);
+        assert_eq!(fill_dll.bw(), ADAPTIVE_DLL_BW_MIN);
+        assert!(timing_dll.bw() > ADAPTIVE_DLL_BW_MIN);
     }
 }
