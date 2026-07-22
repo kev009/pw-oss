@@ -84,6 +84,7 @@ pub(crate) struct BwAdapt {
     granularity: u32,
     period: u32,
     rate: u32,
+    timing_seen: bool,
 }
 
 impl BwAdapt {
@@ -93,6 +94,7 @@ impl BwAdapt {
         self.err_avg = 0.0;
         self.err_var = 0.0;
         self.base_time = 0;
+        self.timing_seen = false;
     }
 
     // latch the committed geometry; update() no-ops until this ran (rate 0)
@@ -101,6 +103,7 @@ impl BwAdapt {
         self.granularity = granularity;
         self.period = period;
         self.rate = rate;
+        self.timing_seen = false;
     }
 
     fn bw_cap(period: u32, granularity: u32) -> f64 {
@@ -129,16 +132,17 @@ impl BwAdapt {
         if rate == 0 {
             return; // unconfigured; nothing to steer safely
         }
-        let bw_max = if delivery_quantized {
-            Self::bw_cap(period, granularity)
-        } else {
-            SPA_DLL_BW_MAX
-        };
+        // The gain ceiling belongs to the committed backend geometry, not to
+        // whichever timing/fill observation happens to close this window.
+        // This keeps fragment > period operation stable when device and
+        // watchdog wakes alternate.
+        let bw_max = Self::bw_cap(period, granularity);
         if dll.bw() == 0.0 {
             dll.set_bw(bw_max, period, rate);
             self.err_avg = 0.0;
             self.err_var = 0.0;
             self.base_time = now;
+            self.timing_seen = false;
             return; // the gains were zero this cycle; track from the next one
         }
         if self.base_time == 0 {
@@ -150,9 +154,10 @@ impl BwAdapt {
         let avg = (self.err_avg * wdw + (err - self.err_avg)) / (wdw + 1.0);
         self.err_var = (self.err_var * wdw + (err - self.err_avg) * (err - avg)) / (wdw + 1.0);
         self.err_avg = avg;
+        self.timing_seen |= !delivery_quantized;
         if now.saturating_sub(self.base_time) > BW_PERIOD_NSEC {
             self.base_time = now;
-            let var = if delivery_quantized {
+            let var = if !self.timing_seen {
                 // Half the uniform-quantization floor (step^2/12): a locked
                 // fill loop regulates the quantized reading, so its sampling
                 // phase correlates with the delivery sawtooth and full
@@ -166,6 +171,7 @@ impl BwAdapt {
             };
             let bw = (self.err_avg.abs() + var.sqrt()) / 1000.0;
             dll.set_bw(bw.clamp(ADAPTIVE_DLL_BW_MIN, bw_max), period, rate);
+            self.timing_seen = false;
         }
     }
 }
@@ -231,7 +237,7 @@ mod servo_tests {
     }
 
     #[test]
-    fn timing_bw_cold_start_ignores_the_granularity_cap() {
+    fn timing_bw_uses_the_committed_granularity_cap() {
         let mut dll = SpaDLL::default();
         dll.init();
         let mut bw = BwAdapt::default();
@@ -239,7 +245,30 @@ mod servo_tests {
 
         assert!(BwAdapt::bw_cap(4096, 8192) < SPA_DLL_BW_MAX);
         bw.update_timing(&mut dll, 0.0, 1_000);
-        assert_eq!(dll.bw(), SPA_DLL_BW_MAX);
+        assert_eq!(dll.bw(), BwAdapt::bw_cap(4096, 8192));
+    }
+
+    #[test]
+    fn alternating_fill_and_timing_cannot_escape_the_granularity_cap() {
+        let cap = BwAdapt::bw_cap(4096, 8192);
+        for timing_first in [false, true] {
+            let mut dll = SpaDLL::default();
+            dll.init();
+            let mut bw = BwAdapt::default();
+            bw.configure(8, 8192, 4096, 48000 * 8);
+            let mut now = 1u64;
+
+            for cycle in 0..500 {
+                let timing = (cycle % 2 == 0) == timing_first;
+                if timing {
+                    bw.update_timing(&mut dll, 384.0, now);
+                } else {
+                    bw.update_fill(&mut dll, -384.0, now);
+                }
+                assert!(dll.bw() <= cap);
+                now += 10_000_000;
+            }
+        }
     }
 
     #[test]

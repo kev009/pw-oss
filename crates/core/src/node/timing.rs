@@ -959,4 +959,39 @@ mod clock_tests {
             );
         }
     }
+
+    #[test]
+    fn accumulated_phase_servo_converges_from_both_phase_offsets() {
+        let duration = 512u64;
+        let rate = 48_000u32;
+        let stride = 8u32;
+        let ideal_period = duration as f64 * SPA_NSEC_PER_SEC as f64 / rate as f64;
+        let actual_period = ideal_period as u64;
+        let phase_offset = (ideal_period / 3.0) as i64;
+
+        // This isolates accumulator convergence from duplicate-partner
+        // rejection, whose intentional early-wake allowance is period / 8.
+        for initial_offset in [-phase_offset, phase_offset] {
+            let mut dll = SpaDLL::default();
+            let mut bw = BwAdapt::default();
+            bw.configure(stride, 1024, duration as u32 * stride, rate * stride);
+            let mut deadline = 1_000_000_000u64;
+            let mut actual = deadline.saturating_add_signed(initial_offset);
+            let mut corr = 1.0;
+            let mut phase_error = 0.0;
+
+            for _ in 0..10_000 {
+                actual = actual.saturating_add(actual_period);
+                deadline = advance_deadline(deadline, duration, rate, corr);
+                phase_error = timing_error_bytes(actual, deadline, rate, stride);
+                corr = dll.update(phase_error);
+                bw.update_timing(&mut dll, phase_error, actual);
+            }
+
+            assert!(
+                phase_error.abs() < 8.0 * stride as f64,
+                "phase offset {initial_offset} did not settle: {phase_error} bytes"
+            );
+        }
+    }
 }
