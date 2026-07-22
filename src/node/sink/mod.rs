@@ -5,6 +5,7 @@ use libspa::sys::*;
 use crate::node::{
     DataControl, DataState, Direction, MAX_PORTS, MainState, ParamBuild, PortConfig,
 };
+use crate::platform;
 
 mod buffer;
 
@@ -845,7 +846,7 @@ impl Direction for SinkDir {
     }
 
     fn info_item(ext: &mut SinkMainExt, key: &str, value: &str) {
-        if key == crate::keys::OSS_DELAY {
+        if key == platform::PLAYBACK_DELAY {
             // per-device default, e.g. from a wireplumber node rule
             if let Ok(v) = value.parse::<u32>() {
                 ext.oss_delay = v.min(1024);
@@ -869,13 +870,13 @@ impl Direction for SinkDir {
         let pod = match (id, index) {
             (SPA_PARAM_PropInfo, 0) => crate::spa::build_latency_offset_prop_info(),
             (SPA_PARAM_PropInfo, 1) => crate::spa::build_params_prop_info(
-                crate::keys::OSS_DELAY,
+                platform::PLAYBACK_DELAY,
                 "OSS buffer fill target (1/8ths of a period)",
                 state.ext.oss_delay,
                 1024,
             ),
             (SPA_PARAM_PropInfo, 2) => crate::spa::build_params_prop_info(
-                crate::keys::OSS_FRAGMENT,
+                platform::FRAGMENT,
                 "OSS fragment size (bytes, power of two, 0 = automatic)",
                 state.oss_fragment,
                 16384,
@@ -883,8 +884,8 @@ impl Direction for SinkDir {
             (SPA_PARAM_Props, 0) => crate::spa::build_latency_offset_props(
                 state.process_latency.ns,
                 &[
-                    (crate::keys::OSS_DELAY, state.ext.oss_delay),
-                    (crate::keys::OSS_FRAGMENT, state.oss_fragment),
+                    (platform::PLAYBACK_DELAY, state.ext.oss_delay),
+                    (platform::FRAGMENT, state.oss_fragment),
                 ],
             ),
             (SPA_PARAM_ProcessLatency, 0) => {
@@ -1109,7 +1110,7 @@ const OSS_SINK_FACTORY_INFO: spa_dict = spa_dict {
 
 pub(crate) const OSS_SINK_FACTORY: spa_handle_factory = spa_handle_factory {
     version: SPA_VERSION_HANDLE_FACTORY,
-    name: c"freebsd-oss.sink".as_ptr(),
+    name: platform::SINK_FACTORY_NAME.as_ptr(),
     info: &OSS_SINK_FACTORY_INFO,
     get_size: Some(crate::node::get_size::<SinkDir>),
     init: Some(crate::node::init::<SinkDir>),
@@ -1119,7 +1120,7 @@ pub(crate) const OSS_SINK_FACTORY: spa_handle_factory = spa_handle_factory {
 // mut: the host logger writes level/has_custom_level back after registration
 pub(crate) static mut OSS_SINK_TOPIC: spa_log_topic = spa_log_topic {
     version: SPA_VERSION_LOG_TOPIC,
-    topic: c"spa.oss.sink".as_ptr(),
+    topic: platform::SINK_LOG_TOPIC.as_ptr(),
     level: SPA_LOG_LEVEL_NONE,
     has_custom_level: false,
 };

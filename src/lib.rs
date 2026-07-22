@@ -26,7 +26,6 @@ mod spa;
 
 mod freebsd;
 
-mod keys;
 mod oss;
 
 use device::OSS_DEVICE_FACTORY;

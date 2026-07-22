@@ -5,6 +5,7 @@ use libspa::sys::*;
 use crate::node::{
     DataControl, DataState, Direction, MAX_PORTS, MainState, ParamBuild, PortConfig,
 };
+use crate::platform;
 
 mod buffer;
 
@@ -534,14 +535,14 @@ impl Direction for SourceDir {
         let pod = match (id, index) {
             (SPA_PARAM_PropInfo, 0) => crate::spa::build_latency_offset_prop_info(),
             (SPA_PARAM_PropInfo, 1) => crate::spa::build_params_prop_info(
-                crate::keys::OSS_FRAGMENT,
+                platform::FRAGMENT,
                 "OSS fragment size (bytes, power of two, 0 = automatic)",
                 state.oss_fragment,
                 16384,
             ),
             (SPA_PARAM_Props, 0) => crate::spa::build_latency_offset_props(
                 state.process_latency.ns,
-                &[(crate::keys::OSS_FRAGMENT, state.oss_fragment)],
+                &[(platform::FRAGMENT, state.oss_fragment)],
             ),
             (SPA_PARAM_ProcessLatency, 0) => {
                 crate::spa::build_process_latency_info(&state.process_latency)
@@ -666,7 +667,7 @@ const OSS_SOURCE_FACTORY_INFO: spa_dict = spa_dict {
 
 pub(crate) const OSS_SOURCE_FACTORY: spa_handle_factory = spa_handle_factory {
     version: SPA_VERSION_HANDLE_FACTORY,
-    name: c"freebsd-oss.source".as_ptr(),
+    name: platform::SOURCE_FACTORY_NAME.as_ptr(),
     info: &OSS_SOURCE_FACTORY_INFO,
     get_size: Some(crate::node::get_size::<SourceDir>),
     init: Some(crate::node::init::<SourceDir>),
@@ -676,7 +677,7 @@ pub(crate) const OSS_SOURCE_FACTORY: spa_handle_factory = spa_handle_factory {
 // mut: the host logger writes level/has_custom_level back after registration
 pub(crate) static mut OSS_SOURCE_TOPIC: spa_log_topic = spa_log_topic {
     version: SPA_VERSION_LOG_TOPIC,
-    topic: c"spa.oss.source".as_ptr(),
+    topic: platform::SOURCE_LOG_TOPIC.as_ptr(),
     level: SPA_LOG_LEVEL_NONE,
     has_custom_level: false,
 };

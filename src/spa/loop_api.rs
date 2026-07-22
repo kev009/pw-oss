@@ -1,4 +1,5 @@
 use super::*;
+use crate::platform;
 
 #[derive(Clone, Copy)]
 pub(crate) struct Loop {
@@ -151,7 +152,10 @@ impl LoopSource {
 impl Drop for LoopSource {
     fn drop(&mut self) {
         if self.is_registered() {
-            eprintln!("freebsd-oss: dropping a registered SPA loop source; aborting");
+            eprintln!(
+                "{}: dropping a registered SPA loop source; aborting",
+                platform::DIAGNOSTIC_TAG
+            );
             std::process::abort();
         }
     }
@@ -370,7 +374,10 @@ pub(crate) unsafe fn queue_task<F: FnOnce() + Send + 'static>(
         let f = unsafe { Box::from_raw(user_data.cast::<F>()) };
         let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
         if ok.is_err() {
-            eprintln!("freebsd-oss: panic in a queued loop task (swallowed)");
+            eprintln!(
+                "{}: panic in a queued loop task (swallowed)",
+                platform::DIAGNOSTIC_TAG
+            );
         }
         // never negative: an inline flush returns this value to the caller,
         // and a negative would make it free the closure a second time

@@ -1,4 +1,5 @@
 use super::*;
+use crate::platform;
 
 pub(super) unsafe extern "C" fn get_interface<D: Direction>(
     handle: *mut spa_handle,
@@ -61,7 +62,10 @@ pub(super) unsafe extern "C" fn clear<D: Direction>(handle: *mut spa_handle) -> 
     if !matches!(detached, Some(err) if err >= 0) {
         // freeing the state now would leave the loop a dangling source; a clean
         // abort beats a use-after-free on the next timer tick
-        eprintln!("freebsd-oss: can't detach the audio wake source; aborting");
+        eprintln!(
+            "{}: can't detach the audio wake source; aborting",
+            platform::DIAGNOSTIC_TAG
+        );
         std::process::abort();
     }
     // the host frees the memory after clear; drop the fields exactly once here
@@ -117,20 +121,20 @@ pub(super) unsafe fn parse_init_dict<D: Direction>(
 
         unsafe {
             crate::spa::for_each_dict_item(info, |key, value| {
-                if key == crate::keys::OSS_DSP_PATH {
+                if key == platform::STREAM_PATH {
                     dsp_path = Some(value.to_string());
-                } else if key == crate::keys::OSS_FORCE_TIMER {
+                } else if key == platform::FORCE_TIMER {
                     if let Some(enabled) = property_bool(value) {
                         force_timer = enabled;
                     } else {
                         crate::warn!(
                             log,
                             "ignoring invalid {} value {:?}",
-                            crate::keys::OSS_FORCE_TIMER,
+                            platform::FORCE_TIMER,
                             value
                         );
                     }
-                } else if key == crate::keys::OSS_FRAGMENT {
+                } else if key == platform::FRAGMENT {
                     // direction-shared per-device default, e.g. from a wireplumber node
                     // rule; stored normalized so readback reports the effective value
                     if let Ok(v) = value.parse::<u32>() {
@@ -235,7 +239,7 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
         crate::error!(
             log,
             "{} missing from the node properties",
-            crate::keys::OSS_DSP_PATH
+            platform::STREAM_PATH
         );
         return -libc::EINVAL;
     };
@@ -263,7 +267,7 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
                 log,
                 "{}: timer wakeups selected by {}",
                 dsp_path,
-                crate::keys::OSS_FORCE_TIMER
+                platform::FORCE_TIMER
             );
         }
         None
@@ -368,11 +372,7 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
                     log,
                     clock: crate::spa::IoArea::null(),
                     position: crate::spa::IoArea::null(),
-                    clock_name: std::ffi::CString::new(format!(
-                        "freebsd-oss.{}",
-                        dsp_path.trim_start_matches("/dev/")
-                    ))
-                    .unwrap_or_default(),
+                    clock_name: platform::clock_name(&dsp_path),
                     main_loop,
                     dsp_path: dsp_path.clone(),
                     timer_fd,
@@ -508,6 +508,7 @@ pub(crate) unsafe extern "C" fn enum_interface_info(
 #[cfg(test)]
 mod tests {
     use super::{parse_init_dict, property_bool, sound_kqueue_enabled};
+    use crate::platform;
 
     #[test]
     fn force_timer_disables_enriched_kqueue_selection() {
@@ -531,19 +532,22 @@ mod tests {
     fn init_dict_matches_the_exact_force_timer_key() {
         let log = crate::spa::Log::test_null();
         let mut dict = crate::spa::Dictionary::new();
-        dict.add_item(crate::keys::OSS_FORCE_TIMER, "true");
+        dict.add_item(platform::FORCE_TIMER, "true");
         let (_, force_timer, _, _) =
             unsafe { parse_init_dict::<crate::node::sink::SinkDir>(dict.raw(), &log) };
         assert!(force_timer);
 
         let mut wrong_key = crate::spa::Dictionary::new();
-        wrong_key.add_item("api.freebsd-oss.force_timer", "true");
+        wrong_key.add_item(
+            platform::FORCE_TIMER.replace("force-timer", "force_timer"),
+            "true",
+        );
         let (_, force_timer, _, _) =
             unsafe { parse_init_dict::<crate::node::sink::SinkDir>(wrong_key.raw(), &log) };
         assert!(!force_timer);
 
         let mut invalid = crate::spa::Dictionary::new();
-        invalid.add_item(crate::keys::OSS_FORCE_TIMER, "maybe");
+        invalid.add_item(platform::FORCE_TIMER, "maybe");
         let (_, force_timer, _, _) =
             unsafe { parse_init_dict::<crate::node::sink::SinkDir>(invalid.raw(), &log) };
         assert!(!force_timer);

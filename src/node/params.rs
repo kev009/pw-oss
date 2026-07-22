@@ -1,5 +1,6 @@
 use super::events::{emit_node_info, handle_process_latency};
 use super::*;
+use crate::platform;
 
 // Updates accepted from a Props pod. None means the property was absent.
 // The sink consumes oss_delay and the source ignores it. Capping oss_delay
@@ -67,10 +68,10 @@ pub(super) fn parse_oss_params(value: &libspa::pod::Value, update: &mut PropsUpd
     }
     for kv in values.chunks(2) {
         match (&kv[0], &kv[1]) {
-            (Value::String(s), Value::Int(x)) if s == crate::keys::OSS_DELAY && *x >= 0 => {
+            (Value::String(s), Value::Int(x)) if s == platform::PLAYBACK_DELAY && *x >= 0 => {
                 update.oss_delay = Some(*x as u32);
             }
-            (Value::String(s), Value::Int(x)) if s == crate::keys::OSS_FRAGMENT && *x >= 0 => {
+            (Value::String(s), Value::Int(x)) if s == platform::FRAGMENT && *x >= 0 => {
                 update.oss_fragment = Some(*x as u32);
             }
             _ => (),
@@ -218,9 +219,9 @@ mod tests {
         let log = crate::spa::Log::test_null();
 
         let params = Value::Struct(vec![
-            Value::String(crate::keys::OSS_DELAY.into()),
+            Value::String(platform::PLAYBACK_DELAY.into()),
             Value::Int(8),
-            Value::String(crate::keys::OSS_FRAGMENT.into()),
+            Value::String(platform::FRAGMENT.into()),
             Value::Int(4096),
             Value::String("bogus.key".into()),
             Value::Int(1),
@@ -251,7 +252,7 @@ mod tests {
                 pod_prop(
                     SPA_PROP_params,
                     Value::Struct(vec![
-                        Value::String(crate::keys::OSS_DELAY.into()),
+                        Value::String(platform::PLAYBACK_DELAY.into()),
                         Value::Int(-1),
                     ]),
                 ),
@@ -262,7 +263,7 @@ mod tests {
         let update = parse_props_update(
             vec![pod_prop(
                 SPA_PROP_params,
-                Value::Struct(vec![Value::String(crate::keys::OSS_DELAY.into())]),
+                Value::Struct(vec![Value::String(platform::PLAYBACK_DELAY.into())]),
             )],
             &log,
         );
