@@ -286,6 +286,9 @@ pub(super) fn odelay(fd: c_int) -> c_int {
 }
 
 pub(super) fn try_odelay(fd: c_int) -> Result<c_int, Errno> {
+    // FreeBSD reports bufsoft only. The hardware buffer is prefilled at
+    // trigger and omitted, so callers may use this as a stable queue signal
+    // but not as complete physical latency or proof that playback stopped.
     ioctl_int(fd, SNDCTL_DSP_GETODELAY, -1).ok_or_else(Errno::last)
 }
 
@@ -298,10 +301,21 @@ pub(super) fn blocksize(fd: c_int) -> c_int {
 }
 
 pub(super) fn get_error(fd: c_int) -> audio_errinfo {
-    // e.g. the device was unplugged mid-stream
+    // GETERROR consumes pcm_channel::xruns, whereas enriched dsp_kqevent()
+    // snapshots the same counter without clearing it. The shared shell keeps
+    // an event-side baseline so a later timer/follower poll cannot report the
+    // same errors twice. A failed ioctl (for example after unplug) reads as an
+    // empty snapshot and the stream I/O path supplies the disconnect status.
     unsafe {
         ioctl_read::<audio_errinfo>(fd, SNDCTL_DSP_GETERROR).unwrap_or_else(|| std::mem::zeroed())
     }
+}
+
+// The kernel counter is unsigned, but the historical OSS ABI exposes it in
+// an `int` field. Preserve the 32-bit representation instead of treating the
+// sign bit as an error; GETERROR has already used ioctl success for validity.
+pub(super) const fn xrun_counter_bits(value: c_int) -> u32 {
+    value as u32
 }
 
 // FreeBSD's paired pause operations: SILENCE saves the ready part of bufsoft
@@ -338,4 +352,202 @@ pub(super) fn afmt_frame_bytes(format: u32) -> u32 {
         };
     let channels = ((format & 0x07f00000) >> 20).max(1); // AFMT_CHANNEL (sound.h:344)
     width * channels
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::{CStr, c_char};
+    use std::fmt::Write as _;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CAbiEntry {
+        name: *const c_char,
+        value: u64,
+    }
+
+    unsafe extern "C" {
+        fn pw_oss_native_abi_report(count: *mut usize) -> *const CAbiEntry;
+    }
+
+    fn native_abi_report() -> Vec<(String, u64)> {
+        let mut count = 0;
+        let entries = unsafe {
+            let entries = pw_oss_native_abi_report(&raw mut count);
+            assert!(!entries.is_null());
+            std::slice::from_raw_parts(entries, count)
+        };
+
+        entries
+            .iter()
+            .map(|entry| {
+                assert!(!entry.name.is_null());
+                let name = unsafe { CStr::from_ptr(entry.name) }
+                    .to_str()
+                    .expect("C ABI report names are ASCII")
+                    .to_owned();
+                (name, entry.value)
+            })
+            .collect()
+    }
+
+    fn rust_abi_report() -> Vec<(&'static str, u64)> {
+        macro_rules! abi_size {
+            ($name:literal, $type:ty) => {
+                (concat!("size.", $name), size_of::<$type>() as u64)
+            };
+        }
+        macro_rules! abi_align {
+            ($name:literal, $type:ty) => {
+                (concat!("align.", $name), align_of::<$type>() as u64)
+            };
+        }
+        macro_rules! abi_offset {
+            ($name:literal, $type:ty, $field:ident) => {
+                (
+                    concat!("offset.", $name, ".", stringify!($field)),
+                    std::mem::offset_of!($type, $field) as u64,
+                )
+            };
+        }
+        macro_rules! abi_const {
+            ($name:ident) => {
+                (concat!("const.", stringify!($name)), $name as u64)
+            };
+        }
+
+        vec![
+            abi_size!("SndstiocNvArg", SndstiocNvArg),
+            abi_align!("SndstiocNvArg", SndstiocNvArg),
+            abi_offset!("SndstiocNvArg", SndstiocNvArg, nbytes),
+            abi_offset!("SndstiocNvArg", SndstiocNvArg, buf),
+            abi_size!("audio_buf_info", audio_buf_info),
+            abi_align!("audio_buf_info", audio_buf_info),
+            abi_offset!("audio_buf_info", audio_buf_info, fragments),
+            abi_offset!("audio_buf_info", audio_buf_info, fragstotal),
+            abi_offset!("audio_buf_info", audio_buf_info, fragsize),
+            abi_offset!("audio_buf_info", audio_buf_info, bytes),
+            abi_size!("audio_errinfo", audio_errinfo),
+            abi_align!("audio_errinfo", audio_errinfo),
+            abi_offset!("audio_errinfo", audio_errinfo, play_underruns),
+            abi_offset!("audio_errinfo", audio_errinfo, rec_overruns),
+            abi_offset!("audio_errinfo", audio_errinfo, play_ptradjust),
+            abi_offset!("audio_errinfo", audio_errinfo, rec_ptradjust),
+            abi_offset!("audio_errinfo", audio_errinfo, play_errorcount),
+            abi_offset!("audio_errinfo", audio_errinfo, rec_errorcount),
+            abi_offset!("audio_errinfo", audio_errinfo, play_lasterror),
+            abi_offset!("audio_errinfo", audio_errinfo, rec_lasterror),
+            abi_offset!("audio_errinfo", audio_errinfo, play_errorparm),
+            abi_offset!("audio_errinfo", audio_errinfo, rec_errorparm),
+            abi_offset!("audio_errinfo", audio_errinfo, filler),
+            abi_size!("oss_audioinfo", oss_audioinfo),
+            abi_align!("oss_audioinfo", oss_audioinfo),
+            abi_offset!("oss_audioinfo", oss_audioinfo, dev),
+            abi_offset!("oss_audioinfo", oss_audioinfo, name),
+            abi_offset!("oss_audioinfo", oss_audioinfo, busy),
+            abi_offset!("oss_audioinfo", oss_audioinfo, pid),
+            abi_offset!("oss_audioinfo", oss_audioinfo, caps),
+            abi_offset!("oss_audioinfo", oss_audioinfo, iformats),
+            abi_offset!("oss_audioinfo", oss_audioinfo, oformats),
+            abi_offset!("oss_audioinfo", oss_audioinfo, magic),
+            abi_offset!("oss_audioinfo", oss_audioinfo, cmd),
+            abi_offset!("oss_audioinfo", oss_audioinfo, card_number),
+            abi_offset!("oss_audioinfo", oss_audioinfo, port_number),
+            abi_offset!("oss_audioinfo", oss_audioinfo, mixer_dev),
+            abi_offset!("oss_audioinfo", oss_audioinfo, legacy_device),
+            abi_offset!("oss_audioinfo", oss_audioinfo, enabled),
+            abi_offset!("oss_audioinfo", oss_audioinfo, flags),
+            abi_offset!("oss_audioinfo", oss_audioinfo, min_rate),
+            abi_offset!("oss_audioinfo", oss_audioinfo, max_rate),
+            abi_offset!("oss_audioinfo", oss_audioinfo, min_channels),
+            abi_offset!("oss_audioinfo", oss_audioinfo, max_channels),
+            abi_offset!("oss_audioinfo", oss_audioinfo, binding),
+            abi_offset!("oss_audioinfo", oss_audioinfo, rate_source),
+            abi_offset!("oss_audioinfo", oss_audioinfo, handle),
+            abi_offset!("oss_audioinfo", oss_audioinfo, nrates),
+            abi_offset!("oss_audioinfo", oss_audioinfo, rates),
+            abi_offset!("oss_audioinfo", oss_audioinfo, song_name),
+            abi_offset!("oss_audioinfo", oss_audioinfo, label),
+            abi_offset!("oss_audioinfo", oss_audioinfo, latency),
+            abi_offset!("oss_audioinfo", oss_audioinfo, devnode),
+            abi_offset!("oss_audioinfo", oss_audioinfo, next_play_engine),
+            abi_offset!("oss_audioinfo", oss_audioinfo, next_rec_engine),
+            abi_offset!("oss_audioinfo", oss_audioinfo, filler),
+            abi_size!("OssChannelOrder", OssChannelOrder),
+            abi_align!("OssChannelOrder", OssChannelOrder),
+            abi_const!(AFMT_U8),
+            abi_const!(AFMT_S16_LE),
+            abi_const!(AFMT_S16_BE),
+            abi_const!(AFMT_S32_LE),
+            abi_const!(AFMT_S32_BE),
+            abi_const!(AFMT_S24_LE),
+            abi_const!(AFMT_S24_BE),
+            abi_const!(AFMT_F32_LE),
+            abi_const!(AFMT_F32_BE),
+            abi_const!(PCM_ENABLE_INPUT),
+            abi_const!(PCM_ENABLE_OUTPUT),
+            abi_const!(PCM_CAP_INPUT),
+            abi_const!(PCM_CAP_OUTPUT),
+            abi_const!(PCM_CAP_VIRTUAL),
+            abi_const!(SNDCTL_DSP_SPEED),
+            abi_const!(SNDCTL_DSP_SETFMT),
+            abi_const!(SNDCTL_DSP_CHANNELS),
+            abi_const!(SNDCTL_DSP_SETFRAGMENT),
+            abi_const!(SNDCTL_DSP_LOW_WATER),
+            abi_const!(SNDCTL_DSP_GETFMTS),
+            abi_const!(SNDCTL_DSP_GETOSPACE),
+            abi_const!(SNDCTL_DSP_GETISPACE),
+            abi_const!(SNDCTL_DSP_SETTRIGGER),
+            abi_const!(SNDCTL_DSP_GETODELAY),
+            abi_const!(SNDCTL_DSP_GETERROR),
+            abi_const!(SNDCTL_DSP_GET_CHNORDER),
+            abi_const!(SNDCTL_DSP_SET_CHNORDER),
+            abi_const!(SNDCTL_DSP_HALT),
+            abi_const!(SNDCTL_DSP_SILENCE),
+            abi_const!(SNDCTL_DSP_SKIP),
+            abi_const!(SNDCTL_ENGINEINFO),
+            abi_const!(SNDSTIOC_REFRESH_DEVS),
+            abi_const!(SNDSTIOC_GET_DEVS),
+        ]
+    }
+
+    #[test]
+    fn c_and_rust_abi_match() {
+        let native = native_abi_report();
+        let rust = rust_abi_report();
+        let entry_count = native.len();
+        let mut report = format!("FreeBSD OSS C/Rust ABI comparison ({entry_count} entries)\n");
+
+        for ((native_name, native_value), (rust_name, rust_value)) in native.iter().zip(&rust) {
+            let status = if native_name == rust_name && native_value == rust_value {
+                "ok"
+            } else {
+                "MISMATCH"
+            };
+            writeln!(
+                report,
+                "{native_name:<48} C={native_value:#018x} Rust={rust_value:#018x} {status}"
+            )
+            .expect("writing to a String cannot fail");
+        }
+        print!("{report}");
+
+        assert_eq!(
+            native.len(),
+            rust.len(),
+            "C and Rust ABI reports cover different numbers of values"
+        );
+        for ((native_name, native_value), (rust_name, rust_value)) in native.iter().zip(&rust) {
+            assert_eq!(native_name, rust_name, "ABI report ordering differs");
+            assert_eq!(native_value, rust_value, "ABI mismatch for {native_name}");
+        }
+    }
+
+    #[test]
+    fn signed_oss_xrun_field_preserves_unsigned_counter_bits() {
+        assert_eq!(super::xrun_counter_bits(0), 0);
+        assert_eq!(super::xrun_counter_bits(-1), u32::MAX);
+        assert_eq!(super::xrun_counter_bits(i32::MIN), 1 << 31);
+    }
 }
