@@ -12,7 +12,7 @@
 
 use std::ffi::{CString, c_char, c_int, c_uint, c_ulong};
 
-use crate::freebsd::{IoctlPod, LibcFd, ioctl_int, ioctl_read};
+use super::sys::{IoctlPod, LibcFd, ioctl_int, ioctl_read};
 
 pub(crate) const SOUND_MIXER_VOLUME: c_uint = 0;
 pub(crate) const SOUND_MIXER_PCM: c_uint = 4;
@@ -22,6 +22,10 @@ pub(crate) const SOUND_MIXER_RECLEV: c_uint = 11;
 pub(crate) const SOUND_MIXER_IGAIN: c_uint = 12;
 
 pub(crate) const SOUND_MIXER_NRDEVICES: c_uint = 25;
+
+const MIXER_SOURCE_MIC: c_uint = SOUND_MIXER_MIC;
+const MIXER_SOURCE_LINE: c_uint = SOUND_MIXER_LINE;
+pub(crate) const MIXER_SOURCE_COUNT: c_uint = SOUND_MIXER_NRDEVICES;
 
 const SOUND_MIXER_MUTE: c_uint = 28;
 const SOUND_MIXER_RECSRC: c_uint = 0xff;
@@ -35,6 +39,15 @@ pub(crate) const SOUND_DEVICE_NAMES: [&str; SOUND_MIXER_NRDEVICES as usize] = [
     "igain", "ogain", "line1", "line2", "line3", "dig1", "dig2", "dig3", "phin", "phout", "video",
     "radio", "monitor",
 ];
+pub(crate) const MIXER_SOURCE_NAMES: [&str; MIXER_SOURCE_COUNT as usize] = SOUND_DEVICE_NAMES;
+
+pub(crate) fn mixer_source_priority(source: c_uint) -> c_int {
+    match source {
+        MIXER_SOURCE_MIC => 100,
+        MIXER_SOURCE_LINE => 90,
+        _ => 80 - source as c_int,
+    }
+}
 
 // sys/soundcard.h mixer_info; the ioctl encodes the size
 #[repr(C)]

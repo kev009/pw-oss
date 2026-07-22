@@ -170,7 +170,7 @@ pub(crate) fn build_enum_format_info(caps: &backend::StreamCaps, index: u32) -> 
 
     let rate = if configuration.rates.len() > 1 {
         // discrete native rates (exclusive devices); a range would admit
-        // in-between rates the hardware can't run (see oss::devices::native_rates)
+        // in-between rates the hardware can't run (see the backend capability probe)
         let target = configuration.preferred_rate.unwrap_or(48000);
         let default = *configuration
             .rates

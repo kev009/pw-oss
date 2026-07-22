@@ -18,16 +18,13 @@
 use libspa::sys::spa_handle_factory;
 use std::ffi::c_int;
 
+mod backend;
 mod device;
+mod freebsd_oss;
 mod monitor;
 mod node;
 mod platform;
 mod spa;
-
-mod backend;
-mod freebsd;
-
-mod oss;
 
 use device::OSS_DEVICE_FACTORY;
 use monitor::OSS_MONITOR_FACTORY;

@@ -2,10 +2,9 @@ use nix::errno::Errno;
 use std::collections::BTreeMap;
 use std::ffi::{CString, c_int};
 
-use crate::backend::{ConversionKind, StreamCaps, StreamConfiguration};
-use crate::freebsd::{LibcFd, NvList, NvRef, SysctlReader};
-
 use super::abi::*;
+use super::sys::{LibcFd, NvList, NvRef, SysctlReader};
+use crate::backend::{ConversionKind, StreamCaps, StreamConfiguration};
 
 // Ask the device what it actually supports. Two sources, merged:
 // - empirical SETCHANNELS/SPEED probes at the extremes (OSS grants the nearest
@@ -286,7 +285,7 @@ pub(crate) fn drain_quantum_ns(devnode: &str, play: bool) -> u64 {
     }
     quantum
 }
-pub(crate) fn read_sndstat() -> Result<Vec<u32>, Errno> {
+fn read_sndstat() -> Result<Vec<u32>, Errno> {
     // sndstat's nvlist interface; the plugin assumes FreeBSD 14.4+
     sndstat_pcm_devices()
         .map(|devs| devs.into_iter().map(|(unit, _, _)| unit).collect())
@@ -327,7 +326,7 @@ pub(crate) fn read_pcm_device_description(sysctl: &mut SysctlReader, index: u32)
         .ok()
 }
 
-pub(crate) fn group_pcm_devices_by_parent(indexes: &[u32]) -> BTreeMap<String, Vec<u32>> {
+fn group_pcm_devices_by_parent(indexes: &[u32]) -> BTreeMap<String, Vec<u32>> {
     let mut sysctl = SysctlReader::new();
     let mut indexes_by_parent: BTreeMap<String, Vec<u32>> = BTreeMap::new();
     for index in indexes {
@@ -339,7 +338,11 @@ pub(crate) fn group_pcm_devices_by_parent(indexes: &[u32]) -> BTreeMap<String, V
     indexes_by_parent
 }
 
-pub(crate) fn list_pcm_devices(indexes: &[u32]) -> Vec<PcmDevice> {
+pub(crate) fn read_device_groups() -> Result<BTreeMap<String, Vec<u32>>, Errno> {
+    read_sndstat().map(|indexes| group_pcm_devices_by_parent(&indexes))
+}
+
+pub(crate) fn list_audio_devices(indexes: &[u32]) -> Vec<PcmDevice> {
     let mut result = Vec::with_capacity(indexes.len());
     let mut sysctl = SysctlReader::new();
     // Direction support from the nvlist channel counts (vchans on or off);

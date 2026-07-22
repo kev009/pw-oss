@@ -3,10 +3,10 @@
 use libspa::sys::SPA_AUDIO_FORMAT_U8;
 use std::ffi::c_int;
 
-pub(crate) use crate::oss::{
+pub(crate) use crate::freebsd_oss::{
     Dsp as CaptureStream, DspWriter as PlaybackStream, SoundKqueue as WakeQueue,
 };
-pub(crate) use crate::oss::{
+pub(crate) use crate::freebsd_oss::{
     advertised_quantum_cap_frames, buffer_capacity_limit, capture_buffer_request,
     capture_buffer_required, capture_fill_targets, configure_capture_buffer,
     configure_playback_buffer, enriched_sound_kqueue_available as device_wake_available,
@@ -14,12 +14,12 @@ pub(crate) use crate::oss::{
     playback_buffer_required, playback_desired_delay, playback_fill_floor, playback_target_delay,
     probe_caps,
 };
-pub(crate) use crate::oss::{
+pub(crate) use crate::freebsd_oss::{
     bytes_per_sample, channel_positions, configure_capture, configure_playback, validate_config,
 };
 
 #[cfg(test)]
-pub(crate) use crate::oss::{all_formats, test_native_channel_order};
+pub(crate) use crate::freebsd_oss::{all_formats, test_native_channel_order};
 
 #[cfg(test)]
 pub(crate) mod test_transport;

@@ -1,10 +1,12 @@
 use std::cell::Cell;
 use std::ffi::c_int;
+use std::os::fd::RawFd;
 
 use nix::errno::Errno;
 
 use crate::backend::{DeviceEvent, WakeEvent};
-use crate::freebsd::{LibcFd, SysctlReader};
+
+use super::sys::{DevdSocket, LibcFd, SysctlReader};
 
 // The enriched sound kevent payload landed in main while osreldate was
 // 1600018 and was merged to stable/15 at 1501501, but both values predate
@@ -238,10 +240,92 @@ fn kevent(ident: libc::uintptr_t, filter: i16, flags: u16, fflags: u32, data: i6
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum MonitorHotplugEvent {
+    Attached,
+    Detached(String),
+}
+
+fn decode_monitor_event(line: &str) -> Option<MonitorHotplugEvent> {
+    static RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"^([\+-])((?:pcm|uaudio)\d+)").unwrap());
+
+    let groups = RE.captures(line)?;
+    if groups.get(1)?.as_str() == "-" {
+        Some(MonitorHotplugEvent::Detached(
+            groups.get(2)?.as_str().to_string(),
+        ))
+    } else {
+        Some(MonitorHotplugEvent::Attached)
+    }
+}
+
+fn decode_mixer_event(line: &str) -> Option<u32> {
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"^!system=SND subsystem=CONN type=(?:IN|OUT) cdev=dsp([0-9]+)").unwrap()
+    });
+
+    RE.captures(line)
+        .and_then(|groups| groups[1].parse::<u32>().ok())
+}
+
+/// devd connection that exposes decoded sound-device events.
+pub(crate) struct HotplugMonitor(DevdSocket);
+
+impl HotplugMonitor {
+    pub(crate) fn open() -> Result<Self, std::io::Error> {
+        DevdSocket::open().map(Self)
+    }
+
+    pub(crate) fn fd(&self) -> RawFd {
+        self.0.fd()
+    }
+
+    /// Returns connection liveness plus one relevant attach/detach event.
+    pub(crate) fn read_monitor_event(&mut self) -> (bool, Option<MonitorHotplugEvent>) {
+        let mut event = None;
+        let alive = self.0.read_event(|line| {
+            event = decode_monitor_event(line);
+        });
+        (alive, event)
+    }
+
+    /// Returns connection liveness plus the PCM unit named by a sound event.
+    pub(crate) fn read_mixer_event(&mut self) -> (bool, Option<u32>) {
+        let mut unit = None;
+        let alive = self.0.read_event(|line| {
+            unit = decode_mixer_event(line);
+        });
+        (alive, unit)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::backend::test_transport;
+
+    #[test]
+    fn hotplug_payloads_are_decoded() {
+        assert_eq!(
+            decode_monitor_event("-uaudio3 at uhub2"),
+            Some(MonitorHotplugEvent::Detached("uaudio3".into()))
+        );
+        assert_eq!(
+            decode_monitor_event("+pcm7 at uaudio3"),
+            Some(MonitorHotplugEvent::Attached)
+        );
+        assert_eq!(decode_monitor_event("!system=USB"), None);
+
+        assert_eq!(
+            decode_mixer_event("!system=SND subsystem=CONN type=OUT cdev=dsp12"),
+            Some(12)
+        );
+        assert_eq!(
+            decode_mixer_event("!system=SND subsystem=CONN type=NODEV"),
+            None
+        );
+    }
 
     #[test]
     fn one_shot_timer_wakes_the_queue() {

@@ -4,7 +4,9 @@ mod buffer;
 mod devices;
 mod dsp;
 mod event;
+mod identity;
 mod mixer;
+mod sys;
 
 pub(crate) use abi::{
     AFMT_F32_BE, AFMT_F32_LE, AFMT_S16_BE, AFMT_S16_LE, AFMT_S24_BE, AFMT_S24_LE, AFMT_S32_BE,
@@ -23,10 +25,16 @@ pub(crate) use buffer::{
     playback_target_delay,
 };
 pub(crate) use devices::{
-    PcmDevice, group_pcm_devices_by_parent, list_pcm_devices, probe_caps, read_sndstat,
+    PcmDevice as AudioDevice, list_audio_devices, probe_caps, read_device_groups,
 };
 pub(crate) use dsp::{Dsp, DspWriter};
-pub(crate) use event::{SoundKqueue, enriched_sound_kqueue_available};
-pub(crate) use mixer::{
-    Mixer, SOUND_DEVICE_NAMES, SOUND_MIXER_LINE, SOUND_MIXER_MIC, SOUND_MIXER_NRDEVICES,
+pub(crate) use event::{
+    HotplugMonitor, MonitorHotplugEvent, SoundKqueue, enriched_sound_kqueue_available,
 };
+pub(crate) use identity::{
+    DEVICE_API, DEVICE_FACTORY_NAME, DEVICE_INDEXES, DEVICE_LOG_TOPIC, DIAGNOSTIC_TAG, FORCE_TIMER,
+    FRAGMENT, MONITOR_FACTORY_NAME, MONITOR_LOG_TOPIC, PARENT_DEVICE, PLAYBACK_DELAY,
+    SINK_FACTORY_NAME, SINK_LOG_TOPIC, SOURCE_FACTORY_NAME, SOURCE_LOG_TOPIC, STREAM_PATH,
+    clock_name, stream_path,
+};
+pub(crate) use mixer::{MIXER_SOURCE_COUNT, MIXER_SOURCE_NAMES, Mixer, mixer_source_priority};

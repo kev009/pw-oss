@@ -1,7 +1,7 @@
 use nix::errno::Errno;
 use std::ffi::{c_char, c_int, c_long, c_uint, c_ulong, c_void};
 
-use crate::freebsd::{IoctlPod, SysctlReader, ioctl_int, ioctl_read, ioctl_value, ioctl_zeroed};
+use super::sys::{IoctlPod, SysctlReader, ioctl_int, ioctl_read, ioctl_value, ioctl_zeroed};
 
 pub(crate) const AFMT_U8: u32 = 0x00000008;
 pub(crate) const AFMT_S16_LE: u32 = 0x00000010;

@@ -3,12 +3,11 @@ use nix::errno::Errno;
 use std::ffi::{CString, c_int};
 use std::time::Duration;
 
-use crate::backend::{BufferLayout, IoStatus, ReadOutcome, WriteOutcome};
-use crate::freebsd::LibcFd;
-
 use super::abi::*;
 use super::buffer::{MAX_BUFFER_BYTES, MIN_BUFFER_BYTES};
 use super::devices::drain_quantum_ns;
+use super::sys::LibcFd;
+use crate::backend::{BufferLayout, IoStatus, ReadOutcome, WriteOutcome};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct AppliedNativeConfig {
@@ -755,7 +754,7 @@ impl DspWriter {
 
         #[cfg(debug_assertions)]
         {
-            let now = crate::freebsd::monotonic_time_ns();
+            let now = super::sys::monotonic_time_ns();
             let space_after = ospace_in_bytes(self.raw_fd()) as usize;
             let delay_after = odelay(self.raw_fd());
             eprintln!(
