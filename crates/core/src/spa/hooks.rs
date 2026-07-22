@@ -6,14 +6,15 @@ use super::*;
 // pattern): the cursor hops past each entry BEFORE its callback runs, so a
 // listener may remove any hook - its own, the next one, any other - and the
 // plain list unlink fixes the cursor's neighbor pointers like any node's.
-// The former grab-next-first walk only survived self-removal.
+// A grab-next-first walk survives only self-removal; the cursor is what makes
+// arbitrary listener removal safe.
 // The closure receives the hook's spa_callbacks BY VALUE (it is Copy), never
 // a reference into the hook: a callback that removes and frees its own hook
 // must not leave the closure holding a pointer into freed memory. For the
 // same reason callers emit ONE method per traversal (C's spa_hook_list_call
 // shape) - a second callback on the same hook after the first freed it would
 // still be a use-after-free even with the copied callbacks.
-pub(crate) unsafe fn for_each_hook(head: *mut spa_hook_list, mut apply: impl FnMut(spa_callbacks)) {
+pub(super) unsafe fn for_each_hook(head: *mut spa_hook_list, mut apply: impl FnMut(spa_callbacks)) {
     struct CursorGuard(*mut spa_list);
 
     impl Drop for CursorGuard {
@@ -104,7 +105,7 @@ const _: () = assert!(
 // # Safety
 // `head` must point at an initialized hook list whose hooks carry E vtables
 // (the matching add_listener contract), valid for the whole traversal.
-pub(crate) unsafe fn emit_events<E: HookEvents>(
+pub(super) unsafe fn emit_events<E: HookEvents>(
     head: *mut spa_hook_list,
     mut call: impl FnMut(E, *mut c_void),
 ) {

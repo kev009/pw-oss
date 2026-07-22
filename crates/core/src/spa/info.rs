@@ -425,12 +425,6 @@ impl PortInfo {
         self.info.change_mask |= SPA_PORT_CHANGE_MASK_RATE as u64;
     }
 
-    /* currently unused
-    pub fn add_prop<K: Into<DictionaryString>, V: Into<DictionaryString>>(&mut self, key: K, value: V) {
-      self.props.add_item(key, value);
-      self.info.change_mask |= SPA_PORT_CHANGE_MASK_PROPS as u64;
-    }*/
-
     pub(crate) fn add_param(&mut self, id: u32, flags: u32) {
         assert!(self.info.n_params < MAX_PARAMS);
         self.params[self.info.n_params as usize] = spa_param_info {

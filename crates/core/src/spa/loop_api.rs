@@ -1,5 +1,4 @@
 use super::*;
-use crate::platform;
 
 #[derive(Clone, Copy)]
 pub(crate) struct Loop {
@@ -21,6 +20,36 @@ pub(crate) struct Loop {
 }
 
 impl Loop {
+    #[cfg(test)]
+    pub(crate) fn test_null() -> Self {
+        unsafe extern "C" fn unavailable_source(
+            _data: *mut c_void,
+            _source: *mut spa_source,
+        ) -> c_int {
+            -libc::ENOTSUP
+        }
+        unsafe extern "C" fn unavailable_invoke(
+            _data: *mut c_void,
+            _func: spa_invoke_func_t,
+            _seq: u32,
+            _buffer: *const c_void,
+            _size: usize,
+            _block: bool,
+            _user_data: *mut c_void,
+        ) -> c_int {
+            -libc::ENOTSUP
+        }
+
+        Self {
+            loop_: std::ptr::NonNull::from(Box::leak(Box::new(unsafe {
+                std::mem::zeroed::<spa_loop>()
+            }))),
+            add_source_fn: unavailable_source,
+            remove_source_fn: unavailable_source,
+            invoke_fn: unavailable_invoke,
+        }
+    }
+
     /// # Safety
     /// `loop_` must point at a live, initialized spa_loop from the host's
     /// support array, and the host keeps it (and its methods vtable) valid
@@ -89,13 +118,15 @@ impl Loop {
 pub(crate) struct LoopSource {
     source: std::pin::Pin<Box<spa_source>>,
     loop_: Option<Loop>,
+    diagnostic_tag: &'static str,
 }
 
 impl LoopSource {
-    pub(crate) fn new(source: spa_source) -> Self {
+    pub(crate) fn new(source: spa_source, diagnostic_tag: &'static str) -> Self {
         Self {
             source: Box::pin(source),
             loop_: None,
+            diagnostic_tag,
         }
     }
 
@@ -154,7 +185,7 @@ impl Drop for LoopSource {
         if self.is_registered() {
             eprintln!(
                 "{}: dropping a registered SPA loop source; aborting",
-                platform::DIAGNOSTIC_TAG
+                self.diagnostic_tag
             );
             std::process::abort();
         }
@@ -180,6 +211,83 @@ pub(crate) struct System {
 }
 
 impl System {
+    #[cfg(test)]
+    pub(crate) fn test_null() -> Self {
+        unsafe extern "C" fn unavailable_fd(_data: *mut c_void, _fd: c_int) -> c_int {
+            -libc::ENOTSUP
+        }
+        unsafe extern "C" fn unavailable_clock(
+            _data: *mut c_void,
+            _clock_id: c_int,
+            _value: *mut timespec,
+        ) -> c_int {
+            -libc::ENOTSUP
+        }
+        unsafe extern "C" fn unavailable_create(
+            _data: *mut c_void,
+            _clock_id: c_int,
+            _flags: c_int,
+        ) -> c_int {
+            -libc::ENOTSUP
+        }
+        unsafe extern "C" fn unavailable_read(
+            _data: *mut c_void,
+            _fd: c_int,
+            _expirations: *mut u64,
+        ) -> c_int {
+            -libc::ENOTSUP
+        }
+        unsafe extern "C" fn unavailable_settime(
+            _data: *mut c_void,
+            _fd: c_int,
+            _flags: c_int,
+            _new_value: *const itimerspec,
+            _old_value: *mut itimerspec,
+        ) -> c_int {
+            -libc::ENOTSUP
+        }
+
+        Self {
+            system: std::ptr::NonNull::from(Box::leak(Box::new(unsafe {
+                std::mem::zeroed::<spa_system>()
+            }))),
+            close_fn: unavailable_fd,
+            clock_gettime_fn: unavailable_clock,
+            timerfd_create_fn: unavailable_create,
+            timerfd_read_fn: unavailable_read,
+            timerfd_settime_fn: unavailable_settime,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_clock(now_ns: u64) -> Self {
+        unsafe extern "C" fn fixed_clock(
+            data: *mut c_void,
+            _clock_id: c_int,
+            value: *mut timespec,
+        ) -> c_int {
+            if data.is_null() || value.is_null() {
+                return -libc::EINVAL;
+            }
+            let now_ns = unsafe { *data.cast::<u64>() };
+            unsafe {
+                (*value).tv_sec = (now_ns / SPA_NSEC_PER_SEC as u64) as i64;
+                (*value).tv_nsec = (now_ns % SPA_NSEC_PER_SEC as u64) as i64;
+            }
+            0
+        }
+
+        let system = Self::test_null();
+        let now = Box::into_raw(Box::new(now_ns)).cast::<c_void>();
+        unsafe {
+            (*system.system.as_ptr()).iface.cb.data = now;
+        }
+        Self {
+            clock_gettime_fn: fixed_clock,
+            ..system
+        }
+    }
+
     /// # Safety
     /// `system` must point at a live, initialized spa_system from the host's
     /// support array, and the host keeps it (and its methods vtable) valid
@@ -357,7 +465,11 @@ pub(crate) unsafe fn block_on_loop<T, F: FnOnce(&mut T) + Send>(
 // # Safety
 // The loop must outlive the queued item's execution: host loops come from
 // the spa_support array and live for the plugin host's lifetime.
-pub(crate) unsafe fn queue_task<F: FnOnce() + Send + 'static>(loop_: &Loop, f: F) -> bool {
+pub(crate) unsafe fn queue_task<F: FnOnce() + Send + 'static>(
+    loop_: &Loop,
+    diagnostic_tag: &'static str,
+    f: F,
+) -> bool {
     unsafe extern "C" fn trampoline<F: FnOnce() + Send + 'static>(
         _loop: *mut libspa::sys::spa_loop,
         _async: bool,
@@ -368,20 +480,18 @@ pub(crate) unsafe fn queue_task<F: FnOnce() + Send + 'static>(loop_: &Loop, f: F
     ) -> c_int {
         // user_data is the Box::into_raw'd closure below; the loop runs each
         // queued item exactly once, so this is the sole owner
-        let f = unsafe { Box::from_raw(user_data.cast::<F>()) };
+        let context = unsafe { Box::from_raw(user_data.cast::<(F, &'static str)>()) };
+        let (f, diagnostic_tag) = *context;
         let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
         if ok.is_err() {
-            eprintln!(
-                "{}: panic in a queued loop task (swallowed)",
-                platform::DIAGNOSTIC_TAG
-            );
+            eprintln!("{diagnostic_tag}: panic in a queued loop task (swallowed)");
         }
         // never negative: an inline flush returns this value to the caller,
         // and a negative would make it free the closure a second time
         0
     }
 
-    let ctx = Box::into_raw(Box::new(f));
+    let ctx = Box::into_raw(Box::new((f, diagnostic_tag)));
     let err = unsafe {
         loop_.invoke(
             Some(trampoline::<F>),

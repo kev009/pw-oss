@@ -4,7 +4,7 @@ use super::*;
 // The source pod must NOT live in `out`: the builder's overflow callback grows
 // the Vec by reallocating, which would move the source out from under the
 // filter mid-copy. Returns a pointer into `out`, valid until `out` changes.
-pub(crate) unsafe fn filter_pod(
+pub(super) unsafe fn filter_pod(
     out: &mut Vec<u8>,
     src: *mut spa_pod,
     filter: *const spa_pod,
@@ -300,7 +300,8 @@ pub(crate) fn build_latency_offset_props(ns: i64, params: &[(&str, u32)]) -> Vec
 }
 
 // PropInfo for a custom u32 tunable carried in the Props params struct; the
-// advertised default is the CURRENT (effective) value, like the ALSA plugin
+// advertised default is the CURRENT effective value so clients do not reset
+// a live backend tunable merely by reading and writing the parameter
 pub(crate) fn build_params_prop_info(
     name: &str,
     description: &str,
