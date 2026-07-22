@@ -48,15 +48,26 @@ jobs:
         run: cargo build --locked -p spa-kitchen-sink-core --release --features test-support
 
   freebsd:
-    name: FreeBSD build and test
+    name: FreeBSD ${{ matrix.release }} build and test
     runs-on: ubuntu-26.04
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 15.1 deliberately exercises the timer fallback. Re-enable 16.0
+          # when vmactions/freebsd-vm publishes conf/16.0.conf and its image;
+          # that kernel carries enriched OSS sound kevents.
+          - release: "15.1"
+            enriched_kqueue: "0"
+          # - release: "16.0"
+          #   enriched_kqueue: "1"
     steps:
       - uses: actions/checkout@v7
       - name: Build and test on FreeBSD
         uses: vmactions/freebsd-vm@v1
         with:
-          release: "15.1"
+          release: ${{ matrix.release }}
           usesh: true
           mem: 4096
           # pkgconf for libspa-sys's pkg-config probe; pipewire for the native
@@ -64,15 +75,23 @@ jobs:
           # (mirroring the port's build deps)
           prepare: |
             pkg install -y pkgconf rust pipewire llvm19
+            service devd onestatus || service devd onestart
+            kldstat -q -m snd_dummy || kldload snd_dummy
+            test -e /dev/dsp.dummy
           run: |
             set -eu
             export LIBCLANG_PATH=/usr/local/llvm19/lib
             export CARGO_TERM_COLOR=always
             export RUST_BACKTRACE=1
+            export PW_OSS_EXPECT_ENRICHED_KQUEUE=${{ matrix.enriched_kqueue }}
 
             echo "==> rustc / cargo"
             rustc --version
             cargo --version
+            echo "==> FreeBSD / snd_dummy"
+            uname -a
+            sysctl -n kern.osreldate
+            ls -l /dev/dsp.dummy
 
             # Fail fast on style before spending time on builds.
             echo "==> cargo fmt --all --check"
@@ -97,6 +116,13 @@ jobs:
             # ABI coverage is visible in the job log even when all tests pass.
             echo "==> FreeBSD OSS C/Rust ABI comparison"
             cargo test --locked -p spa-kitchen-sink-freebsd-oss freebsd_oss::abi::tests::c_and_rust_abi_match -- --exact --nocapture
+
+            # Real kernel PCM and SPA-factory coverage without physical audio
+            # hardware: format/duplex geometry, queue/xrun recovery, devd and
+            # module hotplug, and node processing. Route probing is read-only;
+            # these tests perform no mixer writes.
+            echo "==> snd_dummy kernel integration"
+            cargo test --locked -p spa-kitchen-sink-freebsd-oss freebsd_oss::native_tests:: -- --ignored --nocapture --test-threads=1
 
             # Optimized path: timing / DLL / wake logic can differ under -O.
             echo "==> cargo test --locked --workspace --release --all-targets"

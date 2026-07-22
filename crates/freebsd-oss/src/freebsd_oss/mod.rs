@@ -6,6 +6,8 @@ mod dsp;
 mod event;
 mod identity;
 mod mixer;
+#[cfg(test)]
+mod native_tests;
 mod sys;
 
 use abi::{

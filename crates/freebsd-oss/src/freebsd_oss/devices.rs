@@ -60,6 +60,19 @@ fn sndstat_pcm_devices() -> Option<Vec<(u32, bool, bool)>> {
     Some(out)
 }
 
+#[cfg(test)]
+pub(super) fn snd_dummy_unit() -> Option<u32> {
+    let mut sysctl = SysctlReader::new();
+    sndstat_pcm_devices()?
+        .into_iter()
+        .map(|(unit, _, _)| unit)
+        .find(|unit| {
+            sysctl
+                .read_string(format!("dev.pcm.{unit}.%desc"), 1024)
+                .is_ok_and(|description| description == "Dummy Audio Device")
+        })
+}
+
 pub(crate) fn sndstat_dsp_info(devnode: &str, play: bool) -> Option<SndstatDspInfo> {
     let nvl = sndstat_snapshot()?;
     let root = nvl.root();
