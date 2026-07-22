@@ -258,6 +258,12 @@ pub(crate) fn reset_device_event<D: Direction>(port: &mut Port<D>) {
     port.wake_threshold = 0;
 }
 
+pub(crate) fn latch_device_loss<D: Direction>(port: &mut Port<D>, status: backend::IoStatus) {
+    if status.device_lost() {
+        port.device_eof = true;
+    }
+}
+
 // Validated view of one host-owned buffer block. valid_data_block is the only
 // constructor, and callers keep the view within the current data-loop cycle.
 //

@@ -8,7 +8,10 @@ use crate::backend::{
 };
 use crate::spa::{IoArea, Log};
 
-use super::super::{Port, PortConfig, RateLimit, device_event_fill};
+use super::super::{
+    NodeShared, Port, PortConfig, RateLimit, RebuildContext, RebuildWork, RebuildWorkSlot,
+    device_event_fill, queue_port_rebuild,
+};
 use std::ffi::c_int;
 
 // a Port on a pipe-backed device: the pipe plays the capture ring
@@ -66,15 +69,42 @@ fn bounded_read_caps_catchup_and_pads_late_cycles() {
 }
 
 #[test]
-fn disconnected_capture_transport_latches_a_rebuild() {
+fn disconnected_capture_transport_queues_a_rebuild() {
     let (r, w) = pipe_pair(false, false);
     let mut port = test_port(r, 1_024, 2_048);
+    port.config = Some(PortConfig {
+        format: libspa::param::audio::AudioFormat::S16LE,
+        rate: 48_000,
+        channels: 4,
+        positions: vec![],
+        flags: 0,
+        stride: 8,
+    });
     let mut buffer = vec![0xaau8; 1_024];
     unsafe { libc::close(w) };
 
     assert_eq!(bounded_read(&mut port, 1_024, &mut buffer, 8), 1_024);
     assert!(port.device_eof);
     assert!(buffer.iter().all(|&byte| byte == 0));
+
+    let shared = std::sync::Arc::new(NodeShared::<SourceDir>::new());
+    let endpoint = RebuildWorkSlot::<SourceDir>::new();
+    let mut deferred = None;
+    assert!(queue_port_rebuild(
+        &mut port,
+        0,
+        RebuildContext {
+            path: "/dev/dsp",
+            fragment_bytes: 0,
+            log: &Log::test_null(),
+            shared: &shared,
+            endpoint: &endpoint,
+            deferred: &mut deferred,
+        },
+    ));
+    assert!(port.rebuild_pending);
+    assert!(matches!(endpoint.take(), Some(RebuildWork::Rebuild(_))));
+    assert!(deferred.is_none());
 }
 
 #[test]

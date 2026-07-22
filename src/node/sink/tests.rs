@@ -14,7 +14,8 @@ use crate::backend::{
 use crate::spa::{IoArea, Log};
 
 use super::super::{
-    Direction, Port, PortConfig, RateLimit, device_event_fill, reset_device_event,
+    Direction, NodeShared, Port, PortConfig, RateLimit, RebuildContext, RebuildWork,
+    RebuildWorkSlot, device_event_fill, latch_device_loss, queue_port_rebuild, reset_device_event,
     take_device_event_xruns, take_fallback_xruns,
 };
 use libspa::sys::SPA_IO_CLOCK_FLAG_XRUN_RECOVER;
@@ -112,6 +113,45 @@ fn playback_kevent_wakes_at_the_live_fill_target() {
     port.ext.target_delay = 8_192;
     assert_eq!(<SinkDir as Direction>::wake_threshold(&port), 57_344);
     unsafe { libc::close(r) };
+}
+
+#[test]
+fn disconnected_playback_transport_queues_a_rebuild() {
+    let (r, w) = pipe_pair(false, false);
+    let mut port = test_port(w, 4_096, 2_048);
+    port.config = Some(PortConfig {
+        format: libspa::param::audio::AudioFormat::S16LE,
+        rate: 48_000,
+        channels: 4,
+        positions: vec![],
+        flags: 0,
+        stride: 8,
+    });
+    unsafe { libc::close(r) };
+
+    let outcome = port.dsp.write(&[0; 1_024]);
+    assert_eq!(outcome.status, IoStatus::Disconnected);
+    latch_device_loss(&mut port, outcome.status);
+    assert!(port.device_eof);
+
+    let shared = std::sync::Arc::new(NodeShared::<SinkDir>::new());
+    let endpoint = RebuildWorkSlot::<SinkDir>::new();
+    let mut deferred = None;
+    assert!(queue_port_rebuild(
+        &mut port,
+        0,
+        RebuildContext {
+            path: "/dev/dsp",
+            fragment_bytes: 0,
+            log: &Log::test_null(),
+            shared: &shared,
+            endpoint: &endpoint,
+            deferred: &mut deferred,
+        },
+    ));
+    assert!(port.rebuild_pending);
+    assert!(matches!(endpoint.take(), Some(RebuildWork::Rebuild(_))));
+    assert!(deferred.is_none());
 }
 
 // "buffer_required() and target_delay() must derive this identically": any

@@ -11,6 +11,8 @@ pub(in crate::node) use worker::{
     MainEvent, RebuildWork, RebuildWorkSlot, RebuildWorker, SwapOutcome,
 };
 pub(crate) use worker::{NodeShared, queue_rebuild};
+#[cfg(test)]
+pub(in crate::node) use worker::{RebuildContext, queue_port_rebuild};
 
 // The backend-tunable live re-apply path: store the new loop-owned value on the
 // data loop (the prime paths read it there), then rebuild any running port

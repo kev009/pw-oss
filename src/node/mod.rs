@@ -32,6 +32,8 @@ use rebuild::{
     MainEvent, NodeShared, RebuildWork, RebuildWorkSlot, RebuildWorker, install_device,
     queue_main_event, release_rebuild_takeover,
 };
+#[cfg(test)]
+use rebuild::{RebuildContext, queue_port_rebuild};
 pub(crate) use sink::{OSS_SINK_FACTORY, OSS_SINK_TOPIC};
 pub(crate) use source::{OSS_SOURCE_FACTORY, OSS_SOURCE_TOPIC};
 use state::*;

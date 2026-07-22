@@ -12,8 +12,9 @@ use crate::spa::{self, Log, process_latency_default};
 use super::{
     DataControl, DataState, Direction, MAX_PORTS, MainState, ParamBuild, Port, PortConfig,
     device_event_fill, device_period_bytes, enum_interface_info, get_size, handle_process_latency,
-    init, ns_to_frame_bytes, poll_rebuild, queue_rebuild, reset_device_event, same_clock,
-    store_and_rebuild, take_device_event_xruns, take_fallback_xruns, try_now_ns, valid_data_block,
+    init, latch_device_loss, ns_to_frame_bytes, poll_rebuild, queue_rebuild, reset_device_event,
+    same_clock, store_and_rebuild, take_device_event_xruns, take_fallback_xruns, try_now_ns,
+    valid_data_block,
 };
 
 mod buffer;
@@ -135,9 +136,7 @@ fn bounded_read(port: &mut Port<SourceDir>, queued: u32, data: &mut [u8], stride
     let ispace = (want.min(queued).min(maxsize) / stride) * stride;
     let nread = if ispace > 0 {
         let outcome = port.dsp.read(&mut data[..ispace as usize]);
-        if outcome.status.device_lost() {
-            port.device_eof = true;
-        }
+        latch_device_loss(port, outcome.status);
         outcome.bytes as u32
     } else {
         0

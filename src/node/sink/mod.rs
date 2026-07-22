@@ -13,9 +13,9 @@ use crate::spa::{self, Log, process_latency_default};
 use super::{
     DataControl, DataState, Direction, MAX_PORTS, MainState, ParamBuild, Port, PortConfig,
     RateLimit, apply_props_param, device_event_fill, device_period_bytes, enum_interface_info,
-    get_size, handle_process_latency, init, ns_to_bytes, ns_to_frame_bytes, poll_rebuild,
-    queue_rebuild, reset_device_event, same_clock, store_and_rebuild, take_device_event_xruns,
-    take_fallback_xruns, try_now_ns, valid_data_block,
+    get_size, handle_process_latency, init, latch_device_loss, ns_to_bytes, ns_to_frame_bytes,
+    poll_rebuild, queue_rebuild, reset_device_event, same_clock, store_and_rebuild,
+    take_device_event_xruns, take_fallback_xruns, try_now_ns, valid_data_block,
 };
 
 mod buffer;
@@ -717,9 +717,7 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
         if port.ext.resuming && port.ext.pending_offset != 0 && !write_result.would_block() {
             port.ext.resuming = false;
         }
-        if write_result.status.device_lost() {
-            port.device_eof = true;
-        }
+        latch_device_loss(port, write_result.status);
 
         // Rate-match only as a follower on a foreign clock: when driving, the
         // timer steering applies the correction, and a same-device follower ticks

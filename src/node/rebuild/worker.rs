@@ -490,13 +490,63 @@ pub(in crate::node) fn submit_or_defer<D: Direction>(
     state: &mut DataState<D>,
     work: RebuildWork<D>,
 ) {
+    submit_or_defer_to(&state.rebuild_work, &mut state.deferred_work, work);
+}
+
+fn submit_or_defer_to<D: Direction>(
+    endpoint: &RebuildWorkSlot<D>,
+    deferred: &mut Option<RebuildWork<D>>,
+    work: RebuildWork<D>,
+) {
     debug_assert!(
-        state.deferred_work.is_none(),
+        deferred.is_none(),
         "worker work must preserve its single-producer order"
     );
-    if let WorkSubmission::Returned(work) = state.rebuild_work.try_submit(work) {
-        state.deferred_work = Some(work);
+    if let WorkSubmission::Returned(work) = endpoint.try_submit(work) {
+        *deferred = Some(work);
     }
+}
+
+pub(in crate::node) struct RebuildContext<'a, D: Direction> {
+    pub(in crate::node) path: &'a str,
+    pub(in crate::node) fragment_bytes: u32,
+    pub(in crate::node) log: &'a Log,
+    pub(in crate::node) shared: &'a std::sync::Arc<NodeShared<D>>,
+    pub(in crate::node) endpoint: &'a RebuildWorkSlot<D>,
+    pub(in crate::node) deferred: &'a mut Option<RebuildWork<D>>,
+}
+
+pub(in crate::node) fn queue_port_rebuild<D: Direction>(
+    port: &mut Port<D>,
+    port_idx: usize,
+    context: RebuildContext<'_, D>,
+) -> bool {
+    let RebuildContext {
+        path,
+        fragment_bytes,
+        log,
+        shared,
+        endpoint,
+        deferred,
+    } = context;
+    let Some(config) = port.config.clone() else {
+        return false;
+    };
+    let request = RebuildRequest {
+        port_idx,
+        generation: port.generation,
+        config,
+        path: path.to_owned(),
+        fragment_bytes,
+        retried: false,
+        retire_first: None,
+        log: log.clone(),
+        shared: std::sync::Arc::downgrade(shared),
+    };
+    submit_or_defer_to(endpoint, deferred, RebuildWork::Rebuild(request));
+    // The request is either in the worker slot or retained by the data loop.
+    port.rebuild_pending = true;
+    true
 }
 
 /// Queue an owned worker rebuild order for `port_idx`'s device and mark
@@ -511,27 +561,18 @@ pub(crate) fn queue_rebuild<D: Direction>(state: &mut DataState<D>, port_idx: us
     if !flush_deferred_work(state) {
         return false;
     }
-    let port = &state.ports[port_idx];
-    let Some(config) = port.config.clone() else {
-        return false; // no negotiated format; nothing to rebuild
-    };
-    let request = RebuildRequest {
+    queue_port_rebuild(
+        &mut state.ports[port_idx],
         port_idx,
-        generation: port.generation,
-        config,
-        path: state.stream_path.clone(),
-        // loop-owned (the prime paths read it here), so this data-loop read
-        // is the serialization-correct snapshot
-        fragment_bytes: state.fragment_bytes,
-        retried: false,
-        retire_first: None,
-        log: state.log.clone(),
-        shared: std::sync::Arc::downgrade(&state.shared),
-    };
-    submit_or_defer(state, RebuildWork::Rebuild(request));
-    // The request is either in the worker slot or retained in DataState.
-    state.ports[port_idx].rebuild_pending = true;
-    true
+        RebuildContext {
+            path: &state.stream_path,
+            fragment_bytes: state.fragment_bytes,
+            log: &state.log,
+            shared: &state.shared,
+            endpoint: &state.rebuild_work,
+            deferred: &mut state.deferred_work,
+        },
+    )
 }
 
 // The unwind guard behind every worker rebuild path: a task that dies
