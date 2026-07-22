@@ -18,17 +18,20 @@
 use libspa::sys::spa_handle_factory;
 use std::ffi::c_int;
 
-mod backend;
-mod device;
 mod freebsd_oss;
-mod monitor;
-mod node;
-mod platform;
-mod spa;
+use spa_kitchen_sink_core::{backend, device, monitor, node, spa};
+pub(crate) use spa_kitchen_sink_core::{debug, info, warn};
 
-use device::OSS_DEVICE_FACTORY;
-use monitor::OSS_MONITOR_FACTORY;
-use node::{OSS_SINK_FACTORY, OSS_SOURCE_FACTORY};
+type SelectedBackend = freebsd_oss::FreeBsdOss;
+
+const MONITOR_FACTORY: spa_handle_factory =
+    monitor::factory::<SelectedBackend>(freebsd_oss::MONITOR_FACTORY_NAME.as_ptr());
+const DEVICE_FACTORY: spa_handle_factory =
+    device::factory::<SelectedBackend>(freebsd_oss::DEVICE_FACTORY_NAME.as_ptr());
+const SINK_FACTORY: spa_handle_factory =
+    node::sink_factory::<SelectedBackend>(freebsd_oss::SINK_FACTORY_NAME.as_ptr());
+const SOURCE_FACTORY: spa_handle_factory =
+    node::source_factory::<SelectedBackend>(freebsd_oss::SOURCE_FACTORY_NAME.as_ptr());
 
 /// The SPA plugin entry point, called by the PipeWire host loader.
 ///
@@ -47,22 +50,22 @@ pub unsafe extern "C" fn spa_handle_factory_enum(
     unsafe {
         match *index {
             0 => {
-                *factory = &OSS_MONITOR_FACTORY;
+                *factory = &MONITOR_FACTORY;
                 *index += 1;
                 1
             }
             1 => {
-                *factory = &OSS_DEVICE_FACTORY;
+                *factory = &DEVICE_FACTORY;
                 *index += 1;
                 1
             }
             2 => {
-                *factory = &OSS_SINK_FACTORY;
+                *factory = &SINK_FACTORY;
                 *index += 1;
                 1
             }
             3 => {
-                *factory = &OSS_SOURCE_FACTORY;
+                *factory = &SOURCE_FACTORY;
                 *index += 1;
                 1
             }
@@ -83,7 +86,36 @@ pub unsafe extern "C" fn spa_handle_factory_enum(
 // silently do nothing - use PIPEWIRE_DEBUG="spa.oss.*:LEVEL" to cover all
 // four.
 
-use libspa::sys::{SPA_VERSION_LOG_TOPIC_ENUM, spa_log_topic};
+use libspa::sys::{
+    SPA_LOG_LEVEL_NONE, SPA_VERSION_LOG_TOPIC, SPA_VERSION_LOG_TOPIC_ENUM, spa_log_topic,
+};
+
+// The plugin crate owns its mutable registered topics. The shared shells only
+// receive their addresses through the compile-time Backend binding.
+static mut DEVICE_TOPIC: spa_log_topic = spa_log_topic {
+    version: SPA_VERSION_LOG_TOPIC,
+    topic: freebsd_oss::DEVICE_LOG_TOPIC.as_ptr(),
+    level: SPA_LOG_LEVEL_NONE,
+    has_custom_level: false,
+};
+static mut SINK_TOPIC: spa_log_topic = spa_log_topic {
+    version: SPA_VERSION_LOG_TOPIC,
+    topic: freebsd_oss::SINK_LOG_TOPIC.as_ptr(),
+    level: SPA_LOG_LEVEL_NONE,
+    has_custom_level: false,
+};
+static mut SOURCE_TOPIC: spa_log_topic = spa_log_topic {
+    version: SPA_VERSION_LOG_TOPIC,
+    topic: freebsd_oss::SOURCE_LOG_TOPIC.as_ptr(),
+    level: SPA_LOG_LEVEL_NONE,
+    has_custom_level: false,
+};
+static mut MONITOR_TOPIC: spa_log_topic = spa_log_topic {
+    version: SPA_VERSION_LOG_TOPIC,
+    topic: freebsd_oss::MONITOR_LOG_TOPIC.as_ptr(),
+    level: SPA_LOG_LEVEL_NONE,
+    has_custom_level: false,
+};
 
 // repr(transparent): the host walks __start..__stop as a plain C array of
 // `struct spa_log_topic *`, so each entry must have exactly the size,
@@ -106,26 +138,22 @@ const _: () = assert!(
 #[unsafe(link_section = "spa_log_topic")]
 #[used]
 #[expect(non_upper_case_globals)]
-static mut spa_log_topic_export_oss_device: TopicPointer =
-    TopicPointer(&raw mut device::OSS_DEVICE_TOPIC);
+static mut spa_log_topic_export_oss_device: TopicPointer = TopicPointer(&raw mut DEVICE_TOPIC);
 
 #[unsafe(link_section = "spa_log_topic")]
 #[used]
 #[expect(non_upper_case_globals)]
-static mut spa_log_topic_export_oss_sink: TopicPointer =
-    TopicPointer(&raw mut node::OSS_SINK_TOPIC);
+static mut spa_log_topic_export_oss_sink: TopicPointer = TopicPointer(&raw mut SINK_TOPIC);
 
 #[unsafe(link_section = "spa_log_topic")]
 #[used]
 #[expect(non_upper_case_globals)]
-static mut spa_log_topic_export_oss_source: TopicPointer =
-    TopicPointer(&raw mut node::OSS_SOURCE_TOPIC);
+static mut spa_log_topic_export_oss_source: TopicPointer = TopicPointer(&raw mut SOURCE_TOPIC);
 
 #[unsafe(link_section = "spa_log_topic")]
 #[used]
 #[expect(non_upper_case_globals)]
-static mut spa_log_topic_export_oss_monitor: TopicPointer =
-    TopicPointer(&raw mut monitor::OSS_MONITOR_TOPIC);
+static mut spa_log_topic_export_oss_monitor: TopicPointer = TopicPointer(&raw mut MONITOR_TOPIC);
 
 // the linker generates these for the section
 unsafe extern "C" {

@@ -1,0 +1,29 @@
+[package]
+name = "spa-kitchen-sink-freebsd-oss"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "FreeBSD OSS sound input/output plugin for PipeWire"
+publish = false
+
+[lib]
+# preserves the libspa_freebsd_oss.so filename
+name = "spa_freebsd_oss"
+crate-type = ["cdylib"]
+
+[dependencies]
+libc.workspace = true
+libspa.workspace = true
+nix.workspace = true
+regex.workspace = true
+spa-kitchen-sink-core = { path = "../core" }
+uds.workspace = true
+
+[dev-dependencies]
+spa-kitchen-sink-core = { path = "../core", features = ["test-support"] }
+
+[build-dependencies]
+cc.workspace = true

@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/core",
+    "crates/freebsd-oss",
 ]
 
 [workspace.package]
@@ -16,5 +17,9 @@ license = "MIT"
 repository = "https://github.com/kev009/pw-oss"
 
 [workspace.dependencies]
+cc = "1.2.67"
 libc = "0.2.186"
 libspa = "0.10.0"
+nix = { version = "0.31.3", features = ["ioctl"] }
+regex = "1.13.1"
+uds = "=0.4.2"
