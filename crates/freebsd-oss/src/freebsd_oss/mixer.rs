@@ -718,10 +718,10 @@ impl RouteController {
         routes: &[RouteSnapshot],
         monitor: &mut HotplugMonitor,
     ) -> (bool, bool) {
-        let (alive, unit) = monitor.read_mixer_event();
+        let (alive, unit, reconnected) = monitor.read_mixer_event();
         (
             alive,
-            unit.is_some_and(|unit| self.handles_native_unit(routes, unit)),
+            reconnected || unit.is_some_and(|unit| self.handles_native_unit(routes, unit)),
         )
     }
 }

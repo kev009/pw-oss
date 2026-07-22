@@ -18,6 +18,18 @@ impl DevdSocket {
         self.socket.as_raw_fd()
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_pair() -> (Self, UnixSeqpacketConn) {
+        let (socket, peer) = UnixSeqpacketConn::pair().expect("create devd test socket pair");
+        (
+            Self {
+                socket,
+                buffer: vec![0; 8192],
+            },
+            peer,
+        )
+    }
+
     // false when the connection is dead (EOF or error): the fd stays readable
     // forever then, and the caller must deregister it or the loop busy-spins
     pub(crate) fn read_event(&mut self, mut apply: impl FnMut(&str)) -> bool {

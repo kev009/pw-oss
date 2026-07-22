@@ -20,6 +20,9 @@ const ENRICHED_SOUND_KQUEUE_15_2_OSREL: u32 = 1_502_000;
 const FREEBSD_16_BASE_OSREL: u32 = 1_600_000;
 const ENRICHED_SOUND_KQUEUE_16_OSREL: u32 = 1_600_019;
 const TIMER_IDENT: libc::uintptr_t = 1;
+const DEVD_RETRY_TIMER_IDENT: libc::uintptr_t = 2;
+const DEVD_RETRY_MIN_MS: u32 = 1_000;
+const DEVD_RETRY_MAX_MS: u32 = 30_000;
 
 pub(crate) fn enriched_sound_kqueue_available() -> bool {
     SysctlReader::new()
@@ -203,18 +206,7 @@ impl OssWakeDriver {
     }
 
     fn submit_change(&self, change: libc::kevent) -> Result<(), Errno> {
-        let mut receipt = kevent(0, 0, 0, 0, 0, 0);
-        let n = unsafe { libc::kevent(self.raw(), &change, 1, &mut receipt, 1, std::ptr::null()) };
-        if n < 0 {
-            return Err(Errno::last());
-        }
-        if n != 1 || receipt.flags & libc::EV_ERROR == 0 {
-            return Err(Errno::EIO);
-        }
-        if receipt.data != 0 {
-            return Err(Errno::from_raw(receipt.data as c_int));
-        }
-        Ok(())
+        submit_change(self.raw(), change)
     }
 }
 
@@ -337,10 +329,63 @@ fn kevent(
     }
 }
 
+fn submit_change(queue_fd: c_int, change: libc::kevent) -> Result<(), Errno> {
+    let mut receipt = kevent(0, 0, 0, 0, 0, 0);
+    let n = unsafe { libc::kevent(queue_fd, &change, 1, &mut receipt, 1, std::ptr::null()) };
+    if n < 0 {
+        return Err(Errno::last());
+    }
+    if n != 1 || receipt.flags & libc::EV_ERROR == 0 {
+        return Err(Errno::EIO);
+    }
+    if receipt.data != 0 {
+        return Err(Errno::from_raw(receipt.data as c_int));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Eq, PartialEq)]
 enum CatalogSignal {
     Attached,
     Detached(String),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum CatalogRefresh {
+    Full,
+    Detached(String),
+}
+
+fn catalog_refresh(signal: Option<CatalogSignal>, reconnected: bool) -> Option<CatalogRefresh> {
+    if reconnected {
+        Some(CatalogRefresh::Full)
+    } else {
+        match signal {
+            Some(CatalogSignal::Attached) => Some(CatalogRefresh::Full),
+            Some(CatalogSignal::Detached(subject)) => Some(CatalogRefresh::Detached(subject)),
+            None => None,
+        }
+    }
+}
+
+fn merge_catalog_signal(
+    current: Option<CatalogSignal>,
+    next: Option<CatalogSignal>,
+) -> Option<CatalogSignal> {
+    match (current, next) {
+        (current, None) => current,
+        (None, next) => next,
+        (Some(CatalogSignal::Detached(a)), Some(CatalogSignal::Detached(b))) if a == b => {
+            Some(CatalogSignal::Detached(a))
+        }
+        // One targeted rescan cannot represent two different detachments.
+        // Promote the batch to a full refresh rather than lose either one.
+        (Some(CatalogSignal::Attached), _)
+        | (_, Some(CatalogSignal::Attached))
+        | (Some(CatalogSignal::Detached(_)), Some(CatalogSignal::Detached(_))) => {
+            Some(CatalogSignal::Attached)
+        }
+    }
 }
 
 fn decode_catalog_signal(line: &str) -> Option<CatalogSignal> {
@@ -369,16 +414,181 @@ fn decode_mixer_event(line: &str) -> Option<u32> {
         .and_then(|groups| groups[1].parse::<u32>().ok())
 }
 
-/// devd connection that exposes decoded sound-device events.
-pub(crate) struct HotplugMonitor(DevdSocket);
+fn take_retry_delay(delay_ms: &mut u32) -> u32 {
+    let delay = *delay_ms;
+    *delay_ms = delay.saturating_mul(2).min(DEVD_RETRY_MAX_MS);
+    delay
+}
+
+fn kevent_read_error_is_fatal(error: Errno) -> bool {
+    // EINTR and resource-pressure failures do not invalidate a kqueue. EBADF
+    // is the one read-side error that proves SPA's stable descriptor is gone.
+    error == Errno::EBADF
+}
+
+/// Stable event queue around a replaceable devd connection. A devd restart
+/// closes existing clients; keep the kqueue watched by SPA alive and use its
+/// timer filter to reconnect without spinning the main loop.
+pub(crate) struct HotplugMonitor {
+    queue: LibcFd,
+    socket: Option<DevdSocket>,
+    socket_key: usize,
+    retry_delay_ms: u32,
+}
 
 impl HotplugMonitor {
     pub(crate) fn open() -> Result<Self, std::io::Error> {
-        DevdSocket::open().map(Self)
+        let queue =
+            LibcFd::kqueue().map_err(|error| std::io::Error::from_raw_os_error(error as c_int))?;
+        let mut monitor = Self {
+            queue,
+            socket: None,
+            socket_key: 0,
+            retry_delay_ms: DEVD_RETRY_MIN_MS,
+        };
+        let installed = match DevdSocket::open() {
+            Ok(socket) => monitor.install_socket(socket).is_ok(),
+            Err(_) => false,
+        };
+        if !installed {
+            monitor
+                .arm_retry()
+                .map_err(|error| std::io::Error::from_raw_os_error(error as c_int))?;
+        }
+        Ok(monitor)
     }
 
     pub(crate) fn fd(&self) -> RawFd {
-        self.0.fd()
+        self.queue.raw()
+    }
+
+    #[cfg(test)]
+    fn test_with_socket(socket: DevdSocket) -> Self {
+        let queue = LibcFd::kqueue().unwrap();
+        let mut monitor = Self {
+            queue,
+            socket: None,
+            socket_key: 0,
+            retry_delay_ms: DEVD_RETRY_MIN_MS,
+        };
+        monitor.install_socket(socket).unwrap();
+        monitor
+    }
+
+    fn install_socket(&mut self, socket: DevdSocket) -> Result<(), Errno> {
+        self.socket_key = self.socket_key.wrapping_add(1).max(1);
+        submit_change(
+            self.queue.raw(),
+            kevent(
+                socket.fd() as libc::uintptr_t,
+                libc::EVFILT_READ,
+                // Keep this level-triggered: devd uses one seqpacket per
+                // event and the callback consumes one packet at a time.
+                libc::EV_ADD | libc::EV_RECEIPT,
+                0,
+                0,
+                self.socket_key,
+            ),
+        )?;
+        self.socket = Some(socket);
+        self.retry_delay_ms = DEVD_RETRY_MIN_MS;
+        Ok(())
+    }
+
+    fn arm_retry(&mut self) -> Result<(), Errno> {
+        let delay_ms = take_retry_delay(&mut self.retry_delay_ms);
+        submit_change(
+            self.queue.raw(),
+            kevent(
+                DEVD_RETRY_TIMER_IDENT,
+                libc::EVFILT_TIMER,
+                libc::EV_ADD | libc::EV_ONESHOT | libc::EV_RECEIPT,
+                libc::NOTE_MSECONDS,
+                i64::from(delay_ms),
+                0,
+            ),
+        )
+    }
+
+    fn reconnect(&mut self) -> Result<bool, Errno> {
+        let Ok(socket) = DevdSocket::open() else {
+            self.arm_retry()?;
+            return Ok(false);
+        };
+        if self.install_socket(socket).is_err() {
+            self.socket = None;
+            self.arm_retry()?;
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    fn handle_socket_loss(&mut self) -> bool {
+        self.socket = None;
+        self.arm_retry().is_ok()
+    }
+
+    /// Drain one kqueue batch. `alive` describes the stable queue itself;
+    /// losing only devd schedules a retry and deliberately remains alive.
+    fn read_event(&mut self, mut apply: impl FnMut(&str)) -> (bool, bool) {
+        let mut events = [kevent(0, 0, 0, 0, 0, 0); 4];
+        let timeout = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let n = unsafe {
+            libc::kevent(
+                self.queue.raw(),
+                std::ptr::null(),
+                0,
+                events.as_mut_ptr(),
+                events.len() as c_int,
+                &timeout,
+            )
+        };
+        if n < 0 {
+            return (!kevent_read_error_is_fatal(Errno::last()), false);
+        }
+
+        let mut reconnected = false;
+        for event in events.into_iter().take(n as usize) {
+            let matches_retry_timer =
+                event.filter == libc::EVFILT_TIMER && event.ident == DEVD_RETRY_TIMER_IDENT;
+            let matches_socket = self.socket.as_ref().is_some_and(|socket| {
+                event.filter == libc::EVFILT_READ
+                    && event.ident == socket.fd() as libc::uintptr_t
+                    && event.udata as usize == self.socket_key
+            });
+            if event.flags & libc::EV_ERROR != 0 {
+                if matches_socket {
+                    if !self.handle_socket_loss() {
+                        return (false, reconnected);
+                    }
+                } else if matches_retry_timer && self.arm_retry().is_err() {
+                    return (false, reconnected);
+                }
+                continue;
+            }
+            if matches_retry_timer {
+                match self.reconnect() {
+                    Ok(restored) => reconnected |= restored,
+                    Err(_) => return (false, reconnected),
+                }
+                continue;
+            }
+
+            if !matches_socket {
+                continue;
+            }
+            let socket_alive = self
+                .socket
+                .as_mut()
+                .is_some_and(|socket| socket.read_event(&mut apply));
+            if !socket_alive && !self.handle_socket_loss() {
+                return (false, reconnected);
+            }
+        }
+        (true, reconnected)
     }
 
     /// Consume one relevant native event and apply its replacement semantics
@@ -389,12 +599,14 @@ impl HotplugMonitor {
         catalog: &mut DeviceCatalog,
     ) -> (bool, Option<CatalogRescan>) {
         let mut signal = None;
-        let alive = self.0.read_event(|line| {
-            signal = decode_catalog_signal(line);
+        let (alive, reconnected) = self.read_event(|line| {
+            signal = merge_catalog_signal(signal.take(), decode_catalog_signal(line));
         });
-        let rescan = match signal {
-            Some(CatalogSignal::Attached) => Some(catalog.rescan(&[])),
-            Some(CatalogSignal::Detached(subject)) => {
+        let rescan = match catalog_refresh(signal, reconnected) {
+            // Events can be lost while devd is down; reconnect maps to Full
+            // and reconciles the catalog before trusting the new connection.
+            Some(CatalogRefresh::Full) => Some(catalog.rescan(&[])),
+            Some(CatalogRefresh::Detached(subject)) => {
                 Some(catalog.rescan(std::slice::from_ref(&subject)))
             }
             None => None,
@@ -403,12 +615,14 @@ impl HotplugMonitor {
     }
 
     /// Returns connection liveness plus the PCM unit named by a sound event.
-    pub(super) fn read_mixer_event(&mut self) -> (bool, Option<u32>) {
+    pub(super) fn read_mixer_event(&mut self) -> (bool, Option<u32>, bool) {
         let mut unit = None;
-        let alive = self.0.read_event(|line| {
-            unit = decode_mixer_event(line);
+        let (alive, reconnected) = self.read_event(|line| {
+            if let Some(decoded) = decode_mixer_event(line) {
+                unit = Some(decoded);
+            }
         });
-        (alive, unit)
+        (alive, unit, reconnected)
     }
 }
 
@@ -466,6 +680,84 @@ mod tests {
             decode_mixer_event("!system=SND subsystem=CONN type=NODEV"),
             None
         );
+    }
+
+    #[test]
+    fn reconnect_forces_a_full_catalog_reconciliation() {
+        assert_eq!(
+            catalog_refresh(Some(CatalogSignal::Detached("uaudio3".into())), true),
+            Some(CatalogRefresh::Full)
+        );
+        assert_eq!(
+            catalog_refresh(Some(CatalogSignal::Detached("uaudio3".into())), false),
+            Some(CatalogRefresh::Detached("uaudio3".into()))
+        );
+    }
+
+    #[test]
+    fn batch_decode_preserves_relevant_signals() {
+        assert_eq!(
+            merge_catalog_signal(Some(CatalogSignal::Attached), None),
+            Some(CatalogSignal::Attached)
+        );
+        assert_eq!(
+            merge_catalog_signal(
+                Some(CatalogSignal::Detached("pcm3".into())),
+                Some(CatalogSignal::Detached("pcm4".into())),
+            ),
+            Some(CatalogSignal::Attached)
+        );
+    }
+
+    #[test]
+    fn only_a_dead_kqueue_ends_the_stable_monitor() {
+        assert!(!kevent_read_error_is_fatal(Errno::EINTR));
+        assert!(!kevent_read_error_is_fatal(Errno::ENOMEM));
+        assert!(kevent_read_error_is_fatal(Errno::EBADF));
+    }
+
+    #[test]
+    fn socket_filter_failure_uses_the_eof_retry_path() {
+        let (socket, _peer) = DevdSocket::test_pair();
+        let mut monitor = HotplugMonitor::test_with_socket(socket);
+        monitor.retry_delay_ms = 1;
+
+        assert!(monitor.handle_socket_loss());
+        assert!(monitor.socket.is_none());
+        assert_eq!(monitor.retry_delay_ms, 2);
+    }
+
+    #[test]
+    fn devd_eof_keeps_the_stable_queue_alive_and_arms_retry() {
+        let (socket, peer) = DevdSocket::test_pair();
+        let mut monitor = HotplugMonitor::test_with_socket(socket);
+        let mut pollfd = libc::pollfd {
+            fd: monitor.fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+
+        peer.send(b"+pcm7 at uaudio3").unwrap();
+        assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 100) }, 1);
+        let mut signal = None;
+        assert_eq!(
+            monitor.read_event(|line| signal = decode_catalog_signal(line)),
+            (true, false)
+        );
+        assert_eq!(signal, Some(CatalogSignal::Attached));
+
+        monitor.retry_delay_ms = 1;
+        drop(peer);
+        pollfd.revents = 0;
+        assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 100) }, 1);
+        assert_eq!(monitor.read_event(|_| {}), (true, false));
+        assert!(monitor.socket.is_none());
+        assert_eq!(monitor.retry_delay_ms, 2);
+        assert!(monitor.fd() >= 0);
+
+        pollfd.revents = 0;
+        assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 100) }, 1);
+        assert_ne!(pollfd.revents & libc::POLLIN, 0);
     }
 
     #[test]
@@ -685,5 +977,17 @@ mod tests {
         assert!(enriched_sound_kqueue_osrel(1_599_999));
         assert!(!enriched_sound_kqueue_osrel(1_600_018));
         assert!(enriched_sound_kqueue_osrel(1_600_019));
+    }
+
+    #[test]
+    fn devd_retry_backoff_is_exponential_and_bounded() {
+        let mut delay = DEVD_RETRY_MIN_MS;
+        assert_eq!(take_retry_delay(&mut delay), 1_000);
+        assert_eq!(take_retry_delay(&mut delay), 2_000);
+        assert_eq!(take_retry_delay(&mut delay), 4_000);
+        assert_eq!(take_retry_delay(&mut delay), 8_000);
+        assert_eq!(take_retry_delay(&mut delay), 16_000);
+        assert_eq!(take_retry_delay(&mut delay), 30_000);
+        assert_eq!(take_retry_delay(&mut delay), 30_000);
     }
 }
