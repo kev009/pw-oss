@@ -48,5 +48,6 @@ use state::{DataControl, DataState, MainState, Port, valid_data_block};
 
 use direction::MutexExt;
 pub(crate) use direction::{
-    BackendOf, BackendPropertiesOf, Direction, MAX_PORTS, ParamBuild, PortConfig,
+    BackendOf, BackendPropertiesOf, BackendPropertyUpdateOf, Direction, MAX_PORTS, ParamBuild,
+    PortConfig, WakeDriverOf,
 };

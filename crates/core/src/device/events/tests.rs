@@ -1,5 +1,8 @@
 use super::*;
+use crate::backend::fake::FakeBackend;
 use crate::spa::ListenerList;
+
+type DeviceEvents = super::DeviceEvents<FakeBackend>;
 
 struct ReentrantDeviceInfoContext {
     events: *const DeviceEvents,
@@ -102,9 +105,14 @@ fn initial_device_transaction_finishes_before_reentrant_changes() {
     events.with_info(|info| info.fix_pointers());
     let info = events.initial_info();
     let initial_object = DeviceObjectEvent::Added {
-        id: 2,
-        rec: false,
-        description: "Playback".into(),
+        endpoint: crate::backend::EndpointSnapshot {
+            key: crate::backend::EndpointKey::qualified("test", "playback"),
+            object_id: 2,
+            direction: crate::backend::StreamDirection::Playback,
+            name: "test.playback".into(),
+            description: "Playback".into(),
+            locator: crate::backend::StreamLocator::new("test", "test://playback"),
+        },
         route_count: 0,
     };
     let mut context = InitialDeviceContext {

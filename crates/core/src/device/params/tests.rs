@@ -1,5 +1,5 @@
+use crate::backend;
 use crate::device::RouteState;
-use crate::platform;
 use crate::spa;
 
 // Profile requests accept NULL reset, valid indexes, and durable names.
@@ -76,7 +76,7 @@ fn route_requests_decode_with_typed_props() {
     assert_eq!(
         super::decode_route_request(pod(vec![
             prop(SPA_PARAM_ROUTE_index, Value::Int(1)),
-            prop(SPA_PARAM_ROUTE_name, Value::String("oss-output".into())),
+            prop(SPA_PARAM_ROUTE_name, Value::String("test-output".into())),
             prop(SPA_PARAM_ROUTE_device, Value::Int(2)),
             prop(SPA_PARAM_ROUTE_save, Value::Bool(true)),
             prop(
@@ -101,7 +101,7 @@ fn route_requests_decode_with_typed_props() {
         ])),
         Ok(super::RouteRequest {
             index: Some(1),
-            name: Some("oss-output".into()),
+            name: Some("test-output".into()),
             device: 2,
             save: true,
             props: Some(super::RouteProps(vec![
@@ -110,7 +110,7 @@ fn route_requests_decode_with_typed_props() {
             ])),
         })
     );
-    // an empty volume array is dropped before it can become a mixer write
+    // an empty volume array is dropped before it can become a control write
     assert_eq!(
         super::decode_route_request(pod(vec![
             prop(SPA_PARAM_ROUTE_device, Value::Int(2)),
@@ -142,30 +142,63 @@ fn route_requests_decode_with_typed_props() {
     assert_eq!(super::decode_route_request(None), Err(-libc::EINVAL));
 }
 
-fn pcm_device(index: u32, play: bool, rec: bool) -> platform::AudioDevice {
-    platform::AudioDevice {
-        index,
-        desc: format!("pcm{index}"),
-        location: "hdac0".to_string(),
-        play,
-        rec,
+fn device_snapshot(index: u32, play: bool, rec: bool) -> backend::DeviceSnapshot {
+    let mut endpoints = Vec::new();
+    for (direction, enabled, suffix) in [
+        (backend::StreamDirection::Playback, play, "play"),
+        (backend::StreamDirection::Capture, rec, "rec"),
+    ] {
+        if enabled {
+            endpoints.push(backend::EndpointSnapshot {
+                key: crate::backend::EndpointKey::qualified(
+                    "test",
+                    &format!("pcm{index}.{suffix}"),
+                ),
+                object_id: index * 2 + u32::from(direction == backend::StreamDirection::Capture),
+                direction,
+                name: format!("pcm{index}.{suffix}"),
+                description: format!("pcm{index}"),
+                locator: crate::backend::StreamLocator::new(
+                    "test",
+                    format!("test://card/{index}/{suffix}"),
+                ),
+            });
+        }
+    }
+    backend::DeviceSnapshot {
+        description: format!("pcm{index}"),
+        endpoints,
     }
 }
 
 fn route(control: Option<u32>, rec: bool) -> RouteState {
     RouteState {
+        key: crate::backend::RouteKey(0),
         node_id: if rec { 3 } else { 2 },
-        rec,
+        direction: if rec {
+            backend::StreamDirection::Capture
+        } else {
+            backend::StreamDirection::Playback
+        },
         name: "analog-output".to_string(),
         description: "Analog Output".to_string(),
         priority: 100,
-        mixer: 0,
-        control,
-        follows_recsrc: false,
-        source: None,
+        availability: crate::backend::RouteAvailability::Yes,
         active: true,
-        levels: (75, 50),
-        mute: rec,
+        volume: crate::backend::RouteVolume {
+            values: vec![0.75f32.powi(3), 0.5f32.powi(3)],
+            channels: vec![
+                libspa::sys::SPA_AUDIO_CHANNEL_FL,
+                libspa::sys::SPA_AUDIO_CHANNEL_FR,
+            ],
+            base: 1.0,
+            step: 1.0 / 101.0,
+            hardware: control.is_some(),
+        },
+        mute: crate::backend::RouteMute {
+            value: rec,
+            hardware: control.is_some(),
+        },
         save: !rec,
     }
 }
@@ -186,7 +219,7 @@ fn profile_parses_back_with_classes_struct() {
     let pod = super::build_profile_info(
         SPA_PARAM_Profile,
         1,
-        &[pcm_device(0, true, true)],
+        &device_snapshot(0, true, true),
         true,
         true,
     );
@@ -285,7 +318,7 @@ fn route_parses_back_with_hardware_volume_flags() {
                         id: SPA_PARAM_Route,
                         properties: vec![
                             // HARDWARE on mute and channelVolumes: the
-                            // mixer control owns them, so pulse and the
+                            // route controller owns them, so pulse and the
                             // session manager write them at the card
                             Property {
                                 key: SPA_PROP_mute,

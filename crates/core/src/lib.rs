@@ -1,4 +1,4 @@
-//! Backend-neutral SPA audio contracts.
+//! Backend-neutral SPA shells and compile-time backend contracts.
 
 #![warn(unreachable_pub)]
 #![warn(clippy::match_same_arms)]
@@ -8,4 +8,7 @@
 #![warn(clippy::used_underscore_binding)]
 
 pub mod backend;
+pub mod device;
+pub mod monitor;
+pub mod node;
 pub mod spa;

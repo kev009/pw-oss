@@ -19,7 +19,6 @@ pub struct Log {
 unsafe impl Send for Log {}
 
 impl Log {
-    #[allow(dead_code)]
     pub(crate) unsafe fn wrap(
         log: *mut spa_log,
         topic: Option<std::ptr::NonNull<spa_log_topic>>,
