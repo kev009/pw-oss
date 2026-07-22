@@ -1,7 +1,8 @@
 name: CodeQL
 
-# FreeBSD-only crate: do not attempt a real cargo build on the Linux runner.
-# build-mode: none extracts Rust sources + Cargo metadata without compiling.
+# The concrete plugin is FreeBSD-only, so do not attempt a full workspace
+# build on the Linux runner. build-mode: none extracts Rust sources and Cargo
+# metadata, including the backend-neutral core, without compiling the plugin.
 on:
   push:
     branches: [master]
@@ -20,7 +21,7 @@ permissions:
 jobs:
   analyze:
     name: Analyze (rust)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     permissions:
       contents: read

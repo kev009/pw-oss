@@ -19,9 +19,37 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  core:
+    name: Ubuntu core and fake backend
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    env:
+      RUSTUP_TOOLCHAIN: "1.96.0"
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the workspace MSRV
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component clippy,rustfmt
+      - name: Install SPA build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libclang-dev libpipewire-0.3-dev pkg-config
+      - name: Toolchain versions
+        run: |
+          rustc --version
+          cargo --version
+          pkg-config --modversion libspa-0.2
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint the portable core and fake backend
+        run: cargo clippy --locked -p spa-kitchen-sink-core --all-targets --features test-support -- -D warnings
+      - name: Test the portable core and fake backend
+        run: cargo test --locked -p spa-kitchen-sink-core --all-targets --features test-support
+      - name: Build the portable core at the workspace MSRV
+        run: cargo build --locked -p spa-kitchen-sink-core --release --features test-support
+
   freebsd:
     name: FreeBSD build and test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
@@ -47,20 +75,29 @@ jobs:
             cargo --version
 
             # Fail fast on style before spending time on builds.
-            echo "==> cargo fmt --check"
-            cargo fmt --check
+            echo "==> cargo fmt --all --check"
+            cargo fmt --all -- --check
 
             # Clippy before tests: same compile work, clearer signal on nits.
-            echo "==> cargo clippy --locked --all-targets -D warnings"
-            cargo clippy --locked --all-targets -- -D warnings
+            echo "==> cargo clippy --locked --workspace --all-targets -D warnings"
+            cargo clippy --locked --workspace --all-targets -- -D warnings
+
+            # Catch cfg(debug_assertions) differences before the artifact build.
+            echo "==> cargo clippy --locked --workspace --release --all-targets -D warnings"
+            cargo clippy --locked --workspace --release --all-targets -- -D warnings
 
             # Explicit release artifact (ports / SPA plugin consumers care).
-            echo "==> cargo build --locked --release"
-            cargo build --locked --release
+            echo "==> cargo build --locked --workspace --release"
+            cargo build --locked --workspace --release
 
-            echo "==> cargo test --locked"
-            cargo test --locked
+            echo "==> cargo test --locked --workspace"
+            cargo test --locked --workspace
+
+            # Print and enforce the native-header comparison separately so
+            # ABI coverage is visible in the job log even when all tests pass.
+            echo "==> FreeBSD OSS C/Rust ABI comparison"
+            cargo test --locked -p spa-kitchen-sink-freebsd-oss freebsd_oss::abi::tests::c_and_rust_abi_match -- --exact --nocapture
 
             # Optimized path: timing / DLL / wake logic can differ under -O.
-            echo "==> cargo test --locked --release --all-targets"
-            cargo test --locked --release --all-targets
+            echo "==> cargo test --locked --workspace --release --all-targets"
+            cargo test --locked --workspace --release --all-targets
