@@ -1,6 +1,6 @@
 use nix::errno::Errno;
 use std::collections::BTreeMap;
-use std::ffi::{CString, c_int};
+use std::ffi::{CString, c_char, c_int};
 
 use super::abi::*;
 use super::sys::{LibcFd, NvList, NvRef, SysctlReader};
@@ -143,6 +143,104 @@ fn mixer_control_path(path: &str) -> Option<(CString, u32)> {
         .parse::<u32>()
         .ok()?;
     Some((CString::new(format!("/dev/mixer{unit}")).ok()?, unit))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BusyOwner {
+    pid: Option<c_int>,
+    command: Option<String>,
+}
+
+fn c_char_text(value: &[c_char]) -> Option<String> {
+    let end = value
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(value.len());
+    let bytes = value[..end]
+        .iter()
+        .map(|byte| *byte as u8)
+        .collect::<Vec<_>>();
+    let text = String::from_utf8_lossy(&bytes).trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+fn select_busy_owner(
+    unit: u32,
+    play: bool,
+    infos: impl IntoIterator<Item = oss_audioinfo>,
+) -> Option<BusyOwner> {
+    let direction_cap = if play { PCM_CAP_OUTPUT } else { PCM_CAP_INPUT };
+    let open_mode = if play {
+        PCM_ENABLE_OUTPUT
+    } else {
+        PCM_ENABLE_INPUT
+    };
+    // A busy primary channel hosting vchans may precede the process-owned
+    // virtual channel and still carry the kernel's "<UNUSED>" identity.
+    // Prefer an attributed engine, while retaining an unattributed match so
+    // the diagnostic can still distinguish a busy channel from no match.
+    // ENGINEINFO cannot prove which allocation blocked the failed open, so
+    // even the preferred identity remains diagnostic context only.
+    let mut best: Option<BusyOwner> = None;
+    for info in infos.into_iter().filter(|info| {
+        info.card_number == unit as c_int
+            && info.caps & direction_cap != 0
+            && info.busy & open_mode != 0
+    }) {
+        let owner = BusyOwner {
+            pid: (info.pid > 0).then_some(info.pid),
+            command: c_char_text(&info.cmd).filter(|command| command != "<UNUSED>"),
+        };
+        if owner.pid.is_some() {
+            return Some(owner);
+        }
+        if best
+            .as_ref()
+            .is_none_or(|current| current.command.is_none() && owner.command.is_some())
+        {
+            best = Some(owner);
+        }
+    }
+    best
+}
+
+fn busy_owner(path: &str, play: bool) -> Option<BusyOwner> {
+    let (control_path, unit) = mixer_control_path(path)?;
+    let fd = LibcFd::open(&control_path, libc::O_RDONLY | libc::O_NONBLOCK)?;
+    let infos = (0..4096).map_while(|device| engine_info_at(fd.raw(), device));
+    select_busy_owner(unit, play, infos)
+}
+
+pub(super) fn open_failure_diagnostic(path: &str, play: bool, error: Errno) -> Option<String> {
+    let direction = if play { "playback" } else { "capture" };
+    match error {
+        Errno::EACCES | Errno::EPERM => Some(format!(
+            "{path}: {direction} access denied; check devfs permissions and ACLs for the PipeWire service user"
+        )),
+        Errno::EBUSY => {
+            let detail = match busy_owner(path, play) {
+                Some(BusyOwner {
+                    pid: Some(pid),
+                    command: Some(command),
+                }) => format!("held by {command}, pid {pid}"),
+                Some(BusyOwner {
+                    pid: Some(pid),
+                    command: None,
+                }) => format!("held by pid {pid}"),
+                Some(BusyOwner {
+                    pid: None,
+                    command: Some(command),
+                }) => format!("held by {command}"),
+                Some(BusyOwner {
+                    pid: None,
+                    command: None,
+                })
+                | None => "owner unavailable".to_string(),
+            };
+            Some(format!("{path}: {direction} channel is busy ({detail})"))
+        }
+        _ => None,
+    }
 }
 
 fn collect_native_rates(
@@ -633,12 +731,19 @@ impl crate::backend::DeviceCatalog for DeviceCatalog {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::ffi::c_char;
+
+    use nix::errno::Errno;
 
     use super::{
-        DeviceCatalog, PcmDevice, SndstatDspInfo, collect_native_rates, common_description,
-        exclusive_rate_fallback, mixer_control_path,
+        BusyOwner, DeviceCatalog, PcmDevice, SndstatDspInfo, collect_native_rates,
+        common_description, exclusive_rate_fallback, mixer_control_path, open_failure_diagnostic,
+        select_busy_owner,
     };
-    use crate::freebsd_oss::abi::{PCM_CAP_INPUT, PCM_CAP_OUTPUT, PCM_CAP_VIRTUAL, oss_audioinfo};
+    use crate::freebsd_oss::abi::{
+        PCM_CAP_INPUT, PCM_CAP_OUTPUT, PCM_CAP_VIRTUAL, PCM_ENABLE_INPUT, PCM_ENABLE_OUTPUT,
+        oss_audioinfo,
+    };
 
     fn pcm(desc: &str) -> PcmDevice {
         PcmDevice {
@@ -657,6 +762,112 @@ mod tests {
         info.nrates = rates.len() as u32;
         info.rates[..rates.len()].copy_from_slice(rates);
         info
+    }
+
+    fn busy_engine(unit: i32, caps: i32, busy: i32, pid: i32, command: &[u8]) -> oss_audioinfo {
+        let mut info = engine(unit, caps, &[]);
+        info.busy = busy;
+        info.pid = pid;
+        for (slot, byte) in info.cmd.iter_mut().zip(command.iter().copied()) {
+            *slot = byte as c_char;
+        }
+        info
+    }
+
+    #[test]
+    fn busy_owner_matches_pcm_unit_direction_and_open_state() {
+        let infos = [
+            busy_engine(3, PCM_CAP_OUTPUT, PCM_ENABLE_OUTPUT, 10, b"wrong-unit"),
+            busy_engine(2, PCM_CAP_INPUT, PCM_ENABLE_INPUT, 11, b"capture"),
+            busy_engine(2, PCM_CAP_OUTPUT, 0, 12, b"idle"),
+            busy_engine(2, PCM_CAP_OUTPUT, PCM_ENABLE_OUTPUT, 13, b"music\0ignored"),
+        ];
+        assert_eq!(
+            select_busy_owner(2, true, infos),
+            Some(BusyOwner {
+                pid: Some(13),
+                command: Some("music".into()),
+            })
+        );
+        assert_eq!(
+            select_busy_owner(2, false, infos),
+            Some(BusyOwner {
+                pid: Some(11),
+                command: Some("capture".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn busy_owner_prefers_attributed_vchan_over_unattributed_primary() {
+        let infos = [
+            busy_engine(2, PCM_CAP_OUTPUT, PCM_ENABLE_OUTPUT, -1, b"<UNUSED>"),
+            busy_engine(
+                2,
+                PCM_CAP_OUTPUT | PCM_CAP_VIRTUAL,
+                PCM_ENABLE_OUTPUT,
+                42,
+                b"pipewire",
+            ),
+        ];
+        assert_eq!(
+            select_busy_owner(2, true, infos),
+            Some(BusyOwner {
+                pid: Some(42),
+                command: Some("pipewire".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn busy_owner_retains_an_unattributed_busy_engine() {
+        assert_eq!(
+            select_busy_owner(
+                2,
+                true,
+                [busy_engine(
+                    2,
+                    PCM_CAP_OUTPUT,
+                    PCM_ENABLE_OUTPUT,
+                    -1,
+                    b"<UNUSED>",
+                )],
+            ),
+            Some(BusyOwner {
+                pid: None,
+                command: None,
+            })
+        );
+    }
+
+    #[test]
+    fn open_failure_diagnostic_is_limited_to_access_and_busy_errors() {
+        assert_eq!(
+            open_failure_diagnostic("/dev/dsp2", true, Errno::EACCES),
+            Some(
+                "/dev/dsp2: playback access denied; check devfs permissions and ACLs for the PipeWire service user"
+                    .into()
+            )
+        );
+        assert!(
+            open_failure_diagnostic("/dev/dsp.invalid", false, Errno::EBUSY)
+                .is_some_and(|message| message.ends_with("(owner unavailable)"))
+        );
+        assert_eq!(
+            open_failure_diagnostic("/dev/dsp2", true, Errno::ENODEV),
+            None
+        );
+    }
+
+    #[test]
+    fn unterminated_engine_command_is_bounded_by_its_abi_field() {
+        let info = busy_engine(2, PCM_CAP_OUTPUT, PCM_ENABLE_OUTPUT, 13, &[b'x'; 64]);
+        assert_eq!(
+            select_busy_owner(2, true, [info])
+                .and_then(|owner| owner.command)
+                .as_deref(),
+            Some("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+        );
     }
 
     #[test]

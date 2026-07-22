@@ -307,6 +307,10 @@ pub(crate) fn configure_capture(
     };
     if let Err(err) = stream.open() {
         crate::warn!(log, "dsp open: {}", err);
+        if let Some(diagnostic) = super::devices::open_failure_diagnostic(stream.path(), false, err)
+        {
+            crate::warn!(log, "{}", diagnostic);
+        }
         return Err(-(err as c_int));
     }
     let applied = match stream.configure(format, config.channels, config.rate, channel_order) {
@@ -358,6 +362,10 @@ pub(crate) fn configure_playback(
     };
     if let Err(err) = stream.open() {
         crate::warn!(log, "{}: open: {}", stream.path(), err);
+        if let Some(diagnostic) = super::devices::open_failure_diagnostic(stream.path(), true, err)
+        {
+            crate::warn!(log, "{}", diagnostic);
+        }
         return Err(-(err as c_int));
     }
     let applied = stream.configure(format, config.channels, config.rate, channel_order);
