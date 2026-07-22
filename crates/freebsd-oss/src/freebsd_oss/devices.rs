@@ -4,7 +4,11 @@ use std::ffi::{CString, c_int};
 
 use super::abi::*;
 use super::sys::{LibcFd, NvList, NvRef, SysctlReader};
-use crate::backend::{ConversionKind, StreamCaps, StreamConfiguration};
+use crate::backend::{
+    CatalogChange, CatalogError, CatalogGroupSnapshot, CatalogRescan, ConfigurationFlags,
+    ConversionPath, DeliveryQuantum, DeviceKey, DeviceSnapshot, EndpointKey, EndpointSnapshot,
+    QuantumQuality, RateSet, StreamCaps, StreamConfiguration, StreamDirection, StreamLocator,
+};
 
 // Ask the device what it actually supports. Two sources, merged:
 // - empirical SETCHANNELS/SPEED probes at the extremes (OSS grants the nearest
@@ -105,20 +109,32 @@ fn caps_from_sndstat(nv: &SndstatDspInfo, rates: Vec<u32>) -> StreamCaps {
     StreamCaps {
         configurations: vec![StreamConfiguration {
             formats: super::backend::formats_from_native_mask(nv.formats, nv.bitperfect),
-            min_channels: nv.min_chn.max(1),
-            max_channels: nv.max_chn.max(nv.min_chn).max(1),
-            min_rate: nv.min_rate.max(1),
-            max_rate: nv.max_rate.max(nv.min_rate).max(1),
+            channels: super::backend::channel_layouts(
+                nv.min_chn.max(1),
+                nv.max_chn.max(nv.min_chn).max(1),
+            ),
+            rates: if rates.is_empty() {
+                RateSet::Range {
+                    min: nv.min_rate.max(1),
+                    max: nv.max_rate.max(nv.min_rate).max(1),
+                }
+            } else {
+                RateSet::Discrete(rates)
+            },
             preferred_rate: None, // the native values are the preference
-            rates,
             rate_tolerance: feeder_rate_round(),
+            conversion: if nv.bitperfect {
+                ConversionPath::None
+            } else {
+                ConversionPath::Kernel
+            },
+            flags: if nv.bitperfect {
+                ConfigurationFlags::with_opaque_layout()
+            } else {
+                ConfigurationFlags::with_layout_reorder_and_opaque()
+            },
         }],
         preferred: 0,
-        conversion: if nv.bitperfect {
-            ConversionKind::None
-        } else {
-            ConversionKind::Backend
-        },
     }
 }
 
@@ -230,16 +246,17 @@ pub(crate) fn probe_caps(path: &str, play: bool) -> Option<StreamCaps> {
     Some(StreamCaps {
         configurations: vec![StreamConfiguration {
             formats: super::backend::formats_from_native_mask(formats as u32, false),
-            min_channels: min_channels as u32,
-            max_channels: max_channels as u32,
-            min_rate: min_rate as u32,
-            max_rate: max_rate as u32,
+            channels: super::backend::channel_layouts(min_channels as u32, max_channels as u32),
+            rates: RateSet::Range {
+                min: min_rate as u32,
+                max: max_rate as u32,
+            },
             preferred_rate,
-            rates: vec![], // the feeder converts; the range really is dense
             rate_tolerance: feeder_rate_round(),
+            conversion: ConversionPath::Kernel,
+            flags: ConfigurationFlags::with_layout_reorder_and_opaque(),
         }],
         preferred: 0,
-        conversion: ConversionKind::Backend,
     })
 }
 // The device's real drain quantum, as TIME: the hardware buffer blocksize of
@@ -250,24 +267,24 @@ pub(crate) fn probe_caps(path: &str, play: bool) -> Option<StreamCaps> {
 // hardware cadence governs the mix pull the same way. Time-domain so a later
 // rate renegotiation converts cleanly; drivers with rate-proportional blocks
 // (fixed frame counts) read slightly large or small across rates, which only
-// shifts a floor. 0 = unknown, use the soft fragsize alone.
-pub(crate) fn drain_quantum_ns(devnode: &str, play: bool) -> u64 {
+// shifts a floor. Unavailable means to use the soft fragment size alone.
+pub(crate) fn delivery_quantum(devnode: &str, play: bool) -> DeliveryQuantum {
     let devnode = devnode.trim_start_matches("/dev/"); // sndstat devnodes are bare
     let want_dir = if play {
         PCM_CAP_OUTPUT as u64
     } else {
         PCM_CAP_INPUT as u64
     };
-    let mut quantum: u64 = 0;
+    let mut quantum = DeliveryQuantum::unavailable();
     let Some(nvl) = sndstat_snapshot() else {
-        return 0;
+        return quantum;
     };
     for dev in nvl.root().nvlist_array(c"dsps") {
         if dev.boolean(c"from_user").unwrap_or(false) || dev.string(c"devnode") != Some(devnode) {
             continue;
         }
         let Some(p) = dev.nvlist(c"provider_info") else {
-            return 0;
+            return quantum;
         };
         for chan in p.nvlist_array(c"channel_info") {
             let caps = chan.number(c"caps").unwrap_or(0);
@@ -277,8 +294,15 @@ pub(crate) fn drain_quantum_ns(devnode: &str, play: bool) -> u64 {
             let blksz = chan.number(c"hwbuf_blksz").unwrap_or(0);
             let rate = chan.number(c"hwbuf_rate").unwrap_or(0);
             let stride = afmt_frame_bytes(chan.number(c"hwbuf_format").unwrap_or(0) as u32) as u64;
-            if blksz > 0 && rate > 0 {
-                quantum = quantum.max(blksz.saturating_mul(1_000_000_000) / (rate * stride));
+            if blksz > 0 && rate > 0 && stride > 0 {
+                let candidate = DeliveryQuantum {
+                    frames: (blksz / stride).min(u64::from(u32::MAX)) as u32,
+                    rate: rate.min(u64::from(u32::MAX)) as u32,
+                    quality: QuantumQuality::Estimated,
+                };
+                if candidate.duration_ns() > quantum.duration_ns() {
+                    quantum = candidate;
+                }
             }
         }
         break;
@@ -293,12 +317,12 @@ fn read_sndstat() -> Result<Vec<u32>, Errno> {
 }
 
 #[derive(Debug)]
-pub(crate) struct PcmDevice {
-    pub index: u32,
-    pub desc: String,
-    pub location: String,
-    pub play: bool,
-    pub rec: bool,
+struct PcmDevice {
+    index: u32,
+    desc: String,
+    location: String,
+    play: bool,
+    rec: bool,
 }
 
 pub(crate) fn read_pcm_device_description(sysctl: &mut SysctlReader, index: u32) -> Option<String> {
@@ -338,11 +362,11 @@ fn group_pcm_devices_by_parent(indexes: &[u32]) -> BTreeMap<String, Vec<u32>> {
     indexes_by_parent
 }
 
-pub(crate) fn read_device_groups() -> Result<BTreeMap<String, Vec<u32>>, Errno> {
+fn read_device_groups() -> Result<BTreeMap<String, Vec<u32>>, Errno> {
     read_sndstat().map(|indexes| group_pcm_devices_by_parent(&indexes))
 }
 
-pub(crate) fn list_audio_devices(indexes: &[u32]) -> Vec<PcmDevice> {
+fn list_audio_devices(indexes: &[u32]) -> Vec<PcmDevice> {
     let mut result = Vec::with_capacity(indexes.len());
     let mut sysctl = SysctlReader::new();
     // Direction support from the nvlist channel counts (vchans on or off);
@@ -379,8 +403,227 @@ pub(crate) fn list_audio_devices(indexes: &[u32]) -> Vec<PcmDevice> {
     result
 }
 
+fn common_description(devices: &[PcmDevice]) -> String {
+    // A sndstat group represents several PCM endpoints as one SPA device, so
+    // name it with their longest common description prefix. Drivers commonly
+    // append endpoint details in parentheses; trimming a dangling " (" keeps
+    // the shared group label readable when that suffix is where they diverge.
+    let mut description = devices[0].desc.clone();
+    for device in &devices[1..] {
+        let count = description
+            .chars()
+            .zip(device.desc.chars())
+            .take_while(|(a, b)| a == b)
+            .map(|(c, _)| c.len_utf8())
+            .sum();
+        description.truncate(count);
+    }
+    while description.ends_with(' ') || description.ends_with('(') {
+        description.truncate(description.len() - 1);
+    }
+    description
+}
+
+pub(crate) fn device_snapshot(indexes: &[u32]) -> Option<DeviceSnapshot> {
+    let devices = list_audio_devices(indexes);
+    if devices.is_empty() {
+        return None;
+    }
+    let description = common_description(&devices);
+    let mut endpoints = Vec::new();
+    for device in devices {
+        let endpoint_description = if device.desc == description && !device.location.is_empty() {
+            format!("{} @ {}", device.desc, device.location)
+        } else {
+            device.desc
+        };
+        for (direction, enabled, suffix) in [
+            (StreamDirection::Playback, device.play, "play"),
+            (StreamDirection::Capture, device.rec, "rec"),
+        ] {
+            if enabled {
+                let name = format!("pcm{}.{}", device.index, suffix);
+                endpoints.push(EndpointSnapshot {
+                    key: EndpointKey::qualified(super::identity::DEVICE_API, &name),
+                    object_id: device.index * 2 + u32::from(direction == StreamDirection::Capture),
+                    direction,
+                    name,
+                    description: endpoint_description.clone(),
+                    locator: StreamLocator::new(
+                        super::identity::DEVICE_API,
+                        super::identity::stream_path(device.index),
+                    ),
+                });
+            }
+        }
+    }
+    Some(DeviceSnapshot {
+        description,
+        endpoints,
+    })
+}
+
+fn group_snapshot(key: String, indexes: Vec<u32>) -> Option<CatalogGroupSnapshot> {
+    let object_id = *indexes.first()?;
+    let indexes_value = indexes
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    Some(CatalogGroupSnapshot {
+        properties: vec![
+            (super::identity::PARENT_DEVICE.to_string(), key.clone()),
+            (super::identity::DEVICE_INDEXES.to_string(), indexes_value),
+        ],
+        key: DeviceKey::qualified(super::identity::DEVICE_API, &key),
+        object_id,
+    })
+}
+
+pub(crate) struct DeviceCatalog {
+    groups: BTreeMap<String, Vec<u32>>,
+}
+
+impl DeviceCatalog {
+    pub(crate) const fn open_error_context() -> &'static str {
+        "Can't open /dev/sndstat"
+    }
+
+    pub(crate) const fn refresh_error_context() -> &'static str {
+        "can't re-read sndstat"
+    }
+
+    pub(crate) fn scan() -> Result<Self, CatalogError> {
+        read_device_groups()
+            .map(|groups| Self { groups })
+            .map_err(|error| CatalogError::new(error as i32, error.desc()))
+    }
+
+    pub(crate) fn snapshots(&self) -> Vec<CatalogGroupSnapshot> {
+        self.groups
+            .iter()
+            .filter_map(|(key, indexes)| group_snapshot(key.clone(), indexes.clone()))
+            .collect()
+    }
+
+    pub(super) fn rescan(&mut self, detached: &[String]) -> CatalogRescan {
+        self.rescan_with(detached, read_device_groups)
+    }
+
+    fn rescan_with(
+        &mut self,
+        detached: &[String],
+        read: impl FnOnce() -> Result<BTreeMap<String, Vec<u32>>, nix::errno::Errno>,
+    ) -> CatalogRescan {
+        let mut changes = Vec::new();
+        // Force-retract a named group before reading sndstat. A fast replug can
+        // deliver the '-' event after a replacement has attached with the same
+        // nameunit and index set; a plain old/new map diff would then look
+        // unchanged and leave nodes bound to the retired hardware instance.
+        for subject in detached {
+            let key = if let Some(unit) = subject
+                .strip_prefix("pcm")
+                .and_then(|unit| unit.parse::<u32>().ok())
+            {
+                self.groups
+                    .iter()
+                    .find(|(_, indexes)| indexes.contains(&unit))
+                    .map(|(key, _)| key.clone())
+            } else if self.groups.contains_key(subject) {
+                Some(subject.clone())
+            } else {
+                None
+            };
+            if let Some(key) = key
+                && let Some(indexes) = self.groups.remove(&key)
+                && let Some(object_id) = indexes.first().copied()
+            {
+                changes.push(CatalogChange::Removed {
+                    object_id,
+                    diagnostic: format!("{key} ({indexes:?}) on detach"),
+                });
+            }
+        }
+
+        let new_groups = match read() {
+            Ok(groups) => groups,
+            Err(error) => {
+                return CatalogRescan {
+                    changes,
+                    error: Some(CatalogError::new(error as i32, error.desc())),
+                };
+            }
+        };
+        let old_groups = std::mem::replace(&mut self.groups, new_groups);
+        for (key, indexes) in &old_groups {
+            if self.groups.get(key) != Some(indexes)
+                && let Some(object_id) = indexes.first().copied()
+            {
+                changes.push(CatalogChange::Removed {
+                    object_id,
+                    diagnostic: format!("{key} ({indexes:?})"),
+                });
+            }
+        }
+        for (key, indexes) in &self.groups {
+            if old_groups.get(key) != Some(indexes)
+                && let Some(snapshot) = group_snapshot(key.clone(), indexes.clone())
+            {
+                changes.push(CatalogChange::Added {
+                    snapshot,
+                    diagnostic: format!("{key} ({indexes:?})"),
+                });
+            }
+        }
+        CatalogRescan {
+            changes,
+            error: None,
+        }
+    }
+}
+
+impl crate::backend::DeviceCatalog for DeviceCatalog {
+    fn open_error_context() -> &'static str {
+        Self::open_error_context()
+    }
+
+    fn refresh_error_context() -> &'static str {
+        Self::refresh_error_context()
+    }
+
+    fn scan() -> Result<Self, CatalogError> {
+        Self::scan()
+    }
+
+    fn snapshots(&self) -> Vec<CatalogGroupSnapshot> {
+        self.snapshots()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use super::{DeviceCatalog, PcmDevice, common_description};
+
+    fn pcm(desc: &str) -> PcmDevice {
+        PcmDevice {
+            index: 0,
+            desc: desc.to_string(),
+            location: String::new(),
+            play: true,
+            rec: false,
+        }
+    }
+
+    #[test]
+    fn common_description_stops_at_a_utf8_character_boundary() {
+        assert_eq!(
+            common_description(&[pcm("Beyoncé DAC"), pcm("Beyoncê ADC")]),
+            "Beyonc"
+        );
+    }
+
     #[test]
     fn pcm_format_widths_cover_u8_float_and_three_byte_24() {
         const STEREO: u32 = 2 << 20;
@@ -394,14 +637,62 @@ mod tests {
     }
 
     #[test]
-    fn drain_quantum_probe() {
+    fn detach_survives_a_failed_catalog_read() {
+        let mut catalog = DeviceCatalog {
+            groups: BTreeMap::from([("usb-dac".to_string(), vec![3, 4])]),
+        };
+
+        let result = catalog.rescan_with(&["pcm3".to_string()], || Err(nix::errno::Errno::EIO));
+
+        assert_eq!(
+            result.changes,
+            vec![crate::backend::CatalogChange::Removed {
+                object_id: 3,
+                diagnostic: "usb-dac ([3, 4]) on detach".into(),
+            }]
+        );
+        assert!(result.error.is_some());
+        assert!(catalog.groups.is_empty());
+    }
+
+    #[test]
+    fn detach_retracts_and_readds_an_identical_replacement() {
+        let mut catalog = DeviceCatalog {
+            groups: BTreeMap::from([("usb-dac".to_string(), vec![3, 4])]),
+        };
+
+        let result = catalog.rescan_with(&["pcm3".to_string()], || {
+            Ok(BTreeMap::from([("usb-dac".to_string(), vec![3, 4])]))
+        });
+
+        assert!(result.error.is_none());
+        assert_eq!(result.changes.len(), 2);
+        assert!(matches!(
+            &result.changes[0],
+            crate::backend::CatalogChange::Removed {
+                object_id: 3,
+                diagnostic
+            } if diagnostic == "usb-dac ([3, 4]) on detach"
+        ));
+        assert!(matches!(
+            &result.changes[1],
+            crate::backend::CatalogChange::Added { snapshot, diagnostic }
+                if snapshot.key.as_str() == "freebsd-oss:usb-dac"
+                    && snapshot.object_id == 3
+                    && diagnostic == "usb-dac ([3, 4])"
+        ));
+    }
+
+    #[test]
+    #[ignore = "manual FreeBSD hardware probe"]
+    fn delivery_quantum_probe() {
         for unit in [0u32, 1, 6] {
             let node = format!("/dev/dsp{unit}"); // the production string shape
             println!(
-                "{}: play {} ns, rec {} ns",
+                "{}: play {:?}, rec {:?}",
                 node,
-                super::drain_quantum_ns(&node, true),
-                super::drain_quantum_ns(&node, false)
+                super::delivery_quantum(&node, true),
+                super::delivery_quantum(&node, false)
             );
         }
     }
