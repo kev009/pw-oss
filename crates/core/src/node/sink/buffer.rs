@@ -60,7 +60,14 @@ pub(super) fn retune_period<B: backend::Backend>(
     now: u64,
     log: &Log,
 ) -> RetuneOutcome {
-    let current_fill = measured_fill(port);
+    // Start and suspend-based recovery both reach retune before the prime
+    // phase transitions the backend from Setup to Running. Queue state is
+    // undefined in Setup, and an unprimed backend cannot retune anyway.
+    let current_fill = if port.dsp.is_running() {
+        measured_fill(port)
+    } else {
+        0
+    };
     let request = PlaybackBufferRequest {
         period_bytes: period_in_bytes,
         // A live retune reuses the established backend capacity; graph_rate

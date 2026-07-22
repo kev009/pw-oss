@@ -938,6 +938,38 @@ fn retune_reprime_discards_the_queue_and_resets_node_state() {
     unsafe { libc::close(r) };
 }
 
+// A Start command makes the node runnable but does not trigger the OSS
+// channel. The first data cycle therefore retunes while the stream is still
+// in Setup, then primes it. Keep that pre-prime retune away from Running-only
+// queue and xrun observations.
+#[test]
+fn first_start_cycle_retunes_before_prime_without_sampling_setup_state() {
+    let (r, w) = pipe_pair(true, true);
+    let mut port = test_port(w, 4096, 2048);
+    port.dsp = FakeStream::new("fake://first-start");
+    port.config = Some(PortConfig {
+        format: libspa::param::audio::AudioFormat::S16LE,
+        rate: 48_000,
+        channels: 4,
+        positions: vec![],
+        flags: 0,
+        stride: 8,
+    });
+    let log = Log::test_null();
+
+    assert!(!port.dsp.is_running());
+    assert_eq!(
+        retune_period(&mut port, 4096, 8, 4096, 0, &log),
+        RetuneOutcome::Unchanged
+    );
+    assert!(!port.dsp.is_running());
+
+    prime_playback(&mut port, 4096, 48_000, &FakeProperties::new(true), &log);
+    assert!(port.dsp.is_running());
+    assert_eq!(port.setup_period, 4096);
+    unsafe { libc::close(r) };
+}
+
 // zero-period geometry is never committed: setup_period == 0
 // short-circuits retune_period, so a commit here would wedge the
 // geometry until a full rebuild (the prime gate in process_ports is

@@ -291,10 +291,6 @@ fn retune_reprime_discards_capture_backlog_and_resets_the_epoch() {
 
     assert!(!retune_period(&mut port, 2048, &log));
     assert!(!port.dsp.is_running());
-    assert_eq!(
-        <FakeStream as backend::CaptureOperations>::queued_bytes(&port.dsp),
-        0
-    );
     assert_eq!(port.setup_period, 1024);
     assert!(!port.ext.retune_pending);
     assert!(!port.ext.primed);
@@ -319,6 +315,11 @@ fn retune_reprime_discards_capture_backlog_and_resets_the_epoch() {
     assert!(port.dsp.is_running());
     assert!(port.ext.primed);
     assert_eq!(port.setup_period, 2048);
+    assert_eq!(
+        <FakeStream as backend::CaptureOperations>::queued_bytes(&port.dsp),
+        0,
+        "the suspend-based re-prime discarded the old capture backlog"
+    );
     assert!(cycle.iter().all(|&byte| byte == 0));
     unsafe { libc::close(w) };
 }

@@ -920,7 +920,9 @@ pub trait CaptureOperations: StreamLifecycle {
         log: &Log,
     ) -> CaptureRetune;
     fn read(&mut self, data: &mut [u8]) -> ReadOutcome;
+    /// Observe the live capture queue. The stream must be running.
     fn queued_bytes(&self) -> u32;
+    /// Observe live capture overruns. The stream must be running.
     fn overruns(&self) -> XrunObservation;
     fn recover_overrun(
         &mut self,
@@ -957,7 +959,9 @@ pub trait PlaybackOperations: StreamLifecycle {
     fn write(&mut self, data: &[u8]) -> WriteOutcome;
     fn write_silence(&mut self, bytes: u32);
     fn end_buffer_sequence(&mut self) -> bool;
+    /// Observe the live playback queue. The stream must be running.
     fn queued_bytes(&self) -> u32;
+    /// Observe live playback underruns. The stream must be running.
     fn underruns(&self) -> XrunObservation;
     fn log_underrun_recovery(&self, count: u32, now_ns: u64, suppressed: u32, log: &Log);
     fn log_ignored_underruns(

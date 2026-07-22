@@ -849,10 +849,12 @@ impl CaptureOperations for FakeStream {
     }
 
     fn queued_bytes(&self) -> u32 {
+        assert!(self.running, "capture queue sampled before prime");
         self.capture.len().min(u32::MAX as usize) as u32
     }
 
     fn overruns(&self) -> XrunObservation {
+        assert!(self.running, "capture overruns sampled before prime");
         XrunObservation {
             counter: XrunCounter::PRIMARY,
             value: u64::from(self.xruns),
@@ -997,10 +999,12 @@ impl PlaybackOperations for FakeStream {
     }
 
     fn queued_bytes(&self) -> u32 {
+        assert!(self.running, "playback queue sampled before prime");
         self.queued_playback_bytes()
     }
 
     fn underruns(&self) -> XrunObservation {
+        assert!(self.running, "playback underruns sampled before prime");
         XrunObservation {
             counter: XrunCounter::PRIMARY,
             value: u64::from(self.xruns),
@@ -1247,6 +1251,18 @@ mod tests {
     #[test]
     fn clearing_overrun_recovery_keeps_the_observed_counter() {
         let mut stream = FakeStream::new("fake://overrun-observation");
+        let _ = <FakeStream as CaptureOperations>::prime_buffer(
+            &mut stream,
+            CaptureBufferRequest {
+                period_bytes: 1024,
+                graph_rate: 48_000,
+                stride: 4,
+                device_rate: 48_000,
+            },
+            &FakeProperties::new(false),
+            &mut [],
+            &Log::test_null(),
+        );
         stream.inject_xruns(4);
         stream.overrun_observations = 2;
 
