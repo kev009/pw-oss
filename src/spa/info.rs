@@ -5,7 +5,7 @@ pub(crate) unsafe fn for_each_dict_item(dict: &spa_dict, mut apply: impl FnMut(&
         return;
     }
     let len = dict.n_items as usize;
-    if !crate::spa::raw_slice_len_ok::<spa_dict_item>(len) {
+    if !raw_slice_len_ok::<spa_dict_item>(len) {
         return;
     }
     // items is non-null (checked above) and valid for n_items per the caller

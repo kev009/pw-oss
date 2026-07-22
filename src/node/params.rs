@@ -1,6 +1,7 @@
 use super::events::{emit_node_info, handle_process_latency};
 use super::*;
 use crate::platform;
+use crate::spa::{self, Log, deserialize_pod};
 
 // Updates accepted from a Props pod. None means the property was absent.
 // The sink consumes playback_delay_eighths and the source ignores it. Capping
@@ -24,10 +25,7 @@ pub(crate) enum NodeParamRequest {
 // Parse a deserialized Props object. The adapter owns soft-volume properties,
 // unknown keys are logged and skipped, and invalid platform stream values are
 // ignored.
-pub(super) fn parse_props_update(
-    properties: Vec<libspa::pod::Property>,
-    log: &crate::spa::Log,
-) -> PropsUpdate {
+pub(super) fn parse_props_update(properties: Vec<libspa::pod::Property>, log: &Log) -> PropsUpdate {
     use libspa::pod::Value;
 
     let mut update = PropsUpdate::default();
@@ -107,8 +105,8 @@ pub(crate) fn apply_node_param<D: Direction>(
                 info.ns = ns;
                 handle_process_latency(state, info);
             }
-            if let Some(delay) = update.playback_delay_eighths {
-                let res = D::apply_playback_delay(state, data, delay);
+            if let Some(delay_eighths) = update.playback_delay_eighths {
+                let res = D::apply_playback_delay(state, data, delay_eighths);
                 if res != 0 {
                     return res;
                 }
@@ -135,7 +133,7 @@ pub(crate) fn apply_node_param<D: Direction>(
             0
         }
         NodeParamRequest::ResetProcessLatency => {
-            handle_process_latency(state, crate::spa::process_latency_default());
+            handle_process_latency(state, spa::process_latency_default());
             0
         }
         NodeParamRequest::ProcessLatency(info) => {
@@ -167,7 +165,7 @@ pub(super) unsafe extern "C" fn set_param<D: Direction>(
                 NodeParamRequest::ResetProps
             } else {
                 // Deserialize before borrowing State.
-                match unsafe { crate::spa::deserialize_pod(param) } {
+                match unsafe { deserialize_pod(param) } {
                     Some(Value::Object(Object {
                         type_, properties, ..
                     })) if type_ == SPA_TYPE_OBJECT_Props => {
@@ -182,8 +180,8 @@ pub(super) unsafe extern "C" fn set_param<D: Direction>(
                 NodeParamRequest::ResetProcessLatency
             } else {
                 // Deserialize before borrowing State.
-                let value = unsafe { crate::spa::deserialize_pod(param) };
-                match crate::spa::parse_process_latency_info(value.as_ref()) {
+                let value = unsafe { deserialize_pod(param) };
+                match spa::parse_process_latency_info(value.as_ref()) {
                     Some(info) => NodeParamRequest::ProcessLatency(info),
                     None => return -libc::EINVAL,
                 }
@@ -211,13 +209,14 @@ pub(super) unsafe extern "C" fn set_param<D: Direction>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::spa::pod_prop;
     // Known Props populate the update; adapter-owned, unknown, and invalid
     // values are ignored.
     #[test]
     fn props_update_parses_known_keys_and_drops_the_rest() {
-        use crate::spa::pod_prop;
         use libspa::pod::Value;
-        let log = crate::spa::Log::test_null();
+        use pod_prop;
+        let log = Log::test_null();
 
         let params = Value::Struct(vec![
             Value::String(platform::PLAYBACK_DELAY.into()),

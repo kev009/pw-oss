@@ -12,7 +12,7 @@
 
 use std::ffi::{CString, c_char, c_int, c_uint, c_ulong};
 
-use crate::freebsd::{LibcFd, ioctl_int, ioctl_read};
+use crate::freebsd::{IoctlPod, LibcFd, ioctl_int, ioctl_read};
 
 pub(crate) const SOUND_MIXER_VOLUME: c_uint = 0;
 pub(crate) const SOUND_MIXER_PCM: c_uint = 4;
@@ -46,7 +46,7 @@ struct MixerInfo {
     fillers: [c_int; 10],
 }
 
-unsafe impl crate::freebsd::IoctlPod for MixerInfo {}
+unsafe impl IoctlPod for MixerInfo {}
 
 fn read_req(dev: c_uint) -> c_ulong {
     nix::request_code_read!(b'M', dev, size_of::<c_int>())

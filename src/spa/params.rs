@@ -283,7 +283,7 @@ pub(crate) fn build_latency_offset_props(ns: i64, params: &[(&str, u32)]) -> Vec
 
     let mut properties = vec![pod_prop(SPA_PROP_latencyOffsetNsec, Value::Long(ns))];
 
-    // custom key/value props (oss.delay, oss.fragment) ride in the params struct
+    // Custom key/value properties ride in the params struct.
     if !params.is_empty() {
         let fields = params
             .iter()
@@ -402,8 +402,10 @@ mod pod_tests {
 
         // the sink's Props shape: a long, plus the params struct of
         // string/int pairs
-        let pod =
-            super::build_latency_offset_props(50_000_000, &[("oss.delay", 4), ("oss.fragment", 0)]);
+        let pod = super::build_latency_offset_props(
+            50_000_000,
+            &[("stream.delay", 4), ("stream.fragment", 0)],
+        );
         assert_eq!(
             super::parse_back(&pod),
             Value::Object(Object {
@@ -414,9 +416,9 @@ mod pod_tests {
                     super::pod_prop(
                         SPA_PROP_params,
                         Value::Struct(vec![
-                            Value::String("oss.delay".to_string()),
+                            Value::String("stream.delay".to_string()),
                             Value::Int(4),
-                            Value::String("oss.fragment".to_string()),
+                            Value::String("stream.fragment".to_string()),
                             Value::Int(0),
                         ]),
                     ),
@@ -440,7 +442,7 @@ mod tests {
         let build = |state: &mut Vec<i32>, index: u32| {
             let value = state[index as usize];
             built.push(value);
-            ParamStep::Built(crate::spa::serialize_pod(&libspa::pod::Value::Int(value)))
+            ParamStep::Built(serialize_pod(&libspa::pod::Value::Int(value)))
         };
         let emit = |index: u32, _param: *mut spa_pod| {
             if index == 0 {

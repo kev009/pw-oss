@@ -1,5 +1,6 @@
+use super::super::sink::SinkDir;
 use super::*;
-use crate::node::sink::SinkDir;
+use crate::spa::ListenerList;
 
 struct ReentrantInfoContext {
     events: *const NodeEvents<SinkDir>,
@@ -97,7 +98,7 @@ unsafe extern "C" fn add_node_listener_during_dispatch(
     }
     let events = unsafe { &*context.events };
     events.with_node_info(|info| info.set_max_input_ports(3));
-    let initial = |hooks: &crate::spa::ListenerList<spa_node_events>| {
+    let initial = |hooks: &ListenerList<spa_node_events>| {
         let (node, _port) = events.initial_snapshots();
         hooks.emit(|f, data| {
             if let Some(info) = f.info {

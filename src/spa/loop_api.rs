@@ -304,7 +304,7 @@ impl<T> SendWrap<T> {
 // stack borrows sound, so no 'static is needed). Returns false when the
 // invoke failed or the closure panicked - the closure then may not have run.
 pub(crate) unsafe fn block_on_loop<T, F: FnOnce(&mut T) + Send>(
-    loop_: &crate::spa::Loop,
+    loop_: &Loop,
     target: *mut T,
     f: F,
 ) -> bool {
@@ -357,10 +357,7 @@ pub(crate) unsafe fn block_on_loop<T, F: FnOnce(&mut T) + Send>(
 // # Safety
 // The loop must outlive the queued item's execution: host loops come from
 // the spa_support array and live for the plugin host's lifetime.
-pub(crate) unsafe fn queue_task<F: FnOnce() + Send + 'static>(
-    loop_: &crate::spa::Loop,
-    f: F,
-) -> bool {
+pub(crate) unsafe fn queue_task<F: FnOnce() + Send + 'static>(loop_: &Loop, f: F) -> bool {
     unsafe extern "C" fn trampoline<F: FnOnce() + Send + 'static>(
         _loop: *mut libspa::sys::spa_loop,
         _async: bool,

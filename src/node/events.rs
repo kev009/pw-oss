@@ -1,18 +1,22 @@
 use super::*;
+use crate::spa::{
+    self, ListenerList, LocalListenerTarget, NodeInfo, ParamStep, PortInfo,
+    SPA_NODE_CHANGE_MASK_ALL, SPA_PORT_CHANGE_MASK_ALL, SendWrap, enum_params_loop,
+};
 
 #[cfg(test)]
 mod tests;
 
 struct EventInfo {
-    node: crate::spa::NodeInfo,
-    port: crate::spa::PortInfo,
+    node: NodeInfo,
+    port: PortInfo,
 }
 
 enum NodeNotification {
-    Node(Box<crate::spa::NodeInfo>),
-    Port(Box<crate::spa::PortInfo>),
+    Node(Box<NodeInfo>),
+    Port(Box<PortInfo>),
     Done(c_int),
-    ActivateListeners(std::sync::Arc<crate::spa::ListenerList<spa_node_events>>),
+    ActivateListeners(std::sync::Arc<ListenerList<spa_node_events>>),
 }
 
 struct PendingNodeNotifications {
@@ -25,10 +29,10 @@ struct PendingNodeNotifications {
 // invalidate the live payload. Cross-loop code receives only the atomic
 // publication counter and MainEventTarget, never this listener endpoint.
 pub(super) struct NodeEvents<D: Direction> {
-    pub(super) hooks: crate::spa::ListenerList<spa_node_events>,
+    pub(super) hooks: ListenerList<spa_node_events>,
     info: std::sync::Mutex<EventInfo>,
     pending: std::sync::Mutex<PendingNodeNotifications>,
-    result_target: crate::spa::LocalListenerTarget<spa_node_events>,
+    result_target: LocalListenerTarget<spa_node_events>,
     // Deferred main-loop delivery upgrades this weak self-reference before it
     // invokes listeners. The resulting Rc keeps the endpoint alive if a
     // listener synchronously destroys the node.
@@ -117,16 +121,16 @@ impl<D: Direction> Drop for NodeDispatchClaim<'_, D> {
 impl<D: Direction> NodeEvents<D> {
     pub(super) fn new() -> std::rc::Rc<Self> {
         std::rc::Rc::new_cyclic(|self_weak| Self {
-            hooks: crate::spa::ListenerList::new(),
+            hooks: ListenerList::new(),
             info: std::sync::Mutex::new(EventInfo {
-                node: crate::spa::NodeInfo::new(),
-                port: crate::spa::PortInfo::new(),
+                node: NodeInfo::new(),
+                port: PortInfo::new(),
             }),
             pending: std::sync::Mutex::new(PendingNodeNotifications {
                 queue: std::collections::VecDeque::new(),
                 dispatching: false,
             }),
-            result_target: crate::spa::LocalListenerTarget::new(),
+            result_target: LocalListenerTarget::new(),
             self_weak: self_weak.clone(),
             format_publication: FormatPublication::new(),
             _direction: std::marker::PhantomData,
@@ -137,37 +141,26 @@ impl<D: Direction> NodeEvents<D> {
         self.format_publication.clone()
     }
 
-    pub(super) fn with_info<R>(
-        &self,
-        apply: impl FnOnce(&mut crate::spa::NodeInfo, &mut crate::spa::PortInfo) -> R,
-    ) -> R {
+    pub(super) fn with_info<R>(&self, apply: impl FnOnce(&mut NodeInfo, &mut PortInfo) -> R) -> R {
         let mut info = self.info.lock_unpoisoned();
         let EventInfo { node, port } = &mut *info;
         apply(node, port)
     }
 
-    pub(super) fn with_node_info<R>(
-        &self,
-        apply: impl FnOnce(&mut crate::spa::NodeInfo) -> R,
-    ) -> R {
+    pub(super) fn with_node_info<R>(&self, apply: impl FnOnce(&mut NodeInfo) -> R) -> R {
         self.with_info(|node, _port| apply(node))
     }
 
-    pub(super) fn with_port_info<R>(
-        &self,
-        apply: impl FnOnce(&mut crate::spa::PortInfo) -> R,
-    ) -> R {
+    pub(super) fn with_port_info<R>(&self, apply: impl FnOnce(&mut PortInfo) -> R) -> R {
         self.with_info(|_node, port| apply(port))
     }
 
-    pub(super) fn initial_snapshots(
-        &self,
-    ) -> (Box<crate::spa::NodeInfo>, Box<crate::spa::PortInfo>) {
+    pub(super) fn initial_snapshots(&self) -> (Box<NodeInfo>, Box<PortInfo>) {
         self.with_info(|node, port| {
             let mut node = node.snapshot();
             let mut port = port.snapshot();
-            let _ = node.replace_change_mask(crate::spa::SPA_NODE_CHANGE_MASK_ALL as u64);
-            let _ = port.replace_change_mask(crate::spa::SPA_PORT_CHANGE_MASK_ALL as u64);
+            let _ = node.replace_change_mask(SPA_NODE_CHANGE_MASK_ALL as u64);
+            let _ = port.replace_change_mask(SPA_PORT_CHANGE_MASK_ALL as u64);
             (node, port)
         })
     }
@@ -213,7 +206,7 @@ impl<D: Direction> NodeEvents<D> {
         listener: *mut spa_hook,
         events: *const spa_node_events,
         data: *mut c_void,
-        initial: impl FnOnce(&crate::spa::ListenerList<spa_node_events>) -> R,
+        initial: impl FnOnce(&ListenerList<spa_node_events>) -> R,
     ) -> R {
         let deferred = {
             let mut pending = self.pending.lock_unpoisoned();
@@ -223,7 +216,7 @@ impl<D: Direction> NodeEvents<D> {
                 // Keep a local owner through that callback; listener access
                 // itself remains main-loop-only.
                 #[expect(clippy::arc_with_non_send_sync)]
-                let hooks = std::sync::Arc::new(crate::spa::ListenerList::new());
+                let hooks = std::sync::Arc::new(ListenerList::new());
                 pending
                     .queue
                     .push_back(NodeNotification::ActivateListeners(hooks.clone()));
@@ -348,7 +341,7 @@ impl<D: Direction> NodeEvents<D> {
     // SAFETY: no associated State reference may be live.
     pub(super) unsafe fn emit_result(&self, seq: c_int, result: &spa_result_node_params) {
         self.result_target.with_current(&self.hooks, |hooks| {
-            crate::spa::node_emit_result(hooks, seq, 0, SPA_RESULT_TYPE_NODE_PARAMS, result);
+            spa::node_emit_result(hooks, seq, 0, SPA_RESULT_TYPE_NODE_PARAMS, result);
         });
     }
 }
@@ -363,7 +356,7 @@ pub(super) unsafe extern "C" fn add_listener<D: Direction>(
     assert!(!state.is_null(), "object is not supposed to be null");
     let node_events = unsafe { main_ref(state).events.clone() };
 
-    let initial = |hooks: &crate::spa::ListenerList<spa_node_events>| {
+    let initial = |hooks: &ListenerList<spa_node_events>| {
         // The initial emissions only reach the newly added listener (the list
         // is isolated). One method per traversal, mirroring C's
         // spa_hook_list_call: a listener that removes and frees its hook
@@ -461,7 +454,7 @@ pub(super) unsafe extern "C" fn set_callbacks<D: Direction>(
     // on_wake/process call the table from the data loop; store it there.
     // SAFETY: a by-value table copy plus the host data pointer, which stays
     // valid while set (the same contract)
-    let new_callbacks = unsafe { crate::spa::SendWrap::new(new_callbacks) };
+    let new_callbacks = unsafe { SendWrap::new(new_callbacks) };
     let control = unsafe { DataControl::from_raw(state) };
     if !control.invoke(move |state| state.callbacks = new_callbacks.into_inner()) {
         return -libc::EIO;
@@ -512,15 +505,15 @@ pub(super) unsafe extern "C" fn enum_params<D: Direction>(
     let main = unsafe { main_ptr(state) };
 
     unsafe {
-        crate::spa::enum_params_loop(
+        enum_params_loop(
             main,
             (start, max),
             filter,
             |state, index| match D::build_node_param(state, id, index) {
-                ParamBuild::Built(pod) => crate::spa::ParamStep::Built(pod),
-                ParamBuild::Exhausted => crate::spa::ParamStep::Stop(0),
+                ParamBuild::Built(pod) => ParamStep::Built(pod),
+                ParamBuild::Exhausted => ParamStep::Stop(0),
                 // unknown param id (ALSA convention)
-                ParamBuild::Unknown => crate::spa::ParamStep::Stop(-libc::ENOENT),
+                ParamBuild::Unknown => ParamStep::Stop(-libc::ENOENT),
             },
             |index, param| emit_param_result(&events, seq, id, index, param),
         )
