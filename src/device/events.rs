@@ -1,4 +1,10 @@
 use super::*;
+use crate::platform;
+use crate::spa::{
+    self, DeviceInfo, Dictionary, ListenerList, LocalDispatchGuard, LocalListenerTarget,
+    LocalNotificationQueue, SPA_DEVICE_CHANGE_MASK_ALL, SPA_DEVICE_OBJECT_CHANGE_MASK_ALL, key,
+    pod_prop,
+};
 
 #[cfg(test)]
 mod tests;
@@ -8,10 +14,10 @@ mod tests;
 // All device methods run on the main loop; Rc/RefCell express that ownership
 // without claiming cross-thread access.
 pub(super) struct DeviceEvents {
-    pub(super) hooks: crate::spa::ListenerList<spa_device_events>,
-    pub(super) info: std::cell::RefCell<crate::spa::DeviceInfo>,
-    pub(super) pending: crate::spa::LocalNotificationQueue<DeviceNotification>,
-    result_target: crate::spa::LocalListenerTarget<spa_device_events>,
+    pub(super) hooks: ListenerList<spa_device_events>,
+    pub(super) info: std::cell::RefCell<DeviceInfo>,
+    pub(super) pending: LocalNotificationQueue<DeviceNotification>,
+    result_target: LocalListenerTarget<spa_device_events>,
 }
 
 pub(super) enum DeviceObjectEvent {
@@ -27,34 +33,34 @@ pub(super) enum DeviceObjectEvent {
 }
 
 pub(super) enum DeviceNotification {
-    Info(Box<crate::spa::DeviceInfo>),
+    Info(Box<DeviceInfo>),
     Object(DeviceObjectEvent),
     Event(Vec<u8>),
     Done(c_int),
-    ActivateListeners(std::rc::Rc<crate::spa::ListenerList<spa_device_events>>),
+    ActivateListeners(std::rc::Rc<ListenerList<spa_device_events>>),
 }
 
 impl DeviceEvents {
     pub(super) fn new() -> Self {
         Self {
-            hooks: crate::spa::ListenerList::new(),
-            info: std::cell::RefCell::new(crate::spa::DeviceInfo::new()),
-            pending: crate::spa::LocalNotificationQueue::new(),
-            result_target: crate::spa::LocalListenerTarget::new(),
+            hooks: ListenerList::new(),
+            info: std::cell::RefCell::new(DeviceInfo::new()),
+            pending: LocalNotificationQueue::new(),
+            result_target: LocalListenerTarget::new(),
         }
     }
 
-    pub(super) fn with_info<R>(&self, apply: impl FnOnce(&mut crate::spa::DeviceInfo) -> R) -> R {
+    pub(super) fn with_info<R>(&self, apply: impl FnOnce(&mut DeviceInfo) -> R) -> R {
         apply(&mut self.info.borrow_mut())
     }
 
-    pub(super) fn initial_info(&self) -> Box<crate::spa::DeviceInfo> {
+    pub(super) fn initial_info(&self) -> Box<DeviceInfo> {
         let mut snapshot = self.info.borrow().snapshot();
-        let _ = snapshot.replace_change_mask(crate::spa::SPA_DEVICE_CHANGE_MASK_ALL as u64);
+        let _ = snapshot.replace_change_mask(SPA_DEVICE_CHANGE_MASK_ALL as u64);
         snapshot
     }
 
-    pub(super) fn take_info(&self) -> Box<crate::spa::DeviceInfo> {
+    pub(super) fn take_info(&self) -> Box<DeviceInfo> {
         let mut info = self.info.borrow_mut();
         let snapshot = info.snapshot();
         let _ = info.replace_change_mask(0);
@@ -63,7 +69,7 @@ impl DeviceEvents {
 
     // SAFETY: no reference into the associated State may be live; listener
     // code may synchronously re-enter any device method.
-    pub(super) unsafe fn emit_info(&self, snapshot: &crate::spa::DeviceInfo) {
+    pub(super) unsafe fn emit_info(&self, snapshot: &DeviceInfo) {
         unsafe { self.emit_info_on(&self.hooks, snapshot) };
     }
 
@@ -71,8 +77,8 @@ impl DeviceEvents {
     // isolated activation batch with the same event-table type.
     pub(super) unsafe fn emit_info_on(
         &self,
-        hooks: &crate::spa::ListenerList<spa_device_events>,
-        snapshot: &crate::spa::DeviceInfo,
+        hooks: &ListenerList<spa_device_events>,
+        snapshot: &DeviceInfo,
     ) {
         hooks.emit(|f, data| {
             if let Some(info) = f.info {
@@ -95,7 +101,7 @@ impl DeviceEvents {
     // SAFETY: as emit_info().
     pub(super) unsafe fn emit_result(&self, seq: c_int, result: &spa_result_device_params) {
         self.result_target.with_current(&self.hooks, |hooks| {
-            crate::spa::dev_emit_result(hooks, seq, 0, SPA_RESULT_TYPE_DEVICE_PARAMS, result);
+            spa::dev_emit_result(hooks, seq, 0, SPA_RESULT_TYPE_DEVICE_PARAMS, result);
         });
     }
 
@@ -107,7 +113,7 @@ impl DeviceEvents {
     // SAFETY: as emit_info_on().
     pub(super) unsafe fn emit_object_on(
         &self,
-        hooks: &crate::spa::ListenerList<spa_device_events>,
+        hooks: &ListenerList<spa_device_events>,
         event: &DeviceObjectEvent,
     ) {
         match event {
@@ -123,16 +129,13 @@ impl DeviceEvents {
                 route_count,
             } => {
                 let index = *id / 2;
-                let mut dict = crate::spa::Dictionary::new();
+                let mut dict = Dictionary::new();
                 dict.add_item(
-                    crate::spa::key(SPA_KEY_NODE_NAME),
+                    key(SPA_KEY_NODE_NAME),
                     format!("pcm{index}.{}", if *rec { "rec" } else { "play" }),
                 );
-                dict.add_item(
-                    crate::spa::key(SPA_KEY_NODE_DESCRIPTION),
-                    description.as_str(),
-                );
-                dict.add_item(crate::keys::OSS_DSP_PATH, format!("/dev/dsp{index}"));
+                dict.add_item(key(SPA_KEY_NODE_DESCRIPTION), description.as_str());
+                dict.add_item(platform::STREAM_PATH, platform::stream_path(index));
                 if *route_count > 0 {
                     dict.add_item("card.profile.device", format!("{id}"));
                     dict.add_item("device.routes", format!("{route_count}"));
@@ -141,11 +144,11 @@ impl DeviceEvents {
                     version: SPA_VERSION_DEVICE_OBJECT_INFO,
                     type_: SPA_TYPE_INTERFACE_Node.as_ptr().cast(),
                     factory_name: if *rec {
-                        c"freebsd-oss.source".as_ptr()
+                        platform::SOURCE_FACTORY_NAME.as_ptr()
                     } else {
-                        c"freebsd-oss.sink".as_ptr()
+                        platform::SINK_FACTORY_NAME.as_ptr()
                     },
-                    change_mask: crate::spa::SPA_DEVICE_OBJECT_CHANGE_MASK_ALL as u64,
+                    change_mask: SPA_DEVICE_OBJECT_CHANGE_MASK_ALL as u64,
                     flags: 0,
                     props: dict.raw(),
                 };
@@ -189,10 +192,10 @@ impl DeviceEvents {
         listener: *mut spa_hook,
         events: *const spa_device_events,
         data: *mut c_void,
-        initial: impl FnOnce(&crate::spa::ListenerList<spa_device_events>) -> R,
+        initial: impl FnOnce(&ListenerList<spa_device_events>) -> R,
     ) -> R {
         let deferred = self.pending.defer_when_busy(|| {
-            let hooks = std::rc::Rc::new(crate::spa::ListenerList::new());
+            let hooks = std::rc::Rc::new(ListenerList::new());
             (DeviceNotification::ActivateListeners(hooks.clone()), hooks)
         });
         let hooks = deferred.as_deref().unwrap_or(&self.hooks);
@@ -206,18 +209,13 @@ impl DeviceEvents {
     // Claim the main-loop endpoint's dispatch turn. Reentrant methods append
     // complete transactions to the FIFO and return; the outer owner drains
     // them after finishing its current transaction.
-    pub(super) fn begin_dispatch(
-        &self,
-    ) -> Option<crate::spa::LocalDispatchGuard<'_, DeviceNotification>> {
+    pub(super) fn begin_dispatch(&self) -> Option<LocalDispatchGuard<'_, DeviceNotification>> {
         self.pending.begin_dispatch()
     }
 
     // SAFETY: as emit_info(); only the begin_dispatch() owner may call this.
     // RefCell borrows end before every callback, so listener reentry can append.
-    pub(super) unsafe fn drain(
-        &self,
-        guard: crate::spa::LocalDispatchGuard<'_, DeviceNotification>,
-    ) {
+    pub(super) unsafe fn drain(&self, guard: LocalDispatchGuard<'_, DeviceNotification>) {
         self.pending.drain(guard, |notification| unsafe {
             self.dispatch(&notification);
         });
@@ -236,7 +234,7 @@ impl DeviceEvents {
 // Build owned add/remove events while State is borrowed. Dispatch happens
 // afterward, one traversal per object, with no State reference alive.
 pub(super) fn object_events(
-    pcm_devices: &[crate::oss::PcmDevice],
+    pcm_devices: &[platform::AudioDevice],
     routes: &[RouteState],
     description: &str,
     present: bool,
@@ -285,35 +283,35 @@ pub(super) fn build_object_config(
     let mut props = vec![];
 
     if let Some(((left, right), hw)) = volume {
-        let volumes = vec![oss_to_linear(left), oss_to_linear(right)];
+        let volumes = vec![mixer_to_linear(left), mixer_to_linear(right)];
         // hardware attenuation keeps the node at unity; a soft route IS the
         // node's software volume, so audioconvert applies the levels
         let soft = if hw { vec![1.0; 2] } else { volumes.clone() };
-        props.push(crate::spa::pod_prop(
+        props.push(pod_prop(
             SPA_PROP_channelVolumes,
             Value::ValueArray(ValueArray::Float(volumes)),
         ));
-        props.push(crate::spa::pod_prop(
+        props.push(pod_prop(
             SPA_PROP_channelMap,
             Value::ValueArray(ValueArray::Id(ROUTE_MAP.iter().map(|&c| Id(c)).collect())),
         ));
-        props.push(crate::spa::pod_prop(
+        props.push(pod_prop(
             SPA_PROP_softVolumes,
             Value::ValueArray(ValueArray::Float(soft)),
         ));
     }
 
     if let Some(mute) = mute {
-        props.push(crate::spa::pod_prop(SPA_PROP_mute, Value::Bool(mute)));
-        props.push(crate::spa::pod_prop(SPA_PROP_softMute, Value::Bool(mute)));
+        props.push(pod_prop(SPA_PROP_mute, Value::Bool(mute)));
+        props.push(pod_prop(SPA_PROP_softMute, Value::Bool(mute)));
     }
 
-    crate::spa::serialize_pod(&Value::Object(Object {
+    spa::serialize_pod(&Value::Object(Object {
         type_: SPA_TYPE_EVENT_Device,
         id: SPA_DEVICE_EVENT_ObjectConfig,
         properties: vec![
-            crate::spa::pod_prop(SPA_EVENT_DEVICE_Object, Value::Int(node_id as i32)),
-            crate::spa::pod_prop(
+            pod_prop(SPA_EVENT_DEVICE_Object, Value::Int(node_id as i32)),
+            pod_prop(
                 SPA_EVENT_DEVICE_Props,
                 Value::Object(Object {
                     type_: SPA_TYPE_OBJECT_Props,

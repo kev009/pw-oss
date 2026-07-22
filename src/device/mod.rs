@@ -1,5 +1,13 @@
+#[cfg(debug_assertions)]
+use crate::spa::dump_spa_dict;
+use crate::spa::{
+    ListenerList, Log, Loop, LoopSource, ParamStep, System, TimerFd, enum_params_loop,
+    for_each_dict_item, key,
+};
 use libspa::sys::*;
 use std::ffi::{c_char, c_int, c_uint, c_void};
+
+use crate::platform;
 
 mod events;
 mod params;
@@ -9,11 +17,11 @@ mod watch;
 use events::{DeviceEvents, DeviceNotification, build_object_config, object_events};
 use params::{build_profile_info, build_route_info, set_param};
 use routes::{
-    MixerHandle, ROUTE_CHANNELS, ROUTE_MAP, RouteState, common_description, linear_to_oss,
-    oss_to_linear, probe_routes,
+    MixerHandle, ROUTE_CHANNELS, ROUTE_MAP, RouteState, common_description, linear_to_mixer,
+    mixer_to_linear, probe_routes,
 };
 use watch::{
-    arm_mixer_watch, on_devd_event, on_mixer_timeout, queue_object_config, queue_route_change,
+    arm_mixer_watch, on_hotplug_event, on_mixer_timeout, queue_object_config, queue_route_change,
     refresh_route_shadow, resolve_recsrc, sync_recsrc,
 };
 
@@ -28,19 +36,19 @@ struct State {
 
 struct Runtime {
     events: std::rc::Rc<DeviceEvents>,
-    pcm_devices: Vec<crate::oss::PcmDevice>,
+    pcm_devices: Vec<platform::AudioDevice>,
     description: String,
     profile: u32,       // 0 = off, 1 = default
     profile_save: bool, // echoed back in the Profile pod
     routes: Vec<RouteState>,
     mixers: Vec<MixerHandle>,
-    main_loop: Option<crate::spa::Loop>, // for the mixer poll timer
-    system: Option<crate::spa::System>,  // ditto
-    timer_fd: Option<crate::spa::TimerFd>, // owns the LoopSource fd mirror
-    timer_source: crate::spa::LoopSource,
-    devd_socket: Option<crate::freebsd::DevdSocket>, // jack/default-unit nudges; None = poll only
-    devd_source: crate::spa::LoopSource,
-    log: crate::spa::Log,
+    main_loop: Option<Loop>,   // for the mixer poll timer
+    system: Option<System>,    // ditto
+    timer_fd: Option<TimerFd>, // owns the LoopSource fd mirror
+    timer_source: LoopSource,
+    hotplug_monitor: Option<platform::HotplugMonitor>, // jack/default-unit nudges
+    hotplug_source: LoopSource,
+    log: Log,
 }
 
 // Project only the mutable runtime payload. The host-visible handle and
@@ -88,7 +96,7 @@ unsafe extern "C" fn add_listener(
         }
     };
 
-    let initial = |hooks: &crate::spa::ListenerList<spa_device_events>| {
+    let initial = |hooks: &ListenerList<spa_device_events>| {
         // The initial emissions only reach the newly added listener (the list
         // is isolated). One method per traversal, mirroring C's
         // spa_hook_list_call: a listener that removes and frees its hook
@@ -139,12 +147,12 @@ unsafe extern "C" fn enum_params(
     let runtime = unsafe { &raw mut (*state).runtime };
 
     unsafe {
-        crate::spa::enum_params_loop(
+        enum_params_loop(
             runtime,
             (start, max),
             filter,
             |state, index| {
-                use crate::spa::ParamStep;
+                use ParamStep;
                 // only the active route becomes a Route pod; inactive selectable sources
                 // exist as EnumRoute only (acp emits one Route per device with the
                 // active port's index, alsa-acp-device.c:582-600)
@@ -253,18 +261,24 @@ unsafe extern "C" fn clear(handle: *mut spa_handle) -> c_int {
             // clear runs on the main loop's thread, so detach both sources there.
             if runtime.timer_source.is_registered() {
                 if runtime.timer_source.unregister() < 0 {
-                    eprintln!("freebsd-oss: can't detach the mixer timer source; aborting");
+                    eprintln!(
+                        "{}: can't detach the mixer timer source; aborting",
+                        platform::DIAGNOSTIC_TAG
+                    );
                     std::process::abort();
                 }
                 drop(runtime.timer_fd.take());
                 runtime.timer_source.set_fd(-1);
             }
-            if runtime.devd_source.is_registered() && runtime.devd_source.unregister() < 0 {
-                eprintln!("freebsd-oss: can't detach the devd source; aborting");
+            if runtime.hotplug_source.is_registered() && runtime.hotplug_source.unregister() < 0 {
+                eprintln!(
+                    "{}: can't detach the devd source; aborting",
+                    platform::DIAGNOSTIC_TAG
+                );
                 std::process::abort();
             }
-            if !runtime.devd_source.is_registered() {
-                runtime.devd_source.set_fd(-1);
+            if !runtime.hotplug_source.is_registered() {
+                runtime.hotplug_source.set_fd(-1);
             }
         });
     }
@@ -287,15 +301,15 @@ unsafe fn parse_device_dict(info: *const spa_dict) -> (Option<String>, Vec<u32>)
     if let Some(info) = unsafe { info.as_ref() } {
         #[cfg(debug_assertions)]
         unsafe {
-            crate::spa::dump_spa_dict(info);
+            dump_spa_dict(info);
         }
 
         unsafe {
-            crate::spa::for_each_dict_item(info, |key, value| match key {
-                crate::keys::PCM_PARENT_DEVICE => {
+            for_each_dict_item(info, |key, value| match key {
+                platform::PARENT_DEVICE => {
                     pcm_parent_device = Some(value.to_string());
                 }
-                crate::keys::PCM_DEVICE_INDEXES => {
+                platform::DEVICE_INDEXES => {
                     for part in value.split(',') {
                         if let Ok(index) = part.parse::<u32>() {
                             pcm_device_indexes.push(index);
@@ -325,8 +339,7 @@ unsafe extern "C" fn init(
         spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Log.as_ptr().cast())
             .cast::<spa_log>()
     };
-    let Some(log) =
-        (unsafe { crate::spa::Log::wrap(log, std::ptr::NonNull::new(&raw mut OSS_DEVICE_TOPIC)) })
+    let Some(log) = (unsafe { Log::wrap(log, std::ptr::NonNull::new(&raw mut OSS_DEVICE_TOPIC)) })
     else {
         return -libc::EINVAL;
     };
@@ -348,12 +361,12 @@ unsafe extern "C" fn init(
     let main_loop = if main_loop.is_null() {
         None
     } else {
-        Some(unsafe { crate::spa::Loop::wrap(main_loop) })
+        Some(unsafe { Loop::wrap(main_loop) })
     };
     let system = if system.is_null() {
         None
     } else {
-        Some(unsafe { crate::spa::System::wrap(system) })
+        Some(unsafe { System::wrap(system) })
     };
 
     let state = handle.cast::<State>();
@@ -365,12 +378,12 @@ unsafe extern "C" fn init(
         crate::error!(
             log,
             "{} should contain pcm device indexes",
-            crate::keys::PCM_DEVICE_INDEXES
+            platform::DEVICE_INDEXES
         );
         return -libc::EINVAL;
     }
 
-    let pcm_devices = crate::oss::list_pcm_devices(&pcm_device_indexes);
+    let pcm_devices = platform::list_audio_devices(&pcm_device_indexes);
 
     if pcm_devices.is_empty() {
         crate::error!(log, "can't retrieve pcm device information");
@@ -419,7 +432,7 @@ unsafe extern "C" fn init(
                     system,
 
                     timer_fd: None,
-                    timer_source: crate::spa::LoopSource::new(spa_source {
+                    timer_source: LoopSource::new(spa_source {
                         loop_: std::ptr::null_mut(),
                         func: Some(on_mixer_timeout),
                         data: state.cast::<c_void>(),
@@ -429,10 +442,10 @@ unsafe extern "C" fn init(
                         priv_: std::ptr::null_mut(),
                     }),
 
-                    devd_socket: None,
-                    devd_source: crate::spa::LoopSource::new(spa_source {
+                    hotplug_monitor: None,
+                    hotplug_source: LoopSource::new(spa_source {
                         loop_: std::ptr::null_mut(),
-                        func: Some(on_devd_event),
+                        func: Some(on_hotplug_event),
                         data: state.cast::<c_void>(),
                         fd: -1,
                         mask: SPA_IO_IN,
@@ -451,15 +464,12 @@ unsafe extern "C" fn init(
             let description = state.description.clone();
             state.events.with_info(|info| {
                 info.fix_pointers();
-                info.add_prop(crate::spa::key(SPA_KEY_DEVICE_API), "freebsd-oss");
-                info.add_prop(crate::spa::key(SPA_KEY_MEDIA_CLASS), "Audio/Device");
+                info.add_prop(key(SPA_KEY_DEVICE_API), platform::DEVICE_API);
+                info.add_prop(key(SPA_KEY_MEDIA_CLASS), "Audio/Device");
                 if let Some(pcm_parent_device) = pcm_parent_device {
-                    info.add_prop(crate::spa::key(SPA_KEY_DEVICE_NAME), pcm_parent_device);
+                    info.add_prop(key(SPA_KEY_DEVICE_NAME), pcm_parent_device);
                 }
-                info.add_prop(
-                    crate::spa::key(SPA_KEY_DEVICE_DESCRIPTION),
-                    description.as_str(),
-                );
+                info.add_prop(key(SPA_KEY_DEVICE_DESCRIPTION), description.as_str());
                 info.add_param(SPA_PARAM_EnumProfile, SPA_PARAM_INFO_READ);
                 info.add_param(SPA_PARAM_Profile, SPA_PARAM_INFO_READWRITE);
                 info.add_param(SPA_PARAM_EnumRoute, SPA_PARAM_INFO_READ);
@@ -505,7 +515,7 @@ const OSS_DEVICE_FACTORY_INFO: spa_dict = spa_dict {
 
 pub(crate) const OSS_DEVICE_FACTORY: spa_handle_factory = spa_handle_factory {
     version: SPA_VERSION_HANDLE_FACTORY,
-    name: c"freebsd-oss.device".as_ptr(),
+    name: platform::DEVICE_FACTORY_NAME.as_ptr(),
     info: &OSS_DEVICE_FACTORY_INFO,
     get_size: Some(get_size),
     init: Some(init),
@@ -515,7 +525,7 @@ pub(crate) const OSS_DEVICE_FACTORY: spa_handle_factory = spa_handle_factory {
 // mut: the host logger writes level/has_custom_level back after registration
 pub(crate) static mut OSS_DEVICE_TOPIC: spa_log_topic = spa_log_topic {
     version: SPA_VERSION_LOG_TOPIC,
-    topic: c"spa.oss.device".as_ptr(),
+    topic: platform::DEVICE_LOG_TOPIC.as_ptr(),
     level: SPA_LOG_LEVEL_NONE,
     has_custom_level: false,
 };

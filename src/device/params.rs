@@ -1,4 +1,6 @@
 use super::*;
+use crate::platform;
+use crate::spa::{self, deserialize_pod, pod_prop};
 
 #[cfg(test)]
 mod tests;
@@ -76,7 +78,7 @@ fn apply_route_props(
                     state.routes[pos].name,
                     v
                 );
-                let levels = (linear_to_oss(left), linear_to_oss(right));
+                let levels = (linear_to_mixer(left), linear_to_mixer(right));
                 if levels != state.routes[pos].levels {
                     let applied = match control {
                         Some(c) => state.mixers[mi].mixer.set_level(c, levels.0, levels.1),
@@ -410,7 +412,7 @@ pub(super) unsafe extern "C" fn set_param(
     let value = if param.is_null() {
         None
     } else {
-        match unsafe { crate::spa::deserialize_pod(param) } {
+        match unsafe { deserialize_pod(param) } {
             Some(value) => Some(value),
             None => return -libc::EINVAL,
         }
@@ -443,7 +445,7 @@ pub(super) unsafe extern "C" fn set_param(
 pub(super) fn build_profile_info(
     id: u32,
     index: u32,
-    pcm_devices: &[crate::oss::PcmDevice],
+    pcm_devices: &[platform::AudioDevice],
     profile_save: bool,
     current: bool,
 ) -> Vec<u8> {
@@ -493,28 +495,25 @@ pub(super) fn build_profile_info(
     }
 
     let mut properties = vec![
-        crate::spa::pod_prop(SPA_PARAM_PROFILE_index, Value::Int(index as i32)),
-        crate::spa::pod_prop(SPA_PARAM_PROFILE_name, Value::String(name.to_string())),
-        crate::spa::pod_prop(
+        pod_prop(SPA_PARAM_PROFILE_index, Value::Int(index as i32)),
+        pod_prop(SPA_PARAM_PROFILE_name, Value::String(name.to_string())),
+        pod_prop(
             SPA_PARAM_PROFILE_description,
             Value::String(description.to_string()),
         ),
-        crate::spa::pod_prop(SPA_PARAM_PROFILE_priority, Value::Int(priority)),
-        crate::spa::pod_prop(
+        pod_prop(SPA_PARAM_PROFILE_priority, Value::Int(priority)),
+        pod_prop(
             SPA_PARAM_PROFILE_available,
             Value::Id(Id(SPA_PARAM_AVAILABILITY_yes)),
         ),
-        crate::spa::pod_prop(SPA_PARAM_PROFILE_classes, Value::Struct(class_fields)),
+        pod_prop(SPA_PARAM_PROFILE_classes, Value::Struct(class_fields)),
     ];
 
     if current {
-        properties.push(crate::spa::pod_prop(
-            SPA_PARAM_PROFILE_save,
-            Value::Bool(profile_save),
-        ));
+        properties.push(pod_prop(SPA_PARAM_PROFILE_save, Value::Bool(profile_save)));
     }
 
-    crate::spa::serialize_pod(&Value::Object(Object {
+    spa::serialize_pod(&Value::Object(Object {
         type_: SPA_TYPE_OBJECT_ParamProfile,
         id,
         properties,
@@ -535,9 +534,9 @@ pub(super) fn build_route_info(
     use libspa::utils::Id;
 
     let mut properties = vec![
-        crate::spa::pod_prop(SPA_PARAM_ROUTE_index, Value::Int(pos as i32)),
+        pod_prop(SPA_PARAM_ROUTE_index, Value::Int(pos as i32)),
         // note: PLAYBACK maps to OUTPUT here (the route points out of the graph)
-        crate::spa::pod_prop(
+        pod_prop(
             SPA_PARAM_ROUTE_direction,
             Value::Id(Id(if route.rec {
                 SPA_DIRECTION_INPUT
@@ -545,34 +544,34 @@ pub(super) fn build_route_info(
                 SPA_DIRECTION_OUTPUT
             })),
         ),
-        crate::spa::pod_prop(SPA_PARAM_ROUTE_name, Value::String(route.name.clone())),
-        crate::spa::pod_prop(
+        pod_prop(SPA_PARAM_ROUTE_name, Value::String(route.name.clone())),
+        pod_prop(
             SPA_PARAM_ROUTE_description,
             Value::String(route.description.clone()),
         ),
-        crate::spa::pod_prop(SPA_PARAM_ROUTE_priority, Value::Int(route.priority)),
+        pod_prop(SPA_PARAM_ROUTE_priority, Value::Int(route.priority)),
         // Constant yes: FreeBSD exposes no per-jack state userland can read (the
         // SND CONN devctl names a preferred device, not a jack - see
-        // on_devd_event), and "no" would make WirePlumber's find-best-routes skip
+        // on_hotplug_event), and "no" would make WirePlumber's find-best-routes skip
         // the route and state-routes refuse to save its volume. acp would say
         // "unknown" where detection is absent, but flipping v1's "yes" carries no
         // information and only churns session-manager behavior.
-        crate::spa::pod_prop(
+        pod_prop(
             SPA_PARAM_ROUTE_available,
             Value::Id(Id(SPA_PARAM_AVAILABILITY_yes)),
         ),
-        crate::spa::pod_prop(
+        pod_prop(
             SPA_PARAM_ROUTE_profiles,
             Value::ValueArray(ValueArray::Int(vec![1])),
         ),
-        crate::spa::pod_prop(
+        pod_prop(
             SPA_PARAM_ROUTE_devices,
             Value::ValueArray(ValueArray::Int(vec![route.node_id as i32])),
         ),
     ];
 
     if full {
-        properties.push(crate::spa::pod_prop(
+        properties.push(pod_prop(
             SPA_PARAM_ROUTE_device,
             Value::Int(route.node_id as i32),
         ));
@@ -589,7 +588,10 @@ pub(super) fn build_route_info(
         } else {
             PropertyFlags::empty()
         };
-        let volumes = vec![oss_to_linear(route.levels.0), oss_to_linear(route.levels.1)];
+        let volumes = vec![
+            mixer_to_linear(route.levels.0),
+            mixer_to_linear(route.levels.1),
+        ];
         // with hardware attenuation the node's software volume must stay at
         // unity or the signal is attenuated twice; a soft route IS the
         // software volume, so it mirrors the levels
@@ -598,7 +600,7 @@ pub(super) fn build_route_info(
         } else {
             volumes.clone()
         };
-        properties.push(crate::spa::pod_prop(
+        properties.push(pod_prop(
             SPA_PARAM_ROUTE_props,
             Value::Object(Object {
                 type_: SPA_TYPE_OBJECT_Props,
@@ -624,13 +626,13 @@ pub(super) fn build_route_info(
                         flags: PropertyFlags::READONLY,
                         value: Value::Float(1.0 / 101.0),
                     },
-                    crate::spa::pod_prop(
+                    pod_prop(
                         SPA_PROP_channelMap,
                         Value::ValueArray(ValueArray::Id(
                             ROUTE_MAP.iter().map(|&c| Id(c)).collect(),
                         )),
                     ),
-                    crate::spa::pod_prop(
+                    pod_prop(
                         SPA_PROP_softVolumes,
                         Value::ValueArray(ValueArray::Float(soft)),
                     ),
@@ -638,17 +640,14 @@ pub(super) fn build_route_info(
             }),
         ));
 
-        properties.push(crate::spa::pod_prop(
+        properties.push(pod_prop(
             SPA_PARAM_ROUTE_profile,
             Value::Int(profile as i32),
         ));
-        properties.push(crate::spa::pod_prop(
-            SPA_PARAM_ROUTE_save,
-            Value::Bool(route.save),
-        ));
+        properties.push(pod_prop(SPA_PARAM_ROUTE_save, Value::Bool(route.save)));
     }
 
-    crate::spa::serialize_pod(&Value::Object(Object {
+    spa::serialize_pod(&Value::Object(Object {
         type_: SPA_TYPE_OBJECT_ParamRoute,
         id,
         properties,

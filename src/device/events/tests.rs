@@ -1,4 +1,5 @@
 use super::*;
+use crate::spa::ListenerList;
 
 struct ReentrantDeviceInfoContext {
     events: *const DeviceEvents,
@@ -183,7 +184,7 @@ unsafe extern "C" fn add_device_listener_during_dispatch(
         return;
     }
     let events = unsafe { &*context.events };
-    let initial = |hooks: &crate::spa::ListenerList<spa_device_events>| {
+    let initial = |hooks: &ListenerList<spa_device_events>| {
         unsafe { events.emit_object_on(hooks, &DeviceObjectEvent::Removed { id: 3 }) };
         let result = spa_result_device_params {
             id: SPA_PARAM_Profile,

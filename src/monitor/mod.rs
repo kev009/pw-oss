@@ -1,12 +1,18 @@
+use crate::spa::{
+    Dictionary, ListenerList, LocalDispatchGuard, LocalNotificationQueue, Log, Loop, LoopSource,
+    SPA_DEVICE_CHANGE_MASK_ALL, SPA_DEVICE_OBJECT_CHANGE_MASK_ALL,
+};
 use libspa::sys::*;
 use std::collections::BTreeMap;
 use std::ffi::{c_char, c_int, c_void};
 use std::string::String;
 use std::vec::Vec;
 
+use crate::platform;
+
 struct MonitorEvents {
-    hooks: crate::spa::ListenerList<spa_device_events>,
-    pending: crate::spa::LocalNotificationQueue<MonitorNotification>,
+    hooks: ListenerList<spa_device_events>,
+    pending: LocalNotificationQueue<MonitorNotification>,
 }
 
 enum MonitorObjectEvent {
@@ -22,24 +28,24 @@ enum MonitorObjectEvent {
 
 enum MonitorNotification {
     Object(MonitorObjectEvent),
-    ActivateListeners(std::rc::Rc<crate::spa::ListenerList<spa_device_events>>),
+    ActivateListeners(std::rc::Rc<ListenerList<spa_device_events>>),
 }
 
 impl MonitorEvents {
     fn new() -> Self {
         Self {
-            hooks: crate::spa::ListenerList::new(),
-            pending: crate::spa::LocalNotificationQueue::new(),
+            hooks: ListenerList::new(),
+            pending: LocalNotificationQueue::new(),
         }
     }
 
     // SAFETY: no reference into the associated State may be live; listeners
     // may synchronously re-enter monitor methods. `hooks` is the active list
     // or an isolated activation batch with the same event-table type.
-    unsafe fn emit_info_on(&self, hooks: &crate::spa::ListenerList<spa_device_events>) {
+    unsafe fn emit_info_on(&self, hooks: &ListenerList<spa_device_events>) {
         let info = spa_device_info {
             version: SPA_VERSION_DEVICE_INFO,
-            change_mask: crate::spa::SPA_DEVICE_CHANGE_MASK_ALL as u64,
+            change_mask: SPA_DEVICE_CHANGE_MASK_ALL as u64,
             flags: 0,
             props: &DEV_INFO_PROPS,
             params: std::ptr::null_mut(),
@@ -60,7 +66,7 @@ impl MonitorEvents {
     // SAFETY: as emit_info_on().
     unsafe fn emit_object_on(
         &self,
-        hooks: &crate::spa::ListenerList<spa_device_events>,
+        hooks: &ListenerList<spa_device_events>,
         event: &MonitorObjectEvent,
     ) {
         match event {
@@ -79,14 +85,14 @@ impl MonitorEvents {
                     .map(|i| format!("{i}"))
                     .collect::<Vec<_>>()
                     .join(",");
-                let mut dict = crate::spa::Dictionary::new();
-                dict.add_item(crate::keys::PCM_PARENT_DEVICE, driver.as_str());
-                dict.add_item(crate::keys::PCM_DEVICE_INDEXES, indexes_str);
+                let mut dict = Dictionary::new();
+                dict.add_item(platform::PARENT_DEVICE, driver.as_str());
+                dict.add_item(platform::DEVICE_INDEXES, indexes_str);
                 let info = spa_device_object_info {
                     version: SPA_VERSION_DEVICE_OBJECT_INFO,
                     type_: SPA_TYPE_INTERFACE_Device.as_ptr().cast(),
-                    factory_name: c"freebsd-oss.device".as_ptr(),
-                    change_mask: crate::spa::SPA_DEVICE_OBJECT_CHANGE_MASK_ALL as u64,
+                    factory_name: platform::DEVICE_FACTORY_NAME.as_ptr(),
+                    change_mask: SPA_DEVICE_OBJECT_CHANGE_MASK_ALL as u64,
                     flags: 0,
                     props: dict.raw(),
                 };
@@ -102,7 +108,7 @@ impl MonitorEvents {
     // SAFETY: as emit_info_on().
     unsafe fn emit_objects_on(
         &self,
-        hooks: &crate::spa::ListenerList<spa_device_events>,
+        hooks: &ListenerList<spa_device_events>,
         events: &[MonitorObjectEvent],
     ) {
         for event in events {
@@ -118,23 +124,23 @@ impl MonitorEvents {
         listener: *mut spa_hook,
         events: *const spa_device_events,
         data: *mut c_void,
-        initial: impl FnOnce(&crate::spa::ListenerList<spa_device_events>) -> R,
+        initial: impl FnOnce(&ListenerList<spa_device_events>) -> R,
     ) -> R {
         let deferred = self.pending.defer_when_busy(|| {
-            let hooks = std::rc::Rc::new(crate::spa::ListenerList::new());
+            let hooks = std::rc::Rc::new(ListenerList::new());
             (MonitorNotification::ActivateListeners(hooks.clone()), hooks)
         });
         let hooks = deferred.as_deref().unwrap_or(&self.hooks);
         unsafe { hooks.with_isolated_listener(listener, events, data, || initial(hooks)) }
     }
 
-    fn begin_dispatch(&self) -> Option<crate::spa::LocalDispatchGuard<'_, MonitorNotification>> {
+    fn begin_dispatch(&self) -> Option<LocalDispatchGuard<'_, MonitorNotification>> {
         self.pending.begin_dispatch()
     }
 
     // SAFETY: no State reference may be live; only the begin_dispatch owner
     // calls this, and the RefCell borrow ends before listener dispatch.
-    unsafe fn drain(&self, guard: crate::spa::LocalDispatchGuard<'_, MonitorNotification>) {
+    unsafe fn drain(&self, guard: LocalDispatchGuard<'_, MonitorNotification>) {
         self.pending.drain(guard, |notification| {
             match notification {
                 MonitorNotification::Object(event) => unsafe {
@@ -176,10 +182,10 @@ struct State {
 struct Runtime {
     events: std::rc::Rc<MonitorEvents>,
     pcm_indexes: BTreeMap<String, Vec<u32>>,
-    main_loop: crate::spa::Loop,
-    devd_socket: Option<crate::freebsd::DevdSocket>, // None when devd isn't running (no hotplug)
-    devd_source: crate::spa::LoopSource,
-    log: crate::spa::Log,
+    main_loop: Loop,
+    hotplug_monitor: Option<platform::HotplugMonitor>,
+    hotplug_source: LoopSource,
+    log: Log,
 }
 
 unsafe fn with_runtime_mut<R>(
@@ -229,7 +235,7 @@ unsafe extern "C" fn add_listener(
         }
     };
 
-    let initial = |hooks: &crate::spa::ListenerList<spa_device_events>| {
+    let initial = |hooks: &ListenerList<spa_device_events>| {
         // The initial emissions only reach the newly added listener (the list
         // is isolated). One method per traversal, mirroring C's
         // spa_hook_list_call: a listener that removes and frees its hook
@@ -286,12 +292,15 @@ unsafe extern "C" fn clear(handle: *mut spa_handle) -> c_int {
     unsafe {
         with_runtime_mut(state, |runtime| {
             // clear runs on the registered main loop.
-            if runtime.devd_source.is_registered() && runtime.devd_source.unregister() < 0 {
-                eprintln!("freebsd-oss: can't detach the monitor devd source; aborting");
+            if runtime.hotplug_source.is_registered() && runtime.hotplug_source.unregister() < 0 {
+                eprintln!(
+                    "{}: can't detach the monitor devd source; aborting",
+                    platform::DIAGNOSTIC_TAG
+                );
                 std::process::abort();
             }
-            if !runtime.devd_source.is_registered() {
-                runtime.devd_source.set_fd(-1);
+            if !runtime.hotplug_source.is_registered() {
+                runtime.hotplug_source.set_fd(-1);
             }
         });
     }
@@ -310,7 +319,7 @@ const DEV_INFO_PROPS: spa_dict = spa_dict {
     items: std::ptr::null(),
 };
 
-unsafe extern "C" fn on_devd_event(source: *mut spa_source) {
+unsafe extern "C" fn on_hotplug_event(source: *mut spa_source) {
     let state: *mut State = unsafe { (*source).data.cast() };
     assert!(
         !state.is_null(),
@@ -320,28 +329,17 @@ unsafe extern "C" fn on_devd_event(source: *mut spa_source) {
     let (events, notifications) = {
         let Some(result) = (unsafe {
             with_runtime_mut(state, |state| {
-                let devd_socket = state.devd_socket.as_mut()?;
+                let hotplug_monitor = state.hotplug_monitor.as_mut()?;
 
                 // Any pcm (or its uaudio parent) attach/detach can change the device
                 // set. Resync and build owned notifications before listener dispatch.
-                let mut resync = false;
-                let mut detached: Vec<String> = Vec::new();
-                let alive = devd_socket.read_event(|line| {
-                    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-                        regex::Regex::new(r"^([\+-])((?:pcm|uaudio)\d+)").unwrap()
-                    });
-                    if let Some(groups) = RE.captures(line) {
-                        resync = true;
-                        if groups.get(1).unwrap().as_str() == "-" {
-                            detached.push(groups.get(2).unwrap().as_str().to_string());
-                        }
+                let (alive, event) = hotplug_monitor.read_monitor_event();
+                let notifications = match event {
+                    Some(platform::MonitorHotplugEvent::Attached) => resync_devices(state, &[]),
+                    Some(platform::MonitorHotplugEvent::Detached(subject)) => {
+                        resync_devices(state, &[subject])
                     }
-                });
-
-                let notifications = if resync {
-                    resync_devices(state, &detached)
-                } else {
-                    Vec::new()
+                    None => Vec::new(),
                 };
 
                 if !alive {
@@ -349,12 +347,15 @@ unsafe extern "C" fn on_devd_event(source: *mut spa_source) {
                     // fd spins the main loop forever.
                     crate::warn!(state.log, "devd connection lost; hotplug disabled");
                     // SAFETY: this callback runs on the registered main loop.
-                    if state.devd_source.unregister() < 0 {
-                        eprintln!("freebsd-oss: can't detach the monitor devd source; aborting");
+                    if state.hotplug_source.unregister() < 0 {
+                        eprintln!(
+                            "{}: can't detach the monitor devd source; aborting",
+                            platform::DIAGNOSTIC_TAG
+                        );
                         std::process::abort();
                     }
-                    state.devd_socket = None;
-                    state.devd_source.set_fd(-1);
+                    state.hotplug_monitor = None;
+                    state.hotplug_source.set_fd(-1);
                 }
                 Some((state.events.clone(), notifications))
             })
@@ -401,14 +402,13 @@ fn resync_devices(state: &mut Runtime, detached: &[String]) -> Vec<MonitorObject
         }
     }
 
-    let indexes = match crate::oss::read_sndstat() {
-        Ok(indexes) => indexes,
+    let new_map = match platform::read_device_groups() {
+        Ok(groups) => groups,
         Err(err) => {
             crate::warn!(state.log, "can't re-read sndstat: {}", err);
             return notifications;
         }
     };
-    let new_map = crate::oss::group_pcm_devices_by_parent(&indexes);
     let old_map = std::mem::replace(&mut state.pcm_indexes, new_map);
 
     for (driver, old_indexes) in &old_map {
@@ -445,8 +445,7 @@ unsafe extern "C" fn init(
         spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Log.as_ptr().cast())
             .cast::<spa_log>()
     };
-    let Some(log) =
-        (unsafe { crate::spa::Log::wrap(log, std::ptr::NonNull::new(&raw mut OSS_MONITOR_TOPIC)) })
+    let Some(log) = (unsafe { Log::wrap(log, std::ptr::NonNull::new(&raw mut OSS_MONITOR_TOPIC)) })
     else {
         return -libc::EINVAL;
     };
@@ -460,13 +459,13 @@ unsafe extern "C" fn init(
         return -libc::EINVAL;
     }
 
-    let main_loop = unsafe { crate::spa::Loop::wrap(main_loop) };
+    let main_loop = unsafe { Loop::wrap(main_loop) };
 
     let state = handle.cast::<State>();
     assert!(!state.is_null(), "handle is not supposed to be null");
 
-    let pcm_indexes = match crate::oss::read_sndstat() {
-        Ok(indexes) => crate::oss::group_pcm_devices_by_parent(&indexes),
+    let pcm_indexes = match platform::read_device_groups() {
+        Ok(groups) => groups,
         Err(err) => {
             crate::error!(log, "Can't open /dev/sndstat: {}", err);
             return -(err as c_int);
@@ -474,7 +473,7 @@ unsafe extern "C" fn init(
     };
 
     // no devd (jails, minimal systems) just means no hotplug
-    let devd_socket = match crate::freebsd::DevdSocket::open() {
+    let hotplug_monitor = match platform::HotplugMonitor::open() {
         Ok(socket) => Some(socket),
         Err(err) => {
             crate::warn!(log, "can't connect to devd, hotplug disabled: {}", err);
@@ -482,11 +481,14 @@ unsafe extern "C" fn init(
         }
     };
 
-    let devd_source = crate::spa::LoopSource::new(spa_source {
+    let hotplug_source = LoopSource::new(spa_source {
         loop_: std::ptr::null_mut(),
-        func: Some(on_devd_event),
+        func: Some(on_hotplug_event),
         data: state.cast::<c_void>(),
-        fd: devd_socket.as_ref().map(|s| s.fd()).unwrap_or(-1),
+        fd: hotplug_monitor
+            .as_ref()
+            .map(|monitor| monitor.fd())
+            .unwrap_or(-1),
         mask: SPA_IO_IN,
         rmask: 0,
         priv_: std::ptr::null_mut(),
@@ -522,8 +524,8 @@ unsafe extern "C" fn init(
                     pcm_indexes,
 
                     main_loop,
-                    devd_socket,
-                    devd_source,
+                    hotplug_monitor,
+                    hotplug_source,
 
                     log,
                 },
@@ -533,16 +535,16 @@ unsafe extern "C" fn init(
 
     unsafe {
         with_runtime_mut(state, |state| {
-            if state.devd_socket.is_some() {
+            if state.hotplug_monitor.is_some() {
                 let main_loop = state.main_loop;
                 // SAFETY: init uses the host context accepted by add_source; clear
                 // unregisters the pinned source before State is dropped.
-                let err = state.devd_source.register(&main_loop);
+                let err = state.hotplug_source.register(&main_loop);
                 if err < 0 {
                     // no hotplug then; enumeration still works
                     crate::warn!(state.log, "can't watch devd: {}", err);
-                    state.devd_socket = None;
-                    state.devd_source.set_fd(-1);
+                    state.hotplug_monitor = None;
+                    state.hotplug_source.set_fd(-1);
                 }
             }
         });
@@ -577,7 +579,7 @@ unsafe extern "C" fn enum_interface_info(
 
 pub(crate) const OSS_MONITOR_FACTORY: spa_handle_factory = spa_handle_factory {
     version: SPA_VERSION_HANDLE_FACTORY,
-    name: c"freebsd-oss.monitor".as_ptr(),
+    name: platform::MONITOR_FACTORY_NAME.as_ptr(),
     info: std::ptr::null(),
     get_size: Some(get_size),
     init: Some(init),
@@ -587,7 +589,7 @@ pub(crate) const OSS_MONITOR_FACTORY: spa_handle_factory = spa_handle_factory {
 // mut: the host logger writes level/has_custom_level back after registration
 pub(crate) static mut OSS_MONITOR_TOPIC: spa_log_topic = spa_log_topic {
     version: SPA_VERSION_LOG_TOPIC,
-    topic: c"spa.oss.monitor".as_ptr(),
+    topic: platform::MONITOR_LOG_TOPIC.as_ptr(),
     level: SPA_LOG_LEVEL_NONE,
     has_custom_level: false,
 };
@@ -629,7 +631,7 @@ mod tests {
             return;
         }
         let events = unsafe { &*context.events };
-        let initial = |hooks: &crate::spa::ListenerList<spa_device_events>| unsafe {
+        let initial = |hooks: &ListenerList<spa_device_events>| unsafe {
             events.emit_object_on(hooks, &MonitorObjectEvent::Removed { id: 3 });
         };
         unsafe {

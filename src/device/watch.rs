@@ -1,4 +1,5 @@
 use super::*;
+use crate::platform;
 
 // Tell the session manager to push the new hardware state into the child
 // node's Props (channelVolumes/softVolumes or mute/softMute), keeping
@@ -238,7 +239,7 @@ pub(super) unsafe extern "C" fn on_mixer_timeout(source: *mut spa_source) {
 // What a jack event DOES change kernel-side is the recording source
 // (hdaa_autorecsrc_handler, hdaa.c:562) and pin mutes, so the one sound
 // reaction is nudging the mixer poll instead of waiting out the 1 Hz tick.
-pub(super) unsafe extern "C" fn on_devd_event(source: *mut spa_source) {
+pub(super) unsafe extern "C" fn on_hotplug_event(source: *mut spa_source) {
     let state: *mut State = unsafe { (*source).data.cast() };
     assert!(
         !state.is_null(),
@@ -248,22 +249,11 @@ pub(super) unsafe extern "C" fn on_devd_event(source: *mut spa_source) {
     let (events, notifications) = {
         let Some(result) = (unsafe {
             with_runtime_mut(state, |state| {
-                let devd_socket = state.devd_socket.as_mut()?;
+                let hotplug_monitor = state.hotplug_monitor.as_mut()?;
 
-                let pcm_devices = &state.pcm_devices;
-                let mut nudged = false;
-                let alive = devd_socket.read_event(|line| {
-                    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-                        regex::Regex::new(
-                            r"^!system=SND subsystem=CONN type=(?:IN|OUT) cdev=dsp([0-9]+)",
-                        )
-                        .unwrap()
-                    });
-                    if let Some(groups) = RE.captures(line)
-                        && let Ok(unit) = groups[1].parse::<u32>()
-                    {
-                        nudged |= pcm_devices.iter().any(|d| d.index == unit);
-                    }
+                let (alive, unit) = hotplug_monitor.read_mixer_event();
+                let nudged = unit.is_some_and(|unit| {
+                    state.pcm_devices.iter().any(|device| device.index == unit)
                 });
 
                 let notifications = if nudged {
@@ -281,12 +271,15 @@ pub(super) unsafe extern "C" fn on_devd_event(source: *mut spa_source) {
                         "devd connection lost; falling back to the mixer poll alone"
                     );
                     // SAFETY: this callback runs on the registered main loop.
-                    if state.devd_source.unregister() < 0 {
-                        eprintln!("freebsd-oss: can't detach the devd source; aborting");
+                    if state.hotplug_source.unregister() < 0 {
+                        eprintln!(
+                            "{}: can't detach the devd source; aborting",
+                            platform::DIAGNOSTIC_TAG
+                        );
                         std::process::abort();
                     }
-                    state.devd_socket = None;
-                    state.devd_source.set_fd(-1);
+                    state.hotplug_monitor = None;
+                    state.hotplug_source.set_fd(-1);
                 }
                 Some((state.events.clone(), notifications))
             })
@@ -353,18 +346,18 @@ pub(super) unsafe fn arm_mixer_watch(state: &mut Runtime) {
     // the same poll so kernel-side recording-source flips show up right
     // away; losing devd only costs that immediacy (jails, minimal systems)
     if let Some(main_loop) = &state.main_loop {
-        match crate::freebsd::DevdSocket::open() {
+        match platform::HotplugMonitor::open() {
             Ok(socket) => {
-                state.devd_source.set_fd(socket.fd());
-                state.devd_socket = Some(socket);
+                state.hotplug_source.set_fd(socket.fd());
+                state.hotplug_monitor = Some(socket);
                 // SAFETY: as for the mixer source above.
-                if unsafe { state.devd_source.register(main_loop) } < 0 {
+                if unsafe { state.hotplug_source.register(main_loop) } < 0 {
                     crate::warn!(
                         state.log,
                         "can't watch devd; jack events will wait for the mixer poll"
                     );
-                    state.devd_socket = None;
-                    state.devd_source.set_fd(-1);
+                    state.hotplug_monitor = None;
+                    state.hotplug_source.set_fd(-1);
                 }
             }
             Err(err) => {

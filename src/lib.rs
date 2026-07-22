@@ -21,6 +21,7 @@ use std::ffi::c_int;
 mod device;
 mod monitor;
 mod node;
+mod platform;
 mod spa;
 
 mod freebsd;

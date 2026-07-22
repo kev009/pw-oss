@@ -1,11 +1,13 @@
 use crate::device::RouteState;
+use crate::platform;
+use crate::spa;
 
 // Profile requests accept NULL reset, valid indexes, and durable names.
 #[test]
 fn profile_requests_decode_and_validate() {
     use libspa::pod::{Object, Value};
     use libspa::sys::*;
-    let prop = crate::spa::pod_prop;
+    let prop = spa::pod_prop;
 
     assert_eq!(
         super::decode_profile_request(None),
@@ -62,7 +64,7 @@ fn profile_requests_decode_and_validate() {
 fn route_requests_decode_with_typed_props() {
     use libspa::pod::{Object, Value, ValueArray};
     use libspa::sys::*;
-    let prop = crate::spa::pod_prop;
+    let prop = spa::pod_prop;
 
     let pod = |props| {
         Some(Value::Object(Object {
@@ -140,8 +142,8 @@ fn route_requests_decode_with_typed_props() {
     assert_eq!(super::decode_route_request(None), Err(-libc::EINVAL));
 }
 
-fn pcm_device(index: u32, play: bool, rec: bool) -> crate::oss::PcmDevice {
-    crate::oss::PcmDevice {
+fn pcm_device(index: u32, play: bool, rec: bool) -> platform::AudioDevice {
+    platform::AudioDevice {
         index,
         desc: format!("pcm{index}"),
         location: "hdac0".to_string(),
@@ -188,9 +190,9 @@ fn profile_parses_back_with_classes_struct() {
         true,
         true,
     );
-    let prop = crate::spa::pod_prop;
+    let prop = spa::pod_prop;
     assert_eq!(
-        crate::spa::parse_back(&pod),
+        spa::parse_back(&pod),
         Value::Object(Object {
             type_: SPA_TYPE_OBJECT_ParamProfile,
             id: SPA_PARAM_Profile,
@@ -242,9 +244,9 @@ fn route_parses_back_with_hardware_volume_flags() {
     // a full playback route with a hardware control: the nested Props
     // object, float/id arrays and the HARDWARE/READONLY prop flags
     let pod = super::build_route_info(SPA_PARAM_Route, &route(Some(0), false), 1, 1, true);
-    let prop = crate::spa::pod_prop;
+    let prop = spa::pod_prop;
     assert_eq!(
-        crate::spa::parse_back(&pod),
+        spa::parse_back(&pod),
         Value::Object(Object {
             type_: SPA_TYPE_OBJECT_ParamRoute,
             id: SPA_PARAM_Route,
