@@ -5,48 +5,43 @@ use crate::spa::{
     for_each_dict_item, key,
 };
 use libspa::sys::*;
-use std::ffi::{c_char, c_int, c_uint, c_void};
+use std::ffi::{c_char, c_int, c_void};
 
-use crate::platform;
+use crate::backend::{self, DeviceInit as _, RouteController as _};
 
 mod events;
 mod params;
-mod routes;
 mod watch;
 
 use events::{DeviceEvents, DeviceNotification, build_object_config, object_events};
 use params::{build_profile_info, build_route_info, set_param};
-use routes::{
-    MixerHandle, ROUTE_CHANNELS, ROUTE_MAP, RouteState, common_description, linear_to_mixer,
-    mixer_to_linear, probe_routes,
-};
+type RouteState = backend::RouteSnapshot;
 use watch::{
-    arm_mixer_watch, on_hotplug_event, on_mixer_timeout, queue_object_config, queue_route_change,
-    refresh_route_shadow, resolve_recsrc, sync_recsrc,
+    arm_route_watch, log_route_diagnostic, on_hotplug_event, on_route_timeout, queue_object_config,
+    queue_route_change,
 };
 
 // repr(C): the host casts spa_handle* to State*, so `handle` must stay
 // the first field at offset 0.
 #[repr(C)]
-struct State {
+struct State<B: backend::Backend> {
     handle: spa_handle,
     device: spa_device,
-    runtime: Runtime,
+    runtime: Runtime<B>,
 }
 
-struct Runtime {
-    events: std::rc::Rc<DeviceEvents>,
-    pcm_devices: Vec<platform::AudioDevice>,
-    description: String,
+struct Runtime<B: backend::Backend> {
+    events: std::rc::Rc<DeviceEvents<B>>,
+    snapshot: backend::DeviceSnapshot,
     profile: u32,       // 0 = off, 1 = default
     profile_save: bool, // echoed back in the Profile pod
     routes: Vec<RouteState>,
-    mixers: Vec<MixerHandle>,
-    main_loop: Option<Loop>,   // for the mixer poll timer
+    route_controller: B::Routes,
+    main_loop: Option<Loop>,   // for the route-control poll timer
     system: Option<System>,    // ditto
     timer_fd: Option<TimerFd>, // owns the LoopSource fd mirror
     timer_source: LoopSource,
-    hotplug_monitor: Option<platform::HotplugMonitor>, // jack/default-unit nudges
+    hotplug_monitor: Option<B::Hotplug>, // jack/default-unit nudges
     hotplug_source: LoopSource,
     log: Log,
 }
@@ -54,43 +49,38 @@ struct Runtime {
 // Project only the mutable runtime payload. The host-visible handle and
 // interface stay outside every callback borrow, so listener reentry cannot
 // overlap a broad &mut State.
-unsafe fn with_runtime_mut<R>(
-    state: *mut State,
-    apply: impl for<'a> FnOnce(&'a mut Runtime) -> R,
+unsafe fn with_runtime_mut<B: backend::Backend, R>(
+    state: *mut State<B>,
+    apply: impl for<'a> FnOnce(&'a mut Runtime<B>) -> R,
 ) -> R {
     assert!(!state.is_null(), "state is not supposed to be null");
     let runtime = unsafe { (&raw mut (*state).runtime).as_mut_unchecked() };
     apply(runtime)
 }
 
-unsafe fn with_runtime_ref<R>(
-    state: *const State,
-    apply: impl for<'a> FnOnce(&'a Runtime) -> R,
+unsafe fn with_runtime_ref<B: backend::Backend, R>(
+    state: *const State<B>,
+    apply: impl for<'a> FnOnce(&'a Runtime<B>) -> R,
 ) -> R {
     assert!(!state.is_null(), "state is not supposed to be null");
     let runtime = unsafe { (&raw const (*state).runtime).as_ref_unchecked() };
     apply(runtime)
 }
 
-unsafe extern "C" fn add_listener(
+unsafe extern "C" fn add_listener<B: backend::Backend>(
     object: *mut c_void,
     listener: *mut spa_hook,
     events: *const spa_device_events,
     data: *mut c_void,
 ) -> c_int {
-    let state: *mut State = object.cast();
+    let state: *mut State<B> = object.cast();
     assert!(!state.is_null(), "object is not supposed to be null");
     let (device_events, objects) = {
         unsafe {
             with_runtime_ref(state, |state| {
                 (
                     state.events.clone(),
-                    object_events(
-                        &state.pcm_devices,
-                        &state.routes,
-                        &state.description,
-                        state.profile != 0,
-                    ),
+                    object_events(&state.snapshot, &state.routes, state.profile != 0),
                 )
             })
         }
@@ -121,8 +111,8 @@ unsafe extern "C" fn add_listener(
     0
 }
 
-unsafe extern "C" fn sync(object: *mut c_void, seq: c_int) -> c_int {
-    let state: *mut State = object.cast();
+unsafe extern "C" fn sync<B: backend::Backend>(object: *mut c_void, seq: c_int) -> c_int {
+    let state: *mut State<B> = object.cast();
     assert!(!state.is_null(), "object is not supposed to be null");
     let events = unsafe { with_runtime_ref(state, |state| state.events.clone()) };
     // SAFETY: only the independent endpoint remains borrowed. Done joins the
@@ -133,7 +123,7 @@ unsafe extern "C" fn sync(object: *mut c_void, seq: c_int) -> c_int {
     0
 }
 
-unsafe extern "C" fn enum_params(
+unsafe extern "C" fn enum_params<B: backend::Backend>(
     object: *mut c_void,
     seq: c_int,
     id: u32,
@@ -141,7 +131,7 @@ unsafe extern "C" fn enum_params(
     max: u32,
     filter: *const spa_pod,
 ) -> c_int {
-    let state: *mut State = object.cast();
+    let state: *mut State<B> = object.cast();
     assert!(!state.is_null(), "object is not supposed to be null");
     let events = unsafe { with_runtime_ref(state, |state| state.events.clone()) };
     let runtime = unsafe { &raw mut (*state).runtime };
@@ -153,9 +143,9 @@ unsafe extern "C" fn enum_params(
             filter,
             |state, index| {
                 use ParamStep;
-                // only the active route becomes a Route pod; inactive selectable sources
-                // exist as EnumRoute only (acp emits one Route per device with the
-                // active port's index, alsa-acp-device.c:582-600)
+                // Only the active route becomes a Route pod; inactive
+                // selectable sources remain EnumRoute choices. Consumers use
+                // that single active index as the device's current route.
                 if id == SPA_PARAM_Route
                     && (index as usize) < state.routes.len()
                     && !state.routes[index as usize].active
@@ -168,14 +158,14 @@ unsafe extern "C" fn enum_params(
                     (SPA_PARAM_EnumProfile, 0 | 1) => ParamStep::Built(build_profile_info(
                         SPA_PARAM_EnumProfile,
                         index,
-                        &state.pcm_devices,
+                        &state.snapshot,
                         state.profile_save,
                         false,
                     )),
                     (SPA_PARAM_Profile, 0) => ParamStep::Built(build_profile_info(
                         SPA_PARAM_Profile,
                         state.profile,
-                        &state.pcm_devices,
+                        &state.snapshot,
                         state.profile_save,
                         true,
                     )),
@@ -226,20 +216,24 @@ unsafe extern "C" fn enum_params(
     }
 }
 
-const DEVICE_IMPL: spa_device_methods = spa_device_methods {
-    version: SPA_VERSION_DEVICE_METHODS,
-    add_listener: Some(add_listener),
-    sync: Some(sync),
-    enum_params: Some(enum_params),
-    set_param: Some(set_param),
-};
+struct DeviceMethods<B>(std::marker::PhantomData<B>);
 
-unsafe extern "C" fn get_interface(
+impl<B: backend::Backend> DeviceMethods<B> {
+    const METHODS: spa_device_methods = spa_device_methods {
+        version: SPA_VERSION_DEVICE_METHODS,
+        add_listener: Some(add_listener::<B>),
+        sync: Some(sync::<B>),
+        enum_params: Some(enum_params::<B>),
+        set_param: Some(set_param::<B>),
+    };
+}
+
+unsafe extern "C" fn get_interface<B: backend::Backend>(
     handle: *mut spa_handle,
     type_: *const c_char,
     interface: *mut *mut c_void,
 ) -> c_int {
-    let state = handle.cast::<State>();
+    let state = handle.cast::<State<B>>();
     assert!(!state.is_null(), "handle is not supposed to be null");
     assert!(!interface.is_null());
     if unsafe { spa_streq(type_, SPA_TYPE_INTERFACE_Device.as_ptr().cast()) } {
@@ -253,8 +247,8 @@ unsafe extern "C" fn get_interface(
     0
 }
 
-unsafe extern "C" fn clear(handle: *mut spa_handle) -> c_int {
-    let state = handle.cast::<State>();
+unsafe extern "C" fn clear<B: backend::Backend>(handle: *mut spa_handle) -> c_int {
+    let state = handle.cast::<State<B>>();
     assert!(!state.is_null(), "handle is not supposed to be null");
     unsafe {
         with_runtime_mut(state, |runtime| {
@@ -262,8 +256,9 @@ unsafe extern "C" fn clear(handle: *mut spa_handle) -> c_int {
             if runtime.timer_source.is_registered() {
                 if runtime.timer_source.unregister() < 0 {
                     eprintln!(
-                        "{}: can't detach the mixer timer source; aborting",
-                        platform::DIAGNOSTIC_TAG
+                        "{}: {}",
+                        B::DIAGNOSTIC_TAG,
+                        B::hotplug_diagnostic(backend::HotplugDiagnostic::RouteTimerDetachAbort)
                     );
                     std::process::abort();
                 }
@@ -272,8 +267,9 @@ unsafe extern "C" fn clear(handle: *mut spa_handle) -> c_int {
             }
             if runtime.hotplug_source.is_registered() && runtime.hotplug_source.unregister() < 0 {
                 eprintln!(
-                    "{}: can't detach the devd source; aborting",
-                    platform::DIAGNOSTIC_TAG
+                    "{}: {}",
+                    B::DIAGNOSTIC_TAG,
+                    B::hotplug_diagnostic(backend::HotplugDiagnostic::RouteDetachAbort)
                 );
                 std::process::abort();
             }
@@ -287,16 +283,17 @@ unsafe extern "C" fn clear(handle: *mut spa_handle) -> c_int {
     0
 }
 
-extern "C" fn get_size(_factory: *const spa_handle_factory, _params: *const spa_dict) -> usize {
-    size_of::<State>()
+extern "C" fn get_size<B: backend::Backend>(
+    _factory: *const spa_handle_factory,
+    _params: *const spa_dict,
+) -> usize {
+    size_of::<State<B>>()
 }
 
-// loosely mirror acp's analog input ordering: mic on top, then line, then
-// the rest in a stable bit-derived order
-
-unsafe fn parse_device_dict(info: *const spa_dict) -> (Option<String>, Vec<u32>) {
-    let mut pcm_parent_device = None;
-    let mut pcm_device_indexes = vec![];
+unsafe fn parse_device_dict<B: backend::Backend>(
+    info: *const spa_dict,
+) -> <B as backend::Backend>::DeviceInit {
+    let mut init = B::DeviceInit::default();
 
     if let Some(info) = unsafe { info.as_ref() } {
         #[cfg(debug_assertions)]
@@ -305,29 +302,14 @@ unsafe fn parse_device_dict(info: *const spa_dict) -> (Option<String>, Vec<u32>)
         }
 
         unsafe {
-            for_each_dict_item(info, |key, value| match key {
-                platform::PARENT_DEVICE => {
-                    pcm_parent_device = Some(value.to_string());
-                }
-                platform::DEVICE_INDEXES => {
-                    for part in value.split(',') {
-                        if let Ok(index) = part.parse::<u32>() {
-                            pcm_device_indexes.push(index);
-                        }
-                    }
-                }
-                _ => (),
-            });
+            for_each_dict_item(info, |key, value| init.parse(key, value));
         }
     }
 
-    (pcm_parent_device, pcm_device_indexes)
+    init
 }
 
-// the device description shared by every aggregated pcm unit: the longest
-// common prefix of their descriptions, trimmed of a dangling " (" tail.
-// `pcm_devices` must be non-empty (init rejects an empty list first).
-unsafe extern "C" fn init(
+unsafe extern "C" fn init<B: backend::Backend>(
     _factory: *const spa_handle_factory,
     handle: *mut spa_handle,
     info: *const spa_dict,
@@ -339,13 +321,12 @@ unsafe extern "C" fn init(
         spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Log.as_ptr().cast())
             .cast::<spa_log>()
     };
-    let Some(log) = (unsafe { Log::wrap(log, std::ptr::NonNull::new(&raw mut OSS_DEVICE_TOPIC)) })
-    else {
+    let Some(log) = (unsafe { Log::wrap(log, Some(B::device_log_topic())) }) else {
         return -libc::EINVAL;
     };
 
-    // the main loop and system drive the mixer poll timer; both are optional -
-    // without them external mixer changes just go unnoticed
+    // The main loop and system drive the route-control poll timer; both are
+    // optional, so external changes go unnoticed when they are absent.
     let main_loop = unsafe {
         spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Loop.as_ptr().cast())
             .cast::<spa_loop>()
@@ -369,29 +350,22 @@ unsafe extern "C" fn init(
         Some(unsafe { System::wrap(system) })
     };
 
-    let state = handle.cast::<State>();
+    let state = handle.cast::<State<B>>();
     assert!(!state.is_null(), "handle is not supposed to be null");
 
-    let (pcm_parent_device, pcm_device_indexes) = unsafe { parse_device_dict(info) };
+    let device_init = unsafe { parse_device_dict::<B>(info) };
 
-    if pcm_device_indexes.is_empty() {
-        crate::error!(
-            log,
-            "{} should contain pcm device indexes",
-            platform::DEVICE_INDEXES
-        );
+    if !device_init.is_complete() {
+        crate::error!(log, "{}", B::DeviceInit::missing_selector_diagnostic());
         return -libc::EINVAL;
     }
 
-    let pcm_devices = platform::list_audio_devices(&pcm_device_indexes);
-
-    if pcm_devices.is_empty() {
-        crate::error!(log, "can't retrieve pcm device information");
+    let Some(snapshot) = device_init.snapshot() else {
+        crate::error!(log, "{}", B::DeviceInit::snapshot_diagnostic());
         return -libc::EINVAL;
-    }
+    };
 
-    let (routes, mixers) = probe_routes(&pcm_devices);
-    let common_desc = common_description(&pcm_devices);
+    let (route_controller, routes) = B::Routes::probe(&snapshot);
     let events = std::rc::Rc::new(DeviceEvents::new());
 
     // the host hands us uninitialized memory of get_size() bytes; write the
@@ -402,8 +376,8 @@ unsafe extern "C" fn init(
             State {
                 handle: spa_handle {
                     version: SPA_VERSION_HANDLE,
-                    get_interface: Some(get_interface),
-                    clear: Some(clear),
+                    get_interface: Some(get_interface::<B>),
+                    clear: Some(clear::<B>),
                 },
 
                 device: spa_device {
@@ -411,7 +385,7 @@ unsafe extern "C" fn init(
                         type_: SPA_TYPE_INTERFACE_Device.as_ptr().cast(),
                         version: SPA_VERSION_DEVICE,
                         cb: spa_callbacks {
-                            funcs: std::ptr::from_ref(&DEVICE_IMPL).cast(),
+                            funcs: std::ptr::from_ref(&DeviceMethods::<B>::METHODS).cast(),
                             data: state.cast(),
                         },
                     },
@@ -420,38 +394,43 @@ unsafe extern "C" fn init(
                 runtime: Runtime {
                     events,
 
-                    pcm_devices,
-                    description: common_desc,
+                    snapshot,
                     profile: 1, // default on until a session manager decides otherwise
                     profile_save: false,
 
                     routes,
-                    mixers,
+                    route_controller,
 
                     main_loop,
                     system,
 
                     timer_fd: None,
-                    timer_source: LoopSource::new(spa_source {
-                        loop_: std::ptr::null_mut(),
-                        func: Some(on_mixer_timeout),
-                        data: state.cast::<c_void>(),
-                        fd: -1,
-                        mask: SPA_IO_IN,
-                        rmask: 0,
-                        priv_: std::ptr::null_mut(),
-                    }),
+                    timer_source: LoopSource::new(
+                        spa_source {
+                            loop_: std::ptr::null_mut(),
+                            func: Some(on_route_timeout::<B>),
+                            data: state.cast::<c_void>(),
+                            fd: -1,
+                            mask: SPA_IO_IN,
+                            rmask: 0,
+                            priv_: std::ptr::null_mut(),
+                        },
+                        B::DIAGNOSTIC_TAG,
+                    ),
 
                     hotplug_monitor: None,
-                    hotplug_source: LoopSource::new(spa_source {
-                        loop_: std::ptr::null_mut(),
-                        func: Some(on_hotplug_event),
-                        data: state.cast::<c_void>(),
-                        fd: -1,
-                        mask: SPA_IO_IN,
-                        rmask: 0,
-                        priv_: std::ptr::null_mut(),
-                    }),
+                    hotplug_source: LoopSource::new(
+                        spa_source {
+                            loop_: std::ptr::null_mut(),
+                            func: Some(on_hotplug_event::<B>),
+                            data: state.cast::<c_void>(),
+                            fd: -1,
+                            mask: SPA_IO_IN,
+                            rmask: 0,
+                            priv_: std::ptr::null_mut(),
+                        },
+                        B::DIAGNOSTIC_TAG,
+                    ),
 
                     log,
                 },
@@ -461,13 +440,13 @@ unsafe extern "C" fn init(
 
     unsafe {
         with_runtime_mut(state, |state| {
-            let description = state.description.clone();
+            let description = state.snapshot.description.clone();
             state.events.with_info(|info| {
                 info.fix_pointers();
-                info.add_prop(key(SPA_KEY_DEVICE_API), platform::DEVICE_API);
+                info.add_prop(key(SPA_KEY_DEVICE_API), B::DEVICE_API);
                 info.add_prop(key(SPA_KEY_MEDIA_CLASS), "Audio/Device");
-                if let Some(pcm_parent_device) = pcm_parent_device {
-                    info.add_prop(key(SPA_KEY_DEVICE_NAME), pcm_parent_device);
+                if let Some(parent_name) = device_init.parent_name() {
+                    info.add_prop(key(SPA_KEY_DEVICE_NAME), parent_name);
                 }
                 info.add_prop(key(SPA_KEY_DEVICE_DESCRIPTION), description.as_str());
                 info.add_param(SPA_PARAM_EnumProfile, SPA_PARAM_INFO_READ);
@@ -476,7 +455,7 @@ unsafe extern "C" fn init(
                 info.add_param(SPA_PARAM_Route, SPA_PARAM_INFO_READWRITE);
             });
 
-            arm_mixer_watch(state);
+            arm_route_watch::<B>(state);
         });
     }
 
@@ -507,25 +486,19 @@ unsafe extern "C" fn enum_interface_info(
     }
 }
 
-const OSS_DEVICE_FACTORY_INFO: spa_dict = spa_dict {
+const DEVICE_FACTORY_INFO: spa_dict = spa_dict {
     flags: 0,
     n_items: 0,
     items: std::ptr::null(),
 };
 
-pub(crate) const OSS_DEVICE_FACTORY: spa_handle_factory = spa_handle_factory {
-    version: SPA_VERSION_HANDLE_FACTORY,
-    name: platform::DEVICE_FACTORY_NAME.as_ptr(),
-    info: &OSS_DEVICE_FACTORY_INFO,
-    get_size: Some(get_size),
-    init: Some(init),
-    enum_interface_info: Some(enum_interface_info),
-};
-
-// mut: the host logger writes level/has_custom_level back after registration
-pub(crate) static mut OSS_DEVICE_TOPIC: spa_log_topic = spa_log_topic {
-    version: SPA_VERSION_LOG_TOPIC,
-    topic: platform::DEVICE_LOG_TOPIC.as_ptr(),
-    level: SPA_LOG_LEVEL_NONE,
-    has_custom_level: false,
-};
+pub const fn factory<B: backend::Backend>(name: *const c_char) -> spa_handle_factory {
+    spa_handle_factory {
+        version: SPA_VERSION_HANDLE_FACTORY,
+        name,
+        info: &DEVICE_FACTORY_INFO,
+        get_size: Some(get_size::<B>),
+        init: Some(init::<B>),
+        enum_interface_info: Some(enum_interface_info),
+    }
+}

@@ -1,5 +1,5 @@
 use super::*;
-use crate::platform;
+use crate::backend;
 use crate::spa::{
     self, DeviceInfo, Dictionary, ListenerList, LocalDispatchGuard, LocalListenerTarget,
     LocalNotificationQueue, SPA_DEVICE_CHANGE_MASK_ALL, SPA_DEVICE_OBJECT_CHANGE_MASK_ALL, key,
@@ -13,18 +13,17 @@ mod tests;
 // device method without overlapping a Rust reference to the containing State.
 // All device methods run on the main loop; Rc/RefCell express that ownership
 // without claiming cross-thread access.
-pub(super) struct DeviceEvents {
+pub(super) struct DeviceEvents<B: backend::Backend> {
     pub(super) hooks: ListenerList<spa_device_events>,
     pub(super) info: std::cell::RefCell<DeviceInfo>,
     pub(super) pending: LocalNotificationQueue<DeviceNotification>,
     result_target: LocalListenerTarget<spa_device_events>,
+    backend: std::marker::PhantomData<B>,
 }
 
 pub(super) enum DeviceObjectEvent {
     Added {
-        id: u32,
-        rec: bool,
-        description: String,
+        endpoint: backend::EndpointSnapshot,
         route_count: usize,
     },
     Removed {
@@ -40,13 +39,14 @@ pub(super) enum DeviceNotification {
     ActivateListeners(std::rc::Rc<ListenerList<spa_device_events>>),
 }
 
-impl DeviceEvents {
+impl<B: backend::Backend> DeviceEvents<B> {
     pub(super) fn new() -> Self {
         Self {
             hooks: ListenerList::new(),
             info: std::cell::RefCell::new(DeviceInfo::new()),
             pending: LocalNotificationQueue::new(),
             result_target: LocalListenerTarget::new(),
+            backend: std::marker::PhantomData,
         }
     }
 
@@ -123,19 +123,15 @@ impl DeviceEvents {
                 }
             }),
             DeviceObjectEvent::Added {
-                id,
-                rec,
-                description,
+                endpoint,
                 route_count,
             } => {
-                let index = *id / 2;
+                let id = endpoint.object_id;
+                let rec = endpoint.direction == backend::StreamDirection::Capture;
                 let mut dict = Dictionary::new();
-                dict.add_item(
-                    key(SPA_KEY_NODE_NAME),
-                    format!("pcm{index}.{}", if *rec { "rec" } else { "play" }),
-                );
-                dict.add_item(key(SPA_KEY_NODE_DESCRIPTION), description.as_str());
-                dict.add_item(platform::STREAM_PATH, platform::stream_path(index));
+                dict.add_item(key(SPA_KEY_NODE_NAME), endpoint.name.as_str());
+                dict.add_item(key(SPA_KEY_NODE_DESCRIPTION), endpoint.description.as_str());
+                dict.add_item(B::STREAM_PATH, endpoint.locator.value.as_str());
                 if *route_count > 0 {
                     dict.add_item("card.profile.device", format!("{id}"));
                     dict.add_item("device.routes", format!("{route_count}"));
@@ -143,10 +139,10 @@ impl DeviceEvents {
                 let info = spa_device_object_info {
                     version: SPA_VERSION_DEVICE_OBJECT_INFO,
                     type_: SPA_TYPE_INTERFACE_Node.as_ptr().cast(),
-                    factory_name: if *rec {
-                        platform::SOURCE_FACTORY_NAME.as_ptr()
+                    factory_name: if rec {
+                        B::SOURCE_FACTORY_NAME.as_ptr()
                     } else {
-                        platform::SINK_FACTORY_NAME.as_ptr()
+                        B::SINK_FACTORY_NAME.as_ptr()
                     },
                     change_mask: SPA_DEVICE_OBJECT_CHANGE_MASK_ALL as u64,
                     flags: 0,
@@ -156,7 +152,7 @@ impl DeviceEvents {
                 // entire traversal.
                 hooks.emit(|f, data| {
                     if let Some(object_info) = f.object_info {
-                        unsafe { object_info(data, *id, &info) };
+                        unsafe { object_info(data, id, &info) };
                     }
                 });
             }
@@ -234,47 +230,28 @@ impl DeviceEvents {
 // Build owned add/remove events while State is borrowed. Dispatch happens
 // afterward, one traversal per object, with no State reference alive.
 pub(super) fn object_events(
-    pcm_devices: &[platform::AudioDevice],
+    snapshot: &backend::DeviceSnapshot,
     routes: &[RouteState],
-    description: &str,
     present: bool,
 ) -> Vec<DeviceObjectEvent> {
     let mut events = Vec::new();
-    for device in pcm_devices {
-        for (rec, enabled) in [(false, device.play), (true, device.rec)] {
-            if !enabled {
-                continue;
-            }
-
-            let id = device.index * 2 + rec as u32;
-
-            if !present {
-                events.push(DeviceObjectEvent::Removed { id });
-                continue;
-            }
-            let object_description = if device.desc == description && !device.location.is_empty() {
-                format!("{} @ {}", device.desc, device.location)
-            } else {
-                device.desc.clone()
-            };
-
-            // Only nodes with a hardware route get linked to it; the rest (no
-            // mixer, or no usable control - the bitperfect-purist case included)
-            // keep the session manager's node softvol as their only volume.
-            let route_count = routes.iter().filter(|r| r.node_id == id).count();
-            events.push(DeviceObjectEvent::Added {
-                id,
-                rec,
-                description: object_description,
-                route_count,
-            });
+    for endpoint in &snapshot.endpoints {
+        let id = endpoint.object_id;
+        if !present {
+            events.push(DeviceObjectEvent::Removed { id });
+            continue;
         }
+        let route_count = routes.iter().filter(|r| r.node_id == id).count();
+        events.push(DeviceObjectEvent::Added {
+            endpoint: endpoint.clone(),
+            route_count,
+        });
     }
     events
 }
 pub(super) fn build_object_config(
     node_id: u32,
-    volume: Option<((u32, u32), bool)>,
+    volume: Option<(&[f32], bool, &[u32])>,
     mute: Option<bool>,
 ) -> Vec<u8> {
     use libspa::pod::{Object, Value, ValueArray};
@@ -282,18 +259,22 @@ pub(super) fn build_object_config(
 
     let mut props = vec![];
 
-    if let Some(((left, right), hw)) = volume {
-        let volumes = vec![mixer_to_linear(left), mixer_to_linear(right)];
+    if let Some((volumes, hw, channels)) = volume {
+        let volumes = volumes.to_vec();
         // hardware attenuation keeps the node at unity; a soft route IS the
         // node's software volume, so audioconvert applies the levels
-        let soft = if hw { vec![1.0; 2] } else { volumes.clone() };
+        let soft = if hw {
+            vec![1.0; volumes.len()]
+        } else {
+            volumes.clone()
+        };
         props.push(pod_prop(
             SPA_PROP_channelVolumes,
             Value::ValueArray(ValueArray::Float(volumes)),
         ));
         props.push(pod_prop(
             SPA_PROP_channelMap,
-            Value::ValueArray(ValueArray::Id(ROUTE_MAP.iter().map(|&c| Id(c)).collect())),
+            Value::ValueArray(ValueArray::Id(channels.iter().map(|&c| Id(c)).collect())),
         ));
         props.push(pod_prop(
             SPA_PROP_softVolumes,

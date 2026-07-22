@@ -3,27 +3,20 @@ use crate::spa::{
     SPA_DEVICE_CHANGE_MASK_ALL, SPA_DEVICE_OBJECT_CHANGE_MASK_ALL,
 };
 use libspa::sys::*;
-use std::collections::BTreeMap;
 use std::ffi::{c_char, c_int, c_void};
-use std::string::String;
 use std::vec::Vec;
 
-use crate::platform;
+use crate::backend::{self, DeviceCatalog as _, HotplugMonitor as _};
 
-struct MonitorEvents {
+struct MonitorEvents<B: backend::Backend> {
     hooks: ListenerList<spa_device_events>,
     pending: LocalNotificationQueue<MonitorNotification>,
+    backend: std::marker::PhantomData<B>,
 }
 
 enum MonitorObjectEvent {
-    Added {
-        id: u32,
-        driver: String,
-        indexes: Vec<u32>,
-    },
-    Removed {
-        id: u32,
-    },
+    Added(backend::CatalogGroupSnapshot),
+    Removed { id: u32 },
 }
 
 enum MonitorNotification {
@@ -31,11 +24,12 @@ enum MonitorNotification {
     ActivateListeners(std::rc::Rc<ListenerList<spa_device_events>>),
 }
 
-impl MonitorEvents {
+impl<B: backend::Backend> MonitorEvents<B> {
     fn new() -> Self {
         Self {
             hooks: ListenerList::new(),
             pending: LocalNotificationQueue::new(),
+            backend: std::marker::PhantomData,
         }
     }
 
@@ -75,30 +69,22 @@ impl MonitorEvents {
                     unsafe { object_info(data, *id, std::ptr::null()) };
                 }
             }),
-            MonitorObjectEvent::Added {
-                id,
-                driver,
-                indexes,
-            } => {
-                let indexes_str = indexes
-                    .iter()
-                    .map(|i| format!("{i}"))
-                    .collect::<Vec<_>>()
-                    .join(",");
+            MonitorObjectEvent::Added(snapshot) => {
                 let mut dict = Dictionary::new();
-                dict.add_item(platform::PARENT_DEVICE, driver.as_str());
-                dict.add_item(platform::DEVICE_INDEXES, indexes_str);
+                for (key, value) in &snapshot.properties {
+                    dict.add_item(key.as_str(), value.as_str());
+                }
                 let info = spa_device_object_info {
                     version: SPA_VERSION_DEVICE_OBJECT_INFO,
                     type_: SPA_TYPE_INTERFACE_Device.as_ptr().cast(),
-                    factory_name: platform::DEVICE_FACTORY_NAME.as_ptr(),
+                    factory_name: B::DEVICE_FACTORY_NAME.as_ptr(),
                     change_mask: SPA_DEVICE_OBJECT_CHANGE_MASK_ALL as u64,
                     flags: 0,
                     props: dict.raw(),
                 };
                 hooks.emit(|f, data| {
                     if let Some(object_info) = f.object_info {
-                        unsafe { object_info(data, *id, &info) };
+                        unsafe { object_info(data, snapshot.object_id, &info) };
                     }
                 });
             }
@@ -173,46 +159,46 @@ impl MonitorEvents {
 // repr(C): the host casts spa_handle* to State*, so `handle` must stay
 // the first field at offset 0
 #[repr(C)]
-struct State {
+struct State<B: backend::Backend> {
     handle: spa_handle,
     device: spa_device,
-    runtime: Runtime,
+    runtime: Runtime<B>,
 }
 
-struct Runtime {
-    events: std::rc::Rc<MonitorEvents>,
-    pcm_indexes: BTreeMap<String, Vec<u32>>,
+struct Runtime<B: backend::Backend> {
+    events: std::rc::Rc<MonitorEvents<B>>,
+    catalog: B::Catalog,
     main_loop: Loop,
-    hotplug_monitor: Option<platform::HotplugMonitor>,
+    hotplug_monitor: Option<B::Hotplug>,
     hotplug_source: LoopSource,
     log: Log,
 }
 
-unsafe fn with_runtime_mut<R>(
-    state: *mut State,
-    apply: impl for<'a> FnOnce(&'a mut Runtime) -> R,
+unsafe fn with_runtime_mut<B: backend::Backend, R>(
+    state: *mut State<B>,
+    apply: impl for<'a> FnOnce(&'a mut Runtime<B>) -> R,
 ) -> R {
     assert!(!state.is_null(), "state is not supposed to be null");
     let runtime = unsafe { (&raw mut (*state).runtime).as_mut_unchecked() };
     apply(runtime)
 }
 
-unsafe fn with_runtime_ref<R>(
-    state: *const State,
-    apply: impl for<'a> FnOnce(&'a Runtime) -> R,
+unsafe fn with_runtime_ref<B: backend::Backend, R>(
+    state: *const State<B>,
+    apply: impl for<'a> FnOnce(&'a Runtime<B>) -> R,
 ) -> R {
     assert!(!state.is_null(), "state is not supposed to be null");
     let runtime = unsafe { (&raw const (*state).runtime).as_ref_unchecked() };
     apply(runtime)
 }
 
-unsafe extern "C" fn add_listener(
+unsafe extern "C" fn add_listener<B: backend::Backend>(
     object: *mut c_void,
     listener: *mut spa_hook,
     events: *const spa_device_events,
     data: *mut c_void,
 ) -> c_int {
-    let state: *mut State = object.cast();
+    let state: *mut State<B> = object.cast();
     assert!(!state.is_null(), "object is not supposed to be null");
     let (monitor_events, objects) = {
         unsafe {
@@ -220,15 +206,10 @@ unsafe extern "C" fn add_listener(
                 (
                     state.events.clone(),
                     state
-                        .pcm_indexes
-                        .iter()
-                        .filter_map(|(driver, indexes)| {
-                            Some(MonitorObjectEvent::Added {
-                                id: *indexes.first()?,
-                                driver: driver.clone(),
-                                indexes: indexes.clone(),
-                            })
-                        })
+                        .catalog
+                        .snapshots()
+                        .into_iter()
+                        .map(MonitorObjectEvent::Added)
                         .collect::<Vec<_>>(),
                 )
             })
@@ -256,20 +237,24 @@ unsafe extern "C" fn add_listener(
     0
 }
 
-const DEVICE_IMPL: spa_device_methods = spa_device_methods {
-    version: SPA_VERSION_DEVICE_METHODS,
-    add_listener: Some(add_listener),
-    sync: None,
-    enum_params: None,
-    set_param: None,
-};
+struct MonitorMethods<B>(std::marker::PhantomData<B>);
 
-unsafe extern "C" fn get_interface(
+impl<B: backend::Backend> MonitorMethods<B> {
+    const METHODS: spa_device_methods = spa_device_methods {
+        version: SPA_VERSION_DEVICE_METHODS,
+        add_listener: Some(add_listener::<B>),
+        sync: None,
+        enum_params: None,
+        set_param: None,
+    };
+}
+
+unsafe extern "C" fn get_interface<B: backend::Backend>(
     handle: *mut spa_handle,
     type_: *const c_char,
     interface: *mut *mut c_void,
 ) -> c_int {
-    let state = handle.cast::<State>();
+    let state = handle.cast::<State<B>>();
     assert!(!state.is_null(), "handle is not supposed to be null");
 
     assert!(!interface.is_null());
@@ -286,16 +271,17 @@ unsafe extern "C" fn get_interface(
     0
 }
 
-unsafe extern "C" fn clear(handle: *mut spa_handle) -> c_int {
-    let state = handle.cast::<State>();
+unsafe extern "C" fn clear<B: backend::Backend>(handle: *mut spa_handle) -> c_int {
+    let state = handle.cast::<State<B>>();
     assert!(!state.is_null(), "handle is not supposed to be null");
     unsafe {
         with_runtime_mut(state, |runtime| {
             // clear runs on the registered main loop.
             if runtime.hotplug_source.is_registered() && runtime.hotplug_source.unregister() < 0 {
                 eprintln!(
-                    "{}: can't detach the monitor devd source; aborting",
-                    platform::DIAGNOSTIC_TAG
+                    "{}: {}",
+                    B::DIAGNOSTIC_TAG,
+                    B::hotplug_diagnostic(backend::HotplugDiagnostic::MonitorDetachAbort)
                 );
                 std::process::abort();
             }
@@ -309,8 +295,11 @@ unsafe extern "C" fn clear(handle: *mut spa_handle) -> c_int {
     0
 }
 
-extern "C" fn get_size(_factory: *const spa_handle_factory, _params: *const spa_dict) -> usize {
-    size_of::<State>()
+extern "C" fn get_size<B: backend::Backend>(
+    _factory: *const spa_handle_factory,
+    _params: *const spa_dict,
+) -> usize {
+    size_of::<State<B>>()
 }
 
 const DEV_INFO_PROPS: spa_dict = spa_dict {
@@ -319,8 +308,8 @@ const DEV_INFO_PROPS: spa_dict = spa_dict {
     items: std::ptr::null(),
 };
 
-unsafe extern "C" fn on_hotplug_event(source: *mut spa_source) {
-    let state: *mut State = unsafe { (*source).data.cast() };
+unsafe extern "C" fn on_hotplug_event<B: backend::Backend>(source: *mut spa_source) {
+    let state: *mut State<B> = unsafe { (*source).data.cast() };
     assert!(
         !state.is_null(),
         "(*source).data is not supposed to be null"
@@ -331,26 +320,28 @@ unsafe extern "C" fn on_hotplug_event(source: *mut spa_source) {
             with_runtime_mut(state, |state| {
                 let hotplug_monitor = state.hotplug_monitor.as_mut()?;
 
-                // Any pcm (or its uaudio parent) attach/detach can change the device
-                // set. Resync and build owned notifications before listener dispatch.
-                let (alive, event) = hotplug_monitor.read_monitor_event();
-                let notifications = match event {
-                    Some(platform::MonitorHotplugEvent::Attached) => resync_devices(state, &[]),
-                    Some(platform::MonitorHotplugEvent::Detached(subject)) => {
-                        resync_devices(state, &[subject])
-                    }
-                    None => Vec::new(),
-                };
+                // The selected backend owns native event decoding and
+                // replacement matching. Build owned notifications from its
+                // neutral catalog diff before listener dispatch.
+                let (alive, rescan) = hotplug_monitor.read_catalog_rescan(&mut state.catalog);
+                let notifications = rescan
+                    .map(|rescan| catalog_notifications::<B>(state, rescan))
+                    .unwrap_or_default();
 
                 if !alive {
-                    // devd restarted or dropped us; deregister or the level-triggered
-                    // fd spins the main loop forever.
-                    crate::warn!(state.log, "devd connection lost; hotplug disabled");
+                    // A closed level-triggered source must be deregistered or
+                    // it spins the main loop forever.
+                    crate::warn!(
+                        state.log,
+                        "{}",
+                        B::hotplug_diagnostic(backend::HotplugDiagnostic::MonitorLost)
+                    );
                     // SAFETY: this callback runs on the registered main loop.
                     if state.hotplug_source.unregister() < 0 {
                         eprintln!(
-                            "{}: can't detach the monitor devd source; aborting",
-                            platform::DIAGNOSTIC_TAG
+                            "{}: {}",
+                            B::DIAGNOSTIC_TAG,
+                            B::hotplug_diagnostic(backend::HotplugDiagnostic::MonitorDetachAbort)
                         );
                         std::process::abort();
                     }
@@ -368,73 +359,44 @@ unsafe extern "C" fn on_hotplug_event(source: *mut spa_source) {
     unsafe { events.dispatch_all(notifications) };
 }
 
-// re-read sndstat, diff the parent->indexes map, and retract/emit whatever
-// changed; a parent whose index set changed is retracted and re-emitted so a
-// reused unit number never leaves a node bound to the wrong hardware
-fn resync_devices(state: &mut Runtime, detached: &[String]) -> Vec<MonitorObjectEvent> {
-    let mut notifications = Vec::new();
-    // Force-retract every group a detach event names BEFORE diffing: a fast
-    // replug can land the '-' event after the replacement re-attached with the
-    // same nameunit and index set, leaving the maps identical while the
-    // underlying hardware changed; the diff below then re-emits them fresh.
-    for subject in detached {
-        let key = if let Some(unit) = subject
-            .strip_prefix("pcm")
-            .and_then(|u| u.parse::<u32>().ok())
-        {
-            state
-                .pcm_indexes
-                .iter()
-                .find(|(_, v)| v.contains(&unit))
-                .map(|(k, _)| k.clone())
-        } else if state.pcm_indexes.contains_key(subject) {
-            Some(subject.clone())
-        } else {
-            None
-        };
-        if let Some(key) = key
-            && let Some(indexes) = state.pcm_indexes.remove(&key)
-        {
-            crate::info!(state.log, "removing {} ({:?}) on detach", key, indexes);
-            if let Some(&id) = indexes.first() {
-                notifications.push(MonitorObjectEvent::Removed { id });
-            }
-        }
+// Diff the selected backend catalog and retract/emit whatever changed. A
+// parent whose endpoint set changed is retracted and re-emitted so a reused
+// endpoint never leaves a node bound to the wrong hardware.
+fn catalog_notifications<B: backend::Backend>(
+    state: &Runtime<B>,
+    rescan: backend::CatalogRescan,
+) -> Vec<MonitorObjectEvent> {
+    let backend::CatalogRescan { changes, error } = rescan;
+    if let Some(err) = error {
+        crate::warn!(
+            state.log,
+            "{}: {}",
+            B::Catalog::refresh_error_context(),
+            err
+        );
     }
-
-    let new_map = match platform::read_device_groups() {
-        Ok(groups) => groups,
-        Err(err) => {
-            crate::warn!(state.log, "can't re-read sndstat: {}", err);
-            return notifications;
-        }
-    };
-    let old_map = std::mem::replace(&mut state.pcm_indexes, new_map);
-
-    for (driver, old_indexes) in &old_map {
-        if state.pcm_indexes.get(driver) != Some(old_indexes) {
-            crate::info!(state.log, "removing {} ({:?})", driver, old_indexes);
-            if let Some(&id) = old_indexes.first() {
-                notifications.push(MonitorObjectEvent::Removed { id });
+    changes
+        .into_iter()
+        .map(|change| match change {
+            backend::CatalogChange::Added {
+                snapshot,
+                diagnostic,
+            } => {
+                crate::info!(state.log, "registering {}", diagnostic);
+                MonitorObjectEvent::Added(snapshot)
             }
-        }
-    }
-    for (driver, new_indexes) in &state.pcm_indexes {
-        if old_map.get(driver) != Some(new_indexes) {
-            crate::info!(state.log, "registering {} ({:?})", driver, new_indexes);
-            if let Some(&id) = new_indexes.first() {
-                notifications.push(MonitorObjectEvent::Added {
-                    id,
-                    driver: driver.clone(),
-                    indexes: new_indexes.clone(),
-                });
+            backend::CatalogChange::Removed {
+                object_id,
+                diagnostic,
+            } => {
+                crate::info!(state.log, "removing {}", diagnostic);
+                MonitorObjectEvent::Removed { id: object_id }
             }
-        }
-    }
-    notifications
+        })
+        .collect()
 }
 
-unsafe extern "C" fn init(
+unsafe extern "C" fn init<B: backend::Backend>(
     _factory: *const spa_handle_factory,
     handle: *mut spa_handle,
     _info: *const spa_dict,
@@ -445,8 +407,7 @@ unsafe extern "C" fn init(
         spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Log.as_ptr().cast())
             .cast::<spa_log>()
     };
-    let Some(log) = (unsafe { Log::wrap(log, std::ptr::NonNull::new(&raw mut OSS_MONITOR_TOPIC)) })
-    else {
+    let Some(log) = (unsafe { Log::wrap(log, Some(B::monitor_log_topic())) }) else {
         return -libc::EINVAL;
     };
 
@@ -461,38 +422,47 @@ unsafe extern "C" fn init(
 
     let main_loop = unsafe { Loop::wrap(main_loop) };
 
-    let state = handle.cast::<State>();
+    let state = handle.cast::<State<B>>();
     assert!(!state.is_null(), "handle is not supposed to be null");
 
-    let pcm_indexes = match platform::read_device_groups() {
-        Ok(groups) => groups,
+    let catalog = match B::Catalog::scan() {
+        Ok(catalog) => catalog,
         Err(err) => {
-            crate::error!(log, "Can't open /dev/sndstat: {}", err);
-            return -(err as c_int);
+            crate::error!(log, "{}: {}", B::Catalog::open_error_context(), err);
+            return -err.code();
         }
     };
 
-    // no devd (jails, minimal systems) just means no hotplug
-    let hotplug_monitor = match platform::HotplugMonitor::open() {
+    // A missing native event service disables only hotplug; initial
+    // enumeration still succeeds.
+    let hotplug_monitor = match B::Hotplug::open() {
         Ok(socket) => Some(socket),
         Err(err) => {
-            crate::warn!(log, "can't connect to devd, hotplug disabled: {}", err);
+            crate::warn!(
+                log,
+                "{}: {}",
+                B::hotplug_diagnostic(backend::HotplugDiagnostic::MonitorOpen),
+                err
+            );
             None
         }
     };
 
-    let hotplug_source = LoopSource::new(spa_source {
-        loop_: std::ptr::null_mut(),
-        func: Some(on_hotplug_event),
-        data: state.cast::<c_void>(),
-        fd: hotplug_monitor
-            .as_ref()
-            .map(|monitor| monitor.fd())
-            .unwrap_or(-1),
-        mask: SPA_IO_IN,
-        rmask: 0,
-        priv_: std::ptr::null_mut(),
-    });
+    let hotplug_source = LoopSource::new(
+        spa_source {
+            loop_: std::ptr::null_mut(),
+            func: Some(on_hotplug_event::<B>),
+            data: state.cast::<c_void>(),
+            fd: hotplug_monitor
+                .as_ref()
+                .map(|monitor| monitor.fd())
+                .unwrap_or(-1),
+            mask: SPA_IO_IN,
+            rmask: 0,
+            priv_: std::ptr::null_mut(),
+        },
+        B::DIAGNOSTIC_TAG,
+    );
     let events = std::rc::Rc::new(MonitorEvents::new());
 
     // the host hands us uninitialized memory of get_size() bytes; write the
@@ -503,8 +473,8 @@ unsafe extern "C" fn init(
             State {
                 handle: spa_handle {
                     version: SPA_VERSION_HANDLE,
-                    get_interface: Some(get_interface),
-                    clear: Some(clear),
+                    get_interface: Some(get_interface::<B>),
+                    clear: Some(clear::<B>),
                 },
 
                 device: spa_device {
@@ -512,7 +482,7 @@ unsafe extern "C" fn init(
                         type_: SPA_TYPE_INTERFACE_Device.as_ptr().cast(),
                         version: SPA_VERSION_DEVICE,
                         cb: spa_callbacks {
-                            funcs: std::ptr::from_ref(&DEVICE_IMPL).cast(),
+                            funcs: std::ptr::from_ref(&MonitorMethods::<B>::METHODS).cast(),
                             data: state.cast(),
                         },
                     },
@@ -521,7 +491,7 @@ unsafe extern "C" fn init(
                 runtime: Runtime {
                     events,
 
-                    pcm_indexes,
+                    catalog,
 
                     main_loop,
                     hotplug_monitor,
@@ -542,7 +512,12 @@ unsafe extern "C" fn init(
                 let err = state.hotplug_source.register(&main_loop);
                 if err < 0 {
                     // no hotplug then; enumeration still works
-                    crate::warn!(state.log, "can't watch devd: {}", err);
+                    crate::warn!(
+                        state.log,
+                        "{}: {}",
+                        B::hotplug_diagnostic(backend::HotplugDiagnostic::MonitorWatch),
+                        err
+                    );
                     state.hotplug_monitor = None;
                     state.hotplug_source.set_fd(-1);
                 }
@@ -577,26 +552,23 @@ unsafe extern "C" fn enum_interface_info(
     }
 }
 
-pub(crate) const OSS_MONITOR_FACTORY: spa_handle_factory = spa_handle_factory {
-    version: SPA_VERSION_HANDLE_FACTORY,
-    name: platform::MONITOR_FACTORY_NAME.as_ptr(),
-    info: std::ptr::null(),
-    get_size: Some(get_size),
-    init: Some(init),
-    enum_interface_info: Some(enum_interface_info),
-};
-
-// mut: the host logger writes level/has_custom_level back after registration
-pub(crate) static mut OSS_MONITOR_TOPIC: spa_log_topic = spa_log_topic {
-    version: SPA_VERSION_LOG_TOPIC,
-    topic: platform::MONITOR_LOG_TOPIC.as_ptr(),
-    level: SPA_LOG_LEVEL_NONE,
-    has_custom_level: false,
-};
+pub const fn factory<B: backend::Backend>(name: *const c_char) -> spa_handle_factory {
+    spa_handle_factory {
+        version: SPA_VERSION_HANDLE_FACTORY,
+        name,
+        info: std::ptr::null(),
+        get_size: Some(get_size::<B>),
+        init: Some(init::<B>),
+        enum_interface_info: Some(enum_interface_info),
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::fake::FakeBackend;
+
+    type MonitorEvents = super::MonitorEvents<FakeBackend>;
 
     struct LateMonitorListener {
         seen: Vec<u32>,
