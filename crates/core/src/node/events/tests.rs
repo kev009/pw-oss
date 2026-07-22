@@ -1,6 +1,9 @@
-use super::super::sink::SinkDir;
+use super::super::sink::SinkDir as GenericSinkDir;
 use super::*;
+use crate::backend::fake::FakeBackend;
 use crate::spa::ListenerList;
+
+type SinkDir = GenericSinkDir<FakeBackend>;
 
 struct ReentrantInfoContext {
     events: *const NodeEvents<SinkDir>,

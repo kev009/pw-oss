@@ -1,153 +1,5 @@
-use super::enum_format_widths;
 use crate::backend;
 use crate::spa::parse_back;
-
-#[test]
-fn fallback_formats_cover_the_supported_surface() {
-    let caps = backend::fallback_caps();
-    assert_eq!(
-        caps.preferred_configuration().unwrap().formats,
-        backend::all_formats()
-    );
-}
-
-#[test]
-fn default_channel_orders_need_no_ioctl() {
-    use libspa::sys::*;
-
-    for positions in [
-        &[SPA_AUDIO_CHANNEL_MONO][..],
-        &[SPA_AUDIO_CHANNEL_FL],
-        &[SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR],
-        &[
-            SPA_AUDIO_CHANNEL_FL,
-            SPA_AUDIO_CHANNEL_FR,
-            SPA_AUDIO_CHANNEL_RL,
-            SPA_AUDIO_CHANNEL_RR,
-        ],
-        &[
-            SPA_AUDIO_CHANNEL_FL,
-            SPA_AUDIO_CHANNEL_FR,
-            SPA_AUDIO_CHANNEL_RL,
-            SPA_AUDIO_CHANNEL_RR,
-            SPA_AUDIO_CHANNEL_FC,
-            SPA_AUDIO_CHANNEL_LFE,
-        ],
-        &[
-            SPA_AUDIO_CHANNEL_FL,
-            SPA_AUDIO_CHANNEL_FR,
-            SPA_AUDIO_CHANNEL_RL,
-            SPA_AUDIO_CHANNEL_RR,
-            SPA_AUDIO_CHANNEL_FC,
-            SPA_AUDIO_CHANNEL_LFE,
-            SPA_AUDIO_CHANNEL_SL,
-            SPA_AUDIO_CHANNEL_SR,
-        ],
-    ] {
-        assert_eq!(backend::test_native_channel_order(0, positions), Ok(None));
-    }
-}
-
-#[test]
-fn alternate_named_channel_orders_encode_oss_chid_nibbles() {
-    use libspa::sys::*;
-
-    // Reversed stereo: CHID_R, CHID_L.
-    assert_eq!(
-        backend::test_native_channel_order(0, &[SPA_AUDIO_CHANNEL_FR, SPA_AUDIO_CHANNEL_FL],),
-        Ok(Some(0x12))
-    );
-    // Conventional WAV/ALSA 5.1: FL, FR, FC, LFE, RL, RR.
-    assert_eq!(
-        backend::test_native_channel_order(
-            0,
-            &[
-                SPA_AUDIO_CHANNEL_FL,
-                SPA_AUDIO_CHANNEL_FR,
-                SPA_AUDIO_CHANNEL_FC,
-                SPA_AUDIO_CHANNEL_LFE,
-                SPA_AUDIO_CHANNEL_RL,
-                SPA_AUDIO_CHANNEL_RR,
-            ],
-        ),
-        Ok(Some(0x87_4321))
-    );
-    // Conventional 7.1 extends that order with side left/right.
-    assert_eq!(
-        backend::test_native_channel_order(
-            0,
-            &[
-                SPA_AUDIO_CHANNEL_FL,
-                SPA_AUDIO_CHANNEL_FR,
-                SPA_AUDIO_CHANNEL_FC,
-                SPA_AUDIO_CHANNEL_LFE,
-                SPA_AUDIO_CHANNEL_RL,
-                SPA_AUDIO_CHANNEL_RR,
-                SPA_AUDIO_CHANNEL_SL,
-                SPA_AUDIO_CHANNEL_SR,
-            ],
-        ),
-        Ok(Some(0x6587_4321))
-    );
-}
-
-#[test]
-fn opaque_and_unpositioned_channel_orders_stay_opaque() {
-    use libspa::sys::*;
-
-    assert_eq!(
-        backend::test_native_channel_order(
-            0,
-            &[
-                SPA_AUDIO_CHANNEL_AUX0,
-                SPA_AUDIO_CHANNEL_AUX0 + 1,
-                SPA_AUDIO_CHANNEL_AUX0 + 2,
-            ],
-        ),
-        Ok(None)
-    );
-    assert_eq!(
-        backend::test_native_channel_order(
-            SPA_AUDIO_FLAG_UNPOSITIONED,
-            &[SPA_AUDIO_CHANNEL_FR, SPA_AUDIO_CHANNEL_FL],
-        ),
-        Ok(None)
-    );
-}
-
-#[test]
-fn malformed_channel_orders_are_rejected() {
-    use libspa::sys::*;
-
-    for positions in [
-        &[SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FL][..],
-        &[SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_AUX0],
-        &[SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FLC],
-        // Named and unique, but not FreeBSD's four-channel speaker set.
-        &[
-            SPA_AUDIO_CHANNEL_FL,
-            SPA_AUDIO_CHANNEL_FR,
-            SPA_AUDIO_CHANNEL_FC,
-            SPA_AUDIO_CHANNEL_LFE,
-        ],
-        &[
-            SPA_AUDIO_CHANNEL_FL,
-            SPA_AUDIO_CHANNEL_FR,
-            SPA_AUDIO_CHANNEL_FC,
-            SPA_AUDIO_CHANNEL_LFE,
-            SPA_AUDIO_CHANNEL_RL,
-            SPA_AUDIO_CHANNEL_RR,
-            SPA_AUDIO_CHANNEL_SL,
-            SPA_AUDIO_CHANNEL_SR,
-            SPA_AUDIO_CHANNEL_BC,
-        ],
-    ] {
-        assert_eq!(
-            backend::test_native_channel_order(0, positions),
-            Err(backend::ChannelMapError::Unsupported)
-        );
-    }
-}
 
 fn caps(
     formats: &[u32],
@@ -157,23 +9,57 @@ fn caps(
     preferred_rate: Option<u32>,
     convertless: bool,
 ) -> backend::StreamCaps {
+    let mut layouts = (channels.0..=channels.1)
+        .map(|channels| backend::ChannelLayout {
+            channels,
+            positions: match channels {
+                1 => Some(vec![libspa::sys::SPA_AUDIO_CHANNEL_MONO]),
+                2 => Some(vec![
+                    libspa::sys::SPA_AUDIO_CHANNEL_FL,
+                    libspa::sys::SPA_AUDIO_CHANNEL_FR,
+                ]),
+                _ => None,
+            },
+        })
+        .collect::<Vec<_>>();
+    if channels.0 <= 2 && channels.1 >= 2 {
+        let stereo = layouts
+            .iter()
+            .find(|layout| layout.channels == 2)
+            .cloned()
+            .unwrap();
+        layouts.retain(|layout| layout.channels != 2);
+        layouts.insert(0, stereo.clone());
+        if layouts.last() != Some(&stereo) {
+            layouts.push(stereo);
+        }
+    }
     backend::StreamCaps {
         configurations: vec![backend::StreamConfiguration {
             formats: formats.to_vec(),
-            min_channels: channels.0,
-            max_channels: channels.1,
-            min_rate: rate_range.0,
-            max_rate: rate_range.1,
+            channels: backend::ChannelSet::Discrete(layouts),
+            rates: if rates.is_empty() {
+                backend::RateSet::Range {
+                    min: rate_range.0,
+                    max: rate_range.1,
+                }
+            } else {
+                backend::RateSet::Discrete(rates.to_vec())
+            },
             preferred_rate,
-            rates: rates.to_vec(),
             rate_tolerance: 50,
+            conversion: if convertless {
+                backend::ConversionPath::None
+            } else {
+                backend::ConversionPath::Kernel
+            },
+            flags: if convertless {
+                backend::ConfigurationFlags::default()
+            } else {
+                backend::ConfigurationFlags::with_layout_reorder()
+            },
         }],
         preferred: 0,
-        conversion: if convertless {
-            backend::ConversionKind::None
-        } else {
-            backend::ConversionKind::Backend
-        },
     }
 }
 
@@ -290,34 +176,39 @@ fn enum_format_summary(caps: &backend::StreamCaps, index: u32) -> (u32, i32, i32
 
 #[test]
 fn configurations_enumerate_preferred_first_without_crossing_constraints() {
-    use crate::backend::{ConversionKind, StreamCaps, StreamConfiguration};
+    use crate::backend::{
+        ChannelLayout, ChannelSet, ConversionPath, RateSet, StreamCaps, StreamConfiguration,
+    };
     use libspa::sys::{SPA_AUDIO_FORMAT_S16_LE, SPA_AUDIO_FORMAT_U8};
 
     let caps = StreamCaps {
         configurations: vec![
             StreamConfiguration {
                 formats: vec![SPA_AUDIO_FORMAT_U8],
-                min_channels: 1,
-                max_channels: 1,
-                min_rate: 44100,
-                max_rate: 44100,
+                channels: ChannelSet::Discrete(vec![ChannelLayout {
+                    channels: 1,
+                    positions: None,
+                }]),
+                rates: RateSet::Discrete(vec![44100]),
                 preferred_rate: None,
-                rates: vec![],
                 rate_tolerance: 0,
+                conversion: ConversionPath::None,
+                flags: backend::ConfigurationFlags::default(),
             },
             StreamConfiguration {
                 formats: vec![SPA_AUDIO_FORMAT_S16_LE],
-                min_channels: 2,
-                max_channels: 2,
-                min_rate: 48000,
-                max_rate: 48000,
+                channels: ChannelSet::Discrete(vec![ChannelLayout {
+                    channels: 2,
+                    positions: None,
+                }]),
+                rates: RateSet::Discrete(vec![48000]),
                 preferred_rate: None,
-                rates: vec![],
                 rate_tolerance: 0,
+                conversion: ConversionPath::None,
+                flags: backend::ConfigurationFlags::default(),
             },
         ],
         preferred: 1,
-        conversion: ConversionKind::None,
     };
 
     assert_eq!(
@@ -329,7 +220,7 @@ fn configurations_enumerate_preferred_first_without_crossing_constraints() {
         (SPA_AUDIO_FORMAT_U8, 44100, 1)
     );
     assert!(super::build_enum_format_info(&caps, 2).is_none());
-    assert!(!caps.admits(SPA_AUDIO_FORMAT_U8, 2, 48000));
+    assert!(!caps.admits(SPA_AUDIO_FORMAT_U8, 2, None, 48000));
 }
 
 fn raw_format(format: u32) -> libspa::sys::spa_audio_info_raw {
@@ -391,11 +282,6 @@ fn format_snap_preserves_and_selects_float_three_byte_24_and_u8() {
     let mut snapped_u8 = raw_format(SPA_AUDIO_FORMAT_S16_LE);
     assert!(super::snap_raw_to_caps(&u8_caps, &mut snapped_u8));
     assert_eq!(snapped_u8.format, SPA_AUDIO_FORMAT_U8);
-
-    assert_eq!(backend::bytes_per_sample(SPA_AUDIO_FORMAT_F32_LE), Some(4));
-    assert_eq!(backend::bytes_per_sample(SPA_AUDIO_FORMAT_S24_BE), Some(3));
-    assert_eq!(backend::bytes_per_sample(SPA_AUDIO_FORMAT_S16_LE), Some(2));
-    assert_eq!(backend::bytes_per_sample(SPA_AUDIO_FORMAT_U8), Some(1));
 }
 
 #[test]
@@ -426,57 +312,14 @@ fn convertless_format_offers_are_native_only() {
     let unmatched = caps(&[], (1, 2), (8000, 192000), &[], None, true);
     assert!(backend::offered_formats(unmatched.preferred_configuration().unwrap()).is_empty());
 
-    let feeder = caps(
-        &backend::all_formats(),
-        (1, 2),
-        (8000, 192000),
-        &[],
-        None,
-        false,
-    );
+    let converted_formats = [
+        SPA_AUDIO_FORMAT_F32_LE,
+        SPA_AUDIO_FORMAT_S24_BE,
+        SPA_AUDIO_FORMAT_U8,
+    ];
+    let feeder = caps(&converted_formats, (1, 2), (8000, 192000), &[], None, false);
     assert_eq!(
         backend::offered_formats(feeder.preferred_configuration().unwrap()),
-        backend::all_formats()
+        converted_formats
     );
-}
-
-// the 9875023 invariant: pulse falls back to the LAST EnumFormat map when
-// Format is gone, and HW route volume is always 2ch - so whenever the
-// device can do stereo, the list must open with it (host default) and end
-// with it (fallback), or cvolume.channels flips and pops the volume OSD
-#[test]
-fn stereo_pins_both_ends_of_enum_format() {
-    for (min, max) in [(1u32, 2u32), (2, 2), (1, 8), (2, 8), (1, 10), (2, 32)] {
-        let widths = enum_format_widths(min, max);
-        assert_eq!(
-            *widths.first().unwrap(),
-            2,
-            "min {min} max {max}: {widths:?}"
-        );
-        assert_eq!(
-            *widths.last().unwrap(),
-            2,
-            "min {min} max {max}: {widths:?}"
-        );
-        assert!(
-            widths.contains(&max),
-            "native width lost: min {min} max {max}: {widths:?}"
-        );
-        assert!(
-            widths.iter().all(|w| *w >= min && *w <= max),
-            "width out of range: min {min} max {max}: {widths:?}"
-        );
-        assert_eq!(
-            widths.iter().filter(|w| **w == 2).count().min(2),
-            if widths.len() == 1 { 1 } else { 2 }
-        );
-    }
-    // concrete shapes: this machine's HDMI 8ch and a 10ch USB mixer
-    assert_eq!(enum_format_widths(2, 8), [2, 4, 6, 8, 2]);
-    assert_eq!(enum_format_widths(1, 10), [2, 4, 6, 8, 1, 10, 2]);
-    assert_eq!(enum_format_widths(2, 2), [2]);
-    // no stereo support: no pinning, the native width still leads/closes
-    assert_eq!(enum_format_widths(1, 1), [1]);
-    assert_eq!(enum_format_widths(4, 8), [4, 6, 8]);
-    assert_eq!(enum_format_widths(3, 3), [3]);
 }

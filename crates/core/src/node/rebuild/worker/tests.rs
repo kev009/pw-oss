@@ -1,7 +1,52 @@
-use super::super::super::sink::SinkDir;
+use super::super::super::sink::SinkDir as GenericSinkDir;
 use super::*;
-use crate::backend::PlaybackStream;
+use crate::backend::fake::{FakeBackend, FakeProperties, FakeStream};
+use crate::node::fake::FakeDir;
 use crate::spa::Log;
+
+type SinkDir = GenericSinkDir<FakeBackend>;
+
+#[test]
+fn shared_rebuild_installs_the_deterministic_fake_stream() {
+    use std::sync::atomic::Ordering;
+
+    let shared = std::sync::Arc::new(NodeShared::<FakeDir>::new());
+    shared.started.store(true, Ordering::Release);
+    shared.generation.store(11, Ordering::Release);
+    rebuild_task(RebuildRequest {
+        port_idx: 0,
+        generation: 11,
+        config: PortConfig {
+            format: libspa::param::audio::AudioFormat::S16LE,
+            rate: 48_000,
+            channels: 2,
+            positions: vec![],
+            flags: 0,
+            stride: 4,
+        },
+        path: "fake://rebuild".into(),
+        backend_properties: FakeProperties::new(true),
+        retried: false,
+        retire_first: None,
+        log: Log::test_null(),
+        shared: std::sync::Arc::downgrade(&shared),
+    });
+
+    let swap = shared.take_swap().expect("fake rebuild deposited");
+    match swap.outcome {
+        SwapOutcome::Installed {
+            dsp,
+            config,
+            applied_buffer,
+        } => {
+            assert_eq!(dsp.path(), "fake://rebuild");
+            assert_eq!(config.rate, 48_000);
+            assert_eq!(config.stride, 4);
+            assert_eq!(applied_buffer.capacity_bytes, Some(65_536));
+        }
+        _ => panic!("fake rebuild must install"),
+    }
+}
 #[test]
 fn rebuild_worker_runs_off_caller_and_survives_a_panicking_job() {
     let mut worker = RebuildWorker::<SinkDir>::start().expect("worker starts");
@@ -253,7 +298,7 @@ fn rebuild_mailbox_delivers_replaces_and_discards() {
         port_idx: 0,
         generation: 4,
         outcome: SwapOutcome::Failed {
-            placeholder: PlaybackStream::new("/nonexistent/dsp"),
+            placeholder: FakeStream::new("/nonexistent/dsp"),
         },
     });
     assert!(shared.swap_ready());
@@ -293,7 +338,7 @@ fn rebuild_task_deposits_and_respects_the_gates() {
             stride: 4,
         },
         path: "/nonexistent/dsp".into(),
-        fragment_bytes: 0,
+        backend_properties: FakeProperties::new(true),
         retried: false,
         retire_first: None,
         log: Log::test_null(),
@@ -389,7 +434,7 @@ fn a_panicking_rebuild_path_still_deposits_aborted() {
         armed: true,
     };
     guard.complete(SwapOutcome::Failed {
-        placeholder: PlaybackStream::new("/nonexistent/dsp"),
+        placeholder: FakeStream::new("/nonexistent/dsp"),
     });
     let swap = shared.take_swap().expect("the completed outcome");
     assert_eq!(swap.generation, 10);
