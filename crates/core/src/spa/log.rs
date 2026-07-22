@@ -1,7 +1,7 @@
 use super::*;
 
 #[derive(Clone)]
-pub(crate) struct Log {
+pub struct Log {
     // Raw pointers end to end, never long-lived references: the host logger
     // mutates the spa_log pointee (level) and the registered topic
     // (level/has_custom_level) at runtime, so holding a &'static over
@@ -19,6 +19,7 @@ pub(crate) struct Log {
 unsafe impl Send for Log {}
 
 impl Log {
+    #[allow(dead_code)]
     pub(crate) unsafe fn wrap(
         log: *mut spa_log,
         topic: Option<std::ptr::NonNull<spa_log_topic>>,
@@ -38,7 +39,7 @@ impl Log {
         })
     }
 
-    pub(crate) fn log_level(&self) -> spa_log_level {
+    pub fn log_level(&self) -> spa_log_level {
         use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
         // The host logger rewrites the registered topic's level (and the
         // logger's own level) from its own threads on runtime log-level
@@ -65,7 +66,7 @@ impl Log {
         unsafe { AtomicU32::from_ptr(&raw mut (*logger).level).load(Ordering::Relaxed) }
     }
 
-    pub(crate) fn log(&self, level: spa_log_level, file: &str, line: c_int, func: &str, msg: &str) {
+    pub fn log(&self, level: spa_log_level, file: &str, line: c_int, func: &str, msg: &str) {
         let file = CString::new(file).unwrap(); // ours, no interior NULs
         let func = CString::new(func).unwrap(); // ditto
 
@@ -116,9 +117,9 @@ impl Log {
 // a Log that never emits (level NONE, methods never reached): phase-function
 // tests need a Log without a live host logger. Safe because the log! macros
 // gate every method call on log_level(), which reads NONE here.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Log {
-    pub(crate) fn test_null() -> Self {
+    pub fn test_null() -> Self {
         Self {
             logger: std::ptr::NonNull::from(Box::leak(Box::new(unsafe {
                 std::mem::zeroed::<spa_log>()
@@ -152,35 +153,35 @@ macro_rules! log {
 #[macro_export]
 macro_rules! error {
     ($log:expr, $($arg:tt)*) => {
-        $crate::log!($log, SPA_LOG_LEVEL_ERROR, $($arg)*)
+        $crate::log!($log, ::libspa::sys::SPA_LOG_LEVEL_ERROR, $($arg)*)
     };
 }
 
 #[macro_export]
 macro_rules! warn {
     ($log:expr, $($arg:tt)*) => {
-        $crate::log!($log, SPA_LOG_LEVEL_WARN, $($arg)*)
+        $crate::log!($log, ::libspa::sys::SPA_LOG_LEVEL_WARN, $($arg)*)
     };
 }
 
 #[macro_export]
 macro_rules! info {
     ($log:expr, $($arg:tt)*) => {
-        $crate::log!($log, SPA_LOG_LEVEL_INFO, $($arg)*)
+        $crate::log!($log, ::libspa::sys::SPA_LOG_LEVEL_INFO, $($arg)*)
     };
 }
 
 #[macro_export]
 macro_rules! debug {
     ($log:expr, $($arg:tt)*) => {
-        $crate::log!($log, SPA_LOG_LEVEL_DEBUG, $($arg)*)
+        $crate::log!($log, ::libspa::sys::SPA_LOG_LEVEL_DEBUG, $($arg)*)
     };
 }
 
 #[macro_export]
 macro_rules! trace {
     ($log:expr, $($arg:tt)*) => {
-        $crate::log!($log, SPA_LOG_LEVEL_TRACE, $($arg)*)
+        $crate::log!($log, ::libspa::sys::SPA_LOG_LEVEL_TRACE, $($arg)*)
     };
 }
 

@@ -1,20 +1,20 @@
-[package]
-name        = "spa-freebsd-oss-ng"
-version     = "0.9.10"
-edition      = "2024"
+[workspace]
+resolver = "3"
+members = [
+    "crates/core",
+]
+
+[workspace.package]
+version = "0.9.10"
+edition = "2024"
 rust-version = "1.96"
-description = "FreeBSD OSS sound input/output plugin for PipeWire"
-authors     = ["Alex S <shkhln@users.noreply.github.com>", "Kevin Bowling <kevin.bowling@kev009.com>"]
-license     = "MIT"
-repository  = "https://github.com/kev009/pw-oss"
+authors = [
+    "Alex S <shkhln@users.noreply.github.com>",
+    "Kevin Bowling <kevin.bowling@kev009.com>",
+]
+license = "MIT"
+repository = "https://github.com/kev009/pw-oss"
 
-[lib]
-name       = "spa_freebsd_oss" # preserves the libspa_freebsd_oss.so filename
-crate-type = ["cdylib"]
-
-[dependencies]
-libc   = "0.2.186"
+[workspace.dependencies]
+libc = "0.2.186"
 libspa = "0.10.0"
-nix    = { version = "0.31.3", features = ["ioctl"] }
-regex  = "1.13.1"
-uds    = "=0.4.2"

@@ -1,0 +1,17 @@
+[package]
+name = "spa-kitchen-sink-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Backend-neutral SPA audio plugin machinery"
+publish = false
+
+[features]
+test-support = []
+
+[dependencies]
+libc.workspace = true
+libspa.workspace = true
