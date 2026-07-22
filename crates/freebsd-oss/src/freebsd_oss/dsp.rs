@@ -144,7 +144,7 @@ impl Dsp {
 
     // on direct opens the hardware blocksize is per-session state; call after
     // Configure first so the cadence snapshot reflects this session.
-    pub(crate) fn refresh_hw_quantum(&mut self) {
+    pub(crate) fn refresh_delivery_quantum(&mut self) {
         if let Ok(path) = self.path.to_str() {
             self.delivery_quantum = delivery_quantum(path, false);
         }
@@ -1652,7 +1652,21 @@ impl Drop for DspWriter {
 
 #[cfg(test)]
 mod capture_tests {
+    use super::{Dsp, DspWriter, PCM_CAP_VIRTUAL};
     use crate::backend::test_transport::{pattern, pipe_pair};
+
+    #[test]
+    fn virtual_channel_detection_tests_the_capability_bit() {
+        let mut capture = Dsp::new("/dev/dsp0");
+        let mut playback = DspWriter::new("/dev/dsp0");
+        assert!(!capture.is_virtual_channel());
+        assert!(!playback.is_virtual_channel());
+
+        capture.hw_caps = PCM_CAP_VIRTUAL as u32;
+        playback.hw_caps = PCM_CAP_VIRTUAL as u32;
+        assert!(capture.is_virtual_channel());
+        assert!(playback.is_virtual_channel());
+    }
 
     #[test]
     fn oss_overrun_recovery_requires_three_pinned_cycles() {

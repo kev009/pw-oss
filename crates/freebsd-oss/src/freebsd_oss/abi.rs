@@ -204,8 +204,12 @@ pub(super) fn channel_caps(fd: c_int) -> u32 {
 }
 
 pub(super) fn engine_info(fd: c_int) -> Option<oss_audioinfo> {
+    engine_info_at(fd, -1)
+}
+
+pub(super) fn engine_info_at(fd: c_int, device: c_int) -> Option<oss_audioinfo> {
     let mut info = ioctl_zeroed::<oss_audioinfo>();
-    info.dev = -1; // the channel bound to this descriptor
+    info.dev = device;
     unsafe { ioctl_value(fd, SNDCTL_ENGINEINFO, info) }
 }
 

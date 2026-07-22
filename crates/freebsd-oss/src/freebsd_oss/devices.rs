@@ -10,13 +10,11 @@ use crate::backend::{
     QuantumQuality, RateSet, StreamCaps, StreamConfiguration, StreamDirection, StreamLocator,
 };
 
-// Ask the device what it actually supports. Two sources, merged:
-// - empirical SETCHANNELS/SPEED probes at the extremes (OSS grants the nearest
-//   supported value) - but the kernel clamps channel requests to SND_CHN_MAX
-//   and bitperfect devices reject unsupported values instead of snapping;
-// - SNDCTL_AUDIOINFO, which reports the real hardware limits (dsp.c
-//   aggregates chn_getcaps over the device), covering both gaps above.
-// Uses a transient open; the caller falls back if the device is busy.
+// Capability discovery merges sndstat's per-direction limits with OSS engine
+// details. Exclusive endpoints stay unclaimed: indexed ENGINEINFO requests go
+// through their mixer control descriptor. Shareable endpoints additionally
+// use a transient DSP open for empirical SETCHANNELS/SPEED probes; OSS grants
+// the nearest supported value, and the caller falls back if that open is busy.
 
 // native per-direction device info from the sndstat(4) nvlist interface -
 // no dsp open, so an exclusive device's only channel stays unclaimed
@@ -138,21 +136,29 @@ fn caps_from_sndstat(nv: &SndstatDspInfo, rates: Vec<u32>) -> StreamCaps {
     }
 }
 
-// The native rate SET of an exclusive device, from a brief ENGINEINFO-only
-// open. Bitperfect rates aren't a dense range: the kernel snaps the DMA to
-// the nearest native rate but SNDCTL_DSP_SPEED echoes the REQUEST back for
-// playback (feeder_chain keeps c->speed = target), so an in-range non-native
-// rate would negotiate fine and play pitch-shifted with no diagnostics.
-fn native_rates(path: &str, play: bool) -> Vec<u32> {
-    let Ok(cpath) = CString::new(path) else {
-        return vec![];
-    };
-    let mode = if play { libc::O_WRONLY } else { libc::O_RDONLY };
-    let Some(fd) = LibcFd::open(&cpath, mode | libc::O_NONBLOCK) else {
-        return vec![]; // busy: the caller keeps the min..max range
-    };
+fn mixer_control_path(path: &str) -> Option<(CString, u32)> {
+    let unit = path
+        .trim_start_matches("/dev/")
+        .strip_prefix("dsp")?
+        .parse::<u32>()
+        .ok()?;
+    Some((CString::new(format!("/dev/mixer{unit}")).ok()?, unit))
+}
+
+fn collect_native_rates(
+    unit: u32,
+    play: bool,
+    infos: impl IntoIterator<Item = oss_audioinfo>,
+) -> Vec<u32> {
+    let direction = if play { PCM_CAP_OUTPUT } else { PCM_CAP_INPUT };
     let mut rates = vec![];
-    if let Some(ai) = engine_info(fd.raw()) {
+    for ai in infos {
+        if ai.card_number != unit as c_int
+            || ai.caps & direction == 0
+            || ai.caps & PCM_CAP_VIRTUAL != 0
+        {
+            continue;
+        }
         for i in 0..ai.nrates.min(20) as usize {
             rates.push(ai.rates[i]);
         }
@@ -163,23 +169,47 @@ fn native_rates(path: &str, play: bool) -> Vec<u32> {
     rates
 }
 
+// The native rate set of an exclusive device. Query indexed ENGINEINFO
+// records through the mixer control descriptor: unlike opening /dev/dspN,
+// this never claims the device's only PCM channel. Bitperfect rates are not a
+// dense range; admitting an arbitrary in-range playback rate can pitch-shift
+// while SNDCTL_DSP_SPEED still echoes the requested value.
+fn native_rates(path: &str, play: bool) -> Vec<u32> {
+    let Some((control_path, unit)) = mixer_control_path(path) else {
+        return vec![];
+    };
+    let Some(fd) = LibcFd::open(&control_path, libc::O_RDONLY | libc::O_NONBLOCK) else {
+        return vec![];
+    };
+    let infos = (0..4096).map_while(|device| engine_info_at(fd.raw(), device));
+    collect_native_rates(unit, play, infos)
+}
+
+fn exclusive_rate_fallback(nv: &SndstatDspInfo, mut rates: Vec<u32>) -> Vec<u32> {
+    if rates.is_empty() {
+        let min = nv.min_rate.max(1);
+        let max = nv.max_rate.max(nv.min_rate).max(1);
+        rates.push(min);
+        if max != min {
+            rates.push(max);
+        }
+    }
+    rates
+}
+
 pub(crate) fn probe_caps(path: &str, play: bool) -> Option<StreamCaps> {
     let native = sndstat_dsp_info(path.trim_start_matches("/dev/"), play);
 
     // An exclusive channel (bitperfect or vchans off) negotiates the native
-    // values verbatim, and a probe open would briefly claim the only channel;
-    // build the caps from sndstat without opening at all.
+    // values verbatim. Build its limits from sndstat and obtain any discrete
+    // rate list through a non-PCM control descriptor.
     if let Some(nv) = &native
         && (nv.bitperfect || nv.exclusive == Some(true))
     {
-        let mut rates = native_rates(path, play);
-        // native_rates opens the device briefly; if that failed (busy) on a
-        // bitperfect device, fall back to the native EXTREMES - they are
-        // themselves native, while a dense min..max range would admit
-        // pitch-shifting non-native rates (playback echoes the request back)
-        if nv.bitperfect && rates.is_empty() && nv.min_rate != nv.max_rate {
-            rates = vec![nv.min_rate.max(1), nv.max_rate.max(nv.min_rate).max(1)];
-        }
+        // If indexed ENGINEINFO is unavailable, use the native extrema for
+        // every exclusive endpoint. They are incomplete but safe, whereas a
+        // dense range would admit pitch-shifting non-native rates.
+        let rates = exclusive_rate_fallback(nv, native_rates(path, play));
         return Some(caps_from_sndstat(nv, rates));
     }
 
@@ -604,7 +634,11 @@ impl crate::backend::DeviceCatalog for DeviceCatalog {
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::{DeviceCatalog, PcmDevice, common_description};
+    use super::{
+        DeviceCatalog, PcmDevice, SndstatDspInfo, collect_native_rates, common_description,
+        exclusive_rate_fallback, mixer_control_path,
+    };
+    use crate::freebsd_oss::abi::{PCM_CAP_INPUT, PCM_CAP_OUTPUT, PCM_CAP_VIRTUAL, oss_audioinfo};
 
     fn pcm(desc: &str) -> PcmDevice {
         PcmDevice {
@@ -614,6 +648,55 @@ mod tests {
             play: true,
             rec: false,
         }
+    }
+
+    fn engine(unit: i32, caps: i32, rates: &[u32]) -> oss_audioinfo {
+        let mut info = unsafe { std::mem::zeroed::<oss_audioinfo>() };
+        info.card_number = unit;
+        info.caps = caps;
+        info.nrates = rates.len() as u32;
+        info.rates[..rates.len()].copy_from_slice(rates);
+        info
+    }
+
+    #[test]
+    fn exclusive_rates_use_matching_direct_control_engines() {
+        let infos = [
+            engine(3, PCM_CAP_OUTPUT, &[96_000, 48_000]),
+            engine(3, PCM_CAP_OUTPUT | PCM_CAP_VIRTUAL, &[44_100]),
+            engine(3, PCM_CAP_INPUT, &[32_000]),
+            engine(4, PCM_CAP_OUTPUT, &[192_000]),
+            engine(3, PCM_CAP_OUTPUT, &[48_000, 192_000]),
+        ];
+        assert_eq!(
+            collect_native_rates(3, true, infos),
+            [48_000, 96_000, 192_000]
+        );
+    }
+
+    #[test]
+    fn exclusive_rate_probe_uses_the_pcm_units_mixer() {
+        let (path, unit) = mixer_control_path("/dev/dsp12").unwrap();
+        assert_eq!(path.to_str().unwrap(), "/dev/mixer12");
+        assert_eq!(unit, 12);
+        assert!(mixer_control_path("/dev/dsp").is_none());
+        assert!(mixer_control_path("/dev/audio12").is_none());
+    }
+
+    #[test]
+    fn every_exclusive_endpoint_falls_back_to_discrete_rate_extrema() {
+        let info = SndstatDspInfo {
+            formats: 0,
+            min_rate: 44_100,
+            max_rate: 192_000,
+            min_chn: 1,
+            max_chn: 2,
+            exclusive: Some(true),
+            vchan_rate: 0,
+            bitperfect: false,
+        };
+        assert_eq!(exclusive_rate_fallback(&info, vec![]), [44_100, 192_000]);
+        assert_eq!(exclusive_rate_fallback(&info, vec![96_000]), [96_000]);
     }
 
     #[test]

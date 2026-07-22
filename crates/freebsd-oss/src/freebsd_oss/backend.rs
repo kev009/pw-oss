@@ -328,7 +328,7 @@ pub(crate) fn configure_capture(
             ""
         }
     );
-    stream.refresh_hw_quantum();
+    stream.refresh_delivery_quantum();
     stream.set_small_fragments(properties.fragment_bytes(), MIN_BUFFER_BYTES);
     match configure_outcome(config, applied, stream.delivery_quantum()) {
         Ok(outcome) => Ok(outcome),
