@@ -1,9 +1,9 @@
 use nix::errno::Errno;
 use std::collections::BTreeMap;
-use std::ffi::{CString, c_int, c_ulong, c_void};
+use std::ffi::{CString, c_int};
 
 use crate::backend::{ConversionKind, StreamCaps, StreamConfiguration};
-use crate::freebsd::{LibcFd, NvList, NvRef, SysctlReader, ioctl_int, ioctl_value, ioctl_zeroed};
+use crate::freebsd::{LibcFd, NvList, NvRef, SysctlReader};
 
 use super::abi::*;
 
@@ -14,15 +14,6 @@ use super::abi::*;
 // - SNDCTL_AUDIOINFO, which reports the real hardware limits (dsp.c
 //   aggregates chn_getcaps over the device), covering both gaps above.
 // Uses a transient open; the caller falls back if the device is busy.
-#[repr(C)]
-struct SndstiocNvArg {
-    nbytes: usize,
-    buf: *mut c_void,
-}
-
-const SNDSTIOC_REFRESH_DEVS: c_ulong = nix::request_code_none!(b'D', 100);
-const SNDSTIOC_GET_DEVS: c_ulong =
-    nix::request_code_readwrite!(b'D', 101, size_of::<SndstiocNvArg>());
 
 // native per-direction device info from the sndstat(4) nvlist interface -
 // no dsp open, so an exclusive device's only channel stays unclaimed
@@ -40,34 +31,7 @@ pub(crate) struct SndstatDspInfo {
 // one packed snapshot of every sound device from sndstat(4)
 fn sndstat_snapshot() -> Option<NvList> {
     let fd = LibcFd::open(c"/dev/sndstat", libc::O_RDONLY)?;
-    let raw_fd = fd.raw();
-
-    // best-effort; GET still returns the last snapshot if refresh fails
-    let _ = unsafe { libc::ioctl(raw_fd, SNDSTIOC_REFRESH_DEVS) };
-
-    // two-call protocol (size, then fill); the snapshot is per-open cdevpriv,
-    // so it can't change between the calls (a too-small buffer would come back
-    // as nbytes = 0 and unpack cleanly to None)
-    let mut buf: Vec<u8> = Vec::new();
-    for _ in 0..2 {
-        let mut arg = SndstiocNvArg {
-            nbytes: buf.len(),
-            buf: buf.as_mut_ptr().cast(),
-        };
-        if buf.is_empty() {
-            arg.buf = std::ptr::null_mut();
-        }
-        if unsafe { libc::ioctl(raw_fd, SNDSTIOC_GET_DEVS, &mut arg) } == -1 {
-            return None;
-        }
-        if !buf.is_empty() && arg.nbytes <= buf.len() {
-            buf.truncate(arg.nbytes);
-            break;
-        }
-        buf = vec![0; arg.nbytes];
-    }
-
-    NvList::unpack(&buf)
+    NvList::unpack(&sndstat_snapshot_bytes(fd.raw())?)
 }
 
 // pcm unit numbers plus per-direction channel presence; user-registered
@@ -173,9 +137,7 @@ fn native_rates(path: &str, play: bool) -> Vec<u32> {
         return vec![]; // busy: the caller keeps the min..max range
     };
     let mut rates = vec![];
-    let mut ai: oss_audioinfo = ioctl_zeroed();
-    ai.dev = -1; // this fd's channel
-    if let Some(ai) = unsafe { ioctl_value(fd.raw(), SNDCTL_ENGINEINFO, ai) } {
+    if let Some(ai) = engine_info(fd.raw()) {
         for i in 0..ai.nrates.min(20) as usize {
             rates.push(ai.rates[i]);
         }
@@ -215,17 +177,15 @@ pub(crate) fn probe_caps(path: &str, play: bool) -> Option<StreamCaps> {
     };
     let raw_fd = fd.raw();
 
-    let formats = ioctl_int(raw_fd, SNDCTL_DSP_GETFMTS, 0);
+    let formats = supported_formats(raw_fd);
 
     // ENGINEINFO with dev == -1 resolves the channel bound to THIS fd, so the
     // limits are per-direction (AUDIOINFO blends play and rec across the
     // device). Note: kernels before the 15.x sound rewrite report a vchan's
     // fixed rate here instead of the feeder range; harmless, since these
     // values are only consulted when the empirical probe fails.
-    let mut ai: oss_audioinfo = ioctl_zeroed();
-    ai.dev = -1; // this fd's channel
     let (ai_min_ch, ai_max_ch, ai_min_rate, ai_max_rate, ai_caps) =
-        unsafe { ioctl_value(raw_fd, SNDCTL_ENGINEINFO, ai) }.map_or((0, 0, 0, 0, 0), |ai| {
+        engine_info(raw_fd).map_or((0, 0, 0, 0, 0), |ai| {
             (
                 ai.min_channels,
                 ai.max_channels,
@@ -243,20 +203,17 @@ pub(crate) fn probe_caps(path: &str, play: bool) -> Option<StreamCaps> {
     // native format and wider counts are genuinely negotiable, so the engine
     // width extends the probe there (e.g. 10-channel USB mixers).
     let direct = ai_caps != 0 && ai_caps & PCM_CAP_VIRTUAL == 0;
-    let min_channels = pick(ioctl_int(raw_fd, SNDCTL_DSP_CHANNELS, 1), ai_min_ch);
+    let min_channels = pick(probe_min_channels(raw_fd), ai_min_ch);
     let max_channels = {
-        let probed = pick(
-            ioctl_int(raw_fd, SNDCTL_DSP_CHANNELS, SND_CHN_MAX),
-            ai_max_ch,
-        );
+        let probed = pick(probe_max_channels(raw_fd), ai_max_ch);
         if direct {
             probed.max(ai_max_ch)
         } else {
             probed
         }
     };
-    let min_rate = pick(ioctl_int(raw_fd, SNDCTL_DSP_SPEED, 8000), ai_min_rate);
-    let max_rate = pick(ioctl_int(raw_fd, SNDCTL_DSP_SPEED, 192000), ai_max_rate);
+    let min_rate = pick(probe_rate(raw_fd, 8000), ai_min_rate);
+    let max_rate = pick(probe_rate(raw_fd, 192000), ai_max_rate);
 
     let formats = formats?;
     if min_channels < 1 || max_channels < min_channels || min_rate < 1 || max_rate < min_rate {

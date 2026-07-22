@@ -1,7 +1,7 @@
 use nix::errno::Errno;
-use std::ffi::{c_char, c_int, c_long, c_uint, c_ulong};
+use std::ffi::{c_char, c_int, c_long, c_uint, c_ulong, c_void};
 
-use crate::freebsd::{IoctlPod, SysctlReader, ioctl_int, ioctl_read, ioctl_value};
+use crate::freebsd::{IoctlPod, SysctlReader, ioctl_int, ioctl_read, ioctl_value, ioctl_zeroed};
 
 pub(crate) const AFMT_U8: u32 = 0x00000008;
 pub(crate) const AFMT_S16_LE: u32 = 0x00000010;
@@ -13,37 +13,38 @@ pub(crate) const AFMT_S24_BE: u32 = 0x00020000;
 pub(crate) const AFMT_F32_LE: u32 = 0x10000000;
 pub(crate) const AFMT_F32_BE: u32 = 0x20000000;
 
-pub(super) const SNDCTL_DSP_SPEED: c_ulong =
-    nix::request_code_readwrite!(b'P', 2, size_of::<c_int>());
-pub(super) const SNDCTL_DSP_SETFMT: c_ulong =
-    nix::request_code_readwrite!(b'P', 5, size_of::<c_int>());
-pub(super) const SNDCTL_DSP_CHANNELS: c_ulong =
-    nix::request_code_readwrite!(b'P', 6, size_of::<c_int>());
-pub(super) const SNDCTL_DSP_SETFRAGMENT: c_ulong =
-    nix::request_code_readwrite!(b'P', 10, size_of::<c_int>());
-pub(super) const SNDCTL_DSP_LOW_WATER: c_ulong =
-    nix::request_code_write!(b'P', 34, size_of::<c_int>());
-pub(super) const SNDCTL_DSP_GETFMTS: c_ulong =
-    nix::request_code_read!(b'P', 11, size_of::<c_int>());
-pub(super) const SNDCTL_DSP_GETOSPACE: c_ulong =
+const SNDCTL_DSP_SPEED: c_ulong = nix::request_code_readwrite!(b'P', 2, size_of::<c_int>());
+const SNDCTL_DSP_SETFMT: c_ulong = nix::request_code_readwrite!(b'P', 5, size_of::<c_int>());
+const SNDCTL_DSP_CHANNELS: c_ulong = nix::request_code_readwrite!(b'P', 6, size_of::<c_int>());
+const SNDCTL_DSP_SETFRAGMENT: c_ulong = nix::request_code_readwrite!(b'P', 10, size_of::<c_int>());
+const SNDCTL_DSP_LOW_WATER: c_ulong = nix::request_code_write!(b'P', 34, size_of::<c_int>());
+const SNDCTL_DSP_GETFMTS: c_ulong = nix::request_code_read!(b'P', 11, size_of::<c_int>());
+const SNDCTL_DSP_GETOSPACE: c_ulong =
     nix::request_code_read!(b'P', 12, size_of::<audio_buf_info>());
-pub(super) const SNDCTL_DSP_GETISPACE: c_ulong =
+const SNDCTL_DSP_GETISPACE: c_ulong =
     nix::request_code_read!(b'P', 13, size_of::<audio_buf_info>());
-pub(super) const SNDCTL_DSP_SETTRIGGER: c_ulong =
-    nix::request_code_write!(b'P', 16, size_of::<c_int>());
-pub(super) const SNDCTL_DSP_GETODELAY: c_ulong =
-    nix::request_code_read!(b'P', 23, size_of::<c_int>());
-pub(super) const SNDCTL_DSP_GETERROR: c_ulong =
-    nix::request_code_read!(b'P', 25, size_of::<audio_errinfo>());
+const SNDCTL_DSP_SETTRIGGER: c_ulong = nix::request_code_write!(b'P', 16, size_of::<c_int>());
+const SNDCTL_DSP_GETODELAY: c_ulong = nix::request_code_read!(b'P', 23, size_of::<c_int>());
+const SNDCTL_DSP_GETERROR: c_ulong = nix::request_code_read!(b'P', 25, size_of::<audio_errinfo>());
 const SNDCTL_DSP_GET_CHNORDER: c_ulong =
     nix::request_code_read!(b'P', 42, size_of::<OssChannelOrder>());
 const SNDCTL_DSP_SET_CHNORDER: c_ulong =
     nix::request_code_readwrite!(b'P', 42, size_of::<OssChannelOrder>());
-pub(super) const SNDCTL_DSP_HALT: c_ulong = nix::request_code_none!(b'P', 0); // aka SNDCTL_DSP_RESET
-pub(super) const SNDCTL_DSP_SILENCE: c_ulong = nix::request_code_none!(b'P', 31);
-pub(super) const SNDCTL_DSP_SKIP: c_ulong = nix::request_code_none!(b'P', 32);
-pub(super) const SNDCTL_ENGINEINFO: c_ulong =
+const SNDCTL_DSP_HALT: c_ulong = nix::request_code_none!(b'P', 0); // aka SNDCTL_DSP_RESET
+const SNDCTL_DSP_SILENCE: c_ulong = nix::request_code_none!(b'P', 31);
+const SNDCTL_DSP_SKIP: c_ulong = nix::request_code_none!(b'P', 32);
+const SNDCTL_ENGINEINFO: c_ulong =
     nix::request_code_readwrite!(b'X', 12, size_of::<oss_audioinfo>());
+
+#[repr(C)]
+struct SndstiocNvArg {
+    nbytes: usize,
+    buf: *mut c_void,
+}
+
+const SNDSTIOC_REFRESH_DEVS: c_ulong = nix::request_code_none!(b'D', 100);
+const SNDSTIOC_GET_DEVS: c_ulong =
+    nix::request_code_readwrite!(b'D', 101, size_of::<SndstiocNvArg>());
 
 // sys/soundcard.h; the ioctl encodes the size, so a layout mismatch fails
 // cleanly instead of corrupting memory
@@ -86,7 +87,7 @@ pub(super) struct oss_audioinfo {
 unsafe impl IoctlPod for oss_audioinfo {}
 
 // sys/dev/sound/pcm/matrix.h: SETCHANNELS requests are clamped to this
-pub(super) const SND_CHN_MAX: c_int = 8;
+const SND_CHN_MAX: c_int = 8;
 
 pub(super) const PCM_ENABLE_INPUT: c_int = 0x00000001;
 pub(super) const PCM_ENABLE_OUTPUT: c_int = 0x00000002;
@@ -152,7 +153,7 @@ pub(crate) fn feeder_rate_round() -> u32 {
 
 // OSS grants the nearest supported value instead of failing, so a grant that
 // differs from the request beyond `tolerance` is a rejection here
-pub(super) fn set_value(fd: c_int, req: c_ulong, value: u32, tolerance: u32) -> Result<u32, Errno> {
+fn set_value(fd: c_int, req: c_ulong, value: u32, tolerance: u32) -> Result<u32, Errno> {
     let Some(v) = ioctl_int(fd, req, value as c_int) else {
         return Err(Errno::last());
     };
@@ -161,6 +162,86 @@ pub(super) fn set_value(fd: c_int, req: c_ulong, value: u32, tolerance: u32) -> 
         return Err(Errno::EINVAL);
     }
     Ok(actual)
+}
+
+pub(super) fn set_format(fd: c_int, format: u32) -> Result<u32, Errno> {
+    set_value(fd, SNDCTL_DSP_SETFMT, format, 0)
+}
+
+pub(super) fn set_channels(fd: c_int, channels: u32) -> Result<u32, Errno> {
+    set_value(fd, SNDCTL_DSP_CHANNELS, channels, 0)
+}
+
+pub(super) fn set_rate(fd: c_int, rate: u32) -> Result<u32, Errno> {
+    set_value(fd, SNDCTL_DSP_SPEED, rate, feeder_rate_round())
+}
+
+pub(super) fn set_low_water(fd: c_int, bytes: u32) -> bool {
+    ioctl_int(
+        fd,
+        SNDCTL_DSP_LOW_WATER,
+        bytes.clamp(1, c_int::MAX as u32) as c_int,
+    )
+    .is_some()
+}
+
+pub(super) fn input_space(fd: c_int) -> Option<audio_buf_info> {
+    unsafe { ioctl_read(fd, SNDCTL_DSP_GETISPACE) }
+}
+
+pub(super) fn halt(fd: c_int) {
+    // Best-effort: HALT is used immediately before closing the descriptor.
+    let _ = unsafe { libc::ioctl(fd, SNDCTL_DSP_HALT) };
+}
+
+pub(super) fn supported_formats(fd: c_int) -> Option<c_int> {
+    ioctl_int(fd, SNDCTL_DSP_GETFMTS, 0)
+}
+
+pub(super) fn engine_info(fd: c_int) -> Option<oss_audioinfo> {
+    let mut info = ioctl_zeroed::<oss_audioinfo>();
+    info.dev = -1; // the channel bound to this descriptor
+    unsafe { ioctl_value(fd, SNDCTL_ENGINEINFO, info) }
+}
+
+pub(super) fn probe_min_channels(fd: c_int) -> Option<c_int> {
+    ioctl_int(fd, SNDCTL_DSP_CHANNELS, 1)
+}
+
+pub(super) fn probe_max_channels(fd: c_int) -> Option<c_int> {
+    ioctl_int(fd, SNDCTL_DSP_CHANNELS, SND_CHN_MAX)
+}
+
+pub(super) fn probe_rate(fd: c_int, rate: c_int) -> Option<c_int> {
+    ioctl_int(fd, SNDCTL_DSP_SPEED, rate)
+}
+
+pub(super) fn sndstat_snapshot_bytes(fd: c_int) -> Option<Vec<u8>> {
+    // Best-effort; GET still returns the last snapshot if refresh fails.
+    let _ = unsafe { libc::ioctl(fd, SNDSTIOC_REFRESH_DEVS) };
+
+    // The snapshot is per-open cdevpriv, so it cannot change between the size
+    // probe and fill calls. A too-small second buffer returns nbytes = 0.
+    let mut buffer: Vec<u8> = Vec::new();
+    for _ in 0..2 {
+        let mut arg = SndstiocNvArg {
+            nbytes: buffer.len(),
+            buf: if buffer.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                buffer.as_mut_ptr().cast()
+            },
+        };
+        if unsafe { libc::ioctl(fd, SNDSTIOC_GET_DEVS, &mut arg) } == -1 {
+            return None;
+        }
+        if !buffer.is_empty() && arg.nbytes <= buffer.len() {
+            buffer.truncate(arg.nbytes);
+            break;
+        }
+        buffer = vec![0; arg.nbytes];
+    }
+    Some(buffer)
 }
 
 pub(super) fn ospace_in_bytes(fd: c_int) -> c_int {

@@ -1,6 +1,6 @@
 use libc::sysctlbyname;
 use nix::errno::Errno;
-use std::ffi::{CStr, CString, c_int, c_ulong, c_void};
+use std::ffi::{CStr, CString, c_int, c_short, c_ulong, c_void};
 
 mod nv;
 
@@ -19,6 +19,7 @@ impl LibcFd {
     ///
     /// # Safety
     /// `fd` must be open and exclusively transferred to the returned owner.
+    #[cfg(test)]
     pub(crate) unsafe fn from_raw(fd: c_int) -> Self {
         assert!(fd >= 0);
         Self(fd)
@@ -26,6 +27,54 @@ impl LibcFd {
 
     pub(crate) fn raw(&self) -> c_int {
         self.0
+    }
+
+    pub(crate) fn read(&self, buffer: &mut [u8]) -> Result<usize, Errno> {
+        let count = unsafe { libc::read(self.0, buffer.as_mut_ptr().cast(), buffer.len()) };
+        if count < 0 {
+            Err(Errno::last())
+        } else {
+            Ok(count as usize)
+        }
+    }
+
+    pub(crate) fn write(&self, buffer: &[u8]) -> Result<usize, Errno> {
+        let count = unsafe { libc::write(self.0, buffer.as_ptr().cast(), buffer.len()) };
+        if count < 0 {
+            Err(Errno::last())
+        } else {
+            Ok(count as usize)
+        }
+    }
+
+    pub(crate) fn poll(&self, events: c_short, timeout_ms: c_int) -> Result<c_short, Errno> {
+        let mut pollfd = libc::pollfd {
+            fd: self.0,
+            events,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut pollfd, 1, timeout_ms) } < 0 {
+            Err(Errno::last())
+        } else {
+            Ok(pollfd.revents)
+        }
+    }
+
+    pub(crate) fn kqueue() -> Result<Self, Errno> {
+        let fd = unsafe { libc::kqueue() };
+        if fd < 0 {
+            return Err(Errno::last());
+        }
+        // kqueue() predates kqueuex(KQUEUE_CLOEXEC); setting the descriptor
+        // flag works on every supported FreeBSD release.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            let error = Errno::last();
+            unsafe {
+                libc::close(fd);
+            }
+            return Err(error);
+        }
+        Ok(Self(fd))
     }
 }
 
@@ -35,6 +84,19 @@ impl Drop for LibcFd {
             libc::close(self.0);
         }
     }
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn monotonic_time_ns() -> u64 {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    assert_ne!(
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) },
+        -1
+    );
+    (now.tv_sec * libspa::sys::SPA_NSEC_PER_SEC as i64 + now.tv_nsec) as u64
 }
 
 /// A C-compatible plain-data type that an ioctl may initialize byte-for-byte.

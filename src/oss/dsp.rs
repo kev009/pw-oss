@@ -1,11 +1,10 @@
-use libc::{size_t, ssize_t};
+use libc::ssize_t;
 use nix::errno::Errno;
 use std::ffi::{CString, c_int};
+use std::time::Duration;
 
-use crate::{
-    backend::{BufferLayout, IoStatus, ReadOutcome, WriteOutcome},
-    freebsd::{LibcFd, ioctl_int, ioctl_read},
-};
+use crate::backend::{BufferLayout, IoStatus, ReadOutcome, WriteOutcome};
+use crate::freebsd::LibcFd;
 
 use super::abi::*;
 use super::buffer::{MAX_BUFFER_BYTES, MIN_BUFFER_BYTES};
@@ -77,11 +76,14 @@ impl Dsp {
         self.state == DspState::Running
     }
 
-    fn raw_fd(&self) -> c_int {
+    fn descriptor(&self) -> &LibcFd {
         self.fd
             .as_ref()
             .expect("an active DSP state owns its descriptor")
-            .raw()
+    }
+
+    fn raw_fd(&self) -> c_int {
+        self.descriptor().raw()
     }
 
     pub(crate) fn fd(&self) -> Option<c_int> {
@@ -89,14 +91,9 @@ impl Dsp {
     }
 
     pub(crate) fn configure_wake_threshold(&self, bytes: u32) -> bool {
-        self.fd.as_ref().is_some_and(|fd| {
-            ioctl_int(
-                fd.raw(),
-                SNDCTL_DSP_LOW_WATER,
-                bytes.clamp(1, c_int::MAX as u32) as c_int,
-            )
-            .is_some()
-        })
+        self.fd
+            .as_ref()
+            .is_some_and(|fd| set_low_water(fd.raw(), bytes))
     }
 
     pub(crate) fn open(&mut self) -> Result<(), Errno> {
@@ -137,12 +134,12 @@ impl Dsp {
         self.stride = afmt_frame_bytes(format)
             .max(1)
             .saturating_mul(channels.max(1));
-        let format = set_value(self.raw_fd(), SNDCTL_DSP_SETFMT, format, 0)?;
-        let channels = set_value(self.raw_fd(), SNDCTL_DSP_CHANNELS, channels, 0)?;
+        let format = set_format(self.raw_fd(), format)?;
+        let channels = set_channels(self.raw_fd(), channels)?;
         if let Some(order) = channel_order {
             set_channel_order(self.raw_fd(), order)?;
         }
-        let rate = set_value(self.raw_fd(), SNDCTL_DSP_SPEED, rate, feeder_rate_round())?;
+        let rate = set_rate(self.raw_fd(), rate)?;
         Ok(AppliedNativeConfig {
             format,
             channels,
@@ -181,7 +178,7 @@ impl Dsp {
             );
         }
         // best-effort: without it, poll readiness is merely fragment-coarse
-        let _ = ioctl_int(self.raw_fd(), SNDCTL_DSP_LOW_WATER, 1);
+        let _ = set_low_water(self.raw_fd(), 1);
     }
 
     // Stop the channel but keep the fd: SETTRIGGER(0) aborts, resets the ring
@@ -215,46 +212,48 @@ impl Dsp {
         assert_eq!(self.state, DspState::Running);
         while self.skip != 0 {
             let mut scratch = [0u8; 64];
-            let n = unsafe {
-                libc::read(
-                    self.raw_fd(),
-                    scratch.as_mut_ptr().cast(),
-                    (self.skip as usize).min(scratch.len()),
-                )
-            };
-            if n <= 0 {
+            let len = (self.skip as usize).min(scratch.len());
+            match self.descriptor().read(&mut scratch[..len]) {
+                Ok(0) => {
+                    return ReadOutcome {
+                        bytes: 0,
+                        status: IoStatus::Disconnected,
+                    };
+                }
+                Ok(count) => self.skip -= count as u32,
+                Err(error) => {
+                    return ReadOutcome {
+                        bytes: 0,
+                        status: io_status(error),
+                    };
+                }
+            }
+        }
+        let count = match self.descriptor().read(buf) {
+            Ok(0) => {
                 return ReadOutcome {
                     bytes: 0,
-                    status: if n < 0 {
-                        io_status(Errno::last())
-                    } else {
-                        IoStatus::Disconnected
-                    },
+                    status: IoStatus::Disconnected,
                 };
             }
-            self.skip -= n as u32;
-        }
-        let n = unsafe { libc::read(self.raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
-        if n <= 0 {
-            return ReadOutcome {
-                bytes: 0,
-                status: if n < 0 {
-                    io_status(Errno::last())
-                } else {
-                    IoStatus::Disconnected
-                },
-            };
-        }
-        let rem = n as usize % self.stride.max(1) as usize;
+            Ok(count) => count,
+            Err(error) => {
+                return ReadOutcome {
+                    bytes: 0,
+                    status: io_status(error),
+                };
+            }
+        };
+        let rem = count % self.stride.max(1) as usize;
         if rem != 0 {
             self.skip = self.stride - rem as u32;
             return ReadOutcome {
-                bytes: n as usize - rem,
+                bytes: count - rem,
                 status: IoStatus::Progress,
             }; // hide the torn frame's head
         }
         ReadOutcome {
-            bytes: n as usize,
+            bytes: count,
             status: IoStatus::Progress,
         }
     }
@@ -272,36 +271,31 @@ impl Dsp {
         // poll(2), not select(2): FD_SET writes out of bounds past FD_SETSIZE
         // (1024) fds, which a busy daemon can reach; poll also triggers the
         // capture channel just like select/read do (dsp_poll -> chn_poll)
-        let mut pfd = libc::pollfd {
-            fd: self.raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let n = unsafe { libc::poll(&mut pfd, 1, timeout_ms as i32) };
+        let ready = self
+            .descriptor()
+            .poll(libc::POLLIN, timeout_ms.min(c_int::MAX as usize) as c_int)
+            .is_ok_and(|events| events & libc::POLLIN != 0);
         // poll force-starts a trigger-suspended channel but leaves NOTRIGGER
         // set, which would keep the channel from ever auto-restarting; clear it
         if self.needs_trigger {
             self.needs_trigger = false;
             let _ = set_trigger(self.raw_fd(), PCM_ENABLE_INPUT);
         }
-        n > 0 && (pfd.revents & libc::POLLIN) != 0
+        ready
     }
 
     pub(crate) fn queued_bytes(&self) -> u32 {
         assert_eq!(self.state, DspState::Running);
-        unsafe { ioctl_read::<audio_buf_info>(self.raw_fd(), SNDCTL_DSP_GETISPACE) }
-            .map_or(0, |info| info.bytes.max(0) as u32)
+        input_space(self.raw_fd()).map_or(0, |info| info.bytes.max(0) as u32)
     }
 
     // fill, granted fragment and total ring from ONE GETISPACE: the prime path
     // needs all three and they come from the same struct (fragsize/fragstotal
     // are layout constants after SETFRAGMENT; only `bytes` moves). (0, 0, 0) =
     // ioctl failed (e.g. device unplugged mid-stream).
-    pub(crate) fn buffer_layout(&mut self) -> BufferLayout {
+    pub(crate) fn buffer_layout(&self) -> BufferLayout {
         assert_eq!(self.state, DspState::Running);
-        let Some(info) =
-            (unsafe { ioctl_read::<audio_buf_info>(self.raw_fd(), SNDCTL_DSP_GETISPACE) })
-        else {
+        let Some(info) = input_space(self.raw_fd()) else {
             return BufferLayout::default();
         };
         BufferLayout {
@@ -342,17 +336,6 @@ impl Dsp {
             skip: 0,
         }
     }
-}
-
-#[cfg(debug_assertions)]
-fn now_ns_libc() -> u64 {
-    let mut now = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    let err = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
-    assert!(err != -1);
-    (now.tv_sec * libspa::sys::SPA_NSEC_PER_SEC as i64 + now.tv_nsec) as u64
 }
 
 #[derive(Clone, Copy)]
@@ -415,11 +398,14 @@ impl DspWriter {
         self.state == DspState::Running
     }
 
-    fn raw_fd(&self) -> c_int {
+    fn descriptor(&self) -> &LibcFd {
         self.fd
             .as_ref()
             .expect("an active DSP writer state owns its descriptor")
-            .raw()
+    }
+
+    fn raw_fd(&self) -> c_int {
+        self.descriptor().raw()
     }
 
     pub(crate) fn fd(&self) -> Option<c_int> {
@@ -427,14 +413,9 @@ impl DspWriter {
     }
 
     pub(crate) fn configure_wake_threshold(&self, bytes: u32) -> bool {
-        self.fd.as_ref().is_some_and(|fd| {
-            ioctl_int(
-                fd.raw(),
-                SNDCTL_DSP_LOW_WATER,
-                bytes.clamp(1, c_int::MAX as u32) as c_int,
-            )
-            .is_some()
-        })
+        self.fd
+            .as_ref()
+            .is_some_and(|fd| set_low_water(fd.raw(), bytes))
     }
 
     fn silence_buffer(&self) -> &'static [u8; MAX_BUFFER_BYTES] {
@@ -457,9 +438,7 @@ impl DspWriter {
     pub(crate) fn close(&mut self) {
         assert_ne!(self.state, DspState::Closed);
         // discard the queued buffer so close() doesn't block draining it
-        unsafe {
-            libc::ioctl(self.raw_fd(), SNDCTL_DSP_HALT);
-        }
+        halt(self.raw_fd());
         drop(
             self.fd
                 .take()
@@ -559,12 +538,12 @@ impl DspWriter {
             .max(1)
             .saturating_mul(channels.max(1));
         self.silence_byte = silence_byte;
-        let format = set_value(self.raw_fd(), SNDCTL_DSP_SETFMT, format, 0)?;
-        let channels = set_value(self.raw_fd(), SNDCTL_DSP_CHANNELS, channels, 0)?;
+        let format = set_format(self.raw_fd(), format)?;
+        let channels = set_channels(self.raw_fd(), channels)?;
         if let Some(order) = channel_order {
             set_channel_order(self.raw_fd(), order)?;
         }
-        let rate = set_value(self.raw_fd(), SNDCTL_DSP_SPEED, rate, feeder_rate_round())?;
+        let rate = set_rate(self.raw_fd(), rate)?;
         Ok(AppliedNativeConfig {
             format,
             channels,
@@ -745,11 +724,7 @@ impl DspWriter {
                 );
                 break;
             }
-            let ts = libc::timespec {
-                tv_sec: 0,
-                tv_nsec: 2_000,
-            };
-            unsafe { libc::nanosleep(&ts, std::ptr::null_mut()) };
+            std::thread::sleep(Duration::from_nanos(2_000));
         }
         NativeWrite {
             bytes: done as ssize_t,
@@ -769,8 +744,10 @@ impl DspWriter {
         #[cfg(debug_assertions)]
         let delay = odelay(self.raw_fd());
 
-        let nbytes = unsafe { libc::write(self.raw_fd(), buf.as_ptr().cast(), count as size_t) };
-        let error = (nbytes < 0).then(Errno::last);
+        let (nbytes, error) = match self.descriptor().write(&buf[..count as usize]) {
+            Ok(nbytes) => (nbytes as ssize_t, None),
+            Err(error) => (-1, Some(error)),
+        };
         if nbytes > 0 {
             // frame phase of the stream: every accepted byte counts, whoever wrote it
             self.frame_off = (self.frame_off + nbytes as u32) % self.stride.max(1);
@@ -778,7 +755,7 @@ impl DspWriter {
 
         #[cfg(debug_assertions)]
         {
-            let now = now_ns_libc();
+            let now = crate::freebsd::monotonic_time_ns();
             let space_after = ospace_in_bytes(self.raw_fd()) as usize;
             let delay_after = odelay(self.raw_fd());
             eprintln!(

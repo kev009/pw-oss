@@ -37,23 +37,8 @@ pub(crate) struct SoundKqueue {
 
 impl SoundKqueue {
     pub(crate) fn new() -> Result<Self, Errno> {
-        let fd = unsafe { libc::kqueue() };
-        if fd < 0 {
-            return Err(Errno::last());
-        }
-        // kqueue() predates kqueuex(KQUEUE_CLOEXEC); setting the descriptor
-        // flag works on every supported FreeBSD release.
-        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
-            let err = Errno::last();
-            unsafe {
-                libc::close(fd);
-            }
-            return Err(err);
-        }
         Ok(Self {
-            // SAFETY: kqueue returned a fresh descriptor whose ownership is
-            // transferred here.
-            fd: unsafe { LibcFd::from_raw(fd) },
+            fd: LibcFd::kqueue()?,
             registered: None,
             timer_armed: Cell::new(false),
         })
