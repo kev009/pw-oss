@@ -18,15 +18,15 @@ pub(crate) enum SinkDir {}
 
 // main-loop property model
 pub(crate) struct SinkMainExt {
-    pub oss_delay: u32,
-    pub oss_delay_default: u32,
+    pub playback_delay_eighths: u32,
+    pub playback_delay_eighths_default: u32,
 }
 
 impl Default for SinkMainExt {
     fn default() -> Self {
         Self {
-            oss_delay: 10,
-            oss_delay_default: 10,
+            playback_delay_eighths: 10,
+            playback_delay_eighths_default: 10,
         }
     }
 }
@@ -35,7 +35,7 @@ impl Default for SinkMainExt {
 pub(crate) struct SinkDataExt {
     pub cur_timestamp: u64, // method invocation timestamp for `process`
     pub old_timestamp: u64,
-    pub oss_delay: u32, // additional delay in 1/8ths of period
+    pub playback_delay_eighths: u32, // additional delay in 1/8ths of period
 }
 
 impl Default for SinkDataExt {
@@ -43,7 +43,7 @@ impl Default for SinkDataExt {
         Self {
             cur_timestamp: 0,
             old_timestamp: 0,
-            oss_delay: 10,
+            playback_delay_eighths: 10,
         }
     }
 }
@@ -639,7 +639,7 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
             period_in_bytes,
             stride,
             size,
-            state.ext.oss_delay,
+            state.ext.playback_delay_eighths,
             state.ext.cur_timestamp,
             &state.log,
         );
@@ -685,8 +685,8 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
                 port,
                 period_in_bytes,
                 driver_clock.target_rate.denom,
-                state.ext.oss_delay,
-                state.oss_fragment,
+                state.ext.playback_delay_eighths,
+                state.fragment_bytes,
                 &state.log,
             );
         } else if port.ext.resuming {
@@ -849,18 +849,18 @@ impl Direction for SinkDir {
         if key == platform::PLAYBACK_DELAY {
             // per-device default, e.g. from a wireplumber node rule
             if let Ok(v) = value.parse::<u32>() {
-                ext.oss_delay = v.min(1024);
+                ext.playback_delay_eighths = v.min(1024);
             }
         }
     }
 
     fn ext_ready(ext: &mut SinkMainExt) {
-        ext.oss_delay_default = ext.oss_delay;
+        ext.playback_delay_eighths_default = ext.playback_delay_eighths;
     }
 
     fn data_ext(ext: &SinkMainExt) -> SinkDataExt {
         SinkDataExt {
-            oss_delay: ext.oss_delay,
+            playback_delay_eighths: ext.playback_delay_eighths,
             ..Default::default()
         }
     }
@@ -872,20 +872,20 @@ impl Direction for SinkDir {
             (SPA_PARAM_PropInfo, 1) => crate::spa::build_params_prop_info(
                 platform::PLAYBACK_DELAY,
                 "OSS buffer fill target (1/8ths of a period)",
-                state.ext.oss_delay,
+                state.ext.playback_delay_eighths,
                 1024,
             ),
             (SPA_PARAM_PropInfo, 2) => crate::spa::build_params_prop_info(
                 platform::FRAGMENT,
                 "OSS fragment size (bytes, power of two, 0 = automatic)",
-                state.oss_fragment,
+                state.fragment_bytes,
                 16384,
             ),
             (SPA_PARAM_Props, 0) => crate::spa::build_latency_offset_props(
                 state.process_latency.ns,
                 &[
-                    (platform::PLAYBACK_DELAY, state.ext.oss_delay),
-                    (platform::FRAGMENT, state.oss_fragment),
+                    (platform::PLAYBACK_DELAY, state.ext.playback_delay_eighths),
+                    (platform::FRAGMENT, state.fragment_bytes),
                 ],
             ),
             (SPA_PARAM_ProcessLatency, 0) => {
@@ -901,42 +901,42 @@ impl Direction for SinkDir {
 
     // a NULL Props pod resets the props to their defaults and re-applies them
     fn reset_props(state: &mut MainState<SinkDir>, data: &DataControl<SinkDir>) -> c_int {
-        let delay = state.ext.oss_delay_default;
-        let fragment = state.oss_fragment_default;
-        let old_delay = state.ext.oss_delay;
-        let old_fragment = state.oss_fragment;
-        state.ext.oss_delay = delay;
-        state.oss_fragment = fragment;
+        let delay = state.ext.playback_delay_eighths_default;
+        let fragment = state.fragment_bytes_default;
+        let old_delay = state.ext.playback_delay_eighths;
+        let old_fragment = state.fragment_bytes;
+        state.ext.playback_delay_eighths = delay;
+        state.fragment_bytes = fragment;
         let res = crate::node::store_and_rebuild(state, data, move |state| {
-            state.ext.oss_delay = delay;
-            state.oss_fragment = fragment;
+            state.ext.playback_delay_eighths = delay;
+            state.fragment_bytes = fragment;
         });
         if res != 0 {
-            state.ext.oss_delay = old_delay;
-            state.oss_fragment = old_fragment;
+            state.ext.playback_delay_eighths = old_delay;
+            state.fragment_bytes = old_fragment;
             return res;
         }
         crate::node::handle_process_latency(state, crate::spa::process_latency_default());
         0
     }
 
-    fn apply_oss_delay(
+    fn apply_playback_delay(
         state: &mut MainState<SinkDir>,
         data: &DataControl<SinkDir>,
-        delay: u32,
+        delay_eighths: u32,
     ) -> c_int {
-        // cap it: period/8 * oss_delay runs in the RT path and must not overflow
-        let new_delay = delay.min(1024);
-        if new_delay == state.ext.oss_delay {
+        // This factor is multiplied by period/8 on the RT path and must not overflow.
+        let new_delay_eighths = delay_eighths.min(1024);
+        if new_delay_eighths == state.ext.playback_delay_eighths {
             return 0; // unchanged echoes must not rebuild a running device
         }
-        let old_delay = state.ext.oss_delay;
-        state.ext.oss_delay = new_delay;
+        let old_delay_eighths = state.ext.playback_delay_eighths;
+        state.ext.playback_delay_eighths = new_delay_eighths;
         let res = crate::node::apply_props_param(state, data, move |state| {
-            state.ext.oss_delay = new_delay;
+            state.ext.playback_delay_eighths = new_delay_eighths;
         });
         if res != 0 {
-            state.ext.oss_delay = old_delay;
+            state.ext.playback_delay_eighths = old_delay_eighths;
         }
         res
     }

@@ -3,14 +3,14 @@ use super::*;
 use crate::platform;
 
 // Updates accepted from a Props pod. None means the property was absent.
-// The sink consumes oss_delay and the source ignores it. Capping oss_delay
-// and normalizing oss.fragment happen when the update is applied so readback
-// reports the effective value.
+// The sink consumes playback_delay_eighths and the source ignores it. Capping
+// that factor and normalizing the FRAGMENT value happen when the update is
+// applied so readback reports the effective value.
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct PropsUpdate {
     pub latency_offset_ns: Option<i64>,
-    pub oss_delay: Option<u32>,
-    pub oss_fragment: Option<u32>,
+    pub playback_delay_eighths: Option<u32>,
+    pub fragment_bytes: Option<u32>,
 }
 
 // Validated node parameter requests. Raw pods do not cross this boundary.
@@ -22,7 +22,8 @@ pub(crate) enum NodeParamRequest {
 }
 
 // Parse a deserialized Props object. The adapter owns soft-volume properties,
-// unknown keys are logged and skipped, and invalid oss.* values are ignored.
+// unknown keys are logged and skipped, and invalid platform stream values are
+// ignored.
 pub(super) fn parse_props_update(
     properties: Vec<libspa::pod::Property>,
     log: &crate::spa::Log,
@@ -47,8 +48,8 @@ pub(super) fn parse_props_update(
                     update.latency_offset_ns = Some(ns);
                 }
             }
-            // pw-cli set-param <object-id> Props '{ "params": ["oss.delay", 8]}'
-            SPA_PROP_params => parse_oss_params(&property.value, &mut update),
+            // The platform::PLAYBACK_DELAY value is carried in SPA_PROP_params.
+            SPA_PROP_params => parse_stream_params(&property.value, &mut update),
             key => {
                 crate::debug!(log, "ignoring unknown prop {}", key);
             }
@@ -58,7 +59,7 @@ pub(super) fn parse_props_update(
 }
 
 // the SPA_PROP_params payload: a Struct of ("key", value) pairs
-pub(super) fn parse_oss_params(value: &libspa::pod::Value, update: &mut PropsUpdate) {
+pub(super) fn parse_stream_params(value: &libspa::pod::Value, update: &mut PropsUpdate) {
     use libspa::pod::Value;
     let Value::Struct(values) = value else {
         return;
@@ -69,10 +70,10 @@ pub(super) fn parse_oss_params(value: &libspa::pod::Value, update: &mut PropsUpd
     for kv in values.chunks(2) {
         match (&kv[0], &kv[1]) {
             (Value::String(s), Value::Int(x)) if s == platform::PLAYBACK_DELAY && *x >= 0 => {
-                update.oss_delay = Some(*x as u32);
+                update.playback_delay_eighths = Some(*x as u32);
             }
             (Value::String(s), Value::Int(x)) if s == platform::FRAGMENT && *x >= 0 => {
-                update.oss_fragment = Some(*x as u32);
+                update.fragment_bytes = Some(*x as u32);
             }
             _ => (),
         }
@@ -81,8 +82,8 @@ pub(super) fn parse_oss_params(value: &libspa::pod::Value, update: &mut PropsUpd
 
 // Apply a validated request to the main-loop model. Data-loop effects cross
 // only through DataControl. Props apply in this order: latency offset,
-// oss.delay, then oss.fragment. The first failing oss.* update returns its
-// errno.
+// PLAYBACK_DELAY, then FRAGMENT. The first failing backend-specific update
+// returns its errno.
 pub(crate) fn apply_node_param<D: Direction>(
     state: &mut MainState<D>,
     data: &DataControl<D>,
@@ -106,27 +107,27 @@ pub(crate) fn apply_node_param<D: Direction>(
                 info.ns = ns;
                 handle_process_latency(state, info);
             }
-            if let Some(delay) = update.oss_delay {
-                let res = D::apply_oss_delay(state, data, delay);
+            if let Some(delay) = update.playback_delay_eighths {
+                let res = D::apply_playback_delay(state, data, delay);
                 if res != 0 {
                     return res;
                 }
             }
-            if let Some(fragment) = update.oss_fragment {
+            if let Some(fragment) = update.fragment_bytes {
                 // stored normalized, so the Props readback reports the
                 // effective (rounded/clamped) value, not the raw request
                 let new_fragment = normalize_fragment(fragment);
-                if new_fragment != state.oss_fragment {
+                if new_fragment != state.fragment_bytes {
                     // unchanged echoes must not rebuild a running device
-                    let old_fragment = state.oss_fragment;
+                    let old_fragment = state.fragment_bytes;
                     // install_device consumes the main-loop copy while the
                     // data-loop store/rebuild is in progress.
-                    state.oss_fragment = new_fragment;
+                    state.fragment_bytes = new_fragment;
                     let res = apply_props_param(state, data, move |state| {
-                        state.oss_fragment = new_fragment;
+                        state.fragment_bytes = new_fragment;
                     });
                     if res != 0 {
-                        state.oss_fragment = old_fragment;
+                        state.fragment_bytes = old_fragment;
                         return res;
                     }
                 }
@@ -239,8 +240,8 @@ mod tests {
             update,
             PropsUpdate {
                 latency_offset_ns: Some(250_000),
-                oss_delay: Some(8),
-                oss_fragment: Some(4096),
+                playback_delay_eighths: Some(8),
+                fragment_bytes: Some(4096),
             }
         );
 

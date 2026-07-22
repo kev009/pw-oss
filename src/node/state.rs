@@ -56,11 +56,11 @@ pub(crate) struct MainState<D: Direction> {
     // combined into DataControl at each control entry point.
     pub data_loop: crate::spa::Loop,
     pub log: crate::spa::Log,
-    pub dsp_path: String,
+    pub stream_path: String,
     pub caps: crate::oss::DspCaps,
     pub caps_fallback: bool,
-    pub oss_fragment: u32,
-    pub oss_fragment_default: u32,
+    pub fragment_bytes: u32,
+    pub fragment_bytes_default: u32,
     pub latency: [spa_latency_info; 2],
     pub process_latency: spa_process_latency_info,
     pub shared: std::sync::Arc<NodeShared<D>>,
@@ -80,7 +80,7 @@ pub(crate) struct DataState<D: Direction> {
     pub position: crate::spa::IoArea<spa_io_position>,
     pub clock_name: std::ffi::CString, // stamped into spa_io_clock.name
     pub main_loop: Option<crate::spa::Loop>, // for endpoint-only notifications
-    pub dsp_path: String,
+    pub stream_path: String,
     // Exactly one wake descriptor owns wake_source.fd: the portable SPA
     // timer, or the enriched OSS kqueue on sufficiently new kernels.
     pub(super) timer_fd: Option<crate::spa::TimerFd>,
@@ -97,7 +97,7 @@ pub(crate) struct DataState<D: Direction> {
     pub next_time: u64,
     pub callbacks: NodeCallbacks,
     pub ports: [Port<D>; MAX_PORTS],
-    pub oss_fragment: u32, // normalized fragment size in bytes (0 = automatic); read by the prime paths
+    pub fragment_bytes: u32, // normalized fragment size in bytes (0 = automatic); read by the prime paths
     // the Arc'd rendezvous with the owned rebuild worker and
     // clear(); outlives the FFI shell by construction (see NodeShared)
     pub shared: std::sync::Arc<NodeShared<D>>,

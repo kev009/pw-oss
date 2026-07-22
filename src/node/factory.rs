@@ -108,9 +108,9 @@ pub(super) unsafe fn parse_init_dict<D: Direction>(
     info: *const spa_dict,
     log: &crate::spa::Log,
 ) -> (Option<String>, bool, u32, D::MainExt) {
-    let mut dsp_path = None;
+    let mut stream_path = None;
     let mut force_timer = false;
-    let mut oss_fragment = 0u32; // automatic (today's layout) unless the dict says otherwise
+    let mut fragment_bytes = 0u32; // automatic (today's layout) unless the dict says otherwise
     let mut ext = D::MainExt::default();
 
     if let Some(info) = unsafe { info.as_ref() } {
@@ -122,7 +122,7 @@ pub(super) unsafe fn parse_init_dict<D: Direction>(
         unsafe {
             crate::spa::for_each_dict_item(info, |key, value| {
                 if key == platform::STREAM_PATH {
-                    dsp_path = Some(value.to_string());
+                    stream_path = Some(value.to_string());
                 } else if key == platform::FORCE_TIMER {
                     if let Some(enabled) = property_bool(value) {
                         force_timer = enabled;
@@ -138,7 +138,7 @@ pub(super) unsafe fn parse_init_dict<D: Direction>(
                     // direction-shared per-device default, e.g. from a wireplumber node
                     // rule; stored normalized so readback reports the effective value
                     if let Ok(v) = value.parse::<u32>() {
-                        oss_fragment = normalize_fragment(v);
+                        fragment_bytes = normalize_fragment(v);
                     }
                 } else {
                     D::info_item(&mut ext, key, value);
@@ -148,7 +148,7 @@ pub(super) unsafe fn parse_init_dict<D: Direction>(
     }
     D::ext_ready(&mut ext);
 
-    (dsp_path, force_timer, oss_fragment, ext)
+    (stream_path, force_timer, fragment_bytes, ext)
 }
 
 // the static node/port info published at init: flags, props and the param
@@ -233,9 +233,10 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
     let data_loop = unsafe { crate::spa::Loop::wrap(data_loop) };
     let data_system = unsafe { crate::spa::System::wrap(data_system) };
 
-    let (dsp_path, force_timer, oss_fragment, ext) = unsafe { parse_init_dict::<D>(info, &log) };
+    let (stream_path, force_timer, fragment_bytes, ext) =
+        unsafe { parse_init_dict::<D>(info, &log) };
 
-    let Some(dsp_path) = dsp_path else {
+    let Some(stream_path) = stream_path else {
         crate::error!(
             log,
             "{} missing from the node properties",
@@ -266,7 +267,7 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
             crate::debug!(
                 log,
                 "{}: timer wakeups selected by {}",
-                dsp_path,
+                stream_path,
                 platform::FORCE_TIMER
             );
         }
@@ -290,12 +291,16 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
         .expect("one wake descriptor is always constructed");
 
     let mut caps_fallback = false;
-    let caps = crate::oss::probe_caps(&dsp_path, D::PLAYBACK).unwrap_or_else(|| {
-        crate::warn!(log, "{}: can't probe device caps; using fallback", dsp_path);
+    let caps = crate::oss::probe_caps(&stream_path, D::PLAYBACK).unwrap_or_else(|| {
+        crate::warn!(
+            log,
+            "{}: can't probe device caps; using fallback",
+            stream_path
+        );
         caps_fallback = true;
         crate::oss::DspCaps::fallback()
     });
-    crate::debug!(log, "{}: {:?}", dsp_path, caps);
+    crate::debug!(log, "{}: {:?}", stream_path, caps);
 
     let state = handle.cast::<State<D>>();
     assert!(!state.is_null(), "handle is not supposed to be null");
@@ -351,11 +356,11 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
                     events: events.clone(),
                     data_loop,
                     log: log.clone(),
-                    dsp_path: dsp_path.clone(),
+                    stream_path: stream_path.clone(),
                     caps,
                     caps_fallback,
-                    oss_fragment,
-                    oss_fragment_default: oss_fragment,
+                    fragment_bytes,
+                    fragment_bytes_default: fragment_bytes,
                     latency: [
                         crate::spa::latency_info_default(SPA_DIRECTION_INPUT),
                         crate::spa::latency_info_default(SPA_DIRECTION_OUTPUT),
@@ -372,9 +377,9 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
                     log,
                     clock: crate::spa::IoArea::null(),
                     position: crate::spa::IoArea::null(),
-                    clock_name: platform::clock_name(&dsp_path),
+                    clock_name: platform::clock_name(&stream_path),
                     main_loop,
-                    dsp_path: dsp_path.clone(),
+                    stream_path: stream_path.clone(),
                     timer_fd,
                     sound_queue,
                     sound_failed_fd: None,
@@ -395,7 +400,7 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
                         buffers: vec![],
                         io: crate::spa::IoArea::null(),
                         rate_match: crate::spa::IoArea::null(),
-                        dsp: D::Device::new(&dsp_path),
+                        dsp: D::Device::new(&stream_path),
                         dll: std::default::Default::default(),
                         setup_period: 0,
                         bw_adapt: std::default::Default::default(),
@@ -411,7 +416,7 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
                         wake_threshold: 0,
                         ext: std::default::Default::default(),
                     }; MAX_PORTS],
-                    oss_fragment,
+                    fragment_bytes,
                     shared,
                     rebuild_work,
                     deferred_work: None,

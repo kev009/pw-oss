@@ -285,9 +285,9 @@ pub(super) unsafe extern "C" fn send_command<D: Direction>(
             let data_stopped_ref = &data_stopped;
             // Device::new may probe sndstat (the sink does), so build every
             // closed placeholder here on main rather than inside DataControl.
-            let dsp_path = unsafe { &main_ref(state).dsp_path };
+            let stream_path = unsafe { &main_ref(state).stream_path };
             let placeholders: [D::Device; MAX_PORTS] =
-                std::array::from_fn(|_| D::Device::new(dsp_path));
+                std::array::from_fn(|_| D::Device::new(stream_path));
             // Quiesce and transfer device ownership out of DataState. Potentially
             // sleeping SETTRIGGER/close operations then run on this thread while
             // the data loop sees only closed placeholders.

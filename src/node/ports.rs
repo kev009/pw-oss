@@ -89,7 +89,8 @@ pub(super) unsafe extern "C" fn port_enum_params<D: Direction>(
                         if state.caps_fallback {
                             // the init-time probe hit a busy device and baked in fallback
                             // caps; retry now (main thread, transient open)
-                            if let Some(caps) = crate::oss::probe_caps(&state.dsp_path, D::PLAYBACK)
+                            if let Some(caps) =
+                                crate::oss::probe_caps(&state.stream_path, D::PLAYBACK)
                             {
                                 crate::info!(state.log, "re-probed caps: {:?}", caps);
                                 state.caps = caps;
@@ -309,7 +310,7 @@ pub(super) fn set_format_param<D: Direction>(
         // the device rejected caps-derived values: the snapshot may be
         // stale (vchans/bitperfect toggled at runtime); re-probe and
         // re-announce EnumFormat so the host renegotiates from reality
-        if let Some(caps) = crate::oss::probe_caps(&state.dsp_path, D::PLAYBACK) {
+        if let Some(caps) = crate::oss::probe_caps(&state.stream_path, D::PLAYBACK) {
             state.caps_fallback = false;
             // bump only on a real change: the serial flip re-triggers the
             // adapter's negotiation, and an unchanged snapshot would loop
@@ -334,7 +335,7 @@ pub(super) fn release_format<D: Direction>(
     data: &DataControl<D>,
     port_idx: usize,
 ) -> c_int {
-    let placeholder = D::Device::new(&state.dsp_path);
+    let placeholder = D::Device::new(&state.stream_path);
     let Some((retired, deferred)) = data.query(move |state| {
         debug_assert!(!state.rebuild_takeover, "format releases serialize");
         state.rebuild_takeover = true;

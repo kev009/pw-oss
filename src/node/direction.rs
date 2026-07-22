@@ -160,7 +160,7 @@ pub(crate) trait Direction: Sized + 'static {
     // mutates the pointee, so keep it as a raw pointer.
     fn log_topic() -> std::ptr::NonNull<spa_log_topic>;
 
-    // Parse direction-specific node properties such as the sink's oss.delay.
+    // Parse direction-specific node properties such as PLAYBACK_DELAY.
     fn info_item(ext: &mut Self::MainExt, key: &str, value: &str);
     // Finalize direction-specific state after parsing the info dictionary.
     fn ext_ready(ext: &mut Self::MainExt);
@@ -171,13 +171,18 @@ pub(crate) trait Direction: Sized + 'static {
     fn build_node_param(state: &mut MainState<Self>, id: u32, index: u32) -> ParamBuild;
     // Reset Props to their defaults.
     fn reset_props(state: &mut MainState<Self>, data: &DataControl<Self>) -> c_int;
-    // Apply oss.delay. The sink caps, stores, and rebuilds; the source ignores it.
-    fn apply_oss_delay(state: &mut MainState<Self>, data: &DataControl<Self>, delay: u32) -> c_int;
+    // Apply the playback-delay factor. The sink caps, stores, and rebuilds;
+    // the source ignores it.
+    fn apply_playback_delay(
+        state: &mut MainState<Self>,
+        data: &DataControl<Self>,
+        delay_eighths: u32,
+    ) -> c_int;
 
     // used from the main thread only; returns 0 or -errno with the device
-    // closed. `fragment` is the normalized oss.fragment (0 = automatic); the
-    // source applies it at open time, the sink at prime time (the period is
-    // only known then)
+    // closed. `fragment_bytes` is the normalized fragment override
+    // (0 = automatic); the source applies it at open time, the sink at prime
+    // time (the period is only known then).
     fn try_open_configure(
         dsp: &mut Self::Device,
         config: &PortConfig,

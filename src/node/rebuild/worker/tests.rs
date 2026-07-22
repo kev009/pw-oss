@@ -291,7 +291,7 @@ fn rebuild_task_deposits_and_respects_the_gates() {
             stride: 4,
         },
         path: "/nonexistent/dsp".into(),
-        oss_fragment: 0,
+        fragment_bytes: 0,
         retried: false,
         retire_first: None,
         log: crate::spa::Log::test_null(),

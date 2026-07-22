@@ -130,12 +130,12 @@ pub(in crate::node) fn install_device<D: Direction>(
     }
     state.shared.discard_swap();
 
-    let mut new_dsp = D::Device::new(&state.dsp_path);
-    // oss_fragment only mutates from main-thread calls, serialized with us
-    let mut res = D::try_open_configure(&mut new_dsp, &config, state.oss_fragment, &state.log);
+    let mut new_dsp = D::Device::new(&state.stream_path);
+    // fragment_bytes only mutates from main-thread calls, serialized with us
+    let mut res = D::try_open_configure(&mut new_dsp, &config, state.fragment_bytes, &state.log);
 
     if res == -libc::EBUSY {
-        let closed = D::Device::new(&state.dsp_path);
+        let closed = D::Device::new(&state.stream_path);
         let Some(retired) =
             data.query(move |state| std::mem::replace(&mut state.ports[port_idx].dsp, closed))
         else {
@@ -143,7 +143,7 @@ pub(in crate::node) fn install_device<D: Direction>(
             return -libc::EIO;
         };
         drop(retired); // closes the old fd here, off the RT path
-        res = D::try_open_configure(&mut new_dsp, &config, state.oss_fragment, &state.log);
+        res = D::try_open_configure(&mut new_dsp, &config, state.fragment_bytes, &state.log);
     }
 
     let ok = res == 0;
@@ -329,7 +329,7 @@ fn poll_rebuild_completion<D: Direction>(state: &mut DataState<D>, port_idx: usi
             crate::info!(
                 state.log,
                 "{}: background device rebuild applied",
-                state.dsp_path
+                state.stream_path
             );
             submit_or_defer(state, RebuildWork::RetireDevice(old));
             false // the cycle continues on the fresh device (prime re-runs)

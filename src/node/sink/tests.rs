@@ -124,8 +124,8 @@ fn granted_at_required_never_starves_or_drops() {
     for period in [1024u32, 4096, 16384, 65536] {
         for blocksize in [512u32, 1024, 2047, 2048, 16384, 65536] {
             for write_max in [period, period * 2, period * 4] {
-                for oss_delay in [0u32, 4, 32, 1024] {
-                    let desired = desired_delay(period, oss_delay);
+                for playback_delay_eighths in [0u32, 4, 32, 1024] {
+                    let desired = desired_delay(period, playback_delay_eighths);
                     let required = buffer_required(period, desired, blocksize, write_max);
                     for granted in [required, required + 1, required.saturating_mul(2)] {
                         let (target, _) =

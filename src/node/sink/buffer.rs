@@ -18,8 +18,8 @@ pub(super) fn retune_seed(target_goal: u32, fill: u32, write_now: u32, period: u
     target_goal.min(predicted_next_fill(fill, write_now, period))
 }
 
-pub(super) fn desired_delay(period: u32, oss_delay: u32) -> u32 {
-    (period / 8).saturating_mul(oss_delay)
+pub(super) fn desired_delay(period: u32, playback_delay_eighths: u32) -> u32 {
+    (period / 8).saturating_mul(playback_delay_eighths)
 }
 
 // the resampler's per-cycle output can exceed a quantum; its size bounds the
@@ -66,19 +66,19 @@ pub(super) fn buffer_request(
     fragment: u32,
     chunk: u32,
     write_max: u32,
-    oss_delay: u32,
+    playback_delay_eighths: u32,
 ) -> u32 {
     let frag_est = if fragment == 0 { 1024 } else { fragment };
     let transfer = frag_est.max(chunk);
     let stable = buffer_required(
         max_period,
-        desired_delay(max_period, oss_delay),
+        desired_delay(max_period, playback_delay_eighths),
         transfer,
         max_period,
     );
     buffer_required(
         period,
-        desired_delay(period, oss_delay),
+        desired_delay(period, playback_delay_eighths),
         transfer,
         write_max,
     )
@@ -172,7 +172,7 @@ pub(super) fn retune_period(
     period_in_bytes: u32,
     stride: u32,
     write_now: u32,
-    oss_delay: u32,
+    playback_delay_eighths: u32,
     now: u64,
     log: &crate::spa::Log,
 ) -> RetuneOutcome {
@@ -196,7 +196,7 @@ pub(super) fn retune_period(
     // granted fragment (and the session-fixed hw cadence folded in at
     // prime) cannot have changed; reusing it avoids an ioctl here
     let blocksize = port.setup_blocksize;
-    let desired = desired_delay(period_in_bytes, oss_delay);
+    let desired = desired_delay(period_in_bytes, playback_delay_eighths);
     let write_max = period_in_bytes.max(rate_match_bytes(&port.rate_match, stride));
     if port.ext.buffer_size >= buffer_required(period_in_bytes, desired, blocksize, write_max) {
         let old_period = port.setup_period;
@@ -335,8 +335,8 @@ pub(super) fn prime_playback(
     port: &mut crate::node::Port<SinkDir>,
     period_in_bytes: u32,
     graph_rate: u32,
-    oss_delay: u32,
-    oss_fragment: u32,
+    playback_delay_eighths: u32,
+    fragment_bytes: u32,
     log: &crate::spa::Log,
 ) {
     #[cfg(debug_assertions)]
@@ -350,7 +350,7 @@ pub(super) fn prime_playback(
     }
 
     // Size the fill to the granted buffer and the device's real fragment.
-    // oss_fragment (0 = automatic 1 KiB) only mutates on this loop, so the
+    // fragment_bytes (0 = automatic 1 KiB) only mutates on this loop, so the
     // read is race-free; no ioctls beyond what the prime always issued
     // The measurement/drain quantum is the granted fragment - unless the
     // device's hardware cadence is coarser (drivers that ignore
@@ -359,7 +359,7 @@ pub(super) fn prime_playback(
     // servo noise model key on the larger - and the buffer REQUEST must
     // include it, or a device that honors the request grants no room for
     // the ceiling above the floor.
-    let desired = desired_delay(period_in_bytes, oss_delay);
+    let desired = desired_delay(period_in_bytes, playback_delay_eighths);
     let chunk = crate::node::ns_to_frame_bytes(port.dsp.hw_quantum_ns, cfg_rate, stride);
     let write_max = period_in_bytes.max(rate_match_bytes(&port.rate_match, stride));
     let max_period = crate::node::max_ring_period_bytes(stride, cfg_rate, graph_rate);
@@ -367,12 +367,12 @@ pub(super) fn prime_playback(
         period_in_bytes,
         max_period,
         crate::oss::ring_byte_cap(stride, cfg_rate),
-        oss_fragment,
+        fragment_bytes,
         chunk,
         write_max,
-        oss_delay,
+        playback_delay_eighths,
     );
-    let granted = port.dsp.set_buffer_size(request, oss_fragment);
+    let granted = port.dsp.set_buffer_size(request, fragment_bytes);
     let blocksize = port.dsp.blocksize().max(chunk);
 
     // saturating arithmetic: blocksize/rate_match.size are device-provided and

@@ -159,7 +159,7 @@ pub(in crate::node) struct RebuildRequest<D: Direction> {
     pub(in crate::node) generation: u64,
     pub(in crate::node) config: PortConfig,
     pub(in crate::node) path: String,
-    pub(in crate::node) oss_fragment: u32,
+    pub(in crate::node) fragment_bytes: u32,
     pub(in crate::node) retried: bool, // the EBUSY retire round trip already happened
     // RetireAndRetry only: the port's dying fd, closed by the worker under
     // its unwind guard before the retry opens
@@ -519,10 +519,10 @@ pub(crate) fn queue_rebuild<D: Direction>(state: &mut DataState<D>, port_idx: us
         port_idx,
         generation: port.generation,
         config,
-        path: state.dsp_path.clone(),
+        path: state.stream_path.clone(),
         // loop-owned (the prime paths read it here), so this data-loop read
         // is the serialization-correct snapshot
-        oss_fragment: state.oss_fragment,
+        fragment_bytes: state.fragment_bytes,
         retried: false,
         retire_first: None,
         log: state.log.clone(),
@@ -618,7 +618,7 @@ pub(in crate::node) fn rebuild_task<D: Direction>(mut request: RebuildRequest<D>
         let res = D::try_open_configure(
             &mut dsp,
             &request.config,
-            request.oss_fragment,
+            request.fragment_bytes,
             &request.log,
         );
         if !rebuild_request_is_current(&guard.shared, request.generation) {

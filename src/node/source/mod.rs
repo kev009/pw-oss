@@ -402,7 +402,7 @@ fn process_ports(state: &mut DataState<SourceDir>) -> c_int {
                 port,
                 period_in_bytes,
                 graph_rate,
-                state.oss_fragment,
+                state.fragment_bytes,
                 cycle_data,
                 &state.log,
             )
@@ -537,12 +537,12 @@ impl Direction for SourceDir {
             (SPA_PARAM_PropInfo, 1) => crate::spa::build_params_prop_info(
                 platform::FRAGMENT,
                 "OSS fragment size (bytes, power of two, 0 = automatic)",
-                state.oss_fragment,
+                state.fragment_bytes,
                 16384,
             ),
             (SPA_PARAM_Props, 0) => crate::spa::build_latency_offset_props(
                 state.process_latency.ns,
-                &[(platform::FRAGMENT, state.oss_fragment)],
+                &[(platform::FRAGMENT, state.fragment_bytes)],
             ),
             (SPA_PARAM_ProcessLatency, 0) => {
                 crate::spa::build_process_latency_info(&state.process_latency)
@@ -557,24 +557,24 @@ impl Direction for SourceDir {
 
     // a NULL Props pod resets the props to their defaults and re-applies them
     fn reset_props(state: &mut MainState<SourceDir>, data: &DataControl<SourceDir>) -> c_int {
-        let fragment = state.oss_fragment_default;
-        let old_fragment = state.oss_fragment;
-        state.oss_fragment = fragment;
+        let fragment = state.fragment_bytes_default;
+        let old_fragment = state.fragment_bytes;
+        state.fragment_bytes = fragment;
         let res = crate::node::store_and_rebuild(state, data, move |state| {
-            state.oss_fragment = fragment;
+            state.fragment_bytes = fragment;
         });
         if res != 0 {
-            state.oss_fragment = old_fragment;
+            state.fragment_bytes = old_fragment;
             return res;
         }
         crate::node::handle_process_latency(state, crate::spa::process_latency_default());
         0
     }
 
-    fn apply_oss_delay(
+    fn apply_playback_delay(
         _state: &mut MainState<SourceDir>,
         _data: &DataControl<SourceDir>,
-        _delay: u32,
+        _delay_eighths: u32,
     ) -> c_int {
         0 // a playback-only knob; the capture side ignores it (as before)
     }

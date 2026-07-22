@@ -156,7 +156,7 @@ pub(super) fn prime_capture(
     port: &mut crate::node::Port<SourceDir>,
     period_in_bytes: u32,
     graph_rate: u32,
-    oss_fragment: u32,
+    fragment_bytes: u32,
     data: &mut [u8],
     log: &crate::spa::Log,
 ) -> isize {
@@ -172,10 +172,10 @@ pub(super) fn prime_capture(
     if !port.dsp.is_running() {
         let m = period_in_bytes.max(1024);
         let cap = 1u32 << (31 - m.leading_zeros());
-        let frag = if oss_fragment == 0 {
+        let frag = if fragment_bytes == 0 {
             1024
         } else {
-            oss_fragment.min(cap)
+            fragment_bytes.min(cap)
         };
         port.dsp.set_small_fragments(
             frag,
