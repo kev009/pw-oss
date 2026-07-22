@@ -1,18 +1,20 @@
-//! Deterministic byte transport for stream and lifecycle tests.
+//! Native descriptor transport for stream and lifecycle tests.
 //!
-//! A nonblocking pipe reproduces the partial-I/O and backpressure properties
-//! the node cares about without requiring a sound device or OSS ioctls.
+//! A nonblocking pipe exercises real syscall backpressure without requiring a
+//! sound device or native controls. Pipe capacity and partial-write behavior
+//! vary across kernels, so tests needing exact write lengths use the buffered
+//! fake stream instead.
 
 use std::ffi::c_int;
 
-pub(crate) fn set_nonblock(fd: c_int) {
+pub fn set_nonblock(fd: c_int) {
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFL);
         assert_ne!(libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK), -1);
     }
 }
 
-pub(crate) fn pipe_pair(nonblock_read: bool, nonblock_write: bool) -> (c_int, c_int) {
+pub fn pipe_pair(nonblock_read: bool, nonblock_write: bool) -> (c_int, c_int) {
     let mut fds = [0 as c_int; 2];
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
     if nonblock_read {
@@ -24,7 +26,7 @@ pub(crate) fn pipe_pair(nonblock_read: bool, nonblock_write: bool) -> (c_int, c_
     (fds[0], fds[1])
 }
 
-pub(crate) fn drain(fd: c_int) -> Vec<u8> {
+pub fn drain(fd: c_int) -> Vec<u8> {
     let mut out = Vec::new();
     let mut buffer = [0u8; 16_384];
     loop {
@@ -37,14 +39,17 @@ pub(crate) fn drain(fd: c_int) -> Vec<u8> {
     out
 }
 
-pub(crate) fn pattern(len: usize, seed: usize) -> Vec<u8> {
+pub fn pattern(len: usize, seed: usize) -> Vec<u8> {
     (0..len)
         .map(|index| ((index * 7 + seed) % 251) as u8)
         .collect()
 }
 
-pub(crate) fn fill_pipe(write_fd: c_int) -> usize {
-    let fill = vec![0xffu8; 16_384];
+pub fn fill_pipe(write_fd: c_int) -> usize {
+    // POSIX guarantees PIPE_BUF >= 512. Filling with atomic-sized writes means
+    // EAGAIN proves that another portable 512-byte write would block; a larger
+    // request may be rejected while implementation-specific capacity remains.
+    let fill = [0xffu8; 512];
     let mut total = 0usize;
     loop {
         let count = unsafe { libc::write(write_fd, fill.as_ptr().cast(), fill.len()) };
@@ -56,7 +61,7 @@ pub(crate) fn fill_pipe(write_fd: c_int) -> usize {
     total
 }
 
-pub(crate) fn free_space(read_fd: c_int, len: usize) {
+pub fn free_space(read_fd: c_int, len: usize) {
     let mut buffer = vec![0u8; len];
     let mut freed = 0usize;
     while freed < len {

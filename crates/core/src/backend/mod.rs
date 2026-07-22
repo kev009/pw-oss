@@ -373,6 +373,11 @@ pub trait RouteController<H>: Sized + Send + 'static {
     fn read_hotplug(&self, routes: &[RouteSnapshot], monitor: &mut H) -> (bool, bool);
 }
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod fake;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_transport;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StreamToken(u64);
 
