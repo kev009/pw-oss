@@ -1,10 +1,11 @@
 use super::*;
+use crate::backend;
+use crate::backend::{Backend as _, NodeInit as _, StreamLifecycle as _};
 #[cfg(debug_assertions)]
 use crate::spa::dump_spa_dict;
 use crate::spa::{
     self, IoArea, Log, Loop, LoopSource, SendWrap, System, TimerFd, for_each_dict_item, key,
 };
-use crate::{backend, platform};
 
 pub(super) unsafe extern "C" fn get_interface<D: Direction>(
     handle: *mut spa_handle,
@@ -52,14 +53,14 @@ pub(super) unsafe extern "C" fn clear<D: Direction>(handle: *mut spa_handle) -> 
     }
 
     // The data loop still holds the wake source; detach it there before the
-    // state is freed, then close its timerfd or kqueue descriptor.
+    // state is freed, then close its notification descriptor.
     let control = unsafe { DataControl::from_raw(state) };
     let detached = control.query(|state| {
         // SAFETY: this closure runs on the source's registered data loop.
         let err = unsafe { state.wake_source.unregister() };
         if err >= 0 {
             drop(state.timer_fd.take());
-            drop(state.sound_queue.take());
+            drop(state.wake_driver.take());
             state.wake_source.set_fd(-1);
         }
         err
@@ -69,7 +70,7 @@ pub(super) unsafe extern "C" fn clear<D: Direction>(handle: *mut spa_handle) -> 
         // abort beats a use-after-free on the next timer tick
         eprintln!(
             "{}: can't detach the audio wake source; aborting",
-            platform::DIAGNOSTIC_TAG
+            BackendOf::<D>::DIAGNOSTIC_TAG
         );
         std::process::abort();
     }
@@ -85,38 +86,15 @@ pub(crate) extern "C" fn get_size<D: Direction>(
     size_of::<State<D>>()
 }
 
-fn property_bool(value: &str) -> Option<bool> {
-    if value == "1"
-        || value.eq_ignore_ascii_case("true")
-        || value.eq_ignore_ascii_case("yes")
-        || value.eq_ignore_ascii_case("on")
-    {
-        Some(true)
-    } else if value == "0"
-        || value.eq_ignore_ascii_case("false")
-        || value.eq_ignore_ascii_case("no")
-        || value.eq_ignore_ascii_case("off")
-    {
-        Some(false)
-    } else {
-        None
-    }
-}
-
-fn sound_kqueue_enabled(force_timer: bool, enriched_available: bool) -> bool {
+fn selected_wake_enabled(force_timer: bool, enriched_available: bool) -> bool {
     enriched_available && !force_timer
 }
 
-// The init-dict node properties: stream path, wake backend, shared
-// platform::FRAGMENT default, and direction-specific keys consumed by D::info_item.
 pub(super) unsafe fn parse_init_dict<D: Direction>(
     info: *const spa_dict,
     log: &Log,
-) -> (Option<String>, bool, u32, D::MainExt) {
-    let mut stream_path = None;
-    let mut force_timer = false;
-    let mut fragment_bytes = 0u32; // automatic unless the dict says otherwise
-    let mut ext = D::MainExt::default();
+) -> <BackendOf<D> as backend::Backend>::NodeInit {
+    let mut init = <BackendOf<D> as backend::Backend>::NodeInit::new(D::PLAYBACK);
 
     if let Some(info) = unsafe { info.as_ref() } {
         #[cfg(debug_assertions)]
@@ -125,35 +103,15 @@ pub(super) unsafe fn parse_init_dict<D: Direction>(
         }
 
         unsafe {
-            for_each_dict_item(info, |key, value| {
-                if key == platform::STREAM_PATH {
-                    stream_path = Some(value.to_string());
-                } else if key == platform::FORCE_TIMER {
-                    if let Some(enabled) = property_bool(value) {
-                        force_timer = enabled;
-                    } else {
-                        crate::warn!(
-                            log,
-                            "ignoring invalid {} value {:?}",
-                            platform::FORCE_TIMER,
-                            value
-                        );
-                    }
-                } else if key == platform::FRAGMENT {
-                    // direction-shared per-device default, e.g. from a wireplumber node
-                    // rule; stored normalized so readback reports the effective value
-                    if let Ok(v) = value.parse::<u32>() {
-                        fragment_bytes = normalize_fragment(v);
-                    }
-                } else {
-                    D::info_item(&mut ext, key, value);
+            for_each_dict_item(info, |key, value| match init.parse(key, value) {
+                backend::InitItemResult::Handled | backend::InitItemResult::Unknown => {}
+                backend::InitItemResult::InvalidBoolean => {
+                    crate::warn!(log, "ignoring invalid {} value {:?}", key, value);
                 }
             });
         }
     }
-    D::ext_ready(&mut ext);
-
-    (stream_path, force_timer, fragment_bytes, ext)
+    init
 }
 
 // the static node/port info published at init: flags, props and the param
@@ -238,46 +196,52 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
     let data_loop = unsafe { Loop::wrap(data_loop) };
     let data_system = unsafe { System::wrap(data_system) };
 
-    let (stream_path, force_timer, fragment_bytes, ext) =
-        unsafe { parse_init_dict::<D>(info, &log) };
+    let init_properties = unsafe { parse_init_dict::<D>(info, &log) };
+    let backend::NodeInitValues {
+        stream_path,
+        force_timer,
+        properties: backend_properties,
+    } = init_properties.into_values();
 
     let Some(stream_path) = stream_path else {
         crate::error!(
             log,
             "{} missing from the node properties",
-            platform::STREAM_PATH
+            BackendOf::<D>::STREAM_PATH
         );
         return -libc::EINVAL;
     };
 
-    let use_sound_kqueue = sound_kqueue_enabled(force_timer, backend::device_wake_available());
-    let sound_queue = if use_sound_kqueue {
-        match backend::WakeQueue::new() {
+    let use_selected_wake = selected_wake_enabled(force_timer, D::Device::wake_available());
+    let wake_driver = if use_selected_wake {
+        match D::Device::new_wake_driver() {
             Ok(queue) => {
-                crate::debug!(log, "using enriched OSS kqueue device wakeups");
+                crate::debug!(
+                    log,
+                    "{}",
+                    D::Device::wake_diagnostic(backend::WakeDiagnostic::Selected)
+                );
                 Some(queue)
             }
             Err(err) => {
                 crate::warn!(
                     log,
-                    "can't create the OSS kqueue wake source: {}; using the timer",
+                    "{}: {}; using the timer",
+                    D::Device::wake_diagnostic(backend::WakeDiagnostic::Create),
                     err
                 );
                 None
             }
         }
     } else {
-        if force_timer {
-            crate::debug!(
-                log,
-                "{}: timer wakeups selected by {}",
-                stream_path,
-                platform::FORCE_TIMER
-            );
+        if force_timer
+            && let Some(key) = <BackendOf<D> as backend::Backend>::NodeInit::force_timer_key()
+        {
+            crate::debug!(log, "{}: timer wakeups selected by {}", stream_path, key);
         }
         None
     };
-    let timer_fd = if sound_queue.is_none() {
+    let timer_fd = if wake_driver.is_none() {
         match data_system.timerfd_create(
             libc::CLOCK_MONOTONIC,
             (SPA_FD_CLOEXEC | SPA_FD_NONBLOCK) as i32,
@@ -288,21 +252,21 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
     } else {
         None
     };
-    let wake_fd_raw = sound_queue
+    let wake_fd_raw = wake_driver
         .as_ref()
-        .map(backend::WakeQueue::raw)
+        .map(backend::WakeDriver::notification_fd)
         .or_else(|| timer_fd.as_ref().map(TimerFd::raw))
         .expect("one wake descriptor is always constructed");
 
     let mut caps_fallback = false;
-    let caps = backend::probe_caps(&stream_path, D::PLAYBACK).unwrap_or_else(|| {
+    let caps = BackendOf::<D>::probe_caps(&stream_path, D::PLAYBACK).unwrap_or_else(|| {
         crate::warn!(
             log,
             "{}: can't probe device caps; using fallback",
             stream_path
         );
         caps_fallback = true;
-        backend::fallback_caps()
+        BackendOf::<D>::fallback_caps()
     });
     crate::debug!(log, "{}: {:?}", stream_path, caps);
 
@@ -322,7 +286,7 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
         }
     };
     let rebuild_work = rebuild_worker.endpoint();
-    let data_ext = D::data_ext(&ext);
+    let data_ext = D::data_ext(&backend_properties);
     let main_loop = if main_loop.is_null() {
         None
     } else {
@@ -363,8 +327,7 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
                     stream_path: stream_path.clone(),
                     caps,
                     caps_fallback,
-                    fragment_bytes,
-                    fragment_bytes_default: fragment_bytes,
+                    backend_properties,
                     latency: [
                         spa::latency_info_default(SPA_DIRECTION_INPUT),
                         spa::latency_info_default(SPA_DIRECTION_OUTPUT),
@@ -373,7 +336,6 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
                     shared: shared.clone(),
                     rebuild_worker,
                     ring_cap_published: false,
-                    ext,
                 },
                 data: DataState {
                     data_loop,
@@ -381,21 +343,24 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
                     log,
                     clock: IoArea::null(),
                     position: IoArea::null(),
-                    clock_name: platform::clock_name(&stream_path),
+                    clock_name: BackendOf::<D>::clock_name(&stream_path),
                     main_loop,
                     stream_path: stream_path.clone(),
                     timer_fd,
-                    sound_queue,
-                    sound_failed_fd: None,
-                    wake_source: LoopSource::new(spa_source {
-                        loop_: std::ptr::null_mut(),
-                        func: Some(on_wake::<D>),
-                        data: state.cast::<c_void>(),
-                        fd: wake_fd_raw,
-                        mask: SPA_IO_IN,
-                        rmask: 0,
-                        priv_: std::ptr::null_mut(),
-                    }),
+                    wake_driver,
+                    wake_failed_stream: None,
+                    wake_source: LoopSource::new(
+                        spa_source {
+                            loop_: std::ptr::null_mut(),
+                            func: Some(on_wake::<D>),
+                            data: state.cast::<c_void>(),
+                            fd: wake_fd_raw,
+                            mask: SPA_IO_IN,
+                            rmask: 0,
+                            priv_: std::ptr::null_mut(),
+                        },
+                        BackendOf::<D>::DIAGNOSTIC_TAG,
+                    ),
                     ready_dispatching: false,
                     next_time: 0,
                     callbacks: NodeCallbacks::none(),
@@ -408,19 +373,19 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
                         dll: std::default::Default::default(),
                         setup_period: 0,
                         bw_adapt: std::default::Default::default(),
-                        setup_blocksize: 0,
+                        delivery_quantum_bytes: 0,
                         rebuild_pending: false,
                         generation: 0,
+                        stream_token: backend::StreamToken::for_port(0),
                         was_matching: false,
                         warn_limit: RateLimit::new(),
                         pending_xrun: None,
-                        device_event: None,
-                        device_eof: false,
-                        event_xruns_seen: 0,
-                        wake_threshold: 0,
+                        stream_wake: None,
+                        rebuild_required: false,
+                        xrun_tracker: backend::XrunTracker::default(),
                         ext: std::default::Default::default(),
                     }; MAX_PORTS],
-                    fragment_bytes,
+                    backend_properties,
                     shared,
                     rebuild_work,
                     deferred_work: None,
@@ -451,7 +416,7 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
         unsafe {
             with_data_mut(state, |data| {
                 drop(data.timer_fd.take());
-                drop(data.sound_queue.take());
+                drop(data.wake_driver.take());
                 data.wake_source.set_fd(-1);
             });
         };
@@ -516,25 +481,30 @@ pub(crate) unsafe extern "C" fn enum_interface_info(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_init_dict, property_bool, sound_kqueue_enabled};
-    use crate::platform;
+    use super::super::sink::SinkDir;
+    use super::{parse_init_dict, selected_wake_enabled};
+    use crate::backend::fake::{FakeBackend, FakeNodeInit};
+    use crate::backend::{InitItemResult, NodeInit as _};
     use crate::spa::{Dictionary, Log};
 
+    fn force_timer_key() -> &'static str {
+        FakeNodeInit::force_timer_key().expect("the fake exposes a force-timer key")
+    }
+
     #[test]
-    fn force_timer_disables_enriched_kqueue_selection() {
-        assert!(sound_kqueue_enabled(false, true));
-        assert!(!sound_kqueue_enabled(true, true));
-        assert!(!sound_kqueue_enabled(false, false));
-        assert!(!sound_kqueue_enabled(true, false));
+    fn force_timer_disables_enriched_device_wake_selection() {
+        assert!(selected_wake_enabled(false, true));
+        assert!(!selected_wake_enabled(true, true));
+        assert!(!selected_wake_enabled(false, false));
+        assert!(!selected_wake_enabled(true, false));
 
         for value in ["1", "true", "TRUE", "yes", "on"] {
-            assert_eq!(property_bool(value), Some(true), "{value}");
-        }
-        for value in ["0", "false", "FALSE", "no", "off"] {
-            assert_eq!(property_bool(value), Some(false), "{value}");
-        }
-        for value in ["", "2", "maybe", "true "] {
-            assert_eq!(property_bool(value), None, "{value:?}");
+            let mut init = FakeNodeInit::new(true);
+            assert_eq!(
+                init.parse(force_timer_key(), value),
+                InitItemResult::Handled
+            );
+            assert!(init.into_values().force_timer, "{value}");
         }
     }
 
@@ -542,23 +512,20 @@ mod tests {
     fn init_dict_matches_the_exact_force_timer_key() {
         let log = Log::test_null();
         let mut dict = Dictionary::new();
-        dict.add_item(platform::FORCE_TIMER, "true");
-        let (_, force_timer, _, _) =
-            unsafe { parse_init_dict::<super::super::sink::SinkDir>(dict.raw(), &log) };
-        assert!(force_timer);
+        dict.add_item(force_timer_key(), "true");
+        let init = unsafe { parse_init_dict::<SinkDir<FakeBackend>>(dict.raw(), &log) };
+        assert!(init.into_values().force_timer);
 
         let mut wrong_key = Dictionary::new();
-        let wrong_force_timer = platform::FORCE_TIMER.replace("force-timer", "force_timer");
-        assert_ne!(wrong_force_timer, platform::FORCE_TIMER);
+        let wrong_force_timer = force_timer_key().replace("force-timer", "force_timer");
+        assert_ne!(wrong_force_timer, force_timer_key());
         wrong_key.add_item(wrong_force_timer.as_str(), "true");
-        let (_, force_timer, _, _) =
-            unsafe { parse_init_dict::<super::super::sink::SinkDir>(wrong_key.raw(), &log) };
-        assert!(!force_timer);
+        let init = unsafe { parse_init_dict::<SinkDir<FakeBackend>>(wrong_key.raw(), &log) };
+        assert!(!init.into_values().force_timer);
 
         let mut invalid = Dictionary::new();
-        invalid.add_item(platform::FORCE_TIMER, "maybe");
-        let (_, force_timer, _, _) =
-            unsafe { parse_init_dict::<super::super::sink::SinkDir>(invalid.raw(), &log) };
-        assert!(!force_timer);
+        invalid.add_item(force_timer_key(), "maybe");
+        let init = unsafe { parse_init_dict::<SinkDir<FakeBackend>>(invalid.raw(), &log) };
+        assert!(!init.into_values().force_timer);
     }
 }

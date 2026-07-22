@@ -1,31 +1,52 @@
 use super::events::{emit_node_info, handle_process_latency};
 use super::*;
-use crate::platform;
+use crate::backend::BackendProperties as _;
 use crate::spa::{self, Log, deserialize_pod};
 
-// Updates accepted from a Props pod. None means the property was absent.
-// The sink consumes playback_delay_eighths and the source ignores it. Capping
-// that factor and normalizing the FRAGMENT value happen when the update is
-// applied so readback reports the effective value.
-#[derive(Debug, Default, PartialEq)]
-pub(crate) struct PropsUpdate {
+pub(crate) struct PropsUpdate<D: Direction> {
     pub latency_offset_ns: Option<i64>,
-    pub playback_delay_eighths: Option<u32>,
-    pub fragment_bytes: Option<u32>,
+    pub backend: Vec<BackendPropertyUpdateOf<D>>,
+}
+
+impl<D: Direction> std::fmt::Debug for PropsUpdate<D> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PropsUpdate")
+            .field("latency_offset_ns", &self.latency_offset_ns)
+            .field("backend", &self.backend)
+            .finish()
+    }
+}
+
+impl<D: Direction> PartialEq for PropsUpdate<D> {
+    fn eq(&self, other: &Self) -> bool {
+        self.latency_offset_ns == other.latency_offset_ns && self.backend == other.backend
+    }
+}
+
+impl<D: Direction> Default for PropsUpdate<D> {
+    fn default() -> Self {
+        Self {
+            latency_offset_ns: None,
+            backend: Vec::new(),
+        }
+    }
 }
 
 // Validated node parameter requests. Raw pods do not cross this boundary.
-pub(crate) enum NodeParamRequest {
+pub(crate) enum NodeParamRequest<D: Direction> {
     ResetProps, // set_param(Props, NULL)
-    Props(PropsUpdate),
+    Props(PropsUpdate<D>),
     ResetProcessLatency, // set_param(ProcessLatency, NULL)
     ProcessLatency(spa_process_latency_info),
 }
 
 // Parse a deserialized Props object. The adapter owns soft-volume properties,
-// unknown keys are logged and skipped, and invalid platform stream values are
+// unknown keys are logged and skipped, and invalid backend stream values are
 // ignored.
-pub(super) fn parse_props_update(properties: Vec<libspa::pod::Property>, log: &Log) -> PropsUpdate {
+pub(super) fn parse_props_update<D: Direction>(
+    properties: Vec<libspa::pod::Property>,
+    log: &Log,
+) -> PropsUpdate<D> {
     use libspa::pod::Value;
 
     let mut update = PropsUpdate::default();
@@ -46,7 +67,6 @@ pub(super) fn parse_props_update(properties: Vec<libspa::pod::Property>, log: &L
                     update.latency_offset_ns = Some(ns);
                 }
             }
-            // The platform::PLAYBACK_DELAY value is carried in SPA_PROP_params.
             SPA_PROP_params => parse_stream_params(&property.value, &mut update),
             key => {
                 crate::debug!(log, "ignoring unknown prop {}", key);
@@ -57,7 +77,10 @@ pub(super) fn parse_props_update(properties: Vec<libspa::pod::Property>, log: &L
 }
 
 // the SPA_PROP_params payload: a Struct of ("key", value) pairs
-pub(super) fn parse_stream_params(value: &libspa::pod::Value, update: &mut PropsUpdate) {
+pub(super) fn parse_stream_params<D: Direction>(
+    value: &libspa::pod::Value,
+    update: &mut PropsUpdate<D>,
+) {
     use libspa::pod::Value;
     let Value::Struct(values) = value else {
         return;
@@ -65,27 +88,16 @@ pub(super) fn parse_stream_params(value: &libspa::pod::Value, update: &mut Props
     if values.len() % 2 != 0 {
         return;
     }
-    for kv in values.chunks(2) {
-        match (&kv[0], &kv[1]) {
-            (Value::String(s), Value::Int(x)) if s == platform::PLAYBACK_DELAY && *x >= 0 => {
-                update.playback_delay_eighths = Some(*x as u32);
-            }
-            (Value::String(s), Value::Int(x)) if s == platform::FRAGMENT && *x >= 0 => {
-                update.fragment_bytes = Some(*x as u32);
-            }
-            _ => (),
-        }
-    }
+    update.backend = BackendPropertiesOf::<D>::decode_params(value);
 }
 
 // Apply a validated request to the main-loop model. Data-loop effects cross
-// only through DataControl. Props apply in this order: latency offset,
-// PLAYBACK_DELAY, then FRAGMENT. The first failing backend-specific update
-// returns its errno.
+// only through DataControl. The selected property decoder canonicalizes its
+// own update order; the first failing backend-specific update returns errno.
 pub(crate) fn apply_node_param<D: Direction>(
     state: &mut MainState<D>,
     data: &DataControl<D>,
-    request: NodeParamRequest,
+    request: NodeParamRequest<D>,
 ) -> c_int {
     match request {
         NodeParamRequest::ResetProps => {
@@ -105,27 +117,17 @@ pub(crate) fn apply_node_param<D: Direction>(
                 info.ns = ns;
                 handle_process_latency(state, info);
             }
-            if let Some(delay_eighths) = update.playback_delay_eighths {
-                let res = D::apply_playback_delay(state, data, delay_eighths);
-                if res != 0 {
-                    return res;
-                }
-            }
-            if let Some(fragment) = update.fragment_bytes {
-                // stored normalized, so the Props readback reports the
-                // effective (rounded/clamped) value, not the raw request
-                let new_fragment = normalize_fragment(fragment);
-                if new_fragment != state.fragment_bytes {
-                    // unchanged echoes must not rebuild a running device
-                    let old_fragment = state.fragment_bytes;
-                    // install_device consumes the main-loop copy while the
-                    // data-loop store/rebuild is in progress.
-                    state.fragment_bytes = new_fragment;
+            for update in update.backend {
+                let mut properties = state.backend_properties;
+                if properties.apply(update) {
+                    let old = state.backend_properties;
+                    state.backend_properties = properties;
                     let res = apply_props_param(state, data, move |state| {
-                        state.fragment_bytes = new_fragment;
+                        state.backend_properties = properties;
+                        D::sync_backend_properties(&mut state.ext, &properties);
                     });
                     if res != 0 {
-                        state.fragment_bytes = old_fragment;
+                        state.backend_properties = old;
                         return res;
                     }
                 }
@@ -141,6 +143,68 @@ pub(crate) fn apply_node_param<D: Direction>(
             0
         }
     }
+}
+
+pub(super) fn build_backend_node_param<D: Direction>(
+    state: &MainState<D>,
+    id: u32,
+    index: u32,
+) -> ParamBuild {
+    #[expect(non_upper_case_globals)]
+    let pod = match (id, index) {
+        (SPA_PARAM_PropInfo, 0) => spa::build_latency_offset_prop_info(),
+        (SPA_PARAM_PropInfo, index) => {
+            let Some(descriptor) = state
+                .backend_properties
+                .descriptors()
+                .get(index.saturating_sub(1) as usize)
+            else {
+                return ParamBuild::Exhausted;
+            };
+            let value = state
+                .backend_properties
+                .values()
+                .into_iter()
+                .find_map(|(key, value)| (key == descriptor.key).then_some(value))
+                .unwrap_or(0);
+            spa::build_params_prop_info(
+                descriptor.key,
+                descriptor.description,
+                value,
+                descriptor.maximum,
+            )
+        }
+        (SPA_PARAM_Props, 0) => spa::build_latency_offset_props(
+            state.process_latency.ns,
+            &state.backend_properties.values(),
+        ),
+        (SPA_PARAM_ProcessLatency, 0) => spa::build_process_latency_info(&state.process_latency),
+        (SPA_PARAM_Props | SPA_PARAM_ProcessLatency, _) => {
+            return ParamBuild::Exhausted;
+        }
+        _ => return ParamBuild::Unknown,
+    };
+    ParamBuild::Built(pod)
+}
+
+pub(super) fn reset_backend_props<D: Direction>(
+    state: &mut MainState<D>,
+    data: &DataControl<D>,
+) -> c_int {
+    let old = state.backend_properties;
+    let mut properties = old;
+    properties.reset();
+    state.backend_properties = properties;
+    let res = store_and_rebuild(state, data, move |state| {
+        state.backend_properties = properties;
+        D::sync_backend_properties(&mut state.ext, &properties);
+    });
+    if res != 0 {
+        state.backend_properties = old;
+        return res;
+    }
+    handle_process_latency(state, spa::process_latency_default());
+    0
 }
 
 pub(super) unsafe extern "C" fn set_param<D: Direction>(
@@ -169,7 +233,7 @@ pub(super) unsafe extern "C" fn set_param<D: Direction>(
                     Some(Value::Object(Object {
                         type_, properties, ..
                     })) if type_ == SPA_TYPE_OBJECT_Props => {
-                        NodeParamRequest::Props(parse_props_update(properties, &log))
+                        NodeParamRequest::Props(parse_props_update::<D>(properties, &log))
                     }
                     _ => return -libc::EINVAL,
                 }
@@ -209,6 +273,7 @@ pub(super) unsafe extern "C" fn set_param<D: Direction>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::fake::FakePropertyUpdate;
     use crate::spa::pod_prop;
     // Known Props populate the update; adapter-owned, unknown, and invalid
     // values are ignored.
@@ -219,54 +284,51 @@ mod tests {
         let log = Log::test_null();
 
         let params = Value::Struct(vec![
-            Value::String(platform::PLAYBACK_DELAY.into()),
-            Value::Int(8),
-            Value::String(platform::FRAGMENT.into()),
+            Value::String("fake.quantum".into()),
             Value::Int(4096),
             Value::String("bogus.key".into()),
             Value::Int(1),
         ]);
-        let update = parse_props_update(
-            vec![
-                pod_prop(SPA_PROP_volume, Value::Float(1.0)), // softvol: adapter's
-                pod_prop(SPA_PROP_latencyOffsetNsec, Value::Long(250_000)),
-                pod_prop(SPA_PROP_params, params),
-                pod_prop(0x77777, Value::Int(3)), // unknown key: logged, skipped
-            ],
-            &log,
-        );
+        let update =
+            parse_props_update::<crate::node::sink::SinkDir<crate::backend::fake::FakeBackend>>(
+                vec![
+                    pod_prop(SPA_PROP_volume, Value::Float(1.0)), // softvol: adapter's
+                    pod_prop(SPA_PROP_latencyOffsetNsec, Value::Long(250_000)),
+                    pod_prop(SPA_PROP_params, params),
+                    pod_prop(0x77777, Value::Int(3)), // unknown key: logged, skipped
+                ],
+                &log,
+            );
         assert_eq!(
             update,
             PropsUpdate {
                 latency_offset_ns: Some(250_000),
-                playback_delay_eighths: Some(8),
-                fragment_bytes: Some(4096),
+                backend: vec![FakePropertyUpdate::Quantum(4096)],
             }
         );
 
         // negative values are ignored, an odd-length struct is ignored whole,
         // and a mistyped latency offset stays None
-        let update = parse_props_update(
-            vec![
-                pod_prop(SPA_PROP_latencyOffsetNsec, Value::Int(250_000)),
-                pod_prop(
-                    SPA_PROP_params,
-                    Value::Struct(vec![
-                        Value::String(platform::PLAYBACK_DELAY.into()),
-                        Value::Int(-1),
-                    ]),
-                ),
-            ],
-            &log,
-        );
+        let update =
+            parse_props_update::<crate::node::sink::SinkDir<crate::backend::fake::FakeBackend>>(
+                vec![
+                    pod_prop(SPA_PROP_latencyOffsetNsec, Value::Int(250_000)),
+                    pod_prop(
+                        SPA_PROP_params,
+                        Value::Struct(vec![Value::String("fake.quantum".into()), Value::Int(-1)]),
+                    ),
+                ],
+                &log,
+            );
         assert_eq!(update, PropsUpdate::default());
-        let update = parse_props_update(
-            vec![pod_prop(
-                SPA_PROP_params,
-                Value::Struct(vec![Value::String(platform::PLAYBACK_DELAY.into())]),
-            )],
-            &log,
-        );
+        let update =
+            parse_props_update::<crate::node::sink::SinkDir<crate::backend::fake::FakeBackend>>(
+                vec![pod_prop(
+                    SPA_PROP_params,
+                    Value::Struct(vec![Value::String("fake.quantum".into())]),
+                )],
+                &log,
+            );
         assert_eq!(update, PropsUpdate::default());
     }
 }

@@ -31,6 +31,8 @@ impl<T> MutexExt<T> for std::sync::Mutex<T> {
 pub(crate) use backend::StreamConfig as PortConfig;
 pub(crate) type BackendOf<D> = <D as Direction>::Backend;
 pub(crate) type BackendPropertiesOf<D> = <BackendOf<D> as backend::Backend>::Properties;
+pub(crate) type BackendPropertyUpdateOf<D> =
+    <BackendPropertiesOf<D> as backend::BackendProperties>::Update;
 pub(crate) type WakeDriverOf<D> =
     <<D as Direction>::Device as backend::StreamLifecycle>::WakeDriver;
 

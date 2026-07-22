@@ -1,7 +1,9 @@
 use super::events::{emit_param_result, emit_port_info};
 use super::*;
-use super::{build_buffers_info, build_enum_format_info, reset_device_event, snap_raw_to_caps};
+use super::{build_buffers_info, build_enum_format_info, reset_stream_epoch, snap_raw_to_caps};
 use crate::backend;
+use crate::backend::Backend as _;
+use crate::backend::StreamLifecycle as _;
 use crate::spa::{self, Log, ParamStep, build_latency_info, latency_info_default};
 
 pub(super) unsafe extern "C" fn add_port(
@@ -92,7 +94,8 @@ pub(super) unsafe extern "C" fn port_enum_params<D: Direction>(
                         if state.caps_fallback {
                             // the init-time probe hit a busy device and baked in fallback
                             // caps; retry now (main thread, transient open)
-                            if let Some(caps) = backend::probe_caps(&state.stream_path, D::PLAYBACK)
+                            if let Some(caps) =
+                                BackendOf::<D>::probe_caps(&state.stream_path, D::PLAYBACK)
                             {
                                 crate::info!(state.log, "re-probed caps: {:?}", caps);
                                 state.caps = caps;
@@ -135,7 +138,7 @@ pub(super) unsafe extern "C" fn port_enum_params<D: Direction>(
                     (SPA_PARAM_Format | SPA_PARAM_Buffers | SPA_PARAM_Latency, _) => {
                         ParamStep::Stop(0)
                     }
-                    _ => ParamStep::Stop(-libc::ENOENT), // unknown param id (ALSA convention)
+                    _ => ParamStep::Stop(-libc::ENOENT), // unknown SPA param id
                 }
             },
             |index, param| emit_param_result(&events, seq, id, index, param),
@@ -152,7 +155,7 @@ pub(super) fn parse_config<D: Direction>(
     let format = libspa::param::audio::AudioFormat(raw.format);
 
     // only formats from our EnumFormat are expected; reject the rest
-    let Some(bytes_per_sample) = backend::bytes_per_sample(raw.format) else {
+    let Some(bytes_per_sample) = BackendOf::<D>::bytes_per_sample(raw.format) else {
         crate::warn!(state.log, "rejecting unsupported format {:?}", format);
         return Err(-libc::ENOTSUP);
     };
@@ -166,7 +169,7 @@ pub(super) fn parse_config<D: Direction>(
         stride: bytes_per_sample * raw.channels, // bytes per interleaved frame
     };
 
-    match backend::validate_config(&state.caps, &config) {
+    match BackendOf::<D>::validate_config(&state.caps, &config) {
         Err(backend::ChannelMapError::Unsupported) => {
             crate::warn!(
                 state.log,
@@ -176,8 +179,8 @@ pub(super) fn parse_config<D: Direction>(
             return Err(-libc::EINVAL);
         }
         Err(backend::ChannelMapError::ConvertlessReorder) => {
-            // Bitperfect skips the matrix feeder: SET_CHNORDER would update
-            // only the reported matrix while hardware kept its native order.
+            // Bitperfect skips channel conversion: a requested reorder would
+            // update only metadata while hardware kept its native order.
             crate::warn!(
                 state.log,
                 "rejecting channel reorder on a bitperfect device: {:?}",
@@ -235,7 +238,8 @@ pub(super) unsafe fn decode_format(
     }
     let raw = info.as_raw();
 
-    // format flags are stored but unused, OSS writes interleaved frames
+    // Format flags are retained for backend validation; the graph payload is
+    // interleaved.
     if raw.rate == 0 || raw.channels == 0 || raw.channels > SPA_AUDIO_MAX_CHANNELS {
         crate::warn!(
             log,
@@ -265,8 +269,10 @@ pub(super) fn set_format_param<D: Direction>(
     // (audioadapter.c:758, :1059); snap only what the exact path
     // below would reject, so in-caps requests stay untouched
     let admitted = |caps: &backend::StreamCaps, raw: &spa_audio_info_raw| {
-        backend::bytes_per_sample(raw.format)
-            .is_some_and(|_| caps.admits(raw.format, raw.channels, raw.rate))
+        let positions = (raw.flags & SPA_AUDIO_FLAG_UNPOSITIONED == 0)
+            .then(|| &raw.position[..raw.channels.min(SPA_AUDIO_MAX_CHANNELS) as usize]);
+        BackendOf::<D>::bytes_per_sample(raw.format)
+            .is_some_and(|_| caps.admits(raw.format, raw.channels, positions, raw.rate))
     };
     let mut snapped = false;
     if flags & spa::SPA_NODE_PARAM_FLAG_NEAREST != 0 && !admitted(&state.caps, &raw) {
@@ -289,7 +295,12 @@ pub(super) fn set_format_param<D: Direction>(
     // fd and then fail configure, killing the stream for nothing.
     // configure() stays as the backstop for stale caps (a rejection
     // there re-probes and re-announces).
-    if !state.caps.admits(config.format.0, raw.channels, raw.rate) {
+    let positions =
+        (config.flags & SPA_AUDIO_FLAG_UNPOSITIONED == 0).then_some(config.positions.as_slice());
+    if !state
+        .caps
+        .admits(config.format.0, raw.channels, positions, raw.rate)
+    {
         crate::warn!(
             state.log,
             "rejecting out-of-caps format: rate={} channels={}",
@@ -304,10 +315,10 @@ pub(super) fn set_format_param<D: Direction>(
         res = 1;
     }
     if res == -libc::EINVAL || res == -libc::ENOTSUP {
-        // the device rejected caps-derived values: the snapshot may be
-        // stale (vchans/bitperfect toggled at runtime); re-probe and
-        // re-announce EnumFormat so the host renegotiates from reality
-        if let Some(caps) = backend::probe_caps(&state.stream_path, D::PLAYBACK) {
+        // The device rejected caps-derived values: its runtime mode may have
+        // changed since the snapshot. Re-probe and re-announce EnumFormat so
+        // the host renegotiates from reality.
+        if let Some(caps) = BackendOf::<D>::probe_caps(&state.stream_path, D::PLAYBACK) {
             state.caps_fallback = false;
             // bump only on a real change: the serial flip re-triggers the
             // adapter's negotiation, and an unchanged snapshot would loop
@@ -340,7 +351,7 @@ pub(super) fn release_format<D: Direction>(
         let deferred = state.deferred_work.take();
         let port = &mut state.ports[port_idx];
         let retired = std::mem::replace(&mut port.dsp, placeholder);
-        reset_device_event(port);
+        reset_stream_epoch(port);
         port.buffers.clear();
         port.config = None;
         // retire any in-flight background rebuild, and drop its pending
@@ -378,8 +389,7 @@ pub(super) fn release_format<D: Direction>(
 }
 
 // update the port rate and flip Format/Buffers flags to reflect whether a
-// format is negotiated, then re-emit so the host re-reads them (PipeWire
-// ALSA sink/source pattern)
+// format is negotiated, then re-emit so the host re-reads them.
 pub(super) fn publish_format_state<D: Direction>(state: &MainState<D>, rate: Option<u32>) {
     state.events.with_port_info(|info| {
         let _ = info.replace_change_mask(0);

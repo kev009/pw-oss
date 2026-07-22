@@ -4,11 +4,9 @@ use crate::{
 };
 
 // Snap a requested raw format onto the advertised caps for callers that pass
-// SPA_NODE_PARAM_FLAG_NEAREST - audioadapter always negotiates the follower
-// that way (audioadapter.c:758, :1059) - mirroring alsa's set_*_near handling
-// (alsa-pcm.c:2364, :2388). Returns true when anything was adjusted; the
-// caller then returns 1 (alsa-pcm.c:2548) so the adapter re-reads our Format
-// param for the actual values (audioadapter.c:596).
+// SPA_NODE_PARAM_FLAG_NEAREST. Audioadapter negotiates followers this way and
+// re-reads Format when the node returns 1, so callers must report whether the
+// backend-adjusted value differs from the request.
 pub(crate) fn snap_raw_to_caps(
     caps: &backend::StreamCaps,
     raw: &mut libspa::sys::spa_audio_info_raw,
@@ -21,22 +19,22 @@ pub(crate) fn snap_raw_to_caps(
         .enumerate()
         .filter(|(_, configuration)| !configuration.formats.is_empty())
         .min_by_key(|(index, configuration)| {
-            let channel_distance = raw.channels.abs_diff(
-                raw.channels
-                    .clamp(configuration.min_channels, configuration.max_channels),
-            );
-            let rate_distance = if configuration.rates.is_empty() {
-                raw.rate.abs_diff(
-                    raw.rate
-                        .clamp(configuration.min_rate, configuration.max_rate),
-                )
-            } else {
-                configuration
-                    .rates
+            let channel_distance = configuration
+                .channels
+                .layouts()
+                .iter()
+                .map(|layout| layout.channels.abs_diff(raw.channels))
+                .min()
+                .unwrap_or(u32::MAX);
+            let rate_distance = match &configuration.rates {
+                backend::RateSet::Discrete(rates) => rates
                     .iter()
                     .map(|rate| rate.abs_diff(raw.rate))
                     .min()
-                    .unwrap_or(u32::MAX)
+                    .unwrap_or(u32::MAX),
+                backend::RateSet::Range { min, max } => {
+                    raw.rate.abs_diff(raw.rate.clamp(*min, *max))
+                }
             };
             (
                 !configuration.formats.contains(&raw.format),
@@ -60,16 +58,21 @@ pub(crate) fn snap_raw_to_caps(
     // A convertless device with no native format stays unchanged here; the
     // exact-format path rejects it.
 
-    // the position array is 64 wide; garbage caps must not push past it
-    let channels = raw
+    let Some(layout) = configuration
         .channels
-        .clamp(configuration.min_channels, configuration.max_channels)
-        .min(libspa::sys::SPA_AUDIO_MAX_CHANNELS);
+        .layouts()
+        .into_iter()
+        .min_by_key(|layout| layout.channels.abs_diff(raw.channels))
+    else {
+        return changed;
+    };
+    // the position array is 64 wide; garbage caps must not push past it
+    let channels = layout.channels.min(libspa::sys::SPA_AUDIO_MAX_CHANNELS);
     if channels != raw.channels {
         raw.channels = channels;
-        // the requested layout no longer applies; hand out the kernel interleave
-        // order (or AUX slots), same as EnumFormat
-        match backend::channel_positions(channels) {
+        // The requested layout no longer applies; use the layout carried by
+        // this capability (or AUX slots when the backend reports only count).
+        match layout.positions {
             Some(positions) => {
                 for (slot, &p) in raw.position.iter_mut().zip(positions.iter()) {
                     *slot = p;
@@ -84,16 +87,16 @@ pub(crate) fn snap_raw_to_caps(
         changed = true;
     }
 
-    let rate = if !configuration.rates.is_empty() {
-        // discrete native rates (exclusive devices): nearest wins
-        *configuration
-            .rates
-            .iter()
-            .min_by_key(|r| r.abs_diff(raw.rate))
-            .unwrap()
-    } else {
-        raw.rate
-            .clamp(configuration.min_rate, configuration.max_rate)
+    let rate = match &configuration.rates {
+        backend::RateSet::Discrete(rates) => {
+            // Discrete native rates: nearest wins.
+            rates
+                .iter()
+                .min_by_key(|rate| rate.abs_diff(raw.rate))
+                .copied()
+                .unwrap_or(raw.rate)
+        }
+        backend::RateSet::Range { min, max } => raw.rate.clamp(*min, *max),
     };
     if rate != raw.rate {
         raw.rate = rate;
@@ -103,52 +106,27 @@ pub(crate) fn snap_raw_to_caps(
     changed
 }
 
-// The offered channel widths, in EnumFormat order: standard widths in range,
-// then the native max if missing (AUX for non-std), with 2 pinned first (host
-// default) and last (pulse-server falls back to the LAST EnumFormat map when
-// Format is gone; HW routes always report 2ch volume, so a last width of
-// 1/max would thrash cvolume.channels). That can mean two entries for stereo.
-fn enum_format_widths(min_channels: u32, max_channels: u32) -> Vec<u32> {
-    let mut counts = [2u32, 4, 6, 8, 1]
-        .iter()
-        .copied()
-        .filter(|c| *c >= min_channels && *c <= max_channels)
-        .collect::<Vec<_>>();
-    if !counts.contains(&max_channels) {
-        counts.push(max_channels);
-    }
-    // pin 2 first and last; no-op when already only [2]
-    if min_channels <= 2 && max_channels >= 2 {
-        counts.retain(|c| *c != 2);
-        counts.insert(0, 2);
-        if counts.last() != Some(&2) {
-            counts.push(2);
-        }
-    }
-    counts
-}
-
-// One EnumFormat pod per offered channel width (enum_format_widths order),
-// positions from the kernel interleave. None when `index` is past the last
-// result.
+// One EnumFormat pod per backend-provided channel layout, in backend order.
+// None when `index` is past the last result.
 pub(crate) fn build_enum_format_info(caps: &backend::StreamCaps, index: u32) -> Option<Vec<u8>> {
     use libspa::pod::{ChoiceValue, Object, Value, ValueArray};
     use libspa::sys::*;
     use libspa::utils::{Choice, ChoiceEnum, ChoiceFlags, Id};
 
     let mut index = index as usize;
-    let (configuration, channels) = caps
+    let (configuration, layout) = caps
         .configurations_in_preference_order()
         .filter(|configuration| !configuration.formats.is_empty())
         .find_map(|configuration| {
-            let counts = enum_format_widths(configuration.min_channels, configuration.max_channels);
-            if index < counts.len() {
-                Some((configuration, counts[index]))
+            let layouts = configuration.channels.layouts();
+            if index < layouts.len() {
+                Some((configuration, layouts[index].clone()))
             } else {
-                index -= counts.len();
+                index -= layouts.len();
                 None
             }
         })?;
+    let channels = layout.channels;
 
     // Formats supported by this backend configuration, best first.
     let formats = backend::offered_formats(configuration);
@@ -168,39 +146,32 @@ pub(crate) fn build_enum_format_info(caps: &backend::StreamCaps, index: u32) -> 
         )))
     };
 
-    let rate = if configuration.rates.len() > 1 {
-        // discrete native rates (exclusive devices); a range would admit
-        // in-between rates the hardware can't run (see the backend capability probe)
-        let target = configuration.preferred_rate.unwrap_or(48000);
-        let default = *configuration
-            .rates
-            .iter()
-            .min_by_key(|r| r.abs_diff(target))
-            .unwrap();
-        Value::Choice(ChoiceValue::Int(Choice(
-            ChoiceFlags::empty(),
-            ChoiceEnum::Enum {
-                default: default as i32,
-                alternatives: configuration.rates.iter().map(|r| *r as i32).collect(),
-            },
-        )))
-    } else if let [rate] = configuration.rates[..] {
-        Value::Int(rate as i32)
-    } else if configuration.min_rate == configuration.max_rate {
-        Value::Int(configuration.min_rate as i32)
-    } else {
-        pod_int_range(
+    let rate = match &configuration.rates {
+        backend::RateSet::Discrete(rates) if rates.len() > 1 => {
+            let target = configuration.preferred_rate.unwrap_or(48000);
+            let default = *rates.iter().min_by_key(|rate| rate.abs_diff(target))?;
+            Value::Choice(ChoiceValue::Int(Choice(
+                ChoiceFlags::empty(),
+                ChoiceEnum::Enum {
+                    default: default as i32,
+                    alternatives: rates.iter().map(|rate| *rate as i32).collect(),
+                },
+            )))
+        }
+        backend::RateSet::Discrete(rates) => Value::Int(*rates.first()? as i32),
+        backend::RateSet::Range { min, max } if min == max => Value::Int(*min as i32),
+        backend::RateSet::Range { min, max } => pod_int_range(
             configuration
                 .preferred_rate
                 .unwrap_or(48000)
-                .clamp(configuration.min_rate, configuration.max_rate) as i32,
-            configuration.min_rate as i32,
-            configuration.max_rate as i32,
-        )
+                .clamp(*min, *max) as i32,
+            *min as i32,
+            *max as i32,
+        ),
     };
 
-    let positions: Vec<Id> = match backend::channel_positions(channels) {
-        Some(positions) => positions.iter().map(|&p| Id(p)).collect(),
+    let positions: Vec<Id> = match layout.positions {
+        Some(positions) => positions.into_iter().map(Id).collect(),
         None => (0..channels)
             .map(|i| Id(SPA_AUDIO_CHANNEL_AUX0 + i))
             .collect(),
