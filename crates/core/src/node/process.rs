@@ -27,14 +27,15 @@ pub(super) fn check_loop_identity(gate: &DataThreadGate) -> bool {
     false
 }
 
-// Submit a dead-channel rebuild before device I/O. wake_cycle calls this as
-// soon as EV_EOF arrives. The sticky EOF survives timer wakes, and process()
-// retries whenever an earlier submission did not become pending; an in-flight
-// rebuild owns the pending bit and must never be duplicated.
-pub(super) fn queue_device_eof_rebuilds<D: Direction>(state: &mut DataState<D>) {
+// Submit a disconnected-stream rebuild before device I/O. wake_cycle calls
+// this as soon as the backend reports ownership loss. The sticky latch
+// survives timer wakes, and process() retries whenever an earlier submission
+// did not become pending; an in-flight rebuild owns the pending bit and must
+// never be duplicated.
+pub(super) fn queue_required_rebuilds<D: Direction>(state: &mut DataState<D>) {
     for port_idx in 0..state.ports.len() {
         let port = &state.ports[port_idx];
-        if port.device_eof && !port.rebuild_pending {
+        if port.rebuild_required && !port.rebuild_pending {
             queue_rebuild(state, port_idx);
         }
     }
@@ -42,8 +43,67 @@ pub(super) fn queue_device_eof_rebuilds<D: Direction>(state: &mut DataState<D>) 
 
 fn discard_device_snapshots<D: Direction>(state: &mut DataState<D>) {
     for port in &mut state.ports {
-        port.device_event = None;
+        port.stream_wake = None;
     }
+}
+
+type ProcessPhase<D> = (
+    c_int,
+    Option<(PendingXrun, Option<(spa_node_callbacks, *mut c_void)>)>,
+    Option<(Option<spa::Loop>, MainEventTarget<D>, spa::Log, MainEvent)>,
+);
+
+// The shared process body is separate from its raw State projection so the
+// deterministic backend can exercise the same lifecycle without constructing
+// a host-owned SPA interface shell.
+pub(super) fn process_data_cycle<D: Direction>(
+    state: &mut DataState<D>,
+) -> Option<ProcessPhase<D>> {
+    // A cycle that was already signaled when we paused can still land here;
+    // drop it instead of assert!()ing, which aborts the daemon across extern
+    // "C".
+    if !state.started || state.position.is_null() {
+        // Keep sticky disconnect/rebuild state, but never carry this wake's
+        // fill/xrun snapshot into a later Start or IO configuration.
+        discard_device_snapshots(state);
+        return None;
+    }
+
+    // Usually already queued by wake_cycle; retry here if its earlier
+    // submission did not become pending.
+    queue_required_rebuilds(state);
+
+    let result = D::process_ports(state);
+    // Timer-driven I/O can discover a disconnected stream without a wake
+    // event. Semantic stream outcomes latch the same ownership transition
+    // during process_ports; submit it now.
+    queue_required_rebuilds(state);
+    // The event is one pre-I/O snapshot shared by the servo and this process
+    // pass. Never let a host-initiated second process() reuse it after the
+    // device has moved on.
+    discard_device_snapshots(state);
+    // process() normally runs inline from ready(), whose return path also
+    // selects the next wake. Do it here as well for hosts that defer process(),
+    // including the fallback-timer arm when this cycle suspended or replaced
+    // the registered device.
+    if !state.ready_dispatching {
+        super::timing::select_next_wake(state);
+    }
+    // Collect-then-notify: drain the deposited xrun stamp with the hook copy.
+    let pending = state.ports.iter_mut().find_map(|p| p.pending_xrun.take());
+    let main_event = state.pending_main_event.take().map(|event| {
+        (
+            state.main_loop,
+            state.main_events.clone(),
+            state.log.clone(),
+            event,
+        )
+    });
+    Some((
+        result,
+        pending.map(|xrun| (xrun, state.callbacks.hook())),
+        main_event,
+    ))
 }
 
 pub(super) unsafe extern "C" fn process<D: Direction>(object: *mut c_void) -> c_int {
@@ -60,66 +120,21 @@ pub(super) unsafe extern "C" fn process<D: Direction>(object: *mut c_void) -> c_
     // port) so the C callback below runs with no DataState borrow live.
     // SAFETY: object is our State shell (the spa_interface data contract); the
     // borrow ends before any callback is invoked.
-    let phase = unsafe {
-        with_data_mut(root, |state| {
-            // a cycle that was already signaled when we paused can still land here;
-            // drop it instead of assert!()ing, which aborts the daemon across
-            // extern "C"
-            if !state.started || state.position.is_null() {
-                // Keep sticky EOF/rebuild state, but never carry this wake's
-                // fill/xrun snapshot into a later Start or IO configuration.
-                discard_device_snapshots(state);
-                return None;
-            }
-
-            // Usually already queued by wake_cycle; retry here if its earlier
-            // submission did not become pending.
-            queue_device_eof_rebuilds(state);
-
-            let result = D::process_ports(state);
-            // Timer-driven I/O can discover a dead descriptor without an
-            // enriched EV_EOF event. Semantic stream outcomes latch the same
-            // ownership transition during process_ports; submit it now.
-            queue_device_eof_rebuilds(state);
-            // The event is one pre-I/O snapshot shared by the servo and this
-            // process pass. Never let a host-initiated second process() reuse
-            // it after the device has moved on.
-            discard_device_snapshots(state);
-            // process() normally runs inline from ready(), whose return path
-            // also selects the next wake. Do it here as well for hosts that
-            // defer process(), including the fallback-timer arm when this
-            // cycle suspended or replaced the registered device.
-            if !state.ready_dispatching {
-                super::timing::select_next_wake(state);
-            }
-            // collect-then-notify: drain the deposited xrun stamp with the hook copy
-            let pending = state.ports.iter_mut().find_map(|p| p.pending_xrun.take());
-            let main_event = state.pending_main_event.take().map(|event| {
-                (
-                    state.main_loop,
-                    state.main_events.clone(),
-                    state.log.clone(),
-                    event,
-                )
-            });
-            Some((
-                result,
-                pending.map(|t| (t, state.callbacks.hook())),
-                main_event,
-            ))
-        })
-    };
+    let phase = unsafe { with_data_mut(root, process_data_cycle) };
     let Some((result, xrun, main_event)) = phase else {
         return SPA_STATUS_OK as i32;
     };
 
-    if let Some((trigger_us, Some((cb, data)))) = xrun
+    if let Some((xrun, Some((cb, data)))) = xrun
         && let Some(xrun_fun) = cb.xrun
     {
-        // the xrun event for pw-top's counter; the length isn't known at
-        // detection, so 0 delay. No State borrow is live here; sound per
-        // NodeCallbacks::hook (validated copy, data valid while set).
-        unsafe { xrun_fun(data, trigger_us, 0, std::ptr::null_mut()) };
+        // Event-only counters retain the compatibility delay of zero; a
+        // backend that reports lost frames/bytes contributes a real duration.
+        // The SPA callback has no observation-quality field, so only the
+        // trigger and delay cross this ABI boundary.
+        // No State borrow is live here; sound per NodeCallbacks::hook
+        // (validated copy, data valid while set).
+        unsafe { xrun_fun(data, xrun.trigger_us, xrun.delay_us, std::ptr::null_mut()) };
     }
 
     if let Some((main_loop, target, log, event)) = main_event {

@@ -512,7 +512,7 @@ pub(super) unsafe extern "C" fn enum_params<D: Direction>(
             |state, index| match D::build_node_param(state, id, index) {
                 ParamBuild::Built(pod) => ParamStep::Built(pod),
                 ParamBuild::Exhausted => ParamStep::Stop(0),
-                // unknown param id (ALSA convention)
+                // SPA methods reject an unknown param id.
                 ParamBuild::Unknown => ParamStep::Stop(-libc::ENOENT),
             },
             |index, param| emit_param_result(&events, seq, id, index, param),

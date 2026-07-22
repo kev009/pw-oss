@@ -28,73 +28,11 @@ impl<T> MutexExt<T> for std::sync::Mutex<T> {
     }
 }
 
-// Operations common to capture and playback devices.
-pub(crate) trait DeviceOps {
-    fn new(path: &str) -> Self;
-    fn path(&self) -> &str;
-    fn fd(&self) -> Option<c_int>;
-    fn is_closed(&self) -> bool;
-    fn is_running(&self) -> bool;
-    fn configure_wake_threshold(&self, bytes: u32) -> bool;
-    fn close(&mut self);
-    fn suspend(&mut self) -> bool;
-}
-
-impl DeviceOps for backend::CaptureStream {
-    fn new(path: &str) -> Self {
-        Self::new(path)
-    }
-    fn path(&self) -> &str {
-        Self::path(self)
-    }
-    fn fd(&self) -> Option<c_int> {
-        Self::fd(self)
-    }
-    fn is_closed(&self) -> bool {
-        Self::is_closed(self)
-    }
-    fn is_running(&self) -> bool {
-        Self::is_running(self)
-    }
-    fn configure_wake_threshold(&self, bytes: u32) -> bool {
-        Self::configure_wake_threshold(self, bytes)
-    }
-    fn close(&mut self) {
-        Self::close(self);
-    }
-    fn suspend(&mut self) -> bool {
-        Self::suspend(self)
-    }
-}
-
-impl DeviceOps for backend::PlaybackStream {
-    fn new(path: &str) -> Self {
-        Self::new(path)
-    }
-    fn path(&self) -> &str {
-        Self::path(self)
-    }
-    fn fd(&self) -> Option<c_int> {
-        Self::fd(self)
-    }
-    fn is_closed(&self) -> bool {
-        Self::is_closed(self)
-    }
-    fn is_running(&self) -> bool {
-        Self::is_running(self)
-    }
-    fn configure_wake_threshold(&self, bytes: u32) -> bool {
-        Self::configure_wake_threshold(self, bytes)
-    }
-    fn close(&mut self) {
-        Self::close(self);
-    }
-    fn suspend(&mut self) -> bool {
-        Self::suspend(self)
-    }
-}
-
 pub(crate) use backend::StreamConfig as PortConfig;
+pub(crate) type BackendOf<D> = <D as Direction>::Backend;
+pub(crate) type BackendPropertiesOf<D> = <BackendOf<D> as backend::Backend>::Properties;
+pub(crate) type WakeDriverOf<D> =
+    <<D as Direction>::Device as backend::StreamLifecycle>::WakeDriver;
 
 // outcome of a per-(id, index) node param build (the enum_params hook)
 pub(crate) enum ParamBuild {
@@ -109,15 +47,15 @@ pub(crate) trait Direction: Sized + 'static {
     /// probe_caps()/install direction flag
     const PLAYBACK: bool;
     const MEDIA_CLASS: &'static str;
-    /// status a driving node passes to ready(): a playback driver signals
-    /// NEED_DATA; a capture driver signals HAVE_DATA (alsa-pcm.c capture_ready)
+    /// Status a driving node passes to ready(): playback requests input with
+    /// NEED_DATA; capture publishes output with HAVE_DATA.
     const READY_STATUS: i32;
     /// Direction-specific prefix for unknown-command warnings.
     const CMD_WARN_PREFIX: &'static str;
 
     // Send: crosses onto the data loop through install_device's swap
-    type Device: DeviceOps + Send;
-    type MainExt: Default; // direction-specific main-loop/readback fields
+    type Backend: backend::Backend;
+    type Device: backend::StreamLifecycle + Send;
     type DataExt: Default; // direction-specific data-loop fields
     type PortExt: Default; // direction-specific Port fields
 
@@ -125,33 +63,21 @@ pub(crate) trait Direction: Sized + 'static {
     // mutates the pointee, so keep it as a raw pointer.
     fn log_topic() -> std::ptr::NonNull<spa_log_topic>;
 
-    // Parse direction-specific node properties such as PLAYBACK_DELAY.
-    fn info_item(ext: &mut Self::MainExt, key: &str, value: &str);
-    // Finalize direction-specific state after parsing the info dictionary.
-    fn ext_ready(ext: &mut Self::MainExt);
     // Seed data-loop fields from the parsed control model.
-    fn data_ext(ext: &Self::MainExt) -> Self::DataExt;
+    fn data_ext(properties: &BackendPropertiesOf<Self>) -> Self::DataExt;
+    fn sync_backend_properties(ext: &mut Self::DataExt, properties: &BackendPropertiesOf<Self>);
 
     // Serialize one node parameter pod for (id, index).
     fn build_node_param(state: &mut MainState<Self>, id: u32, index: u32) -> ParamBuild;
     // Reset Props to their defaults.
     fn reset_props(state: &mut MainState<Self>, data: &DataControl<Self>) -> c_int;
-    // Apply the playback-delay factor. The sink caps, stores, and rebuilds;
-    // the source ignores it.
-    fn apply_playback_delay(
-        state: &mut MainState<Self>,
-        data: &DataControl<Self>,
-        delay_eighths: u32,
-    ) -> c_int;
-
     // Used from the main thread only; returns the applied configuration or a
-    // negative errno with the device closed. `fragment_bytes` is the
-    // normalized fragment override (0 = automatic); the source applies it at
-    // open time, the sink at prime time (the period is only known then).
+    // negative errno with the device closed. Backend properties are applied
+    // at the lifecycle point where their required stream geometry is known.
     fn try_open_configure(
         stream: &mut Self::Device,
         config: &PortConfig,
-        fragment_bytes: u32,
+        properties: &BackendPropertiesOf<Self>,
         log: &Log,
     ) -> Result<backend::ConfigureOutcome, c_int>;
     // Reset direction-specific state during a device swap.
@@ -178,9 +104,9 @@ pub(crate) trait Direction: Sized + 'static {
     fn servo_fill(port: &mut Port<Self>) -> u32;
     fn servo_hold(port: &Port<Self>) -> bool;
     fn servo_err(port: &Port<Self>, fill: u32) -> f64;
-    // Byte threshold that makes a sound kevent correspond to the next graph
-    // cycle: queued capture data, or playback free space at the live target.
-    fn wake_threshold(port: &Port<Self>) -> u32;
+    // Applied buffer state used by the backend to select its native wake
+    // threshold. The shared node does not interpret native readiness units.
+    fn wake_buffer_state(port: &Port<Self>) -> backend::WakeBufferState;
 
     // process(): the direction-specific data path over the ports
     fn process_ports(state: &mut DataState<Self>) -> c_int;

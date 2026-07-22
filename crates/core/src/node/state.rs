@@ -2,6 +2,7 @@ use std::mem::offset_of;
 
 use super::{BwAdapt, RateLimit, SpaDLL, *};
 use crate::backend;
+use crate::backend::StreamLifecycle as _;
 use crate::spa::{self, IoArea, Log, Loop, LoopSource, System, TimerFd, block_on_loop};
 
 #[repr(C)]
@@ -61,8 +62,7 @@ pub(crate) struct MainState<D: Direction> {
     pub stream_path: String,
     pub caps: backend::StreamCaps,
     pub caps_fallback: bool,
-    pub fragment_bytes: u32,
-    pub fragment_bytes_default: u32,
+    pub backend_properties: BackendPropertiesOf<D>,
     pub latency: [spa_latency_info; 2],
     pub process_latency: spa_process_latency_info,
     pub shared: std::sync::Arc<NodeShared<D>>,
@@ -71,7 +71,6 @@ pub(crate) struct MainState<D: Direction> {
     // endpoint; clear stops and joins this worker before State is dropped.
     pub(super) rebuild_worker: RebuildWorker<D>,
     pub ring_cap_published: bool,
-    pub ext: D::MainExt,
 }
 
 pub(crate) struct DataState<D: Direction> {
@@ -83,15 +82,14 @@ pub(crate) struct DataState<D: Direction> {
     pub clock_name: std::ffi::CString, // stamped into spa_io_clock.name
     pub main_loop: Option<Loop>,       // for endpoint-only notifications
     pub stream_path: String,
-    // Exactly one wake descriptor owns wake_source.fd: the portable SPA
-    // timer, or the enriched OSS kqueue on sufficiently new kernels.
+    // Exactly one notification descriptor owns wake_source.fd: the portable
+    // SPA timer or the selected backend wake driver.
     pub(super) timer_fd: Option<TimerFd>,
-    pub(super) sound_queue: Option<backend::WakeQueue>,
-    // Native wake registration or threshold setup failed for this descriptor.
-    // Audio cycles stay on the kqueue's timer filter; an explicit driver
-    // update gives the same fd one bounded retry without repeating the warning
-    // until one succeeds.
-    pub(super) sound_failed_fd: Option<c_int>,
+    pub(super) wake_driver: Option<WakeDriverOf<D>>,
+    // Native wake registration or threshold setup failed for this stream
+    // generation. An explicit driver update gives it one bounded retry without
+    // repeating the warning until one succeeds.
+    pub(super) wake_failed_stream: Option<backend::StreamIdentity>,
     pub(super) wake_source: LoopSource,
     // True only while on_wake is inside the host's ready callback. An inline
     // process() leaves next-wake selection to the callback epilogue; a
@@ -100,7 +98,7 @@ pub(crate) struct DataState<D: Direction> {
     pub next_time: u64,
     pub callbacks: NodeCallbacks,
     pub ports: [Port<D>; MAX_PORTS],
-    pub fragment_bytes: u32, // normalized override (0 = automatic); read by the prime paths
+    pub backend_properties: BackendPropertiesOf<D>,
     // the Arc'd rendezvous with the owned rebuild worker and
     // clear(); outlives the FFI shell by construction (see NodeShared)
     pub shared: std::sync::Arc<NodeShared<D>>,
@@ -174,8 +172,8 @@ pub(crate) struct Port<D: Direction> {
     pub dsp: D::Device,
     pub dll: SpaDLL,
     pub setup_period: u32, // device bytes per graph cycle the stream/servo was set up for
-    pub bw_adapt: BwAdapt, // variance-adaptive bandwidth (ALSA scheme)
-    pub setup_blocksize: u32, // device fragment size (measurement quantization)
+    pub bw_adapt: BwAdapt, // variance-adaptive servo bandwidth
+    pub delivery_quantum_bytes: u32, // applied delivery granularity
     // A main-loop device rebuild is in flight; skip cycles until poll_rebuild
     // consumes its completion. Data-loop-owned: set when the order is queued,
     // cleared when the completion swap is consumed (or by the install/suspend
@@ -185,82 +183,100 @@ pub(crate) struct Port<D: Direction> {
     // or configuration changes. A completion applies only when its snapshot
     // still matches; wrapping is safe because the fence uses equality only.
     pub generation: u64,
+    // Stable for the lifetime of this logical port; native descriptor changes
+    // are fenced by pairing it with `generation` in every wake registration.
+    pub stream_token: backend::StreamToken,
     pub was_matching: bool, // rate matching active last cycle (relock on transition)
     pub warn_limit: RateLimit,
     // Data-loop-owned xrun detected this cycle (trigger time in
     // µs). detect_underrun/recover_overrun deposit it instead of calling the
     // host back mid-cycle; process() drains it and invokes the copied xrun
     // hook only after the DataState/port borrows end (collect-then-notify).
-    pub pending_xrun: Option<u64>,
-    // Latest enriched sound kevent, valid until this cycle's device I/O.
-    // Timer-driven/follower paths leave it empty and use the ioctl fallback.
-    pub device_event: Option<backend::DeviceEvent>,
-    // EV_EOF is ownership state, not a cycle measurement. Keep it latched
-    // across timer wakes and failed rebuild submissions until the device or
-    // trigger epoch is reset.
-    pub device_eof: bool,
-    pub event_xruns_seen: u32,
-    // Last native wake threshold installed for the registered device.
-    pub wake_threshold: u32,
+    pub pending_xrun: Option<PendingXrun>,
+    // Latest backend wake snapshot, valid until this cycle's device I/O.
+    // Timer-driven/follower paths leave it empty and query the stream.
+    pub stream_wake: Option<backend::StreamWake>,
+    // Disconnect is ownership state, not a cycle measurement. Keep it latched
+    // across timer wakes and failed rebuild submissions until the stream or
+    // measurement epoch is reset.
+    pub rebuild_required: bool,
+    pub xrun_tracker: backend::XrunTracker,
     pub ext: D::PortExt, // direction-specific fields (see sink/source)
 }
 
-pub(crate) fn device_event_fill<D: Direction>(port: &Port<D>) -> Option<u32> {
-    let event = port.device_event?;
-    if Some(event.fd) != port.dsp.fd() {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PendingXrun {
+    pub(crate) trigger_us: u64,
+    pub(crate) delay_us: u64,
+    pub(crate) quality: Option<backend::ObservationQuality>,
+}
+
+pub(crate) fn pending_xrun(
+    trigger_us: u64,
+    delta: backend::XrunDelta,
+    config: Option<&PortConfig>,
+) -> PendingXrun {
+    let delay_us = config.map_or(0, |config| {
+        let rate = u128::from(config.rate.max(1));
+        if let Some(frames) = delta.lost_frames {
+            (u128::from(frames).saturating_mul(1_000_000) / rate).min(u128::from(u64::MAX)) as u64
+        } else if let Some(bytes) = delta.lost_bytes {
+            (u128::from(bytes).saturating_mul(1_000_000)
+                / (rate * u128::from(config.stride.max(1))))
+            .min(u128::from(u64::MAX)) as u64
+        } else {
+            0
+        }
+    });
+    PendingXrun {
+        trigger_us,
+        delay_us,
+        quality: delta.quality,
+    }
+}
+
+impl<D: Direction> Port<D> {
+    pub(crate) const fn stream_identity(&self) -> backend::StreamIdentity {
+        backend::StreamIdentity::new(self.stream_token, self.generation)
+    }
+}
+
+pub(crate) fn wake_queue_fill<D: Direction>(port: &Port<D>) -> Option<u32> {
+    let event = port.stream_wake?;
+    if event.stream != port.stream_identity() {
         return None;
     }
-    if D::PLAYBACK {
-        let stride = port.stride_rate().map(|(stride, _)| stride).unwrap_or(1);
-        event
-            .queued_frames
-            .map(|frames| frames.saturating_mul(stride as u64).min(u32::MAX as u64) as u32)
-    } else {
-        Some(event.available_bytes)
-    }
+    event
+        .queue
+        .map(|queue| queue.fill_bytes.min(u64::from(u32::MAX)) as u32)
 }
 
-pub(crate) fn take_device_event_xruns<D: Direction>(port: &mut Port<D>) -> Option<u32> {
-    let event = port.device_event?;
-    if Some(event.fd) != port.dsp.fd() {
+pub(crate) fn take_wake_xruns<D: Direction>(port: &mut Port<D>) -> Option<backend::XrunDelta> {
+    let event = port.stream_wake?;
+    if event.stream != port.stream_identity() {
         return None;
     }
-    let previous = port.event_xruns_seen;
-    port.event_xruns_seen = event.xruns;
-    Some(if event.xruns >= previous {
-        event.xruns - previous
-    } else {
-        // The channel reset its statistics (new trigger epoch or an external
-        // GETERROR). Start the new epoch at the value in this snapshot.
-        event.xruns
-    })
+    event
+        .xruns
+        .map(|observation| port.xrun_tracker.observe(observation))
 }
 
-// GETERROR clears pcm_channel::xruns, while dsp_kqevent() snapshots that same
-// counter without clearing it (FreeBSD sys/dev/sound/pcm/dsp.c).
-// On a device-event -> timer/follower transition, remove the portion already
-// reported from snapshots before resetting our event-side baseline.
-pub(crate) fn take_fallback_xruns<D: Direction>(port: &mut Port<D>, total: u32) -> u32 {
-    let reported = std::mem::take(&mut port.event_xruns_seen);
-    if total >= reported {
-        total - reported
-    } else {
-        // A trigger/reset began a new kernel epoch without passing through
-        // reset_device_event. Fail toward reporting the new errors.
-        total
-    }
+pub(crate) fn take_polled_xruns<D: Direction>(
+    port: &mut Port<D>,
+    observation: backend::XrunObservation,
+) -> backend::XrunDelta {
+    port.xrun_tracker.observe(observation)
 }
 
-pub(crate) fn reset_device_event<D: Direction>(port: &mut Port<D>) {
-    port.device_event = None;
-    port.device_eof = false;
-    port.event_xruns_seen = 0;
-    port.wake_threshold = 0;
+pub(crate) fn reset_stream_epoch<D: Direction>(port: &mut Port<D>) {
+    port.stream_wake = None;
+    port.rebuild_required = false;
+    port.xrun_tracker.reset();
 }
 
-pub(crate) fn latch_device_loss<D: Direction>(port: &mut Port<D>, status: backend::IoStatus) {
-    if status.device_lost() {
-        port.device_eof = true;
+pub(crate) fn latch_rebuild_required<D: Direction>(port: &mut Port<D>, status: backend::IoStatus) {
+    if status.requires_rebuild() {
+        port.rebuild_required = true;
     }
 }
 
@@ -458,28 +474,75 @@ impl NodeCallbacks {
 
 #[cfg(test)]
 mod tests {
-    use super::super::sink::SinkDir;
+    use super::super::sink::SinkDir as GenericSinkDir;
     use super::*;
+    use crate::backend::fake::FakeBackend;
+
+    type SinkDir = GenericSinkDir<FakeBackend>;
+
+    #[test]
+    fn xrun_report_preserves_duration_and_quality() {
+        let config = PortConfig {
+            format: libspa::param::audio::AudioFormat::S16LE,
+            rate: 48_000,
+            channels: 4,
+            positions: vec![],
+            flags: 0,
+            stride: 8,
+        };
+        assert_eq!(
+            pending_xrun(
+                123,
+                backend::XrunDelta {
+                    events: 1,
+                    lost_frames: Some(480),
+                    lost_bytes: None,
+                    quality: Some(backend::ObservationQuality::Estimated),
+                },
+                Some(&config),
+            ),
+            PendingXrun {
+                trigger_us: 123,
+                delay_us: 10_000,
+                quality: Some(backend::ObservationQuality::Estimated),
+            }
+        );
+        assert_eq!(
+            pending_xrun(
+                456,
+                backend::XrunDelta {
+                    events: 1,
+                    lost_frames: None,
+                    lost_bytes: Some(3_840),
+                    quality: Some(backend::ObservationQuality::Exact),
+                },
+                Some(&config),
+            )
+            .delay_us,
+            10_000
+        );
+    }
+
     fn test_port(fd: c_int) -> Port<SinkDir> {
         Port {
             config: None,
             buffers: vec![],
             io: IoArea::null(),
             rate_match: IoArea::null(),
-            dsp: backend::PlaybackStream::test_on_fd(fd, 8),
+            dsp: backend::fake::FakeStream::test_on_fd(fd, 8),
             dll: Default::default(),
             setup_period: 0,
             bw_adapt: Default::default(),
-            setup_blocksize: 0,
+            delivery_quantum_bytes: 0,
             rebuild_pending: false,
             generation: 0,
+            stream_token: backend::StreamToken::for_port(0),
             was_matching: false,
             warn_limit: RateLimit::new(),
             pending_xrun: None,
-            device_event: None,
-            device_eof: false,
-            event_xruns_seen: 0,
-            wake_threshold: 0,
+            stream_wake: None,
+            rebuild_required: false,
+            xrun_tracker: backend::XrunTracker::default(),
             ext: Default::default(),
         }
     }
