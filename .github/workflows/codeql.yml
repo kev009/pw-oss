@@ -1,8 +1,8 @@
 name: CodeQL
 
-# The concrete plugin is FreeBSD-only, so do not attempt a full workspace
-# build on the Linux runner. build-mode: none extracts Rust sources and Cargo
-# metadata, including the backend-neutral core, without compiling the plugin.
+# Rust CodeQL uses build mode "none": it extracts every workspace source,
+# including the FreeBSD-only plugin, without requiring a FreeBSD sysroot.
+# Compilation, tests, and clippy run separately in ci.yml on Ubuntu and FreeBSD.
 on:
   push:
     branches: [master]
@@ -19,8 +19,8 @@ permissions:
   contents: read
 
 jobs:
-  analyze:
-    name: Analyze (rust)
+  analyze-workspace-sources:
+    name: Analyze (rust workspace, sources)
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     permissions:
@@ -36,6 +36,8 @@ jobs:
         uses: github/codeql-action/init@v4
         with:
           languages: rust
+          # This is the only build mode supported for Rust. It covers the
+          # FreeBSD-only plugin crate even though it cannot build on Linux.
           build-mode: none
 
       - name: Perform CodeQL analysis
