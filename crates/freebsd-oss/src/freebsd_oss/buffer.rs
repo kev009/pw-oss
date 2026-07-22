@@ -2,7 +2,11 @@
 //!
 //! These calculations encode kernel limits and OSS fragment behavior. Keeping
 //! them pure and together makes the policy testable without opening a device
-//! and keeps the SPA node focused on graph lifecycle and servo state.
+//! and keeps numerical OSS ring policy out of the SPA node.
+
+use crate::backend::{
+    CaptureBufferGeometry, CaptureBufferRequest, PlaybackBufferGeometry, PlaybackBufferRequest,
+};
 
 // sys/dev/sound/pcm/channel.h
 pub(crate) const MAX_BUFFER_BYTES: usize = 131_072;
@@ -51,6 +55,12 @@ pub(crate) fn max_buffer_period_bytes(stride: u32, device_rate: u32, graph_rate:
 }
 
 /// A node.max-latency cap when four graph periods would not fit the OSS ring.
+///
+/// At fat strides (for example a 20-channel S32 interface), the fixed PCM
+/// soft-ring byte cap can hold fewer than two ordinary graph periods. Capture
+/// then has no arrival-jitter headroom and playback cannot retain both quanta
+/// plus its delay target. The 44.1 kHz comparison publishes a conservative
+/// time-domain cap before that geometry becomes structurally unsafe.
 pub(crate) fn advertised_quantum_cap_frames(stride: u32, rate: u32) -> Option<u32> {
     let stride = stride.max(1);
     let frames = buffer_capacity_limit(stride, rate) / stride / 4;
@@ -186,6 +196,142 @@ pub(crate) fn capture_buffer_required(period: u32, blocksize: u32) -> u32 {
         .max(period.saturating_mul(2))
 }
 
+pub(crate) fn capture_buffer_plan(
+    request: CaptureBufferRequest,
+    fragment_bytes: u32,
+) -> (u32, u32) {
+    let max_period =
+        max_buffer_period_bytes(request.stride, request.device_rate, request.graph_rate);
+    let m = request.period_bytes.max(1_024);
+    let fragment_cap = 1u32 << (31 - m.leading_zeros());
+    let fragment = if fragment_bytes == 0 {
+        1_024
+    } else {
+        fragment_bytes.min(fragment_cap)
+    };
+    let capacity = capture_buffer_request(
+        request.period_bytes,
+        max_period,
+        request.stride,
+        request.device_rate,
+    );
+    (fragment, capacity)
+}
+
+pub(crate) fn capture_applied_geometry(
+    request: CaptureBufferRequest,
+    capacity_bytes: u32,
+    granted_quantum_bytes: u32,
+    delivery_quantum_ns: u64,
+) -> CaptureBufferGeometry {
+    let delivery_quantum_bytes =
+        delivery_quantum_bytes(delivery_quantum_ns, request.device_rate, request.stride);
+    let quantum_bytes = granted_quantum_bytes.max(delivery_quantum_bytes);
+    let (target_fill_bytes, peak_fill_bytes) =
+        capture_fill_targets(request.period_bytes, quantum_bytes, capacity_bytes);
+    CaptureBufferGeometry {
+        capacity_bytes,
+        quantum_bytes,
+        target_fill_bytes,
+        peak_fill_bytes,
+        required_capacity_bytes: capture_buffer_required(request.period_bytes, quantum_bytes),
+        device_lost: false,
+    }
+}
+
+fn delivery_quantum_bytes(ns: u64, rate: u32, stride: u32) -> u32 {
+    let stride = stride.max(1);
+    let bytes = ((ns as u128)
+        .saturating_mul(rate as u128)
+        .saturating_mul(stride as u128)
+        / 1_000_000_000)
+        .min(u32::MAX as u128) as u32;
+    bytes
+        .checked_next_multiple_of(stride)
+        .unwrap_or(u32::MAX - u32::MAX % stride)
+}
+
+pub(crate) fn playback_buffer_plan(
+    request: PlaybackBufferRequest,
+    delivery_quantum_ns: u64,
+    fragment_bytes: u32,
+    delay_eighths: u32,
+) -> (u32, u32) {
+    let hardware_quantum =
+        delivery_quantum_bytes(delivery_quantum_ns, request.device_rate, request.stride);
+    let write_max = request.period_bytes.max(request.maximum_write_bytes);
+    let max_period =
+        max_buffer_period_bytes(request.stride, request.device_rate, request.graph_rate);
+    let capacity = playback_buffer_request(
+        request.period_bytes,
+        max_period,
+        request.stride,
+        request.device_rate,
+        fragment_bytes,
+        hardware_quantum,
+        write_max,
+        delay_eighths,
+    );
+    (capacity, hardware_quantum)
+}
+
+pub(crate) fn playback_applied_geometry(
+    request: PlaybackBufferRequest,
+    capacity_bytes: u32,
+    granted_quantum_bytes: u32,
+    delivery_quantum_ns: u64,
+    delay_eighths: u32,
+) -> PlaybackBufferGeometry {
+    let hardware_quantum =
+        delivery_quantum_bytes(delivery_quantum_ns, request.device_rate, request.stride);
+    let quantum_bytes = granted_quantum_bytes.max(hardware_quantum);
+    let write_max = request.period_bytes.max(request.maximum_write_bytes);
+    let desired = playback_desired_delay(request.period_bytes, delay_eighths);
+    let (target_fill_bytes, delay_capped) = playback_target_delay(
+        capacity_bytes,
+        request.period_bytes,
+        quantum_bytes,
+        write_max,
+        desired,
+    );
+    PlaybackBufferGeometry {
+        capacity_bytes,
+        quantum_bytes,
+        target_fill_bytes,
+        target_goal_bytes: target_fill_bytes,
+        minimum_fill_bytes: playback_fill_floor(request.period_bytes, quantum_bytes),
+        required_capacity_bytes: playback_buffer_required(
+            request.period_bytes,
+            desired,
+            quantum_bytes,
+            write_max,
+        ),
+        delay_capped,
+    }
+}
+
+pub(crate) fn playback_retuned_geometry(
+    request: PlaybackBufferRequest,
+    capacity_bytes: u32,
+    granted_quantum_bytes: u32,
+    delivery_quantum_ns: u64,
+    current_fill_bytes: u32,
+    delay_eighths: u32,
+) -> PlaybackBufferGeometry {
+    let mut geometry = playback_applied_geometry(
+        request,
+        capacity_bytes,
+        granted_quantum_bytes,
+        delivery_quantum_ns,
+        delay_eighths,
+    );
+    let predicted = current_fill_bytes
+        .saturating_add(request.write_bytes)
+        .saturating_sub(request.period_bytes);
+    geometry.target_fill_bytes = geometry.target_goal_bytes.min(predicted);
+    geometry
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,6 +373,17 @@ mod tests {
     }
 
     #[test]
+    fn delivery_quantum_rounds_to_frames_and_stays_saturated() {
+        assert_eq!(delivery_quantum_bytes(5_333_333, 48_000, 8), 2_048);
+        assert_eq!(delivery_quantum_bytes(0, 48_000, 8), 0);
+        assert_eq!(
+            delivery_quantum_bytes(u64::MAX, u32::MAX, 8),
+            u32::MAX - u32::MAX % 8
+        );
+        assert_eq!(delivery_quantum_bytes(u64::MAX, u32::MAX, 1), u32::MAX);
+    }
+
+    #[test]
     fn playback_buffer_request_covers_the_largest_negotiable_quantum() {
         let request = playback_buffer_request(4_096, 16_384, 8, 48_000, 0, 2_048, 4_096, 4);
         assert!(
@@ -243,6 +400,53 @@ mod tests {
     }
 
     #[test]
+    fn playback_target_matches_live_geometry() {
+        assert_eq!(
+            playback_target_delay(65_536, 16_384, 2_048, 16_384, 0),
+            (20_480, false)
+        );
+        assert_eq!(playback_fill_floor(16_384, 8_192), 24_576);
+    }
+
+    #[test]
+    fn playback_grant_at_required_has_safe_headroom() {
+        for period in [1_024u32, 4_096, 16_384, 65_536] {
+            for quantum in [512u32, 1_024, 2_047, 2_048, 16_384, 65_536] {
+                for write_max in [period, period.saturating_mul(2), period.saturating_mul(4)] {
+                    for delay_eighths in [0u32, 4, 32, 1_024] {
+                        let desired = playback_desired_delay(period, delay_eighths);
+                        let required =
+                            playback_buffer_required(period, desired, quantum, write_max);
+                        for granted in [
+                            required,
+                            required.saturating_add(1),
+                            required.saturating_mul(2),
+                        ] {
+                            let (target, _) =
+                                playback_target_delay(granted, period, quantum, write_max, desired);
+                            assert!(target >= playback_fill_floor(period, quantum));
+                            assert!(
+                                target.saturating_add(write_max).saturating_add(quantum) <= granted
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn playback_small_grant_and_oversized_delay_are_bounded() {
+        assert_eq!(
+            playback_target_delay(8_192, 16_384, 1_024, 16_384, 0),
+            (4_096, false)
+        );
+        let (target, capped) = playback_target_delay(65_536, 4_096, 1_024, 4_096, u32::MAX);
+        assert_eq!(target, 65_536 - 4_096 - 1_024);
+        assert!(capped);
+    }
+
+    #[test]
     fn capture_buffer_request_floors_and_caps() {
         assert_eq!(capture_buffer_request(1_024, 16_384, 8, 48_000), 16_384 * 4);
         assert_eq!(
@@ -254,5 +458,25 @@ mod tests {
             capture_buffer_request(65_536, 65_536, 8, 48_000),
             MAX_BUFFER_BYTES as u32
         );
+    }
+
+    #[test]
+    fn capture_targets_track_arrival_granularity() {
+        for period in [1_024u32, 4_096, 16_384, 65_536] {
+            for quantum in [512u32, 1_024, 2_047, 2_048, 16_384, 65_536] {
+                let (target, peak) = capture_fill_targets(period, quantum, 0);
+                assert_eq!(target, period + quantum / 2);
+                assert_eq!(peak, target + quantum / 2 + period / 2);
+
+                let ring = capture_buffer_required(period, quantum);
+                let (bounded_target, bounded_peak) = capture_fill_targets(period, quantum, ring);
+                assert_eq!(bounded_target, target);
+                assert!(bounded_peak >= target + quantum);
+                assert!(bounded_peak <= ring - quantum);
+
+                let (_, degenerate_peak) = capture_fill_targets(period, quantum, period);
+                assert!(degenerate_peak <= period.saturating_sub(quantum));
+            }
+        }
     }
 }

@@ -1,14 +1,24 @@
 use libc::ssize_t;
 use nix::errno::Errno;
+use std::cell::Cell;
 use std::ffi::{CString, c_int};
 use std::time::Duration;
 
 use super::abi::*;
-use super::buffer::{MAX_BUFFER_BYTES, MIN_BUFFER_BYTES};
-use super::devices::drain_quantum_ns;
+use super::buffer::{
+    MAX_BUFFER_BYTES, MIN_BUFFER_BYTES, capture_applied_geometry, capture_buffer_plan,
+    playback_applied_geometry, playback_buffer_plan, playback_retuned_geometry,
+};
+use super::devices::delivery_quantum;
+use super::event::OssWakeDriver;
+use super::identity::OssNodeProperties;
 use super::sys::LibcFd;
-use crate::backend::{BufferLayout, IoStatus, ReadOutcome, WriteOutcome};
-
+use crate::backend::{
+    BufferLayout, CaptureBufferGeometry, CaptureBufferRequest, CaptureRetune, DeliveryQuantum,
+    IoStatus, PlaybackBufferGeometry, PlaybackBufferRequest, PlaybackRetune, ReadOutcome,
+    StreamError, StreamIdentity, WakeBufferState, WakeError, WriteOutcome, XrunObservation,
+};
+use crate::spa::Log;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct AppliedNativeConfig {
     pub(super) format: u32,
@@ -16,38 +26,105 @@ pub(super) struct AppliedNativeConfig {
     pub(super) rate: u32,
 }
 
+#[derive(Default)]
+struct CaptureBufferState {
+    period_bytes: u32,
+    quantum_bytes: u32,
+    capacity_bytes: u32,
+    mismatch_cycles: u32,
+    pinned_cycles: u32,
+}
+
+#[derive(Default)]
+struct PlaybackBufferState {
+    period_bytes: u32,
+    quantum_bytes: u32,
+    capacity_bytes: u32,
+    mismatch_cycles: u32,
+    last_retune_log_ns: u64,
+    suppressed_retune_logs: u32,
+}
+
 fn io_status(error: Errno) -> IoStatus {
-    if error == Errno::EAGAIN || error == Errno::EWOULDBLOCK {
+    if error == Errno::EAGAIN || error == Errno::EWOULDBLOCK || error == Errno::EINTR {
         IoStatus::WouldBlock
     } else {
         match error {
-            Errno::EINTR => IoStatus::Interrupted,
             Errno::EBADF | Errno::ENODEV | Errno::ENXIO | Errno::EPIPE => IoStatus::Disconnected,
-            _ => IoStatus::Failed,
+            // OSS commonly reports EIO for a dying channel whose descriptor
+            // still exists. Treat every remaining non-retryable errno as
+            // fatal so the shared shell replaces the stream instead of
+            // repeatedly dropping graph buffers on the same descriptor.
+            _ => IoStatus::Fatal(StreamError::from_native_code(error as i32)),
         }
     }
 }
 
+fn native_frame_stride(format: u32, channels: u32) -> u32 {
+    afmt_frame_bytes(format)
+        .max(1)
+        .saturating_mul(channels.max(1))
+}
+
+fn native_silence_byte(format: u32) -> u8 {
+    if format == AFMT_U8 { 0x80 } else { 0 }
+}
+
+fn wake_threshold_changed(current: u32, desired: u32, quantum: u32) -> bool {
+    current == 0 || current.abs_diff(desired) >= quantum.max(1)
+}
+
+fn capture_wake_threshold(buffer: WakeBufferState) -> u32 {
+    buffer.target_fill_bytes.max(buffer.period_bytes).max(1)
+}
+
+fn playback_wake_threshold(buffer: WakeBufferState) -> u32 {
+    buffer
+        .capacity_bytes
+        .saturating_sub(buffer.target_fill_bytes)
+        .max(1)
+}
+
+fn install_wake_threshold(
+    fd: c_int,
+    current: &Cell<u32>,
+    desired: u32,
+    quantum: u32,
+) -> Result<(), WakeError> {
+    if !wake_threshold_changed(current.get(), desired, quantum) {
+        return Ok(());
+    }
+    if !set_low_water(fd, desired) {
+        return Err(WakeError::threshold(desired, Errno::last()));
+    }
+    current.set(desired);
+    Ok(())
+}
+
 pub(crate) struct Dsp {
     path: CString,
-    hw_quantum_ns: u64, // the hardware drain quantum (sndstat); 0 = fragment-accurate
+    delivery_quantum: DeliveryQuantum,
     fd: Option<LibcFd>,
     state: DspState,
     needs_trigger: bool, // trigger-suspended: NOTRIGGER must be cleared on restart
     stride: u32,         // negotiated frame bytes; reads must consume whole frames
     skip: u32,           // tail bytes of a torn frame to discard before the next read
+    wake_threshold: Cell<u32>,
+    buffer: CaptureBufferState,
 }
 
 impl Dsp {
     pub(crate) fn new(path: &str) -> Self {
         Self {
             path: CString::new(path).unwrap(),
-            hw_quantum_ns: drain_quantum_ns(path, false),
+            delivery_quantum: delivery_quantum(path, false),
             fd: None,
             state: DspState::Closed,
             needs_trigger: false,
             stride: 1,
             skip: 0,
+            wake_threshold: Cell::new(0),
+            buffer: CaptureBufferState::default(),
         }
     }
 
@@ -59,15 +136,15 @@ impl Dsp {
         self.path.to_str().unwrap_or("") // constructed from &str; always valid
     }
 
-    pub(crate) fn delivery_quantum_ns(&self) -> u64 {
-        self.hw_quantum_ns
+    pub(crate) fn delivery_quantum(&self) -> DeliveryQuantum {
+        self.delivery_quantum
     }
 
     // on direct opens the hardware blocksize is per-session state; call after
-    // configure so the snapshot reflects THIS session (see drain_quantum_ns)
+    // Configure first so the cadence snapshot reflects this session.
     pub(crate) fn refresh_hw_quantum(&mut self) {
         if let Ok(path) = self.path.to_str() {
-            self.hw_quantum_ns = drain_quantum_ns(path, false);
+            self.delivery_quantum = delivery_quantum(path, false);
         }
     }
 
@@ -85,14 +162,24 @@ impl Dsp {
         self.descriptor().raw()
     }
 
-    pub(crate) fn fd(&self) -> Option<c_int> {
-        self.fd.as_ref().map(LibcFd::raw)
-    }
-
-    pub(crate) fn configure_wake_threshold(&self, bytes: u32) -> bool {
-        self.fd
+    pub(crate) fn register_wake(
+        &self,
+        driver: &mut OssWakeDriver,
+        stream: StreamIdentity,
+        buffer: WakeBufferState,
+    ) -> Result<(), WakeError> {
+        let fd = self
+            .fd
             .as_ref()
-            .is_some_and(|fd| set_low_water(fd.raw(), bytes))
+            .ok_or_else(|| WakeError::new(Errno::ENODEV))?;
+        let threshold = capture_wake_threshold(buffer);
+        install_wake_threshold(
+            fd.raw(),
+            &self.wake_threshold,
+            threshold,
+            buffer.quantum_bytes,
+        )?;
+        driver.register_stream(fd.raw(), false, stream, buffer.frame_stride)
     }
 
     pub(crate) fn open(&mut self) -> Result<(), Errno> {
@@ -119,6 +206,72 @@ impl Dsp {
         self.state = DspState::Closed;
         self.needs_trigger = false;
         self.skip = 0;
+        self.buffer = CaptureBufferState::default();
+        self.wake_threshold.set(0);
+    }
+
+    pub(crate) fn clear_overrun_observation(&mut self) {
+        self.buffer.pinned_cycles = 0;
+    }
+
+    /// Classify and recover a FreeBSD capture overrun. chn_rdfeed disposes a
+    /// hardware lump upstream when bufsoft is full, so a counter tick alone
+    /// does not corrupt the queued data. Re-prime only when the soft ring stays
+    /// pinned across consecutive cycles: that is evidence the catch-up read
+    /// cannot drain it. This avoids turning a short kernel drop into a much
+    /// longer backlog discard, silence period, and servo relock.
+    ///
+    /// `Some(reset_epoch)` means recovery was selected; the boolean reports
+    /// whether trigger suspension established a fresh native event epoch.
+    pub(crate) fn recover_overrun(
+        &mut self,
+        overrun_count: u32,
+        pre_read_fill: Option<u32>,
+        log: &Log,
+    ) -> Option<bool> {
+        const PINNED_CYCLE_LIMIT: u32 = 3;
+
+        let pinned = match (pre_read_fill, self.buffer.capacity_bytes) {
+            (Some(fill), capacity) if capacity > 0 => {
+                fill > capacity.saturating_sub(self.buffer.quantum_bytes)
+            }
+            (Some(_), _) => true,
+            (None, _) => false,
+        };
+        self.buffer.pinned_cycles = if pinned {
+            self.buffer.pinned_cycles.saturating_add(1)
+        } else {
+            0
+        };
+        if self.buffer.pinned_cycles < PINNED_CYCLE_LIMIT {
+            crate::debug!(
+                log,
+                "{} overrun counts ignored (kernel disposed upstream; fill {:?} of ring {})",
+                overrun_count,
+                pre_read_fill,
+                self.buffer.capacity_bytes
+            );
+            return None;
+        }
+
+        self.buffer.pinned_cycles = 0;
+        Some(self.suspend())
+    }
+
+    pub(crate) fn log_overrun_recovery(
+        &self,
+        overrun_count: u32,
+        now: u64,
+        suppressed: u32,
+        log: &Log,
+    ) {
+        crate::warn!(
+            log,
+            "OSS reported {:3} overruns @ {} with the ring pinned; re-priming (+{} warnings suppressed)",
+            overrun_count,
+            now,
+            suppressed
+        );
     }
 
     pub(super) fn configure(
@@ -129,12 +282,12 @@ impl Dsp {
         channel_order: Option<u64>,
     ) -> Result<AppliedNativeConfig, Errno> {
         assert_eq!(self.state, DspState::Setup);
-        // plain AFMT selector (no channel field), so this yields the sample width
-        self.stride = afmt_frame_bytes(format)
-            .max(1)
-            .saturating_mul(channels.max(1));
         let format = set_format(self.raw_fd(), format)?;
         let channels = set_channels(self.raw_fd(), channels)?;
+        // Derive frame alignment from the successful native readback. The
+        // current FreeBSD selectors reject a changed format/count, but keeping
+        // the stream state tied to the grant makes that invariant explicit.
+        self.stride = native_frame_stride(format, channels);
         if let Some(order) = channel_order {
             set_channel_order(self.raw_fd(), order)?;
         }
@@ -159,6 +312,7 @@ impl Dsp {
         if self.state != DspState::Setup {
             return; // triggered channels can't retune; the next re-prime will
         }
+        self.wake_threshold.set(0);
         // max-then-min, not clamp: the kernel cap must win over the floor.
         let ring = ring.max(MIN_BUFFER_BYTES).min(MAX_BUFFER_BYTES as u32);
         if fragment == 0 {
@@ -178,6 +332,110 @@ impl Dsp {
         }
         // best-effort: without it, poll readiness is merely fragment-coarse
         let _ = set_low_water(self.raw_fd(), 1);
+    }
+
+    pub(crate) fn prime_buffer(
+        &mut self,
+        request: CaptureBufferRequest,
+        properties: &OssNodeProperties,
+        scratch: &mut [u8],
+        log: &Log,
+    ) -> CaptureBufferGeometry {
+        if !self.is_running() {
+            let (fragment, capacity) = capture_buffer_plan(request, properties.fragment_bytes());
+            self.set_small_fragments(fragment, capacity);
+        }
+
+        let ready = self.ready_for_reading(0);
+        let layout = self.buffer_layout();
+        let mut device_lost = false;
+        if ready {
+            let mut backlog = layout.queued_bytes;
+            while backlog > 0 {
+                let chunk = (backlog.min(scratch.len() as u32) / request.stride.max(1))
+                    * request.stride.max(1);
+                if chunk == 0 {
+                    break;
+                }
+                let outcome = self.read(&mut scratch[..chunk as usize]);
+                device_lost |= outcome.status.requires_rebuild();
+                if outcome.bytes == 0 {
+                    break;
+                }
+                backlog = backlog.saturating_sub(outcome.bytes as u32);
+            }
+        }
+
+        let mut geometry = capture_applied_geometry(
+            request,
+            layout.capacity_bytes,
+            layout.quantum_bytes,
+            self.delivery_quantum().duration_ns(),
+        );
+        geometry.device_lost = device_lost;
+        self.buffer = CaptureBufferState {
+            period_bytes: request.period_bytes,
+            quantum_bytes: geometry.quantum_bytes,
+            capacity_bytes: geometry.capacity_bytes,
+            mismatch_cycles: 0,
+            pinned_cycles: 0,
+        };
+        if geometry.capacity_bytes > 0 && geometry.capacity_bytes < geometry.required_capacity_bytes
+        {
+            crate::warn!(
+                log,
+                "granted OSS capture ring ({}) is smaller than the fill geometry needs ({}); \
+                 audio will glitch. Lower the PipeWire quantum; we set the fragment size \
+                 explicitly, so hw.snd.latency has no effect",
+                geometry.capacity_bytes,
+                geometry.required_capacity_bytes
+            );
+        }
+        geometry
+    }
+
+    pub(crate) fn retune_buffer(
+        &mut self,
+        request: CaptureBufferRequest,
+        primed: bool,
+        log: &Log,
+    ) -> CaptureRetune {
+        if !primed
+            || self.buffer.period_bytes == 0
+            || request.period_bytes == 0
+            || request.period_bytes == self.buffer.period_bytes
+        {
+            self.buffer.mismatch_cycles = 0;
+            return CaptureRetune::Unchanged;
+        }
+        self.buffer.mismatch_cycles = self.buffer.mismatch_cycles.saturating_add(1);
+        if self.buffer.mismatch_cycles < 2 {
+            return CaptureRetune::Pending;
+        }
+
+        let geometry = capture_applied_geometry(
+            request,
+            self.buffer.capacity_bytes,
+            self.buffer.quantum_bytes,
+            self.delivery_quantum().duration_ns(),
+        );
+        if geometry.capacity_bytes >= geometry.required_capacity_bytes {
+            self.buffer.period_bytes = request.period_bytes;
+            self.buffer.mismatch_cycles = 0;
+            CaptureRetune::Applied(geometry)
+        } else if self.suspend() {
+            crate::info!(
+                log,
+                "capture period {} -> {} bytes exceeds the ring ({}); re-priming",
+                self.buffer.period_bytes,
+                request.period_bytes,
+                self.buffer.capacity_bytes
+            );
+            self.buffer.mismatch_cycles = 0;
+            CaptureRetune::Reprime
+        } else {
+            CaptureRetune::Rebuild
+        }
     }
 
     // Stop the channel but keep the fd: SETTRIGGER(0) aborts, resets the ring
@@ -305,9 +563,9 @@ impl Dsp {
         }
     }
 
-    pub(crate) fn overruns(&self) -> u32 {
+    pub(crate) fn overruns(&self) -> XrunObservation {
         assert_eq!(self.state, DspState::Running);
-        get_error(self.raw_fd()).rec_overruns.max(0) as u32
+        XrunObservation::resetting_events(xrun_counter_bits(get_error(self.raw_fd()).rec_overruns))
     }
 }
 
@@ -326,13 +584,15 @@ impl Dsp {
     pub(crate) fn test_on_fd(fd: c_int, stride: u32) -> Self {
         Self {
             path: c"test-fd".to_owned(),
-            hw_quantum_ns: 0,
+            delivery_quantum: DeliveryQuantum::unavailable(),
             // The test constructor takes ownership of this pipe endpoint.
             fd: Some(unsafe { LibcFd::from_raw(fd) }),
             state: DspState::Setup,
             needs_trigger: false,
             stride,
             skip: 0,
+            wake_threshold: Cell::new(0),
+            buffer: CaptureBufferState::default(),
         }
     }
 }
@@ -345,14 +605,17 @@ struct NativeWrite {
 
 pub(crate) struct DspWriter {
     path: String,
-    hw_quantum_ns: u64, // the hardware drain quantum (sndstat); 0 = fragment-accurate
+    delivery_quantum: DeliveryQuantum,
     fd: Option<LibcFd>,
     state: DspState,
     needs_trigger: bool,  // trigger-suspended: writes buffer until armed
     pause_shadowed: bool, // SILENCE saved bufsoft; Start must pair it with SKIP
     stride: u32,          // negotiated frame bytes; the byte stream must stay frame-aligned
     silence_byte: u8,     // 0x80 for biased U8 PCM; zero for every other supported format
-    frame_off: u32,       // bytes into a frame a short write left the stream at (0 = aligned)
+    playback_delay_eighths: u32,
+    frame_off: u32, // bytes into a frame a short write left the stream at (0 = aligned)
+    wake_threshold: Cell<u32>,
+    buffer: PlaybackBufferState,
     #[cfg(debug_assertions)]
     prev_ns: u64,
 }
@@ -361,17 +624,119 @@ static ZERO_SILENCE: [u8; MAX_BUFFER_BYTES] = [0; MAX_BUFFER_BYTES];
 static U8_SILENCE: [u8; MAX_BUFFER_BYTES] = [0x80; MAX_BUFFER_BYTES];
 
 impl DspWriter {
+    // Debug-build diagnostics for the FreeBSD scheduling class/priority the
+    // data loop actually received. RT setup problems show up here first.
+    #[cfg(debug_assertions)]
+    pub(crate) fn debug_log_priorities(log: &Log) {
+        fn prio_type(type_: std::ffi::c_ushort) -> &'static str {
+            match type_ {
+                libc::RTP_PRIO_REALTIME => "realtime",
+                libc::RTP_PRIO_NORMAL => "normal",
+                libc::RTP_PRIO_IDLE => "idle",
+                _ => unreachable!(),
+            }
+        }
+
+        fn gettid() -> i32 {
+            let mut tid = 0;
+            if unsafe { libc::thr_self(&mut tid) } != -1 {
+                assert!(tid <= i32::MAX as i64);
+                tid as i32
+            } else {
+                0
+            }
+        }
+
+        let mut rtp = libc::rtprio { type_: 0, prio: 0 };
+
+        let pid = unsafe { libc::getpid() };
+        if unsafe { libc::rtprio(libc::RTP_LOOKUP, pid, &mut rtp) } != -1 {
+            crate::warn!(
+                log,
+                "process priority ({:5}): type = {}, prio = {}",
+                pid,
+                prio_type(rtp.type_),
+                rtp.prio
+            );
+        }
+
+        let tid = gettid();
+        if unsafe { libc::rtprio_thread(libc::RTP_LOOKUP, tid, &mut rtp) } != -1 {
+            crate::warn!(
+                log,
+                "thread priority ({:6}): type = {}, prio = {}",
+                tid,
+                prio_type(rtp.type_),
+                rtp.prio
+            );
+        }
+    }
+
+    /// Threshold for a recoverable FreeBSD playback underrun. A vchan mixer
+    /// can count a momentarily short child and pad it with silence while the
+    /// queue remains healthy. Gate recovery on a genuinely low fill, capped
+    /// by the normal delivery sawtooth; otherwise a delivery quantum wider
+    /// than the graph period would trigger recovery on every accounting tick.
+    pub(crate) fn underrun_low(
+        target_fill: u32,
+        delivery_quantum: u32,
+        period_bytes: u32,
+        drained_bytes: u32,
+    ) -> u32 {
+        let low = period_bytes
+            .min(target_fill.saturating_sub(delivery_quantum))
+            .max(period_bytes / 4);
+        let wander = (period_bytes / 4).max(delivery_quantum);
+        low.min(
+            target_fill
+                .saturating_sub(drained_bytes)
+                .saturating_sub(wander),
+        )
+        .max(period_bytes / 16)
+    }
+
+    pub(crate) fn log_underrun_recovery(&self, count: u32, now: u64, suppressed: u32, log: &Log) {
+        crate::warn!(
+            log,
+            "{}: OSS reported {:3} underruns @ {} (+{} warnings suppressed)",
+            self.path(),
+            count,
+            now,
+            suppressed
+        );
+    }
+
+    pub(crate) fn log_ignored_underruns(
+        &self,
+        count: u32,
+        observed_fill: u32,
+        recovery_threshold: u32,
+        log: &Log,
+    ) {
+        crate::debug!(
+            log,
+            "{}: {} underrun counts ignored (fill {} >= {})",
+            self.path(),
+            count,
+            observed_fill,
+            recovery_threshold
+        );
+    }
+
     pub(crate) fn new(path: &str) -> Self {
         Self {
             path: path.to_string(),
-            hw_quantum_ns: drain_quantum_ns(path, true), // main thread; nodes are built there
+            delivery_quantum: delivery_quantum(path, true), // main thread; nodes are built there
             fd: None,
             state: DspState::Closed,
             needs_trigger: false,
             pause_shadowed: false,
             stride: 1,
             silence_byte: 0,
+            playback_delay_eighths: 10,
             frame_off: 0,
+            wake_threshold: Cell::new(0),
+            buffer: PlaybackBufferState::default(),
             #[cfg(debug_assertions)]
             prev_ns: 0,
         }
@@ -385,12 +750,12 @@ impl DspWriter {
         &self.path
     }
 
-    pub(crate) fn delivery_quantum_ns(&self) -> u64 {
-        self.hw_quantum_ns
+    pub(crate) fn delivery_quantum(&self) -> DeliveryQuantum {
+        self.delivery_quantum
     }
 
     pub(crate) fn refresh_delivery_quantum(&mut self) {
-        self.hw_quantum_ns = drain_quantum_ns(&self.path, true);
+        self.delivery_quantum = delivery_quantum(&self.path, true);
     }
 
     pub(crate) fn is_running(&self) -> bool {
@@ -407,14 +772,26 @@ impl DspWriter {
         self.descriptor().raw()
     }
 
-    pub(crate) fn fd(&self) -> Option<c_int> {
-        self.fd.as_ref().map(LibcFd::raw)
-    }
-
-    pub(crate) fn configure_wake_threshold(&self, bytes: u32) -> bool {
-        self.fd
+    pub(crate) fn register_wake(
+        &self,
+        driver: &mut OssWakeDriver,
+        stream: StreamIdentity,
+        buffer: WakeBufferState,
+    ) -> Result<(), WakeError> {
+        let fd = self
+            .fd
             .as_ref()
-            .is_some_and(|fd| set_low_water(fd.raw(), bytes))
+            .ok_or_else(|| WakeError::new(Errno::ENODEV))?;
+        // EVFILT_WRITE reports free bytes. Wake when draining the live target
+        // makes enough space for the next graph write.
+        let threshold = playback_wake_threshold(buffer);
+        install_wake_threshold(
+            fd.raw(),
+            &self.wake_threshold,
+            threshold,
+            buffer.quantum_bytes,
+        )?;
+        driver.register_stream(fd.raw(), true, stream, buffer.frame_stride)
     }
 
     fn silence_buffer(&self) -> &'static [u8; MAX_BUFFER_BYTES] {
@@ -447,6 +824,8 @@ impl DspWriter {
         self.needs_trigger = false;
         self.pause_shadowed = false;
         self.frame_off = 0;
+        self.buffer = PlaybackBufferState::default();
+        self.wake_threshold.set(0);
     }
 
     // Stop the channel but keep the fd: SETTRIGGER(0) aborts, resets the ring
@@ -528,17 +907,13 @@ impl DspWriter {
         format: u32,
         channels: u32,
         rate: u32,
-        silence_byte: u8,
         channel_order: Option<u64>,
     ) -> Result<AppliedNativeConfig, Errno> {
         assert_eq!(self.state, DspState::Setup);
-        // plain AFMT selector (no channel field), so this yields the sample width
-        self.stride = afmt_frame_bytes(format)
-            .max(1)
-            .saturating_mul(channels.max(1));
-        self.silence_byte = silence_byte;
         let format = set_format(self.raw_fd(), format)?;
         let channels = set_channels(self.raw_fd(), channels)?;
+        self.stride = native_frame_stride(format, channels);
+        self.silence_byte = native_silence_byte(format);
         if let Some(order) = channel_order {
             set_channel_order(self.raw_fd(), order)?;
         }
@@ -560,6 +935,7 @@ impl DspWriter {
     /// in-place retune path with a fill target the real ring cannot hold.
     pub(crate) fn set_buffer_size(&self, len: u32, fragment: u32) -> BufferLayout {
         assert_eq!(self.state, DspState::Setup);
+        self.wake_threshold.set(0);
         if fragment == 0 {
             // the fragment count field is 16 bits; an extreme oss.delay x quantum
             // request must clamp, not truncate
@@ -587,6 +963,146 @@ impl DspWriter {
             queued_bytes: 0,
             quantum_bytes: blocksize(self.raw_fd()).max(0) as u32,
             capacity_bytes: ospace_in_bytes(self.raw_fd()).max(0) as u32,
+        }
+    }
+
+    pub(crate) fn prime_buffer(
+        &mut self,
+        request: PlaybackBufferRequest,
+        properties: &OssNodeProperties,
+        log: &Log,
+    ) -> PlaybackBufferGeometry {
+        self.playback_delay_eighths = properties.playback_delay_eighths();
+        let fragment_bytes = properties.fragment_bytes();
+        let (capacity_request, _) = playback_buffer_plan(
+            request,
+            self.delivery_quantum().duration_ns(),
+            fragment_bytes,
+            self.playback_delay_eighths,
+        );
+        let applied = self.set_buffer_size(capacity_request, fragment_bytes);
+        let geometry = playback_applied_geometry(
+            request,
+            applied.capacity_bytes,
+            applied.quantum_bytes,
+            self.delivery_quantum().duration_ns(),
+            self.playback_delay_eighths,
+        );
+        self.buffer = PlaybackBufferState {
+            period_bytes: request.period_bytes,
+            quantum_bytes: geometry.quantum_bytes,
+            capacity_bytes: geometry.capacity_bytes,
+            ..PlaybackBufferState::default()
+        };
+
+        crate::warn!(
+            log,
+            "{}: granted {}, blocksize {}, period {}, target delay {}",
+            self.path(),
+            geometry.capacity_bytes,
+            geometry.quantum_bytes,
+            request.period_bytes,
+            geometry.target_fill_bytes
+        );
+        self.log_delay_capped(geometry, log);
+        if geometry.capacity_bytes < request.period_bytes.saturating_mul(2) {
+            crate::warn!(
+                log,
+                "{}: granted OSS buffer ({}) is smaller than two quanta ({}); \
+                 audio will glitch. Lower the PipeWire quantum; we set the fragment size \
+                 explicitly, so hw.snd.latency has no effect",
+                self.path(),
+                geometry.capacity_bytes,
+                request.period_bytes.saturating_mul(2)
+            );
+        }
+        self.write_silence(geometry.target_fill_bytes);
+        geometry
+    }
+
+    pub(crate) fn retune_buffer(
+        &mut self,
+        request: PlaybackBufferRequest,
+        current_fill_bytes: u32,
+        now_ns: u64,
+        log: &Log,
+    ) -> PlaybackRetune {
+        if !self.is_running()
+            || self.buffer.period_bytes == 0
+            || request.period_bytes == 0
+            || request.period_bytes == self.buffer.period_bytes
+        {
+            self.buffer.mismatch_cycles = 0;
+            return PlaybackRetune::Unchanged;
+        }
+        self.buffer.mismatch_cycles = self.buffer.mismatch_cycles.saturating_add(1);
+        if self.buffer.mismatch_cycles < 2 {
+            return PlaybackRetune::Pending;
+        }
+
+        let geometry = playback_retuned_geometry(
+            request,
+            self.buffer.capacity_bytes,
+            self.buffer.quantum_bytes,
+            self.delivery_quantum().duration_ns(),
+            current_fill_bytes,
+            self.playback_delay_eighths,
+        );
+        if geometry.capacity_bytes >= geometry.required_capacity_bytes {
+            crate::info!(
+                log,
+                "{}: period {} -> {} bytes; retuned in place (granted {}, target delay {} -> {})",
+                self.path(),
+                self.buffer.period_bytes,
+                request.period_bytes,
+                geometry.capacity_bytes,
+                geometry.target_fill_bytes,
+                geometry.target_goal_bytes
+            );
+            self.buffer.period_bytes = request.period_bytes;
+            self.buffer.mismatch_cycles = 0;
+            self.log_delay_capped(geometry, log);
+            PlaybackRetune::Applied(geometry)
+        } else if self.suspend() {
+            crate::info!(
+                log,
+                "{}: period {} -> {} bytes exceeds the ring ({}); re-priming",
+                self.path(),
+                self.buffer.period_bytes,
+                request.period_bytes,
+                self.buffer.capacity_bytes
+            );
+            self.buffer.mismatch_cycles = 0;
+            PlaybackRetune::Reprime
+        } else {
+            if now_ns.saturating_sub(self.buffer.last_retune_log_ns) >= 1_000_000_000 {
+                crate::info!(
+                    log,
+                    "{}: period {} -> {} bytes; reconfiguring (+{} messages suppressed)",
+                    self.path(),
+                    self.buffer.period_bytes,
+                    request.period_bytes,
+                    self.buffer.suppressed_retune_logs
+                );
+                self.buffer.last_retune_log_ns = now_ns;
+                self.buffer.suppressed_retune_logs = 0;
+            } else {
+                self.buffer.suppressed_retune_logs =
+                    self.buffer.suppressed_retune_logs.saturating_add(1);
+            }
+            PlaybackRetune::Rebuild
+        }
+    }
+
+    fn log_delay_capped(&self, geometry: PlaybackBufferGeometry, log: &Log) {
+        if geometry.delay_capped {
+            crate::info!(
+                log,
+                "{}: the {} target is capped by the granted buffer ({})",
+                self.path(),
+                super::identity::PLAYBACK_DELAY,
+                geometry.capacity_bytes
+            );
         }
     }
 
@@ -685,7 +1201,7 @@ impl DspWriter {
         if self.state != DspState::Running {
             // Setup and Closed own no accepted stream bytes. Their normal
             // transitions also clear frame_off; keep this boundary robust if
-            // a future path reaches it with stale bookkeeping.
+            // this branch is reached with stale bookkeeping.
             self.frame_off = 0;
             return false;
         }
@@ -822,11 +1338,13 @@ impl DspWriter {
 
     /// The fragment size the driver actually granted (may differ from what
     /// SETFRAGMENT asked for; some drivers force a fixed period).
-    pub(crate) fn underruns(&self) -> u32 {
+    pub(crate) fn underruns(&self) -> XrunObservation {
         assert_eq!(self.state, DspState::Running);
         // Timer-driven and follower fallback. Enriched driver wakes consume
         // the xrun count from the same kevent snapshot as their queued fill.
-        get_error(self.raw_fd()).play_underruns.max(0) as u32
+        XrunObservation::resetting_events(xrun_counter_bits(
+            get_error(self.raw_fd()).play_underruns,
+        ))
     }
 }
 
@@ -840,7 +1358,7 @@ impl DspWriter {
     pub(crate) fn test_on_fd(fd: c_int, stride: u32) -> Self {
         Self {
             path: "test-fd".to_string(),
-            hw_quantum_ns: 0,
+            delivery_quantum: DeliveryQuantum::unavailable(),
             // The test constructor takes ownership of this pipe endpoint.
             fd: Some(unsafe { LibcFd::from_raw(fd) }),
             state: DspState::Setup,
@@ -848,7 +1366,10 @@ impl DspWriter {
             pause_shadowed: false,
             stride,
             silence_byte: 0,
+            playback_delay_eighths: 10,
             frame_off: 0,
+            wake_threshold: Cell::new(0),
+            buffer: PlaybackBufferState::default(),
             #[cfg(debug_assertions)]
             prev_ns: 0,
         }
@@ -856,8 +1377,95 @@ impl DspWriter {
 }
 
 #[cfg(test)]
+mod wake_policy_tests {
+    use crate::backend::WakeBufferState;
+
+    #[test]
+    fn native_thresholds_derive_from_applied_buffer_state() {
+        let buffer = WakeBufferState {
+            frame_stride: 8,
+            period_bytes: 16_384,
+            quantum_bytes: 2_048,
+            capacity_bytes: 65_536,
+            target_fill_bytes: 20_480,
+        };
+        assert_eq!(super::capture_wake_threshold(buffer), 20_480);
+        assert_eq!(super::playback_wake_threshold(buffer), 45_056);
+
+        assert_eq!(super::capture_wake_threshold(WakeBufferState::default()), 1);
+        assert_eq!(
+            super::playback_wake_threshold(WakeBufferState {
+                capacity_bytes: 4_096,
+                target_fill_bytes: 4_096,
+                ..WakeBufferState::default()
+            }),
+            1
+        );
+    }
+
+    #[test]
+    fn threshold_updates_follow_native_quantum_granularity() {
+        assert!(super::wake_threshold_changed(0, 16_384, 2_048));
+        assert!(!super::wake_threshold_changed(16_384, 17_407, 2_048));
+        assert!(super::wake_threshold_changed(16_384, 18_432, 2_048));
+        assert!(super::wake_threshold_changed(18_432, 16_384, 2_048));
+        assert!(super::wake_threshold_changed(8, 9, 0));
+    }
+}
+
+#[cfg(test)]
 mod playback_tests {
     use crate::backend::test_transport::{drain, fill_pipe, free_space, pattern, pipe_pair};
+
+    #[test]
+    fn oss_underrun_threshold_tracks_delivery_and_lateness() {
+        let underrun_low = super::DspWriter::underrun_low;
+        assert_eq!(underrun_low(20_480, 2_048, 16_384, 0), 16_384);
+        assert!(20_480 - 2_048 >= underrun_low(20_480, 2_048, 16_384, 0));
+        assert_eq!(underrun_low(20_480, 18_432, 16_384, 0), 20_480 - 18_432);
+        assert_eq!(
+            underrun_low(20_480, 2_048, 16_384, 8_192),
+            20_480 - 8_192 - 4_096
+        );
+        assert_eq!(underrun_low(20_480, 2_048, 16_384, 1 << 30), 16_384 / 16);
+    }
+
+    #[test]
+    fn oss_playback_retune_requires_two_matching_cycles() {
+        use crate::backend::{PlaybackBufferRequest, PlaybackRetune};
+
+        let (read_fd, write_fd) = pipe_pair(true, true);
+        let mut dsp = super::DspWriter::test_on_fd(write_fd, 8);
+        dsp.write_silence(0);
+        dsp.buffer = super::PlaybackBufferState {
+            period_bytes: 2_048,
+            quantum_bytes: 1_024,
+            capacity_bytes: 65_536,
+            ..Default::default()
+        };
+        let request = PlaybackBufferRequest {
+            period_bytes: 4_096,
+            graph_rate: 0,
+            stride: 8,
+            device_rate: 48_000,
+            write_bytes: 4_096,
+            maximum_write_bytes: 4_096,
+        };
+        let log = crate::spa::Log::test_null();
+
+        assert_eq!(
+            dsp.retune_buffer(request, 4_096, 0, &log),
+            PlaybackRetune::Pending
+        );
+        assert_eq!(dsp.buffer.mismatch_cycles, 1);
+        assert!(matches!(
+            dsp.retune_buffer(request, 4_096, 0, &log),
+            PlaybackRetune::Applied(_)
+        ));
+        assert_eq!(dsp.buffer.period_bytes, 4_096);
+        assert_eq!(dsp.buffer.mismatch_cycles, 0);
+        unsafe { libc::close(read_fd) };
+    }
 
     #[test]
     fn native_errors_map_to_semantic_io_statuses() {
@@ -869,13 +1477,18 @@ mod playback_tests {
         );
         assert_eq!(
             super::io_status(nix::errno::Errno::EINTR),
-            IoStatus::Interrupted
+            IoStatus::WouldBlock
         );
         assert_eq!(
             super::io_status(nix::errno::Errno::ENODEV),
             IoStatus::Disconnected
         );
-        assert_eq!(super::io_status(nix::errno::Errno::EIO), IoStatus::Failed);
+        assert_eq!(
+            super::io_status(nix::errno::Errno::EIO),
+            IoStatus::Fatal(crate::backend::StreamError::from_native_code(
+                nix::errno::Errno::EIO as i32
+            ))
+        );
     }
 
     #[test]
@@ -893,12 +1506,10 @@ mod playback_tests {
     fn u8_silence_uses_the_biased_midpoint() {
         let (r, w) = pipe_pair(true, true);
         let mut dsp = super::DspWriter::test_on_fd(w, 2);
-        // A pipe rejects the OSS format ioctl, but configure stores the
-        // negotiated frame geometry and silence byte before issuing it.
-        assert!(
-            dsp.configure(super::AFMT_U8, 2, 48_000, 0x80, None)
-                .is_err()
-        );
+        // Apply the same state derived from a successful native readback; a
+        // pipe cannot accept the configuration ioctls themselves.
+        dsp.stride = super::native_frame_stride(super::AFMT_U8, 2);
+        dsp.silence_byte = super::native_silence_byte(super::AFMT_U8);
         assert_eq!(dsp.stride, 2);
         assert_eq!(dsp.silence_byte, 0x80);
         dsp.write_silence(8);
@@ -1016,6 +1627,31 @@ impl Drop for DspWriter {
 #[cfg(test)]
 mod capture_tests {
     use crate::backend::test_transport::{pattern, pipe_pair};
+
+    #[test]
+    fn oss_overrun_recovery_requires_three_pinned_cycles() {
+        let (read_fd, write_fd) = pipe_pair(false, false);
+        let mut dsp = super::Dsp::test_on_fd(read_fd, 8);
+        dsp.buffer = super::CaptureBufferState {
+            period_bytes: 1_024,
+            quantum_bytes: 1_024,
+            capacity_bytes: 8_192,
+            ..Default::default()
+        };
+        let log = crate::spa::Log::test_null();
+
+        assert_eq!(dsp.recover_overrun(4, Some(8_000), &log), None);
+        assert_eq!(dsp.recover_overrun(4, Some(8_000), &log), None);
+        assert_eq!(dsp.buffer.pinned_cycles, 2);
+        assert_eq!(dsp.recover_overrun(4, Some(100), &log), None);
+        assert_eq!(dsp.buffer.pinned_cycles, 0);
+        assert_eq!(dsp.recover_overrun(4, Some(8_000), &log), None);
+        assert_eq!(dsp.recover_overrun(4, Some(8_000), &log), None);
+        assert_eq!(dsp.recover_overrun(4, Some(8_000), &log), Some(true));
+        assert_eq!(dsp.buffer.pinned_cycles, 0);
+        unsafe { libc::close(write_fd) };
+    }
+
     // capture mirror image: a read that lands mid-frame must hide the torn
     // frame's head and discard its tail, so every returned buffer starts on a
     // frame boundary
