@@ -14,6 +14,8 @@ mod direction;
 mod dll;
 mod events;
 mod factory;
+#[cfg(test)]
+pub(crate) mod fake;
 mod format;
 mod params;
 mod ports;
@@ -25,7 +27,6 @@ mod state;
 mod timing;
 
 use dll::{BwAdapt, SpaDLL};
-pub(crate) use events::handle_process_latency;
 use events::{FormatPublication, MainEventTarget, NodeEvents};
 use format::{build_buffers_info, build_enum_format_info, snap_raw_to_caps};
 use rebuild::{
@@ -34,19 +35,18 @@ use rebuild::{
 };
 #[cfg(test)]
 use rebuild::{RebuildContext, queue_port_rebuild};
-pub(crate) use sink::{OSS_SINK_FACTORY, OSS_SINK_TOPIC};
-pub(crate) use source::{OSS_SOURCE_FACTORY, OSS_SOURCE_TOPIC};
+pub use sink::factory as sink_factory;
+pub use source::factory as source_factory;
 use state::*;
-use timing::{
-    RateLimit, device_period_bytes, ns_to_bytes, ns_to_frame_bytes, same_clock, set_clock_name,
-    try_now_ns,
-};
+use timing::{RateLimit, device_period_bytes, ns_to_bytes, same_clock, set_clock_name, try_now_ns};
 use timing::{on_wake, update_driver_wake};
 
-use crate::backend::normalize_fragment;
 use factory::{enum_interface_info, get_size, init};
+use params::{build_backend_node_param, reset_backend_props};
 use rebuild::{apply_props_param, poll_rebuild, queue_rebuild, store_and_rebuild};
 use state::{DataControl, DataState, MainState, Port, valid_data_block};
 
 use direction::MutexExt;
-pub(crate) use direction::{DeviceOps, Direction, MAX_PORTS, ParamBuild, PortConfig};
+pub(crate) use direction::{
+    BackendOf, BackendPropertiesOf, Direction, MAX_PORTS, ParamBuild, PortConfig,
+};

@@ -1,21 +1,19 @@
-use std::ffi::c_int;
+use std::ffi::{c_char, c_int};
 
 use libspa::sys::*;
 
 use crate::backend::{
-    self, playback_buffer_request as buffer_request, playback_buffer_required as buffer_required,
-    playback_desired_delay as desired_delay, playback_fill_floor as fill_floor,
-    playback_target_delay as target_delay,
+    self, PlaybackBufferGeometry, PlaybackBufferRequest, PlaybackOperations as _, PlaybackRetune,
+    StreamLifecycle as _,
 };
-use crate::platform;
-use crate::spa::{self, Log, process_latency_default};
+use crate::spa::{self, Log};
 
 use super::{
-    DataControl, DataState, Direction, MAX_PORTS, MainState, ParamBuild, Port, PortConfig,
-    RateLimit, apply_props_param, device_event_fill, device_period_bytes, enum_interface_info,
-    get_size, handle_process_latency, init, latch_device_loss, ns_to_bytes, ns_to_frame_bytes,
-    poll_rebuild, queue_rebuild, reset_device_event, same_clock, store_and_rebuild,
-    take_device_event_xruns, take_fallback_xruns, try_now_ns, valid_data_block,
+    BackendPropertiesOf, DataControl, DataState, Direction, MAX_PORTS, MainState, ParamBuild, Port,
+    PortConfig, build_backend_node_param, device_period_bytes, enum_interface_info, get_size, init,
+    latch_rebuild_required, ns_to_bytes, pending_xrun, poll_rebuild, queue_rebuild,
+    reset_backend_props, reset_stream_epoch, same_clock, take_polled_xruns, take_wake_xruns,
+    try_now_ns, valid_data_block, wake_queue_fill,
 };
 
 mod buffer;
@@ -25,38 +23,14 @@ use buffer::*;
 // PortInfo and clock-delay state currently support one playback port.
 const _: () = assert!(MAX_PORTS == 1);
 
-pub(crate) enum SinkDir {}
+pub(crate) struct SinkDir<B>(std::marker::PhantomData<B>);
 
 // main-loop property model
-pub(crate) struct SinkMainExt {
-    pub playback_delay_eighths: u32,
-    pub playback_delay_eighths_default: u32,
-}
-
-impl Default for SinkMainExt {
-    fn default() -> Self {
-        Self {
-            playback_delay_eighths: 10,
-            playback_delay_eighths_default: 10,
-        }
-    }
-}
-
 // direction-specific data-loop fields (DataState.ext)
+#[derive(Default)]
 pub(crate) struct SinkDataExt {
     pub cur_timestamp: u64, // method invocation timestamp for `process`
     pub old_timestamp: u64,
-    pub playback_delay_eighths: u32,
-}
-
-impl Default for SinkDataExt {
-    fn default() -> Self {
-        Self {
-            cur_timestamp: 0,
-            old_timestamp: 0,
-            playback_delay_eighths: 10,
-        }
-    }
 }
 
 // direction-specific Port fields (Port.ext)
@@ -64,94 +38,60 @@ impl Default for SinkDataExt {
 pub(crate) struct SinkPortExt {
     pub xrun_timestamp: u64, // the moment we noticed an underrun (which is a bit later than the start of it)
     pub target_delay: u32,   // live servo target in bytes
-    pub target_goal: u32, // geometry target retained for rate-controlled settling and future primes
-    pub buffer_size: u32, // granted OSS playback ring capacity in bytes
-    pub period_mismatch: u32, // consecutive cycles at a different period (debounce)
-    pub resuming: bool,   // first real buffer after Pause must bypass generic xrun hold
+    pub target_goal: u32,    // retained geometry target for settling and subsequent primes
+    pub minimum_fill: u32,   // safe recovery floor supplied by the selected backend
+    pub buffer_size: u32,    // granted playback ring capacity in bytes
+    pub retune_pending: bool,
+    pub resuming: bool, // first real buffer after Pause must bypass generic xrun hold
     pub rebuild_after_start: bool, // Pause could neither preserve nor reset this device
-    // OSS may accept only a prefix from its nonblocking fd. Keep the host
+    // A nonblocking backend may accept only a prefix. Keep the host
     // buffer until every byte is accepted, and resume at this byte offset.
     pub pending_buffer: Option<u32>,
     pub pending_offset: u32,
-    // the rebuild-pending arm of retune_period can run every cycle; its own
-    // limiter, because sharing port.warn_limit would let a persistent refusal
-    // consume the dropped-bytes/underrun warnings' emission slots and fold
-    // unrelated events into their suppressed counts
-    pub retune_limit: RateLimit,
 }
 
-fn measured_fill(port: &Port<SinkDir>) -> u32 {
-    device_event_fill(port).unwrap_or_else(|| port.dsp.queued_bytes())
+fn measured_fill<B: backend::Backend>(port: &Port<SinkDir<B>>) -> u32 {
+    wake_queue_fill(port).unwrap_or_else(|| port.dsp.queued_bytes())
 }
 
-fn measured_underruns(port: &mut Port<SinkDir>) -> u32 {
-    if let Some(count) = take_device_event_xruns(port) {
+fn measured_underruns<B: backend::Backend>(port: &mut Port<SinkDir<B>>) -> backend::XrunDelta {
+    if let Some(count) = take_wake_xruns(port) {
         count
     } else {
-        let total = port.dsp.underruns();
-        take_fallback_xruns(port, total)
+        let observation = port.dsp.underruns();
+        take_polled_xruns(port, observation)
     }
 }
 
-// The xrun-detection phase, on a running channel. The vchan mixer counts a
-// momentarily-short child as an xrun and pads it with silence
-// (feeder_mixer.c); with the fill still healthy that's accounting noise, not
-// a dropout - only a genuinely low fill at wakeup is a real underrun worth
-// recovery and reporting. "Low" is a period, capped by the healthy sawtooth
-// floor (target minus one fragment): with a fragment wider than the period
-// the fill routinely dips under one fragment while perfectly locked, and
-// gating on the fragment size would fire recovery on every accounting tick
-// there. Arms the recovery hold (xrun_timestamp) and reports the EVENT to
-// the host once, not per held cycle.
-// `underrun_count` is the counter the caller read this cycle (nonzero, or
-// this isn't called); measured outside so tests can drive the gate.
-// the "genuinely low at wakeup" threshold: a period, capped by the healthy
-// sawtooth floor (target minus one fragment). A late cycle finds a
-// legitimately lower fill (the device kept draining, `drained` bytes over
-// the lateness), so the threshold tracks the expected healthy fill at THIS
-// moment; the floor keeps a true empty ring (a real underrun reads 0 until
-// we write) detectable at any lateness.
-fn underrun_low(target_delay: u32, blocksize: u32, period_in_bytes: u32, drained: u32) -> u32 {
-    let low = period_in_bytes
-        .min(target_delay.saturating_sub(blocksize))
-        .max(period_in_bytes / 4);
-    let wander = (period_in_bytes / 4).max(blocksize);
-    low.min(target_delay.saturating_sub(drained).saturating_sub(wander))
-        .max(period_in_bytes / 16)
-}
-
-fn detect_underrun(
-    port: &mut Port<SinkDir>,
+// Classify one semantic underrun observation and arm the shared graph hold
+// only when the selected backend says its queue state requires recovery.
+fn detect_underrun<B: backend::Backend>(
+    port: &mut Port<SinkDir<B>>,
     period_in_bytes: u32,
-    underrun_count: u32,
+    underrun: backend::XrunDelta,
     cur_timestamp: u64,
     clock_nsec: u64,
     log: &Log,
 ) {
+    let underrun_count = underrun.events;
     let Some((stride, cfg_rate)) = port.stride_rate() else {
         return;
     };
-    // cached blocksize: the channel can't be retuned while triggered, and
-    // the gate must not cost ioctls on healthy cycles
+    // Cached delivery geometry keeps the healthy gate allocation- and
+    // query-free on the real-time path.
     let elapsed = cur_timestamp.saturating_sub(clock_nsec);
     let drained = ns_to_bytes(elapsed, cfg_rate, stride);
-    let low = underrun_low(
+    let fill = measured_fill(port);
+    let recovery_threshold = <B::Playback as backend::PlaybackOperations>::underrun_low(
         port.ext.target_delay,
-        port.setup_blocksize,
+        port.delivery_quantum_bytes,
         period_in_bytes,
         drained,
     );
-    let odelay_now = measured_fill(port);
-    if odelay_now < low {
+    if fill < recovery_threshold {
         if let Some(suppressed) = port.warn_limit.check(cur_timestamp) {
-            crate::warn!(
-                log,
-                "{}: OSS reported {:3} underruns @ {} (+{} warnings suppressed)",
-                port.dsp.path(),
-                underrun_count,
-                cur_timestamp,
-                suppressed
-            );
+            port.dsp
+                .log_underrun_recovery(underrun_count, cur_timestamp, suppressed, log);
         }
         if port.ext.xrun_timestamp == 0 {
             // snapshot the DRIVER clock, not wall time: the recovery
@@ -164,33 +104,29 @@ fn detect_underrun(
             // once per event, not per held cycle; deposited, not called -
             // process() notifies the host after the State borrows end
             // (collect-then-notify, see node::process)
-            port.pending_xrun = Some(cur_timestamp / 1000);
+            port.pending_xrun = Some(pending_xrun(
+                cur_timestamp / 1000,
+                underrun,
+                port.config.as_ref(),
+            ));
         }
     } else {
-        // suppressed counts stay diagnosable: a marginal system that
-        // ticks the counter while self-healing shows up at debug level
-        crate::debug!(
-            log,
-            "{}: {} underrun counts ignored (fill {} >= {})",
-            port.dsp.path(),
-            underrun_count,
-            odelay_now,
-            low
-        );
+        port.dsp
+            .log_ignored_underruns(underrun_count, fill, recovery_threshold, log);
     }
 }
 
 // The recovery phase, entered while an underrun hold is pending
 // (xrun_timestamp != 0). Recover on the first data cycle past the event
-// (ALSA does the same: snap the fill, resume immediately): relock the servo,
+// (snap the fill and resume immediately): relock the servo,
 // re-prime the fill to target and write this cycle's data in the SAME cycle.
 // Waiting for a particular process cadence discards real buffers per failed
 // attempt, and a follower under a corr-steered driver may never hit a fixed
 // window at all. Until the recovery cycle arrives the buffer is consumed
 // unwritten (the skip-buffer hold). Returns the cycle's write result
 // (`size` when held).
-fn recover_or_hold(
-    port: &mut Port<SinkDir>,
+fn recover_or_hold<B: backend::Backend>(
+    port: &mut Port<SinkDir<B>>,
     clock_nsec: u64,
     clock_flags: u32,
     data: &[u8],
@@ -205,7 +141,7 @@ fn recover_or_hold(
         // reaches the geometry's safe floor, but do not raise a soft-settling
         // target toward its optional goal. A steady target already equals the
         // goal and is therefore fully restored.
-        let safe = fill_floor(port.setup_period, port.setup_blocksize);
+        let safe = port.ext.minimum_fill;
         port.ext.target_delay = port
             .ext
             .target_delay
@@ -236,21 +172,20 @@ fn recover_or_hold(
     }
 }
 
-// The first real buffer after Pause is not an unexpected xrun. SKIP has already
-// restored the real audio that SILENCE moved into FreeBSD's shadow buffer; seed
-// the live target from that restored queue and write the current graph buffer
-// immediately instead of consuming it with the generic one-cycle xrun hold.
-// An empty queue plus a real driver underrun is the fallback for a Pause that
-// found no soft-buffer audio to shadow.
-fn resume_playback(
-    port: &mut Port<SinkDir>,
+// The first real buffer after Pause is not an unexpected xrun. The backend has
+// already restored any queue it preserved during Pause; seed the live target
+// from that queue and write the current graph buffer immediately instead of
+// consuming it with the generic one-cycle xrun hold. An empty queue plus a real
+// driver underrun is the fallback when the backend preserved no audio.
+fn resume_playback<B: backend::Backend>(
+    port: &mut Port<SinkDir<B>>,
     queued: u32,
     paused_underruns: u32,
     data: &[u8],
     log: &Log,
 ) -> backend::WriteOutcome {
-    // GETODELAY excludes the hardware buffer, so zero soft fill by itself does
-    // not prove playback stopped. Require the driver's underrun count too;
+    // A backend may report only its observable queue, so zero fill by itself
+    // does not prove playback stopped. Require its underrun count too;
     // otherwise appending real data is the only gap-free choice.
     let drained = queued == 0 && paused_underruns > 0;
     if drained {
@@ -269,7 +204,7 @@ fn resume_playback(
     let result = port.dsp.write(data);
     if !drained && result.bytes > 0 {
         // Preserve whatever real audio survived the pause as the live target.
-        // Seed from bytes OSS actually accepted: a blocked or short write must
+        // Seed from bytes the backend actually accepted: a blocked or short write must
         // not claim that its unaccepted suffix is already queued.
         port.ext.target_delay = port.ext.target_goal.min(predicted_next_fill(
             queued,
@@ -287,7 +222,7 @@ fn resume_playback(
 // synthetic samples into the queued stream. The target stays at most a quarter
 // period ahead of measured fill, inside the normal DLL band; as real audio
 // accumulates under rate steering, the target follows it to the goal.
-fn settle_target(port: &mut Port<SinkDir>, fill: u32, stride: u32) {
+fn settle_target<B: backend::Backend>(port: &mut Port<SinkDir<B>>, fill: u32, stride: u32) {
     if port.ext.target_delay >= port.ext.target_goal {
         return;
     }
@@ -299,10 +234,15 @@ fn settle_target(port: &mut Port<SinkDir>, fill: u32, stride: u32) {
 // The follower-servo phase, matching a foreign clock: the DLL serves rate
 // matching only (when driving, the servo runs at the device wake where the clock
 // is published, and a same-device follower has nothing to correct - updating
-// anyway would wind the integrator; ALSA gates the same way). `odelay` is
+// anyway would wind the integrator). `odelay` is
 // the fill the caller measured this cycle. Returns the rate correction and
 // whether this cycle's buffer must be skipped (overfill drain).
-fn follower_servo(port: &mut Port<SinkDir>, odelay: u32, stride: u32, nsec: u64) -> (f64, bool) {
+fn follower_servo<B: backend::Backend>(
+    port: &mut Port<SinkDir<B>>,
+    odelay: u32,
+    stride: u32,
+    nsec: u64,
+) -> (f64, bool) {
     let mut corr: f64 = 1.0;
     let mut skip_write = false;
     settle_target(port, odelay, stride);
@@ -313,7 +253,7 @@ fn follower_servo(port: &mut Port<SinkDir>, odelay: u32, stride: u32, nsec: u64)
     }
     let err_raw = odelay as f64 - port.ext.target_delay as f64;
     if err_raw.abs() > port.setup_period as f64 {
-        // Fill snap (ALSA's max_resync): a level error past one period is
+        // Fill snap: a level error past one period is
         // beyond what the +/-1% actuator removes promptly and would wind the
         // integrator against the clamp. Correct the level directly -
         // refill on underfill, drain a cycle on overfill - and relock.
@@ -343,7 +283,7 @@ fn follower_servo(port: &mut Port<SinkDir>, odelay: u32, stride: u32, nsec: u64)
 // of inserting silence; correct only later drift around that reachable level.
 // A genuine underrun is the only path that raises it to the geometry floor.
 // Returns whether this cycle's buffer must be skipped (overfill drain).
-fn level_correct(port: &mut Port<SinkDir>, odelay: u32) -> bool {
+fn level_correct<B: backend::Backend>(port: &mut Port<SinkDir<B>>, odelay: u32) -> bool {
     let err_raw = odelay as f64 - port.ext.target_delay as f64;
     if err_raw < -(port.setup_period as f64) {
         port.dsp
@@ -367,26 +307,39 @@ fn clear_pending_write(ext: &mut SinkPortExt) {
     ext.pending_offset = 0;
 }
 
-fn end_input_sequence(port: &mut Port<SinkDir>) {
-    // This buffer will no longer supply a retained suffix. Close any frame
-    // that its accepted prefix left open before a different buffer arrives.
-    if port.dsp.end_buffer_sequence() {
-        reset_device_event(port);
+fn finish_input_sequence<B: backend::Backend>(
+    port: &mut Port<SinkDir<B>>,
+    event_epoch_reset: bool,
+) {
+    // A native reset establishes a fresh measurement epoch, but it must not
+    // forgive a fatal I/O outcome that already marked this descriptor for
+    // replacement.
+    let rebuild_required = port.rebuild_required;
+    if event_epoch_reset {
+        reset_stream_epoch(port);
     }
+    port.rebuild_required |= rebuild_required;
     clear_pending_write(&mut port.ext);
 }
 
-fn release_input(port: &mut Port<SinkDir>, result: &mut c_int) {
+fn end_input_sequence<B: backend::Backend>(port: &mut Port<SinkDir<B>>) {
+    // This buffer will no longer supply a retained suffix. Close any frame
+    // that its accepted prefix left open before a different buffer arrives.
+    let event_epoch_reset = port.dsp.end_buffer_sequence();
+    finish_input_sequence(port, event_epoch_reset);
+}
+
+fn release_input<B: backend::Backend>(port: &mut Port<SinkDir<B>>, result: &mut c_int) {
     end_input_sequence(port);
     need_data(&mut port.io, result);
 }
 
-fn consume_freewheel_input(port: &mut Port<SinkDir>) {
+fn consume_freewheel_input<B: backend::Backend>(port: &mut Port<SinkDir<B>>) {
     end_input_sequence(port);
     port.io.with(|io| io.status = SPA_STATUS_NEED_DATA as i32);
 }
 
-// Return the first byte OSS has not accepted from this host buffer. A new
+// Return the first byte the backend has not accepted from this host buffer. A new
 // buffer identity, or a chunk shorter than its previously accepted prefix,
 // invalidates the old offset and starts from the new slice's beginning.
 fn pending_write_offset(ext: &mut SinkPortExt, buffer_id: u32, size: usize) -> usize {
@@ -397,7 +350,11 @@ fn pending_write_offset(ext: &mut SinkPortExt, buffer_id: u32, size: usize) -> u
     ext.pending_offset as usize
 }
 
-fn prepare_pending_write(port: &mut Port<SinkDir>, buffer_id: u32, size: usize) -> usize {
+fn prepare_pending_write<B: backend::Backend>(
+    port: &mut Port<SinkDir<B>>,
+    buffer_id: u32,
+    size: usize,
+) -> usize {
     let changed = port.ext.pending_offset != 0
         && (port.ext.pending_buffer != Some(buffer_id) || port.ext.pending_offset as usize > size);
     if changed {
@@ -409,16 +366,14 @@ fn prepare_pending_write(port: &mut Port<SinkDir>, buffer_id: u32, size: usize) 
     pending_write_offset(&mut port.ext, buffer_id, size)
 }
 
-// A positive short write is normal for FreeBSD's nonblocking chn_write: it
-// returns the bytes copied before the soft ring filled, without an errno.
-// Retain the untouched suffix; EAGAIN can accompany a prefix when a split
-// frame's bounded completion retry runs out of room.
+// Retain the untouched suffix of a semantic partial write. A retryable
+// zero-byte outcome retains the whole graph buffer for the next process cycle.
 fn retain_partial_write(
     ext: &mut SinkPortExt,
     requested: u32,
     write: backend::WriteOutcome,
 ) -> bool {
-    if write.bytes > 0 && write.bytes < requested as usize && write.retryable_partial() {
+    if write.bytes < requested as usize && write.retryable_partial() {
         ext.pending_offset = ext.pending_offset.saturating_add(write.bytes as u32);
         true
     } else {
@@ -426,14 +381,17 @@ fn retain_partial_write(
     }
 }
 
-// Once OSS has accepted a prefix, the suffix is part of the same PCM byte
+// Once the backend accepts a prefix, the suffix is part of the same PCM byte
 // sequence. Finish it before any fill correction can skip it or insert
 // synthetic audio between the two pieces.
-fn write_retained_tail(port: &mut Port<SinkDir>, data: &[u8]) -> Option<backend::WriteOutcome> {
+fn write_retained_tail<B: backend::Backend>(
+    port: &mut Port<SinkDir<B>>,
+    data: &[u8],
+) -> Option<backend::WriteOutcome> {
     (port.ext.pending_offset != 0).then(|| port.dsp.write(data))
 }
 
-fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
+fn process_ports<B: backend::Backend>(state: &mut DataState<SinkDir<B>>) -> c_int {
     state.ext.old_timestamp = state.ext.cur_timestamp;
     // on a failed clock read reuse the previous stamp (rate limits and the
     // underrun gate degrade for a cycle) rather than abort the data loop
@@ -441,8 +399,7 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
 
     // Freewheeling: the graph runs faster than realtime, so consume the input
     // without touching the device. The io NEED_DATA + return HAVE_DATA pair
-    // looks odd for a sink but matches alsa-pcm-sink.c:788-791; it is what
-    // keeps the freewheel pump running.
+    // looks odd for a sink, but it is what keeps the freewheel pump running.
     // position is non-null on the process path (checked by on_wake/process)
     if state.position.with_ref(|p| p.clock.flags).unwrap_or(0) & SPA_IO_CLOCK_FLAG_FREEWHEEL != 0 {
         for port in &mut state.ports {
@@ -597,7 +554,6 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
             period_in_bytes,
             stride,
             size,
-            state.ext.playback_delay_eighths,
             state.ext.cur_timestamp,
             &state.log,
         );
@@ -622,7 +578,7 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
         let mut resumed_write = None;
         if !port.dsp.is_running() {
             // A trigger suspend or replacement discarded the accepted prefix
-            // along with the OSS queue. Replay this host buffer from byte zero
+            // along with the backend queue. Replay this host buffer from byte zero
             // after priming the fresh ring.
             if port.ext.pending_offset != 0 {
                 port.ext.pending_offset = 0;
@@ -643,8 +599,7 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
                 port,
                 period_in_bytes,
                 driver_clock.target_rate.denom,
-                state.ext.playback_delay_eighths,
-                state.fragment_bytes,
+                &state.backend_properties,
                 &state.log,
             );
         } else if port.ext.resuming {
@@ -652,12 +607,12 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
             // paused. Do not turn it into a host xrun or discard this first
             // resumed buffer.
             let paused_underruns = measured_underruns(port);
-            if paused_underruns > 0 {
+            if paused_underruns.events > 0 {
                 crate::debug!(
                     state.log,
                     "{}: {} underruns accrued while paused",
                     port.dsp.path(),
-                    paused_underruns
+                    paused_underruns.events
                 );
             }
             if port.ext.pending_offset == 0 {
@@ -665,14 +620,14 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
                 resumed_write = Some(resume_playback(
                     port,
                     queued,
-                    paused_underruns,
+                    paused_underruns.events,
                     cycle_data,
                     &state.log,
                 ));
             }
         } else {
             let underruns = measured_underruns(port);
-            if underruns > 0 {
+            if underruns.events > 0 {
                 detect_underrun(
                     port,
                     period_in_bytes,
@@ -693,7 +648,7 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
             recover_or_hold(port, driver_clock.nsec, driver_clock.flags, cycle_data)
         } else {
             let mut skip_write = false;
-            if !retuned && matching && port.setup_period != 0 && port.ext.period_mismatch == 0 {
+            if !retuned && matching && port.setup_period != 0 && !port.ext.retune_pending {
                 (corr, skip_write) =
                     follower_servo(port, measured_fill(port), stride, state.ext.cur_timestamp);
             }
@@ -702,7 +657,7 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
                 && state.following
                 && !matching
                 && port.setup_period != 0
-                && port.ext.period_mismatch == 0
+                && !port.ext.retune_pending
             {
                 skip_write = level_correct(port, measured_fill(port));
             }
@@ -717,12 +672,11 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
         if port.ext.resuming && port.ext.pending_offset != 0 && !write_result.would_block() {
             port.ext.resuming = false;
         }
-        latch_device_loss(port, write_result.status);
+        latch_rebuild_required(port, write_result.status);
 
         // Rate-match only as a follower on a foreign clock: when driving, the
-        // timer steering applies the correction, and a same-device follower ticks
-        // from our clock so there is nothing to match (ALSA gates on the clock
-        // name the same way).
+        // timer steering applies the correction, and a same-device follower
+        // ticks from our clock so there is nothing to match.
         port.was_matching = matching;
         port.rate_match.with(|rm| {
             if matching {
@@ -788,131 +742,55 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
     result
 }
 
-impl Direction for SinkDir {
+impl<B: backend::Backend> Direction for SinkDir<B> {
     const DIRECTION: spa_direction = SPA_DIRECTION_INPUT;
     const PLAYBACK: bool = true;
     const MEDIA_CLASS: &'static str = "Audio/Sink";
     const READY_STATUS: i32 = SPA_STATUS_NEED_DATA as i32;
     const CMD_WARN_PREFIX: &'static str = "";
 
-    type Device = backend::PlaybackStream;
-    type MainExt = SinkMainExt;
+    type Backend = B;
+    type Device = B::Playback;
     type DataExt = SinkDataExt;
     type PortExt = SinkPortExt;
 
     fn log_topic() -> std::ptr::NonNull<spa_log_topic> {
-        std::ptr::NonNull::new(&raw mut OSS_SINK_TOPIC).expect("a static's address is never null")
+        B::sink_log_topic()
     }
 
-    fn info_item(ext: &mut SinkMainExt, key: &str, value: &str) {
-        if key == platform::PLAYBACK_DELAY {
-            // per-device default, e.g. from a wireplumber node rule
-            if let Ok(v) = value.parse::<u32>() {
-                ext.playback_delay_eighths = v.min(1024);
-            }
-        }
+    fn data_ext(properties: &BackendPropertiesOf<SinkDir<B>>) -> SinkDataExt {
+        let _ = properties;
+        SinkDataExt::default()
     }
 
-    fn ext_ready(ext: &mut SinkMainExt) {
-        ext.playback_delay_eighths_default = ext.playback_delay_eighths;
+    fn sync_backend_properties(
+        _ext: &mut SinkDataExt,
+        _properties: &BackendPropertiesOf<SinkDir<B>>,
+    ) {
     }
 
-    fn data_ext(ext: &SinkMainExt) -> SinkDataExt {
-        SinkDataExt {
-            playback_delay_eighths: ext.playback_delay_eighths,
-            ..Default::default()
-        }
-    }
-
-    fn build_node_param(state: &mut MainState<SinkDir>, id: u32, index: u32) -> ParamBuild {
-        #[expect(non_upper_case_globals)]
-        let pod = match (id, index) {
-            (SPA_PARAM_PropInfo, 0) => spa::build_latency_offset_prop_info(),
-            (SPA_PARAM_PropInfo, 1) => spa::build_params_prop_info(
-                platform::PLAYBACK_DELAY,
-                "Playback buffer fill target (1/8ths of a period)",
-                state.ext.playback_delay_eighths,
-                1024,
-            ),
-            (SPA_PARAM_PropInfo, 2) => spa::build_params_prop_info(
-                platform::FRAGMENT,
-                "OSS fragment size (bytes, power of two, 0 = automatic)",
-                state.fragment_bytes,
-                16384,
-            ),
-            (SPA_PARAM_Props, 0) => spa::build_latency_offset_props(
-                state.process_latency.ns,
-                &[
-                    (platform::PLAYBACK_DELAY, state.ext.playback_delay_eighths),
-                    (platform::FRAGMENT, state.fragment_bytes),
-                ],
-            ),
-            (SPA_PARAM_ProcessLatency, 0) => {
-                spa::build_process_latency_info(&state.process_latency)
-            }
-            (SPA_PARAM_PropInfo | SPA_PARAM_Props | SPA_PARAM_ProcessLatency, _) => {
-                return ParamBuild::Exhausted;
-            }
-            _ => return ParamBuild::Unknown,
-        };
-        ParamBuild::Built(pod)
+    fn build_node_param(state: &mut MainState<SinkDir<B>>, id: u32, index: u32) -> ParamBuild {
+        build_backend_node_param(state, id, index)
     }
 
     // a NULL Props pod resets the props to their defaults and re-applies them
-    fn reset_props(state: &mut MainState<SinkDir>, data: &DataControl<SinkDir>) -> c_int {
-        let delay_eighths = state.ext.playback_delay_eighths_default;
-        let fragment_bytes = state.fragment_bytes_default;
-        let old_delay_eighths = state.ext.playback_delay_eighths;
-        let old_fragment_bytes = state.fragment_bytes;
-        state.ext.playback_delay_eighths = delay_eighths;
-        state.fragment_bytes = fragment_bytes;
-        let res = store_and_rebuild(state, data, move |state| {
-            state.ext.playback_delay_eighths = delay_eighths;
-            state.fragment_bytes = fragment_bytes;
-        });
-        if res != 0 {
-            state.ext.playback_delay_eighths = old_delay_eighths;
-            state.fragment_bytes = old_fragment_bytes;
-            return res;
-        }
-        handle_process_latency(state, process_latency_default());
-        0
-    }
-
-    fn apply_playback_delay(
-        state: &mut MainState<SinkDir>,
-        data: &DataControl<SinkDir>,
-        delay_eighths: u32,
-    ) -> c_int {
-        // This factor is multiplied by period/8 on the RT path and must not overflow.
-        let new_delay_eighths = delay_eighths.min(1024);
-        if new_delay_eighths == state.ext.playback_delay_eighths {
-            return 0; // unchanged echoes must not rebuild a running device
-        }
-        let old_delay_eighths = state.ext.playback_delay_eighths;
-        state.ext.playback_delay_eighths = new_delay_eighths;
-        let res = apply_props_param(state, data, move |state| {
-            state.ext.playback_delay_eighths = new_delay_eighths;
-        });
-        if res != 0 {
-            state.ext.playback_delay_eighths = old_delay_eighths;
-        }
-        res
+    fn reset_props(state: &mut MainState<SinkDir<B>>, data: &DataControl<SinkDir<B>>) -> c_int {
+        reset_backend_props(state, data)
     }
 
     fn try_open_configure(
-        stream: &mut backend::PlaybackStream,
+        stream: &mut B::Playback,
         config: &PortConfig,
-        _fragment_bytes: u32,
+        properties: &BackendPropertiesOf<SinkDir<B>>,
         log: &Log,
     ) -> Result<backend::ConfigureOutcome, c_int> {
-        // the sink's SETFRAGMENT happens at prime time (process_ports), where
-        // the graph period the layout depends on is known
-        backend::configure_playback(stream, config, log)
+        // Playback buffer layout is applied at prime time, when the graph
+        // period it depends on is known.
+        stream.configure(config, properties, log)
     }
 
-    fn on_device_swapped(state: &mut DataState<SinkDir>, port_idx: usize) {
-        reset_device_event(&mut state.ports[port_idx]);
+    fn on_device_swapped(state: &mut DataState<SinkDir<B>>, port_idx: usize) {
+        reset_stream_epoch(&mut state.ports[port_idx]);
         let ext = &mut state.ports[port_idx].ext;
         ext.xrun_timestamp = 0;
         ext.resuming = false;
@@ -920,15 +798,15 @@ impl Direction for SinkDir {
         clear_pending_write(ext);
     }
 
-    fn on_buffers_swapped(state: &mut DataState<SinkDir>, port_idx: usize) {
+    fn on_buffers_swapped(state: &mut DataState<SinkDir<B>>, port_idx: usize) {
         let port = &mut state.ports[port_idx];
         if port.dsp.end_buffer_sequence() {
-            reset_device_event(port);
+            reset_stream_epoch(port);
         }
         clear_pending_write(&mut port.ext);
     }
 
-    fn on_start_loop(state: &mut DataState<SinkDir>) {
+    fn on_start_loop(state: &mut DataState<SinkDir<B>>) {
         let resumes_pause = !state.started;
         for port in &mut state.ports {
             port.ext.xrun_timestamp = 0;
@@ -949,7 +827,7 @@ impl Direction for SinkDir {
                 // before process() may write again.
                 resume_running = false;
                 if port.dsp.suspend() {
-                    reset_device_event(port);
+                    reset_stream_epoch(port);
                 } else {
                     port.ext.rebuild_after_start = true;
                 }
@@ -969,7 +847,7 @@ impl Direction for SinkDir {
         state.ext.old_timestamp = 0;
     }
 
-    fn on_pause_loop(state: &mut DataState<SinkDir>) {
+    fn on_pause_loop(state: &mut DataState<SinkDir<B>>) {
         for port in &mut state.ports {
             // A soft Pause preserves a partially accepted host buffer: SKIP
             // restores its accepted prefix, and Start continues the suffix.
@@ -984,7 +862,7 @@ impl Direction for SinkDir {
                 // ring so Start primes cleanly; if the device also refuses
                 // that, force replacement before another playback write.
                 if port.dsp.suspend() {
-                    reset_device_event(port);
+                    reset_stream_epoch(port);
                 } else {
                     port.ext.rebuild_after_start = true;
                 }
@@ -992,7 +870,7 @@ impl Direction for SinkDir {
         }
     }
 
-    fn on_suspend_loop(state: &mut DataState<SinkDir>) {
+    fn on_suspend_loop(state: &mut DataState<SinkDir<B>>) {
         for port in &mut state.ports {
             port.ext.resuming = false;
             port.ext.rebuild_after_start = false;
@@ -1000,7 +878,7 @@ impl Direction for SinkDir {
         }
     }
 
-    fn on_role_flip(state: &mut DataState<SinkDir>) {
+    fn on_role_flip(state: &mut DataState<SinkDir<B>>) {
         // a role flip shifts the servo's measurement phase, not the fill:
         // relock the DLL instead of holding playback like an underrun (the
         // fill snap in the write path corrects any real level error)
@@ -1011,7 +889,7 @@ impl Direction for SinkDir {
         }
     }
 
-    fn debug_cycle(state: &DataState<SinkDir>, now: u64, nsec: u64) {
+    fn debug_cycle(state: &DataState<SinkDir<B>>, now: u64, nsec: u64) {
         if cfg!(debug_assertions) {
             eprintln!(
                 "cycle: {}, delay: {} ms @ {}",
@@ -1023,66 +901,59 @@ impl Direction for SinkDir {
         }
     }
 
-    fn servo_ready(_port: &Port<SinkDir>) -> bool {
+    fn servo_ready(_port: &Port<SinkDir<B>>) -> bool {
         true
     }
 
-    // One FreeBSD note: GETODELAY reports the soft buffer only - the kernel
-    // pre-fills the hardware buffer at trigger and never counts it - so the
-    // absolute delay is understated by bufhard; the servo only needs
-    // cycle-to-cycle consistency and is unaffected.
-    fn servo_fill(port: &mut Port<SinkDir>) -> u32 {
+    // Queue observations may omit backend-internal staging. The servo needs
+    // cycle-to-cycle consistency rather than an absolute physical-latency
+    // estimate, so a stable omission does not bias its correction.
+    fn servo_fill(port: &mut Port<SinkDir<B>>) -> u32 {
         let fill = measured_fill(port);
         let stride = port.stride_rate().map(|(stride, _)| stride).unwrap_or(1);
         settle_target(port, fill, stride);
         fill
     }
 
-    fn servo_hold(port: &Port<SinkDir>) -> bool {
+    fn servo_hold(port: &Port<SinkDir<B>>) -> bool {
         port.ext.xrun_timestamp != 0
     }
 
-    fn servo_err(port: &Port<SinkDir>, fill: u32) -> f64 {
+    fn servo_err(port: &Port<SinkDir<B>>, fill: u32) -> f64 {
         fill as f64 - port.ext.target_delay as f64
     }
 
-    fn wake_threshold(port: &Port<SinkDir>) -> u32 {
-        // EVFILT_WRITE fires when free >= LOW_WATER. A healthy cycle wakes
-        // with target_delay queued, writes one period, then goes inactive
-        // until that period drains and the queue returns to the live target.
-        port.ext
-            .buffer_size
-            .saturating_sub(port.ext.target_delay)
-            .max(1)
+    fn wake_buffer_state(port: &Port<SinkDir<B>>) -> backend::WakeBufferState {
+        backend::WakeBufferState {
+            frame_stride: port.stride_rate().map_or(1, |(stride, _)| stride),
+            period_bytes: port.setup_period,
+            quantum_bytes: port.delivery_quantum_bytes,
+            capacity_bytes: port.ext.buffer_size,
+            target_fill_bytes: port.ext.target_delay,
+        }
     }
 
-    fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
+    fn process_ports(state: &mut DataState<SinkDir<B>>) -> c_int {
         process_ports(state)
     }
 }
 
-const OSS_SINK_FACTORY_INFO: spa_dict = spa_dict {
+const SINK_FACTORY_INFO: spa_dict = spa_dict {
     flags: 0,
     n_items: 0,
     items: std::ptr::null(),
 };
 
-pub(crate) const OSS_SINK_FACTORY: spa_handle_factory = spa_handle_factory {
-    version: SPA_VERSION_HANDLE_FACTORY,
-    name: platform::SINK_FACTORY_NAME.as_ptr(),
-    info: &OSS_SINK_FACTORY_INFO,
-    get_size: Some(get_size::<SinkDir>),
-    init: Some(init::<SinkDir>),
-    enum_interface_info: Some(enum_interface_info),
-};
-
-// mut: the host logger writes level/has_custom_level back after registration
-pub(crate) static mut OSS_SINK_TOPIC: spa_log_topic = spa_log_topic {
-    version: SPA_VERSION_LOG_TOPIC,
-    topic: platform::SINK_LOG_TOPIC.as_ptr(),
-    level: SPA_LOG_LEVEL_NONE,
-    has_custom_level: false,
-};
+pub const fn factory<B: backend::Backend>(name: *const c_char) -> spa_handle_factory {
+    spa_handle_factory {
+        version: SPA_VERSION_HANDLE_FACTORY,
+        name,
+        info: &SINK_FACTORY_INFO,
+        get_size: Some(get_size::<SinkDir<B>>),
+        init: Some(init::<SinkDir<B>>),
+        enum_interface_info: Some(enum_interface_info),
+    }
+}
 
 #[cfg(test)]
 mod tests;
