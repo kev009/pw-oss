@@ -1,4 +1,6 @@
 use super::*;
+use crate::backend;
+use crate::spa::System;
 
 // Run the servo before the clock is published so every field below belongs
 // to this cycle (the shape of ALSA's update_time); both directions share
@@ -39,7 +41,8 @@ fn driver_servo<D: Direction>(
 
         // An enriched sound event is an IRQ-style clock observation. Its fill
         // is fragment-quantized and can be consistently one fragment below
-        // LOW_WATER; steering from that biased level winds the DLL forever.
+        // the native wake threshold; steering from that biased level winds the
+        // DLL forever.
         // ALSA likewise uses wake-time error in IRQ mode and buffer-level error
         // only for timer scheduling. The timer fallback still needs the latter
         // because it has no device-clock observation of its own.
@@ -170,7 +173,7 @@ pub(super) fn wake_cycle<D: Direction>(
     // re-anchor it through the stall path below; an absolute re-arm computed
     // from a stale deadline would fire immediately and busy-spin the loop
     // until the synthetic deadline caught up with wall time.
-    let Some(now) = crate::node::try_now_ns(&state.data_system) else {
+    let Some(now) = try_now_ns(&state.data_system) else {
         disable_device_wake(state);
         set_timeout_rel(state, SPA_NSEC_PER_SEC as u64 / 100);
         return None;
@@ -260,13 +263,13 @@ enum WakeKind {
 fn drain_wake<D: Direction>(state: &mut DataState<D>) -> Option<WakeKind> {
     if let Some(queue) = &state.sound_queue {
         match queue.next_event() {
-            Ok(Some(crate::oss::WakeEvent::Timer)) => {
+            Ok(Some(backend::WakeEvent::Timer)) => {
                 for port in &mut state.ports {
                     port.device_event = None;
                 }
                 Some(WakeKind::Timer)
             }
-            Ok(Some(crate::oss::WakeEvent::Device(event))) => {
+            Ok(Some(backend::WakeEvent::Device(event))) => {
                 let Some(port) = state
                     .ports
                     .iter_mut()
@@ -328,8 +331,8 @@ pub(crate) fn invalidate_device_wake<D: Direction>(state: &mut DataState<D>) {
 
 // Keep the sound knote aligned with the one running driver device. true means
 // the knote is registered; the independent deadline watchdog remains armed.
-// The node currently exposes one port; the fd match still makes stale events
-// and future device replacement explicit.
+// The node exposes one port; the fd match rejects stale events after device
+// replacement.
 pub(crate) fn refresh_device_wake<D: Direction>(state: &mut DataState<D>) -> bool {
     refresh_device_wake_inner(state, false)
 }
@@ -381,7 +384,11 @@ fn refresh_device_wake_inner<D: Direction>(state: &mut DataState<D>, retry_faile
         threshold,
         state.ports[port_idx].setup_blocksize,
     );
-    if needs_threshold && !state.ports[port_idx].dsp.set_low_water(threshold) {
+    if needs_threshold
+        && !state.ports[port_idx]
+            .dsp
+            .configure_wake_threshold(threshold)
+    {
         if let Some(queue) = &mut state.sound_queue {
             let _ = queue.unregister_device();
         }
@@ -530,12 +537,12 @@ pub(crate) fn update_driver_wake<D: Direction>(state: &mut DataState<D>) {
 
     // This path runs for explicit state changes (Start, role/configuration
     // changes and device replacement), never for ordinary audio cycles. Give
-    // a transient LOW_WATER/registration failure one bounded retry. Preserve
-    // its marker during the attempt so a permanent failure warns once per
-    // failure episode rather than once per transition.
+    // a transient native-threshold/registration failure one bounded retry.
+    // Preserve its marker during the attempt so a permanent failure warns once
+    // per failure episode rather than once per transition.
     refresh_device_wake_inner(state, true);
 
-    match crate::node::try_now_ns(&state.data_system) {
+    match try_now_ns(&state.data_system) {
         Some(now) => {
             state.next_time = now;
             #[cfg(debug_assertions)]
@@ -575,7 +582,7 @@ pub(super) fn arm_timer<D: Direction>(state: &DataState<D>, value_ns: u64, flags
         let delay_ns = if value_ns == 0 || flags == 0 {
             value_ns
         } else {
-            crate::node::try_now_ns(&state.data_system)
+            try_now_ns(&state.data_system)
                 .map(|now| deadline_delay(value_ns, now))
                 .unwrap_or(SPA_NSEC_PER_SEC as u64 / 100)
         };
@@ -709,7 +716,7 @@ impl RateLimit {
 // Fallible on purpose: every caller runs on the data loop under extern "C",
 // where an assert would abort the whole daemon - each caller has a soft
 // path (park the timer, reuse the previous stamp, skip a cycle).
-pub(crate) fn try_now_ns(system: &crate::spa::System) -> Option<u64> {
+pub(crate) fn try_now_ns(system: &System) -> Option<u64> {
     let mut now = libspa::sys::timespec {
         tv_sec: 0,
         tv_nsec: 0,

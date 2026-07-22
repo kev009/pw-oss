@@ -2,19 +2,25 @@ use super::{
     SourceDir, SourcePortExt, bounded_read, fill_targets, follower_servo, recover_overrun,
     retune_period, ring_request, ring_required,
 };
-use crate::oss::test_util::{pattern, pipe_pair};
+use crate::backend::{
+    self, CaptureStream, DeviceEvent,
+    test_transport::{pattern, pipe_pair},
+};
+use crate::spa::{IoArea, Log};
+
+use super::super::{Port, PortConfig, RateLimit, device_event_fill};
 use std::ffi::c_int;
 
 // a Port on a pipe-backed device: the pipe plays the capture ring
 // (byte-exact accounting), GETISPACE fails on a pipe, so the phase
 // functions get the queued fill passed explicitly (as the callers do)
-fn test_port(read_fd: c_int, period: u32, read_peak: u32) -> crate::node::Port<SourceDir> {
-    crate::node::Port {
+fn test_port(read_fd: c_int, period: u32, read_peak: u32) -> Port<SourceDir> {
+    Port {
         config: None,
         buffers: vec![],
-        io: crate::spa::IoArea::null(),
-        rate_match: crate::spa::IoArea::null(),
-        dsp: crate::oss::Dsp::test_on_fd(read_fd, 8),
+        io: IoArea::null(),
+        rate_match: IoArea::null(),
+        dsp: CaptureStream::test_on_fd(read_fd, 8),
         dll: Default::default(),
         setup_period: period,
         bw_adapt: Default::default(),
@@ -22,7 +28,7 @@ fn test_port(read_fd: c_int, period: u32, read_peak: u32) -> crate::node::Port<S
         rebuild_pending: false,
         generation: 0,
         was_matching: false,
-        warn_limit: crate::node::RateLimit::new(),
+        warn_limit: RateLimit::new(),
         pending_xrun: None,
         device_event: None,
         device_eof: false,
@@ -60,17 +66,29 @@ fn bounded_read_caps_catchup_and_pads_late_cycles() {
 }
 
 #[test]
+fn disconnected_capture_transport_latches_a_rebuild() {
+    let (r, w) = pipe_pair(false, false);
+    let mut port = test_port(r, 1_024, 2_048);
+    let mut buffer = vec![0xaau8; 1_024];
+    unsafe { libc::close(w) };
+
+    assert_eq!(bounded_read(&mut port, 1_024, &mut buffer, 8), 1_024);
+    assert!(port.device_eof);
+    assert!(buffer.iter().all(|&byte| byte == 0));
+}
+
+#[test]
 fn capture_kevent_uses_ready_bytes_without_rounding_to_frames() {
     let (r, w) = pipe_pair(false, false);
     let mut port = test_port(r, 1024, 2048);
-    port.device_event = Some(crate::oss::DeviceEvent {
+    port.device_event = Some(DeviceEvent {
         fd: port.dsp.fd().unwrap(),
         available_bytes: 1027,
-        ready_frames: 128,
+        queued_frames: Some(128),
         xruns: 0,
         eof: false,
     });
-    assert_eq!(crate::node::device_event_fill(&port), Some(1027));
+    assert_eq!(device_event_fill(&port), Some(1027));
     unsafe { libc::close(w) };
 }
 
@@ -78,7 +96,7 @@ fn capture_kevent_uses_ready_bytes_without_rounding_to_frames() {
 fn bounded_read_uses_biased_u8_silence() {
     let (r, w) = pipe_pair(false, false);
     let mut port = test_port(r, 16, 32);
-    port.config = Some(crate::node::PortConfig {
+    port.config = Some(PortConfig {
         format: libspa::param::audio::AudioFormat::U8,
         rate: 48000,
         channels: 8,
@@ -131,7 +149,7 @@ fn retune_recommits_in_place() {
     let mut port = test_port(r, 1024, 0);
     port.ext.primed = true;
     port.ext.ring_size = 8192;
-    let log = crate::spa::Log::test_null();
+    let log = Log::test_null();
 
     assert!(!retune_period(&mut port, 2048, &log)); // debounced
     assert_eq!(port.setup_period, 1024);
@@ -156,8 +174,8 @@ fn retune_requests_rebuild_when_the_suspend_is_refused() {
     let s = pattern(8, 5);
     assert_eq!(unsafe { libc::write(w, s.as_ptr().cast(), 8) }, 8);
     let mut buf = [0u8; 8];
-    assert_eq!(port.dsp.read(&mut buf), 8);
-    let log = crate::spa::Log::test_null();
+    assert_eq!(port.dsp.read(&mut buf).bytes, 8);
+    let log = Log::test_null();
 
     assert!(!retune_period(&mut port, 2048, &log));
     assert!(retune_period(&mut port, 2048, &log));
@@ -178,7 +196,7 @@ fn overruns_recover_only_when_the_ring_stays_pinned() {
     let mut port = test_port(r, 1024, 0);
     port.ext.primed = true;
     port.ext.ring_size = 8192; // blocksize 1024: pinned above 7168
-    let log = crate::spa::Log::test_null();
+    let log = Log::test_null();
 
     // two pinned cycles: counted, no recovery yet
     recover_overrun(&mut port, 4, Some(8000), 0, &log);
@@ -218,7 +236,7 @@ fn follower_servo_locks_in_band_and_relocks_on_snap() {
     // with a negotiated config the geometry latches and the DLL engages:
     // the first in-band update cold-starts the gains, the second must
     // produce a real (non-unity) correction
-    port.config = Some(crate::node::PortConfig {
+    port.config = Some(PortConfig {
         format: libspa::param::audio::AudioFormat::S32LE,
         rate: 48000,
         channels: 2,
@@ -242,9 +260,9 @@ fn ring_request_floors_and_caps() {
     // budget, and the kernel cap always wins
     assert_eq!(ring_request(1024, 16384, 8, 48_000), 16384 * 4);
     assert_eq!(ring_request(32768, 16384, 8, 48_000), 32768 * 4);
-    assert!(ring_request(64, 64, 8, 48_000) >= crate::oss::MIN_BUFFER_BYTES);
+    assert!(ring_request(64, 64, 8, 48_000) >= 65_536);
     assert_eq!(
         ring_request(65536, 65536, 8, 48_000),
-        crate::oss::buffer_capacity_limit(8, 48_000)
+        backend::buffer_capacity_limit(8, 48_000)
     );
 }

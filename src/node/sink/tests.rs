@@ -7,8 +7,16 @@ use super::{
     buffer_request, buffer_required, desired_delay, fill_floor, predicted_next_fill, retune_seed,
     target_delay,
 };
-use crate::node::PortConfig;
-use crate::oss::test_util::{drain, fill_pipe, free_space, pattern, pipe_pair};
+use crate::backend::{
+    self, DeviceEvent, IoStatus, PlaybackStream, WriteOutcome,
+    test_transport::{drain, fill_pipe, free_space, pattern, pipe_pair},
+};
+use crate::spa::{IoArea, Log};
+
+use super::super::{
+    Direction, Port, PortConfig, RateLimit, device_event_fill, reset_device_event,
+    take_device_event_xruns, take_fallback_xruns,
+};
 use libspa::sys::SPA_IO_CLOCK_FLAG_XRUN_RECOVER;
 use std::ffi::c_int;
 
@@ -16,13 +24,13 @@ use std::ffi::c_int;
 // (byte-exact accounting, short writes on a full ring), GETODELAY reads 0
 // (the ioctl fails on a pipe), so the phase functions get the fill level
 // passed explicitly where a decision needs it
-fn test_port(write_fd: c_int, target_delay: u32, period: u32) -> crate::node::Port<SinkDir> {
-    crate::node::Port {
+fn test_port(write_fd: c_int, target_delay: u32, period: u32) -> Port<SinkDir> {
+    Port {
         config: None,
         buffers: vec![],
-        io: crate::spa::IoArea::null(),
-        rate_match: crate::spa::IoArea::null(),
-        dsp: crate::oss::DspWriter::test_on_fd(write_fd, 8),
+        io: IoArea::null(),
+        rate_match: IoArea::null(),
+        dsp: PlaybackStream::test_on_fd(write_fd, 8),
         dll: Default::default(),
         setup_period: period,
         bw_adapt: Default::default(),
@@ -30,7 +38,7 @@ fn test_port(write_fd: c_int, target_delay: u32, period: u32) -> crate::node::Po
         rebuild_pending: false,
         generation: 0,
         was_matching: false,
-        warn_limit: crate::node::RateLimit::new(),
+        warn_limit: RateLimit::new(),
         pending_xrun: None,
         device_event: None,
         device_eof: false,
@@ -65,24 +73,24 @@ fn playback_kevent_supplies_fill_and_xrun_deltas() {
         flags: 0,
         stride: 8,
     });
-    port.device_event = Some(crate::oss::DeviceEvent {
+    port.device_event = Some(DeviceEvent {
         fd: port.dsp.fd().unwrap(),
         available_bytes: 1234,
-        ready_frames: 512,
+        queued_frames: Some(512),
         xruns: 3,
         eof: false,
     });
 
-    assert_eq!(crate::node::device_event_fill(&port), Some(4096));
-    assert_eq!(crate::node::take_device_event_xruns(&mut port), Some(3));
-    assert_eq!(crate::node::take_device_event_xruns(&mut port), Some(0));
-    assert_eq!(crate::node::take_fallback_xruns(&mut port, 5), 2);
+    assert_eq!(device_event_fill(&port), Some(4096));
+    assert_eq!(take_device_event_xruns(&mut port), Some(3));
+    assert_eq!(take_device_event_xruns(&mut port), Some(0));
+    assert_eq!(take_fallback_xruns(&mut port, 5), 2);
     assert_eq!(port.event_xruns_seen, 0);
     port.device_event.as_mut().unwrap().xruns = 1; // a new kernel counter epoch
-    assert_eq!(crate::node::take_device_event_xruns(&mut port), Some(1));
+    assert_eq!(take_device_event_xruns(&mut port), Some(1));
     port.wake_threshold = 4096;
     port.device_eof = true;
-    crate::node::reset_device_event(&mut port);
+    reset_device_event(&mut port);
     assert!(port.device_event.is_none());
     assert!(!port.device_eof);
     assert_eq!(port.event_xruns_seen, 0);
@@ -95,23 +103,14 @@ fn playback_kevent_wakes_at_the_live_fill_target() {
     let (r, w) = pipe_pair(true, true);
     let mut port = test_port(w, 20_480, 16_384);
     port.ext.buffer_size = 65_536;
-    assert_eq!(
-        <SinkDir as crate::node::Direction>::wake_threshold(&port),
-        45_056
-    );
+    assert_eq!(<SinkDir as Direction>::wake_threshold(&port), 45_056);
 
     // LOW_WATER is clamped away from zero, and otherwise follows the live
     // target directly even while an in-place retune settles it.
     port.ext.target_delay = 65_536;
-    assert_eq!(
-        <SinkDir as crate::node::Direction>::wake_threshold(&port),
-        1
-    );
+    assert_eq!(<SinkDir as Direction>::wake_threshold(&port), 1);
     port.ext.target_delay = 8_192;
-    assert_eq!(
-        <SinkDir as crate::node::Direction>::wake_threshold(&port),
-        57_344
-    );
+    assert_eq!(<SinkDir as Direction>::wake_threshold(&port), 57_344);
     unsafe { libc::close(r) };
 }
 
@@ -161,7 +160,7 @@ fn small_grant_is_best_effort_half() {
 
 #[test]
 fn oversized_delay_is_capped_and_reported() {
-    // oss.delay pushing past the ceiling: clamped to it, flagged for the log
+    // platform::PLAYBACK_DELAY pushing past the ceiling: clamp and flag it
     let (target, capped) = target_delay(65536, 4096, 1024, 4096, u32::MAX);
     assert_eq!(target, 65536 - 4096 - 1024);
     assert!(capped);
@@ -286,8 +285,8 @@ fn resume_writes_the_first_buffer_without_an_xrun_hold() {
     // SKIP restored queued audio from the kernel shadow: append only real data,
     // even if GETERROR counted the silence buffer draining while paused.
     assert_eq!(
-        resume_playback(&mut port, 1024, 3, &data, &crate::spa::Log::test_null()).bytes,
-        data.len() as isize
+        resume_playback(&mut port, 1024, 3, &data, &Log::test_null()).bytes,
+        data.len()
     );
     assert!(!port.ext.resuming);
     assert_eq!(port.ext.target_delay, 1024);
@@ -297,8 +296,8 @@ fn resume_writes_the_first_buffer_without_an_xrun_hold() {
     // zero soft fill still continues directly rather than inserting silence.
     port.ext.resuming = true;
     assert_eq!(
-        resume_playback(&mut port, 0, 0, &data, &crate::spa::Log::test_null()).bytes,
-        data.len() as isize
+        resume_playback(&mut port, 0, 0, &data, &Log::test_null()).bytes,
+        data.len()
     );
     assert_eq!(port.ext.target_delay, 0);
     assert_eq!(drain(r), data);
@@ -312,7 +311,7 @@ fn full_resume_write_remains_retryable() {
     port.dsp.write_silence(0);
     let capacity = fill_pipe(w);
     let data = pattern(2048, 10);
-    let log = crate::spa::Log::test_null();
+    let log = Log::test_null();
 
     port.ext.resuming = true;
     let blocked = resume_playback(&mut port, 1024, 0, &data, &log);
@@ -322,8 +321,8 @@ fn full_resume_write_remains_retryable() {
 
     free_space(r, data.len());
     let written = resume_playback(&mut port, 1024, 0, &data, &log);
-    assert_eq!(written.bytes, data.len() as isize);
-    assert_eq!(written.error, None);
+    assert_eq!(written.bytes, data.len());
+    assert_eq!(written.status, IoStatus::Progress);
     assert!(!port.ext.resuming);
     let queued = drain(r);
     assert_eq!(queued.len(), capacity);
@@ -341,7 +340,7 @@ fn short_resume_seeds_from_bytes_the_device_accepted() {
     let data = pattern(2048, 18);
 
     port.ext.resuming = true;
-    let written = resume_playback(&mut port, 2048, 0, &data, &crate::spa::Log::test_null());
+    let written = resume_playback(&mut port, 2048, 0, &data, &Log::test_null());
     assert_eq!(written.bytes, 1024);
     assert_eq!(port.ext.target_delay, 1024);
     assert!(!port.ext.resuming);
@@ -356,9 +355,9 @@ fn partial_writes_advance_only_within_the_same_host_buffer() {
     assert!(retain_partial_write(
         &mut ext,
         16384,
-        crate::oss::PlaybackWrite {
+        WriteOutcome {
             bytes: 8192,
-            error: None,
+            status: IoStatus::Progress,
         },
     ));
     assert_eq!(pending_write_offset(&mut ext, 7, 16384), 8192);
@@ -366,9 +365,9 @@ fn partial_writes_advance_only_within_the_same_host_buffer() {
     assert!(retain_partial_write(
         &mut ext,
         8192,
-        crate::oss::PlaybackWrite {
+        WriteOutcome {
             bytes: 4096,
-            error: Some(nix::errno::Errno::EAGAIN),
+            status: IoStatus::WouldBlock,
         },
     ));
     assert_eq!(pending_write_offset(&mut ext, 7, 16384), 12288);
@@ -381,9 +380,9 @@ fn partial_writes_advance_only_within_the_same_host_buffer() {
     assert!(!retain_partial_write(
         &mut ext,
         16384,
-        crate::oss::PlaybackWrite {
+        WriteOutcome {
             bytes: 4096,
-            error: Some(nix::errno::Errno::EIO),
+            status: IoStatus::Failed,
         },
     ));
     assert_eq!(ext.pending_offset, 0);
@@ -391,9 +390,9 @@ fn partial_writes_advance_only_within_the_same_host_buffer() {
 
 #[test]
 fn zero_byte_write_is_retryable_backpressure() {
-    let write = crate::oss::PlaybackWrite {
+    let write = WriteOutcome {
         bytes: 0,
-        error: None,
+        status: IoStatus::WouldBlock,
     };
     assert!(write.would_block());
 }
@@ -421,7 +420,7 @@ fn retained_tail_precedes_fill_correction() {
     free_space(r, data.len());
     let tail = &data[port.ext.pending_offset as usize..];
     let written = write_retained_tail(&mut port, tail).unwrap();
-    assert_eq!(written.bytes, tail.len() as isize);
+    assert_eq!(written.bytes, tail.len());
     assert_eq!(port.ext.xrun_timestamp, 1);
 
     let queued = drain(r);
@@ -524,8 +523,8 @@ fn drained_resume_reprimes_and_writes_in_the_same_cycle() {
     let data = pattern(2048, 7);
 
     assert_eq!(
-        resume_playback(&mut port, 0, 1, &data, &crate::spa::Log::test_null()).bytes,
-        data.len() as isize
+        resume_playback(&mut port, 0, 1, &data, &Log::test_null()).bytes,
+        data.len()
     );
     assert!(!port.ext.resuming);
     let out = drain(r);
@@ -569,7 +568,7 @@ fn underrun_detection_arms_the_hold_once() {
         flags: 0,
         stride: 8,
     });
-    let log = crate::spa::Log::test_null();
+    let log = Log::test_null();
 
     detect_underrun(&mut port, 2048, 3, 1_000_000, 500_000, &log);
     assert_eq!(port.ext.xrun_timestamp, 500_000);
@@ -668,7 +667,7 @@ fn retune_recommits_in_place_without_splicing_silence() {
     let mut port = test_port(w, 4096, 2048);
     port.dsp.write_silence(0); // a retuning channel is running
     port.ext.buffer_size = 16384;
-    let log = crate::spa::Log::test_null();
+    let log = Log::test_null();
 
     // one flip is debounced: write at the old geometry for a cycle
     assert_eq!(
@@ -737,7 +736,7 @@ fn short_retune_write_keeps_its_seed_for_the_current_cycle() {
     let mut port = test_port(w, fill, 2048);
     port.dsp.write_silence(0);
     port.ext.buffer_size = 16384;
-    let log = crate::spa::Log::test_null();
+    let log = Log::test_null();
     assert_eq!(
         retune_period(&mut port, period, 8, write_now, 0, 0, &log),
         RetuneOutcome::Unchanged
@@ -758,7 +757,7 @@ fn retune_preserves_capacity_for_real_audio() {
     let mut port = test_port(w, 4096, 2048);
     port.dsp.write_silence(0); // a retuning channel is running
     port.ext.buffer_size = 16384;
-    let log = crate::spa::Log::test_null();
+    let log = Log::test_null();
 
     // debounce cycle: no writes yet
     assert_eq!(
@@ -795,7 +794,7 @@ fn retune_requests_rebuild_when_the_suspend_is_refused() {
     let (r, w) = pipe_pair(true, true);
     let mut port = test_port(w, 4096, 2048);
     port.dsp.write_silence(0);
-    let log = crate::spa::Log::test_null();
+    let log = Log::test_null();
 
     assert_eq!(
         retune_period(&mut port, 4096, 8, 4096, 0, 0, &log),
@@ -830,9 +829,9 @@ fn zero_period_is_never_committed() {
 fn request_covers_the_largest_negotiable_quantum() {
     // the prime-time request holds the stable floor so later period changes
     // retune in place; the kernel cap always wins
-    let cap = crate::oss::buffer_capacity_limit(8, 48000);
+    let cap = backend::buffer_capacity_limit(8, 48000);
     let req = buffer_request(4096, 16384, 8, 48000, 0, 2048, 4096, 4);
     assert!(req >= buffer_required(16384, desired_delay(16384, 4), 2048, 16384));
-    assert!(req >= crate::oss::MIN_BUFFER_BYTES.min(cap));
+    assert!(req >= 65_536.min(cap));
     assert!(req <= cap);
 }

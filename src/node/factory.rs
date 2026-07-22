@@ -1,5 +1,10 @@
 use super::*;
-use crate::platform;
+#[cfg(debug_assertions)]
+use crate::spa::dump_spa_dict;
+use crate::spa::{
+    self, IoArea, Log, Loop, LoopSource, SendWrap, System, TimerFd, for_each_dict_item, key,
+};
+use crate::{backend, platform};
 
 pub(super) unsafe extern "C" fn get_interface<D: Direction>(
     handle: *mut spa_handle,
@@ -102,25 +107,25 @@ fn sound_kqueue_enabled(force_timer: bool, enriched_available: bool) -> bool {
     enriched_available && !force_timer
 }
 
-// the init-dict node properties: the device path, wake backend, shared
-// oss.fragment default and whatever direction-specific keys D::info_item consumes
+// The init-dict node properties: stream path, wake backend, shared
+// platform::FRAGMENT default, and direction-specific keys consumed by D::info_item.
 pub(super) unsafe fn parse_init_dict<D: Direction>(
     info: *const spa_dict,
-    log: &crate::spa::Log,
+    log: &Log,
 ) -> (Option<String>, bool, u32, D::MainExt) {
     let mut stream_path = None;
     let mut force_timer = false;
-    let mut fragment_bytes = 0u32; // automatic (today's layout) unless the dict says otherwise
+    let mut fragment_bytes = 0u32; // automatic unless the dict says otherwise
     let mut ext = D::MainExt::default();
 
     if let Some(info) = unsafe { info.as_ref() } {
         #[cfg(debug_assertions)]
         unsafe {
-            crate::spa::dump_spa_dict(info);
+            dump_spa_dict(info);
         }
 
         unsafe {
-            crate::spa::for_each_dict_item(info, |key, value| {
+            for_each_dict_item(info, |key, value| {
                 if key == platform::STREAM_PATH {
                     stream_path = Some(value.to_string());
                 } else if key == platform::FORCE_TIMER {
@@ -155,8 +160,8 @@ pub(super) unsafe fn parse_init_dict<D: Direction>(
 // directory (the readable/writable flags flip later in port_set_param)
 pub(super) fn publish_static_info<D: Direction>(state: &MainState<D>) {
     state.events.with_info(|node, port| {
-        // NodeEvents is now at its final Rc allocation, so weave the inline
-        // params arrays' self-pointers only after State construction.
+        // Weave the inline params arrays' self-pointers only after NodeEvents
+        // reaches its final Rc allocation.
         node.fix_pointers();
         port.fix_pointers();
 
@@ -167,8 +172,8 @@ pub(super) fn publish_static_info<D: Direction>(state: &MainState<D>) {
         }
         // The RT flag declares process() safe on the realtime data loop.
         node.set_flags(SPA_NODE_FLAG_RT as u64);
-        node.add_prop(crate::spa::key(SPA_KEY_MEDIA_CLASS), D::MEDIA_CLASS);
-        node.add_prop(crate::spa::key(SPA_KEY_NODE_DRIVER), "true");
+        node.add_prop(key(SPA_KEY_MEDIA_CLASS), D::MEDIA_CLASS);
+        node.add_prop(key(SPA_KEY_NODE_DRIVER), "true");
 
         // No EnumPortConfig/PortConfig (or node-level IO/EnumFormat): dead
         // surface on a follower, see build_port_format_info.
@@ -201,7 +206,7 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
         spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Log.as_ptr().cast())
             .cast::<spa_log>()
     };
-    let Some(log) = (unsafe { crate::spa::Log::wrap(log, Some(D::log_topic())) }) else {
+    let Some(log) = (unsafe { Log::wrap(log, Some(D::log_topic())) }) else {
         return -libc::EINVAL;
     };
 
@@ -230,8 +235,8 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
         return -libc::EINVAL;
     }
 
-    let data_loop = unsafe { crate::spa::Loop::wrap(data_loop) };
-    let data_system = unsafe { crate::spa::System::wrap(data_system) };
+    let data_loop = unsafe { Loop::wrap(data_loop) };
+    let data_system = unsafe { System::wrap(data_system) };
 
     let (stream_path, force_timer, fragment_bytes, ext) =
         unsafe { parse_init_dict::<D>(info, &log) };
@@ -245,10 +250,9 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
         return -libc::EINVAL;
     };
 
-    let use_sound_kqueue =
-        sound_kqueue_enabled(force_timer, crate::oss::enriched_sound_kqueue_available());
+    let use_sound_kqueue = sound_kqueue_enabled(force_timer, backend::device_wake_available());
     let sound_queue = if use_sound_kqueue {
-        match crate::oss::SoundKqueue::new() {
+        match backend::WakeQueue::new() {
             Ok(queue) => {
                 crate::debug!(log, "using enriched OSS kqueue device wakeups");
                 Some(queue)
@@ -286,19 +290,19 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
     };
     let wake_fd_raw = sound_queue
         .as_ref()
-        .map(crate::oss::SoundKqueue::raw)
-        .or_else(|| timer_fd.as_ref().map(crate::spa::TimerFd::raw))
+        .map(backend::WakeQueue::raw)
+        .or_else(|| timer_fd.as_ref().map(TimerFd::raw))
         .expect("one wake descriptor is always constructed");
 
     let mut caps_fallback = false;
-    let caps = crate::oss::probe_caps(&stream_path, D::PLAYBACK).unwrap_or_else(|| {
+    let caps = backend::probe_caps(&stream_path, D::PLAYBACK).unwrap_or_else(|| {
         crate::warn!(
             log,
             "{}: can't probe device caps; using fallback",
             stream_path
         );
         caps_fallback = true;
-        crate::oss::DspCaps::fallback()
+        backend::fallback_caps()
     });
     crate::debug!(log, "{}: {:?}", stream_path, caps);
 
@@ -322,7 +326,7 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
     let main_loop = if main_loop.is_null() {
         None
     } else {
-        Some(unsafe { crate::spa::Loop::wrap(main_loop) })
+        Some(unsafe { Loop::wrap(main_loop) })
     };
 
     // the host hands us uninitialized memory of get_size() bytes; write the
@@ -362,10 +366,10 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
                     fragment_bytes,
                     fragment_bytes_default: fragment_bytes,
                     latency: [
-                        crate::spa::latency_info_default(SPA_DIRECTION_INPUT),
-                        crate::spa::latency_info_default(SPA_DIRECTION_OUTPUT),
+                        spa::latency_info_default(SPA_DIRECTION_INPUT),
+                        spa::latency_info_default(SPA_DIRECTION_OUTPUT),
                     ],
-                    process_latency: crate::spa::process_latency_default(),
+                    process_latency: spa::process_latency_default(),
                     shared: shared.clone(),
                     rebuild_worker,
                     ring_cap_published: false,
@@ -375,15 +379,15 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
                     data_loop,
                     data_system,
                     log,
-                    clock: crate::spa::IoArea::null(),
-                    position: crate::spa::IoArea::null(),
+                    clock: IoArea::null(),
+                    position: IoArea::null(),
                     clock_name: platform::clock_name(&stream_path),
                     main_loop,
                     stream_path: stream_path.clone(),
                     timer_fd,
                     sound_queue,
                     sound_failed_fd: None,
-                    wake_source: crate::spa::LoopSource::new(spa_source {
+                    wake_source: LoopSource::new(spa_source {
                         loop_: std::ptr::null_mut(),
                         func: Some(on_wake::<D>),
                         data: state.cast::<c_void>(),
@@ -398,8 +402,8 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
                     ports: [Port {
                         config: None,
                         buffers: vec![],
-                        io: crate::spa::IoArea::null(),
-                        rate_match: crate::spa::IoArea::null(),
+                        io: IoArea::null(),
+                        rate_match: IoArea::null(),
                         dsp: D::Device::new(&stream_path),
                         dll: std::default::Default::default(),
                         setup_period: 0,
@@ -408,7 +412,7 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
                         rebuild_pending: false,
                         generation: 0,
                         was_matching: false,
-                        warn_limit: crate::node::RateLimit::new(),
+                        warn_limit: RateLimit::new(),
                         pending_xrun: None,
                         device_event: None,
                         device_eof: false,
@@ -462,7 +466,7 @@ pub(crate) unsafe extern "C" fn init<D: Direction>(
     let control = unsafe { DataControl::from_raw(state) };
     let gate = unsafe { gate_ref(state) };
     let thread = &raw const gate.thread;
-    let loop_thread = unsafe { crate::spa::SendWrap::new(thread.cast_mut()) };
+    let loop_thread = unsafe { SendWrap::new(thread.cast_mut()) };
     let seeded = control.invoke(move |_data| {
         let thread = loop_thread.into_inner();
         let tid = unsafe { libc::pthread_self() } as usize;
@@ -514,6 +518,7 @@ pub(crate) unsafe extern "C" fn enum_interface_info(
 mod tests {
     use super::{parse_init_dict, property_bool, sound_kqueue_enabled};
     use crate::platform;
+    use crate::spa::{Dictionary, Log};
 
     #[test]
     fn force_timer_disables_enriched_kqueue_selection() {
@@ -535,26 +540,25 @@ mod tests {
 
     #[test]
     fn init_dict_matches_the_exact_force_timer_key() {
-        let log = crate::spa::Log::test_null();
-        let mut dict = crate::spa::Dictionary::new();
+        let log = Log::test_null();
+        let mut dict = Dictionary::new();
         dict.add_item(platform::FORCE_TIMER, "true");
         let (_, force_timer, _, _) =
-            unsafe { parse_init_dict::<crate::node::sink::SinkDir>(dict.raw(), &log) };
+            unsafe { parse_init_dict::<super::super::sink::SinkDir>(dict.raw(), &log) };
         assert!(force_timer);
 
-        let mut wrong_key = crate::spa::Dictionary::new();
-        wrong_key.add_item(
-            platform::FORCE_TIMER.replace("force-timer", "force_timer"),
-            "true",
-        );
+        let mut wrong_key = Dictionary::new();
+        let wrong_force_timer = platform::FORCE_TIMER.replace("force-timer", "force_timer");
+        assert_ne!(wrong_force_timer, platform::FORCE_TIMER);
+        wrong_key.add_item(wrong_force_timer.as_str(), "true");
         let (_, force_timer, _, _) =
-            unsafe { parse_init_dict::<crate::node::sink::SinkDir>(wrong_key.raw(), &log) };
+            unsafe { parse_init_dict::<super::super::sink::SinkDir>(wrong_key.raw(), &log) };
         assert!(!force_timer);
 
-        let mut invalid = crate::spa::Dictionary::new();
+        let mut invalid = Dictionary::new();
         invalid.add_item(platform::FORCE_TIMER, "maybe");
         let (_, force_timer, _, _) =
-            unsafe { parse_init_dict::<crate::node::sink::SinkDir>(invalid.raw(), &log) };
+            unsafe { parse_init_dict::<super::super::sink::SinkDir>(invalid.raw(), &log) };
         assert!(!force_timer);
     }
 }

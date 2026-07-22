@@ -164,7 +164,7 @@ pub(in crate::node) struct RebuildRequest<D: Direction> {
     // RetireAndRetry only: the port's dying fd, closed by the worker under
     // its unwind guard before the retry opens
     pub(in crate::node) retire_first: Option<D::Device>,
-    pub(in crate::node) log: crate::spa::Log,
+    pub(in crate::node) log: Log,
     // Weak avoids a NodeShared -> mailbox -> retry request -> NodeShared
     // cycle while a RetireAndRetry completion waits for the data loop.
     pub(in crate::node) shared: std::sync::Weak<NodeShared<D>>,
@@ -627,32 +627,36 @@ pub(in crate::node) fn rebuild_task<D: Direction>(mut request: RebuildRequest<D>
             // Close the stale fd here, never in the mailbox.
             drop(dsp);
             SwapOutcome::Aborted
-        } else if res == 0 {
-            SwapOutcome::Installed {
-                dsp,
-                config: request.config.clone(),
-            }
-        } else if res == -libc::EBUSY && !request.retried {
-            // retire_first is None again here (taken above); poll_rebuild
-            // fills it with the dying fd for the retry round trip
-            SwapOutcome::RetireAndRetry {
-                request: RebuildRequest {
-                    retried: true,
-                    ..request
-                },
-                // try_open_configure leaves the device closed on failure;
-                // reuse it on the RT side instead of constructing there.
-                placeholder: dsp,
-            }
         } else {
-            crate::warn!(
-                request.log,
-                "{}: background rebuild failed ({}); the port loses its format",
-                request.path,
-                res
-            );
-            // As above, failure leaves a ready closed placeholder.
-            SwapOutcome::Failed { placeholder: dsp }
+            match res {
+                Ok(outcome) => SwapOutcome::Installed {
+                    dsp,
+                    config: outcome.actual_config,
+                },
+                Err(err) if err == -libc::EBUSY && !request.retried => {
+                    // retire_first is None again here (taken above); poll_rebuild
+                    // fills it with the dying fd for the retry round trip
+                    SwapOutcome::RetireAndRetry {
+                        request: RebuildRequest {
+                            retried: true,
+                            ..request
+                        },
+                        // try_open_configure leaves the device closed on failure;
+                        // reuse it on the RT side instead of constructing there.
+                        placeholder: dsp,
+                    }
+                }
+                Err(err) => {
+                    crate::warn!(
+                        request.log,
+                        "{}: background rebuild failed ({}); the port loses its format",
+                        request.path,
+                        err
+                    );
+                    // As above, failure leaves a ready closed placeholder.
+                    SwapOutcome::Failed { placeholder: dsp }
+                }
+            }
         }
     };
     guard.complete(outcome);

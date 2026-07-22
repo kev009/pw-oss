@@ -1,7 +1,7 @@
 use nix::errno::Errno;
 use std::ffi::{c_char, c_int, c_long, c_uint, c_ulong};
 
-use crate::freebsd::{IoctlPod, ioctl_int, ioctl_read, ioctl_value};
+use crate::freebsd::{IoctlPod, SysctlReader, ioctl_int, ioctl_read, ioctl_value};
 
 pub(crate) const AFMT_U8: u32 = 0x00000008;
 pub(crate) const AFMT_S16_LE: u32 = 0x00000010;
@@ -83,7 +83,7 @@ pub(super) struct oss_audioinfo {
     pub(super) filler: [c_int; 184],
 }
 
-unsafe impl crate::freebsd::IoctlPod for oss_audioinfo {}
+unsafe impl IoctlPod for oss_audioinfo {}
 
 // sys/dev/sound/pcm/matrix.h: SETCHANNELS requests are clamped to this
 pub(super) const SND_CHN_MAX: c_int = 8;
@@ -129,8 +129,8 @@ struct OssChannelOrder(u64);
 
 unsafe impl IoctlPod for OssChannelOrder {}
 
-unsafe impl crate::freebsd::IoctlPod for audio_buf_info {}
-unsafe impl crate::freebsd::IoctlPod for audio_errinfo {}
+unsafe impl IoctlPod for audio_buf_info {}
+unsafe impl IoctlPod for audio_errinfo {}
 
 #[derive(Debug, PartialEq)]
 pub(super) enum DspState {
@@ -143,8 +143,8 @@ pub(super) enum DspState {
 // it's a runtime sysctl (0..500), so read it, falling back to the default
 pub(super) const FEEDER_RATE_ROUND_DEFAULT: u32 = 25;
 
-pub(super) fn feeder_rate_round() -> u32 {
-    crate::freebsd::SysctlReader::new()
+pub(crate) fn feeder_rate_round() -> u32 {
+    SysctlReader::new()
         .read_u32("hw.snd.feeder_rate_round")
         .unwrap_or(FEEDER_RATE_ROUND_DEFAULT)
         .min(500)
@@ -152,14 +152,15 @@ pub(super) fn feeder_rate_round() -> u32 {
 
 // OSS grants the nearest supported value instead of failing, so a grant that
 // differs from the request beyond `tolerance` is a rejection here
-pub(super) fn set_value(fd: c_int, req: c_ulong, value: u32, tolerance: u32) -> Result<(), Errno> {
+pub(super) fn set_value(fd: c_int, req: c_ulong, value: u32, tolerance: u32) -> Result<u32, Errno> {
     let Some(v) = ioctl_int(fd, req, value as c_int) else {
         return Err(Errno::last());
     };
-    if (v as i64 - value as i64).unsigned_abs() > tolerance as u64 {
+    let actual = u32::try_from(v).map_err(|_| Errno::EINVAL)?;
+    if (actual as i64 - value as i64).unsigned_abs() > tolerance as u64 {
         return Err(Errno::EINVAL);
     }
-    Ok(())
+    Ok(actual)
 }
 
 pub(super) fn ospace_in_bytes(fd: c_int) -> c_int {

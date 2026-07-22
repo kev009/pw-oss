@@ -1,17 +1,8 @@
 use super::*;
 
-pub(super) use crate::oss::{
-    capture_buffer_request as ring_request, capture_buffer_required as ring_required,
-    capture_fill_targets as fill_targets,
-};
-
-// the shared geometry-commit tail of the prime and in-place retune paths:
-// fill targets for `period` against the granted ring, and a servo relock
-pub(super) fn commit_geometry(
-    port: &mut crate::node::Port<SourceDir>,
-    period: u32,
-    blocksize: u32,
-) {
+// Apply the fill targets for `period` against the granted ring and relock the
+// servo.
+pub(super) fn commit_geometry(port: &mut Port<SourceDir>, period: u32, blocksize: u32) {
     let (target, peak) = fill_targets(period, blocksize, port.ext.ring_size);
     port.setup_period = period;
     port.setup_blocksize = blocksize;
@@ -33,11 +24,7 @@ pub(super) fn commit_geometry(
 // channel so the prime phase re-applies the fragment layout at the new size
 // in this very cycle. Returns true when the driver refused the trigger stop
 // (dying fd) and only a main-thread rebuild remains.
-pub(super) fn retune_period(
-    port: &mut crate::node::Port<SourceDir>,
-    period_in_bytes: u32,
-    log: &crate::spa::Log,
-) -> bool {
+pub(super) fn retune_period(port: &mut Port<SourceDir>, period_in_bytes: u32, log: &Log) -> bool {
     if !port.ext.primed
         || port.setup_period == 0
         || period_in_bytes == 0
@@ -77,7 +64,7 @@ pub(super) fn retune_period(
         port.ext.primed = false;
         // SETTRIGGER starts a new kernel xrun epoch; SETFRAGMENT also resets
         // the low-water mark during the prime that follows.
-        crate::node::reset_device_event(port);
+        reset_device_event(port);
         false
     } else {
         // period_mismatch stays >= 2 on purpose: if the caller can't queue the
@@ -92,17 +79,17 @@ pub(super) fn retune_period(
 // hand the graph one period of silence while the ring fills. Don't wait for
 // real data: an empty first cycle reads as a missed deadline to the graph.
 // Re-apply the fragment layout while the channel is in setup (legal after a
-// trigger suspend too, so live oss.fragment changes reach a suspended
+// trigger suspend too, so live platform::FRAGMENT changes reach a suspended
 // source). Returns the cycle's byte count (the period of silence), or
 // EMPTY_CYCLE before a format is negotiated (unreachable past the caller's
 // gate).
 pub(super) fn prime_capture(
-    port: &mut crate::node::Port<SourceDir>,
+    port: &mut Port<SourceDir>,
     period_in_bytes: u32,
     graph_rate: u32,
     fragment_bytes: u32,
     data: &mut [u8],
-    log: &crate::spa::Log,
+    log: &Log,
 ) -> isize {
     let maxsize = data.len() as u32;
     let Some((stride, rate)) = port.stride_rate() else {
@@ -121,11 +108,12 @@ pub(super) fn prime_capture(
         } else {
             fragment_bytes.min(cap)
         };
-        port.dsp.set_small_fragments(
+        backend::configure_capture_buffer(
+            &port.dsp,
             frag,
             ring_request(
                 period_in_bytes,
-                crate::oss::max_buffer_period_bytes(stride, rate, graph_rate),
+                backend::max_buffer_period_bytes(stride, rate, graph_rate),
                 stride,
                 rate,
             ),
@@ -137,7 +125,12 @@ pub(super) fn prime_capture(
     // final now that ready_for_reading has triggered the channel. The
     // ACTUAL grant, not the request - the kernel clamps the ring silently,
     // and the fill geometry must fit reality.
-    let (backlog, fragsize, ring) = port.dsp.ispace_layout();
+    let layout = port.dsp.buffer_layout();
+    let (backlog, fragsize, ring) = (
+        layout.queued_bytes,
+        layout.quantum_bytes,
+        layout.capacity_bytes,
+    );
     if ready {
         let mut backlog = backlog;
         while backlog > 0 {
@@ -147,11 +140,14 @@ pub(super) fn prime_capture(
             if chunk == 0 {
                 break; // a sub-frame tail; it completes into a frame later
             }
-            let n = port.dsp.read(&mut data[..chunk as usize]);
-            if n <= 0 {
+            let outcome = port.dsp.read(&mut data[..chunk as usize]);
+            if outcome.status.device_lost() {
+                port.device_eof = true;
+            }
+            if outcome.bytes == 0 {
                 break;
             }
-            backlog -= n as u32;
+            backlog -= outcome.bytes as u32;
         }
     }
     port.ext.primed = true;
@@ -159,7 +155,7 @@ pub(super) fn prime_capture(
     // the measurement/arrival quantum is the granted fragment or the
     // hardware cadence sndstat reports, whichever is coarser (see the
     // sink); data arrives in these lumps regardless of the soft fragment
-    let chunk = crate::node::ns_to_frame_bytes(port.dsp.hw_quantum_ns, rate, stride);
+    let chunk = ns_to_frame_bytes(port.dsp.delivery_quantum_ns(), rate, stride);
     commit_geometry(port, period_in_bytes, fragsize.max(chunk));
     port.ext.pinned_cycles = 0;
     if port.ext.ring_size > 0

@@ -3,6 +3,7 @@ use std::ffi::c_int;
 
 use nix::errno::Errno;
 
+use crate::backend::{DeviceEvent, WakeEvent};
 use crate::freebsd::{LibcFd, SysctlReader};
 
 // The enriched sound kevent payload landed in main while osreldate was
@@ -13,21 +14,6 @@ const ENRICHED_SOUND_KQUEUE_15_2_OSREL: u32 = 1_502_000;
 const FREEBSD_16_BASE_OSREL: u32 = 1_600_000;
 const ENRICHED_SOUND_KQUEUE_16_OSREL: u32 = 1_600_019;
 const TIMER_IDENT: libc::uintptr_t = 1;
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct DeviceEvent {
-    pub(crate) fd: c_int,
-    pub(crate) available_bytes: u32,
-    pub(crate) ready_frames: u64,
-    pub(crate) xruns: u32,
-    pub(crate) eof: bool,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum WakeEvent {
-    Timer,
-    Device(DeviceEvent),
-}
 
 pub(crate) fn enriched_sound_kqueue_available() -> bool {
     SysctlReader::new()
@@ -249,7 +235,7 @@ fn decode_event(event: libc::kevent) -> Result<Option<WakeEvent>, Errno> {
     Ok(Some(WakeEvent::Device(DeviceEvent {
         fd,
         available_bytes: event.data.max(0).min(u32::MAX as i64) as u32,
-        ready_frames: event.ext[0],
+        queued_frames: Some(event.ext[0]),
         xruns: event.ext[1].min(u32::MAX as u64) as u32,
         eof: event.flags & libc::EV_EOF != 0,
     })))
@@ -270,6 +256,7 @@ fn kevent(ident: libc::uintptr_t, filter: i16, flags: u16, fflags: u32, data: i6
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::test_transport;
 
     #[test]
     fn one_shot_timer_wakes_the_queue() {
@@ -310,7 +297,7 @@ mod tests {
 
     #[test]
     fn device_registration_delivers_through_the_nested_queue() {
-        let (read_fd, write_fd) = crate::oss::test_util::pipe_pair(true, true);
+        let (read_fd, write_fd) = test_transport::pipe_pair(true, true);
         let mut queue = SoundKqueue::new().unwrap();
         queue.register_device(write_fd, true).unwrap();
 
@@ -352,7 +339,7 @@ mod tests {
 
     #[test]
     fn simultaneous_device_and_watchdog_wake_once() {
-        let (read_fd, write_fd) = crate::oss::test_util::pipe_pair(true, true);
+        let (read_fd, write_fd) = test_transport::pipe_pair(true, true);
         let mut queue = SoundKqueue::new().unwrap();
         queue.register_device(write_fd, true).unwrap();
         queue.arm_timer(1).unwrap();
@@ -388,7 +375,7 @@ mod tests {
                 Some(WakeEvent::Device(DeviceEvent {
                     fd: 42,
                     available_bytes: 8192,
-                    ready_frames: 768,
+                    queued_frames: Some(768),
                     xruns: 3,
                     eof: false,
                 }))
@@ -404,7 +391,7 @@ mod tests {
 
     #[test]
     fn unregister_tolerates_a_device_closed_by_teardown() {
-        let (read_fd, write_fd) = crate::oss::test_util::pipe_pair(true, true);
+        let (read_fd, write_fd) = test_transport::pipe_pair(true, true);
         let mut queue = SoundKqueue::new().unwrap();
         queue.register_device(write_fd, true).unwrap();
         unsafe {
@@ -426,7 +413,7 @@ mod tests {
             Some(WakeEvent::Device(DeviceEvent {
                 fd: 42,
                 available_bytes: 8192,
-                ready_frames: 768,
+                queued_frames: Some(768),
                 xruns: 3,
                 eof: true,
             }))

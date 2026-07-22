@@ -13,6 +13,7 @@ pub(crate) fn spa_command_to_str(body: &libspa::sys::spa_pod_object_body) -> &'s
 }
 
 use super::*;
+use crate::spa::SendWrap;
 
 // the io areas set_io accepts, with the geometry a full deref needs
 pub(super) const NODE_IO_AREAS: [(u32, usize, usize); 2] = [
@@ -84,7 +85,7 @@ pub(super) unsafe extern "C" fn set_io<D: Direction>(
 
     // clock/position are read on the data loop; apply the change there.
     // SAFETY: the host keeps the io areas valid while set (set_io contract)
-    let data = unsafe { crate::spa::SendWrap::new(data) };
+    let data = unsafe { SendWrap::new(data) };
     let control = unsafe { DataControl::from_raw(state) };
     let applied = control.invoke(move |state| {
         let data = data.into_inner();
@@ -98,9 +99,7 @@ pub(super) unsafe extern "C" fn set_io<D: Direction>(
                 unsafe { state.clock.set(data) }; // null clears
 
                 // identify our clock so same-device followers can skip rate matching
-                state
-                    .clock
-                    .with(|c| crate::node::set_clock_name(c, &state.clock_name));
+                state.clock.with(|c| set_clock_name(c, &state.clock_name));
             }
             // SAFETY: as above
             SPA_IO_Position => unsafe { state.position.set(data) }, // null clears
@@ -137,7 +136,7 @@ pub(super) fn replace_port_devices<D: Direction>(
 ) -> [D::Device; MAX_PORTS] {
     devices.map(|(index, device)| {
         ports[index].rebuild_pending = false;
-        crate::node::reset_device_event(&mut ports[index]);
+        reset_device_event(&mut ports[index]);
         std::mem::replace(&mut ports[index].dsp, device)
     })
 }
@@ -302,7 +301,7 @@ pub(super) unsafe extern "C" fn send_command<D: Direction>(
                 let devices: [(usize, D::Device); MAX_PORTS] = std::array::from_fn(|index| {
                     let port = &mut state.ports[index];
                     port.rebuild_pending = true;
-                    crate::node::reset_device_event(port);
+                    reset_device_event(port);
                     port.generation = port.generation.wrapping_add(1);
                     state
                         .shared
@@ -382,8 +381,10 @@ pub(super) unsafe extern "C" fn send_command<D: Direction>(
 
 #[cfg(test)]
 mod tests {
+    use super::super::sink::SinkDir;
     use super::*;
-    use crate::node::sink::SinkDir;
+    use crate::backend;
+    use crate::spa::IoArea;
     // an aligned backing store for the admission tests (every io struct's
     // alignment divides 16)
     #[repr(align(16))]
@@ -448,9 +449,9 @@ mod tests {
         Port {
             config: None,
             buffers: vec![],
-            io: crate::spa::IoArea::null(),
-            rate_match: crate::spa::IoArea::null(),
-            dsp: crate::oss::DspWriter::test_on_fd(fd, 8),
+            io: IoArea::null(),
+            rate_match: IoArea::null(),
+            dsp: backend::PlaybackStream::test_on_fd(fd, 8),
             dll: Default::default(),
             setup_period: 0,
             bw_adapt: Default::default(),
@@ -458,7 +459,7 @@ mod tests {
             rebuild_pending: false,
             generation: 0,
             was_matching: false,
-            warn_limit: crate::node::RateLimit::new(),
+            warn_limit: RateLimit::new(),
             pending_xrun: None,
             device_event: None,
             device_eof: false,
@@ -488,19 +489,19 @@ mod tests {
 
     #[test]
     fn extracted_devices_restore_ports_and_clear_pending_claims() {
-        let (old_read, old_write) = crate::oss::test_util::pipe_pair(true, true);
-        let (new_read, new_write) = crate::oss::test_util::pipe_pair(true, true);
+        let (old_read, old_write) = backend::test_transport::pipe_pair(true, true);
+        let (new_read, new_write) = backend::test_transport::pipe_pair(true, true);
         let mut ports = [test_port(old_write)];
         ports[0].rebuild_pending = true;
 
-        let devices = [(0, crate::oss::DspWriter::test_on_fd(new_write, 8))];
+        let devices = [(0, backend::PlaybackStream::test_on_fd(new_write, 8))];
         let mut placeholders = replace_port_devices(&mut ports, devices);
 
         assert!(!ports[0].rebuild_pending);
         assert_eq!(ports[0].dsp.write(&[2; 8]).bytes, 8);
         assert_eq!(placeholders[0].write(&[1; 8]).bytes, 8);
-        assert_eq!(crate::oss::test_util::drain(new_read), [2; 8]);
-        assert_eq!(crate::oss::test_util::drain(old_read), [1; 8]);
+        assert_eq!(backend::test_transport::drain(new_read), [2; 8]);
+        assert_eq!(backend::test_transport::drain(old_read), [1; 8]);
 
         unsafe {
             libc::close(old_read);

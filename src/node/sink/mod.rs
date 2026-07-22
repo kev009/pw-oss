@@ -2,10 +2,21 @@ use std::ffi::c_int;
 
 use libspa::sys::*;
 
-use crate::node::{
-    DataControl, DataState, Direction, MAX_PORTS, MainState, ParamBuild, PortConfig,
+use crate::backend::{
+    self, playback_buffer_request as buffer_request, playback_buffer_required as buffer_required,
+    playback_desired_delay as desired_delay, playback_fill_floor as fill_floor,
+    playback_target_delay as target_delay,
 };
 use crate::platform;
+use crate::spa::{self, Log, process_latency_default};
+
+use super::{
+    DataControl, DataState, Direction, MAX_PORTS, MainState, ParamBuild, Port, PortConfig,
+    RateLimit, apply_props_param, device_event_fill, device_period_bytes, enum_interface_info,
+    get_size, handle_process_latency, init, ns_to_bytes, ns_to_frame_bytes, poll_rebuild,
+    queue_rebuild, reset_device_event, same_clock, store_and_rebuild, take_device_event_xruns,
+    take_fallback_xruns, try_now_ns, valid_data_block,
+};
 
 mod buffer;
 
@@ -35,7 +46,7 @@ impl Default for SinkMainExt {
 pub(crate) struct SinkDataExt {
     pub cur_timestamp: u64, // method invocation timestamp for `process`
     pub old_timestamp: u64,
-    pub playback_delay_eighths: u32, // additional delay in 1/8ths of period
+    pub playback_delay_eighths: u32,
 }
 
 impl Default for SinkDataExt {
@@ -66,19 +77,19 @@ pub(crate) struct SinkPortExt {
     // limiter, because sharing port.warn_limit would let a persistent refusal
     // consume the dropped-bytes/underrun warnings' emission slots and fold
     // unrelated events into their suppressed counts
-    pub retune_limit: crate::node::RateLimit,
+    pub retune_limit: RateLimit,
 }
 
-fn measured_fill(port: &crate::node::Port<SinkDir>) -> u32 {
-    crate::node::device_event_fill(port).unwrap_or_else(|| port.dsp.odelay())
+fn measured_fill(port: &Port<SinkDir>) -> u32 {
+    device_event_fill(port).unwrap_or_else(|| port.dsp.queued_bytes())
 }
 
-fn measured_underruns(port: &mut crate::node::Port<SinkDir>) -> u32 {
-    if let Some(count) = crate::node::take_device_event_xruns(port) {
+fn measured_underruns(port: &mut Port<SinkDir>) -> u32 {
+    if let Some(count) = take_device_event_xruns(port) {
         count
     } else {
         let total = port.dsp.underruns();
-        crate::node::take_fallback_xruns(port, total)
+        take_fallback_xruns(port, total)
     }
 }
 
@@ -110,12 +121,12 @@ fn underrun_low(target_delay: u32, blocksize: u32, period_in_bytes: u32, drained
 }
 
 fn detect_underrun(
-    port: &mut crate::node::Port<SinkDir>,
+    port: &mut Port<SinkDir>,
     period_in_bytes: u32,
     underrun_count: u32,
     cur_timestamp: u64,
     clock_nsec: u64,
-    log: &crate::spa::Log,
+    log: &Log,
 ) {
     let Some((stride, cfg_rate)) = port.stride_rate() else {
         return;
@@ -123,7 +134,7 @@ fn detect_underrun(
     // cached blocksize: the channel can't be retuned while triggered, and
     // the gate must not cost ioctls on healthy cycles
     let elapsed = cur_timestamp.saturating_sub(clock_nsec);
-    let drained = crate::node::ns_to_bytes(elapsed, cfg_rate, stride);
+    let drained = ns_to_bytes(elapsed, cfg_rate, stride);
     let low = underrun_low(
         port.ext.target_delay,
         port.setup_blocksize,
@@ -136,7 +147,7 @@ fn detect_underrun(
             crate::warn!(
                 log,
                 "{}: OSS reported {:3} underruns @ {} (+{} warnings suppressed)",
-                port.dsp.path,
+                port.dsp.path(),
                 underrun_count,
                 cur_timestamp,
                 suppressed
@@ -161,7 +172,7 @@ fn detect_underrun(
         crate::debug!(
             log,
             "{}: {} underrun counts ignored (fill {} >= {})",
-            port.dsp.path,
+            port.dsp.path(),
             underrun_count,
             odelay_now,
             low
@@ -179,11 +190,11 @@ fn detect_underrun(
 // unwritten (the skip-buffer hold). Returns the cycle's write result
 // (`size` when held).
 fn recover_or_hold(
-    port: &mut crate::node::Port<SinkDir>,
+    port: &mut Port<SinkDir>,
     clock_nsec: u64,
     clock_flags: u32,
     data: &[u8],
-) -> crate::oss::PlaybackWrite {
+) -> backend::WriteOutcome {
     let size = data.len() as u32;
     if clock_nsec > port.ext.xrun_timestamp && clock_flags & SPA_IO_CLOCK_FLAG_XRUN_RECOVER == 0 {
         port.ext.xrun_timestamp = 0;
@@ -209,7 +220,9 @@ fn recover_or_hold(
         #[cfg(debug_assertions)]
         eprintln!(
             "{}: re-priming with {} bytes of silence (odelay {})",
-            port.dsp.path, refill, odelay
+            port.dsp.path(),
+            refill,
+            odelay
         );
 
         port.dsp.write_silence(refill);
@@ -217,9 +230,9 @@ fn recover_or_hold(
         port.dsp.write(data)
     } else {
         #[cfg(debug_assertions)]
-        eprintln!("{}: skipping buffer @ {}", port.dsp.path, clock_nsec);
+        eprintln!("{}: skipping buffer @ {}", port.dsp.path(), clock_nsec);
 
-        crate::oss::PlaybackWrite::consumed(size as isize)
+        backend::WriteOutcome::consumed(size as usize)
     }
 }
 
@@ -230,12 +243,12 @@ fn recover_or_hold(
 // An empty queue plus a real driver underrun is the fallback for a Pause that
 // found no soft-buffer audio to shadow.
 fn resume_playback(
-    port: &mut crate::node::Port<SinkDir>,
+    port: &mut Port<SinkDir>,
     queued: u32,
     paused_underruns: u32,
     data: &[u8],
-    log: &crate::spa::Log,
-) -> crate::oss::PlaybackWrite {
+    log: &Log,
+) -> backend::WriteOutcome {
     // GETODELAY excludes the hardware buffer, so zero soft fill by itself does
     // not prove playback stopped. Require the driver's underrun count too;
     // otherwise appending real data is the only gap-free choice.
@@ -249,7 +262,7 @@ fn resume_playback(
         crate::info!(
             log,
             "{}: playback queue drained while paused; re-priming",
-            port.dsp.path
+            port.dsp.path()
         );
         port.dsp.write_silence(port.ext.target_delay);
     }
@@ -274,7 +287,7 @@ fn resume_playback(
 // synthetic samples into the queued stream. The target stays at most a quarter
 // period ahead of measured fill, inside the normal DLL band; as real audio
 // accumulates under rate steering, the target follows it to the goal.
-fn settle_target(port: &mut crate::node::Port<SinkDir>, fill: u32, stride: u32) {
+fn settle_target(port: &mut Port<SinkDir>, fill: u32, stride: u32) {
     if port.ext.target_delay >= port.ext.target_goal {
         return;
     }
@@ -289,12 +302,7 @@ fn settle_target(port: &mut crate::node::Port<SinkDir>, fill: u32, stride: u32) 
 // anyway would wind the integrator; ALSA gates the same way). `odelay` is
 // the fill the caller measured this cycle. Returns the rate correction and
 // whether this cycle's buffer must be skipped (overfill drain).
-fn follower_servo(
-    port: &mut crate::node::Port<SinkDir>,
-    odelay: u32,
-    stride: u32,
-    nsec: u64,
-) -> (f64, bool) {
+fn follower_servo(port: &mut Port<SinkDir>, odelay: u32, stride: u32, nsec: u64) -> (f64, bool) {
     let mut corr: f64 = 1.0;
     let mut skip_write = false;
     settle_target(port, odelay, stride);
@@ -325,7 +333,7 @@ fn follower_servo(
     }
 
     #[cfg(debug_assertions)]
-    eprintln!("{}: corr = {}, err = {}", port.dsp.path, corr, err_raw);
+    eprintln!("{}: corr = {}, err = {}", port.dsp.path(), corr, err_raw);
 
     (corr, skip_write)
 }
@@ -335,7 +343,7 @@ fn follower_servo(
 // of inserting silence; correct only later drift around that reachable level.
 // A genuine underrun is the only path that raises it to the geometry floor.
 // Returns whether this cycle's buffer must be skipped (overfill drain).
-fn level_correct(port: &mut crate::node::Port<SinkDir>, odelay: u32) -> bool {
+fn level_correct(port: &mut Port<SinkDir>, odelay: u32) -> bool {
     let err_raw = odelay as f64 - port.ext.target_delay as f64;
     if err_raw < -(port.setup_period as f64) {
         port.dsp
@@ -346,48 +354,10 @@ fn level_correct(port: &mut crate::node::Port<SinkDir>, odelay: u32) -> bool {
     false
 }
 
-// used from the main thread only; returns 0 or -errno with the device closed
-fn try_open_configure(
-    dsp: &mut crate::oss::DspWriter,
-    config: &PortConfig,
-    log: &crate::spa::Log,
-) -> c_int {
-    let Ok(channel_order) = config.oss_channel_order() else {
-        crate::warn!(
-            log,
-            "{}: unsupported channel map: {:?}",
-            dsp.path,
-            config.positions
-        );
-        return -libc::EINVAL;
-    };
-    // a busy or vanished device must fail negotiation, not abort
-    if let Err(err) = dsp.open() {
-        crate::warn!(log, "{}: open: {}", dsp.path, err);
-        return -(err as c_int);
-    }
-    // ditto for a device that won't take the format exactly
-    if let Err(err) = dsp.configure(
-        config.oss_format(),
-        config.channels,
-        config.rate,
-        config.silence_byte(),
-        channel_order,
-    ) {
-        crate::warn!(log, "{}: device rejected {:?}: {}", dsp.path, config, err);
-        dsp.close();
-        return -(err as c_int);
-    }
-    // on direct opens the hardware blocksize is per-session state; re-read it
-    // now that THIS configuration is in effect (vchan/uaudio values are stable)
-    dsp.hw_quantum_ns = crate::oss::drain_quantum_ns(&dsp.path, true);
-    0
-}
-
 // the shared not-ready/consumed exit of the sink cycle: publish NEED_DATA on
 // the port io AND fold it into the returned status - the host prefetches the
 // next buffer only on the return bit
-fn need_data(io: &mut crate::spa::IoArea<spa_io_buffers>, result: &mut c_int) {
+fn need_data(io: &mut spa::IoArea<spa_io_buffers>, result: &mut c_int) {
     io.with(|io| io.status = SPA_STATUS_NEED_DATA as i32);
     *result |= SPA_STATUS_NEED_DATA as i32;
 }
@@ -397,21 +367,21 @@ fn clear_pending_write(ext: &mut SinkPortExt) {
     ext.pending_offset = 0;
 }
 
-fn end_input_sequence(port: &mut crate::node::Port<SinkDir>) {
+fn end_input_sequence(port: &mut Port<SinkDir>) {
     // This buffer will no longer supply a retained suffix. Close any frame
     // that its accepted prefix left open before a different buffer arrives.
     if port.dsp.end_buffer_sequence() {
-        crate::node::reset_device_event(port);
+        reset_device_event(port);
     }
     clear_pending_write(&mut port.ext);
 }
 
-fn release_input(port: &mut crate::node::Port<SinkDir>, result: &mut c_int) {
+fn release_input(port: &mut Port<SinkDir>, result: &mut c_int) {
     end_input_sequence(port);
     need_data(&mut port.io, result);
 }
 
-fn consume_freewheel_input(port: &mut crate::node::Port<SinkDir>) {
+fn consume_freewheel_input(port: &mut Port<SinkDir>) {
     end_input_sequence(port);
     port.io.with(|io| io.status = SPA_STATUS_NEED_DATA as i32);
 }
@@ -427,11 +397,7 @@ fn pending_write_offset(ext: &mut SinkPortExt, buffer_id: u32, size: usize) -> u
     ext.pending_offset as usize
 }
 
-fn prepare_pending_write(
-    port: &mut crate::node::Port<SinkDir>,
-    buffer_id: u32,
-    size: usize,
-) -> usize {
+fn prepare_pending_write(port: &mut Port<SinkDir>, buffer_id: u32, size: usize) -> usize {
     let changed = port.ext.pending_offset != 0
         && (port.ext.pending_buffer != Some(buffer_id) || port.ext.pending_offset as usize > size);
     if changed {
@@ -450,12 +416,9 @@ fn prepare_pending_write(
 fn retain_partial_write(
     ext: &mut SinkPortExt,
     requested: u32,
-    write: crate::oss::PlaybackWrite,
+    write: backend::WriteOutcome,
 ) -> bool {
-    if write.bytes > 0
-        && write.bytes < requested as isize
-        && (write.error.is_none() || write.error == Some(nix::errno::Errno::EAGAIN))
-    {
+    if write.bytes > 0 && write.bytes < requested as usize && write.retryable_partial() {
         ext.pending_offset = ext.pending_offset.saturating_add(write.bytes as u32);
         true
     } else {
@@ -466,10 +429,7 @@ fn retain_partial_write(
 // Once OSS has accepted a prefix, the suffix is part of the same PCM byte
 // sequence. Finish it before any fill correction can skip it or insert
 // synthetic audio between the two pieces.
-fn write_retained_tail(
-    port: &mut crate::node::Port<SinkDir>,
-    data: &[u8],
-) -> Option<crate::oss::PlaybackWrite> {
+fn write_retained_tail(port: &mut Port<SinkDir>, data: &[u8]) -> Option<backend::WriteOutcome> {
     (port.ext.pending_offset != 0).then(|| port.dsp.write(data))
 }
 
@@ -477,8 +437,7 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
     state.ext.old_timestamp = state.ext.cur_timestamp;
     // on a failed clock read reuse the previous stamp (rate limits and the
     // underrun gate degrade for a cycle) rather than abort the data loop
-    state.ext.cur_timestamp =
-        crate::node::try_now_ns(&state.data_system).unwrap_or(state.ext.old_timestamp);
+    state.ext.cur_timestamp = try_now_ns(&state.data_system).unwrap_or(state.ext.old_timestamp);
 
     // Freewheeling: the graph runs faster than realtime, so consume the input
     // without touching the device. The io NEED_DATA + return HAVE_DATA pair
@@ -500,7 +459,7 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
         // Consume any completed background rebuild before the cycle reads the
         // port (it may swap in a fresh device or clear the config); a rebuild
         // still in flight skips the cycle.
-        if crate::node::poll_rebuild(state, port_idx) {
+        if poll_rebuild(state, port_idx) {
             let port = &mut state.ports[port_idx];
             release_input(port, &mut result);
             continue;
@@ -519,7 +478,7 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
             // format; rebuild off-loop instead of tripping the dsp state
             // asserts (the &mut port borrow ends here: queue_rebuild snapshots
             // an owned request and owns the pending claim)
-            crate::node::queue_rebuild(state, port_idx);
+            queue_rebuild(state, port_idx);
             let port = &mut state.ports[port_idx];
             release_input(port, &mut result);
             continue;
@@ -528,7 +487,7 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
         if port.ext.rebuild_after_start {
             // Pause could neither preserve nor reset the old queue. Do not
             // append audio behind unknown contents; replace the device first.
-            let queued = crate::node::queue_rebuild(state, port_idx);
+            let queued = queue_rebuild(state, port_idx);
             let port = &mut state.ports[port_idx];
             if queued {
                 port.ext.rebuild_after_start = false;
@@ -549,8 +508,7 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
         // SAFETY: the host keeps the registered buffer pointers valid until
         // the next port_use_buffers (its contract), and the returned block is
         // used within this cycle only
-        let Some(data_0) = (unsafe { crate::node::valid_data_block(port, buffer_id, &state.log) })
-        else {
+        let Some(data_0) = (unsafe { valid_data_block(port, buffer_id, &state.log) }) else {
             // return status, not just io, so the host refills
             release_input(port, &mut result);
             continue;
@@ -578,7 +536,7 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
             crate::warn!(
                 state.log,
                 "{}: SPA_IO_CLOCK_FLAG_XRUN_RECOVER @ {}",
-                port.dsp.path,
+                port.dsp.path(),
                 state.ext.cur_timestamp
             );
         }
@@ -604,7 +562,7 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
         let matching = state.following
             && !state
                 .position
-                .with_ref(|p| crate::node::same_clock(p, &state.clock_name))
+                .with_ref(|p| same_clock(p, &state.clock_name))
                 .unwrap_or(false);
 
         // the resampler can legitimately hand us a few frames over a quantum; warn
@@ -619,7 +577,7 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
                 crate::warn!(
                     state.log,
                     "{}: chunk size {} exceeds one quantum {}",
-                    port.dsp.path,
+                    port.dsp.path(),
                     input_size,
                     quantum_bytes
                 );
@@ -627,7 +585,7 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
         }
 
         // one graph cycle in device bytes (see node::device_period_bytes)
-        let period_in_bytes = crate::node::device_period_bytes(
+        let period_in_bytes = device_period_bytes(
             driver_clock.target_duration,
             cfg_rate,
             driver_clock.target_rate.denom,
@@ -647,7 +605,7 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
             // the driver refused the trigger stop (dying fd): rebuild off-loop
             // (the &mut port borrow ends here: queue_rebuild snapshots an
             // owned request and owns the pending claim)
-            let pending = crate::node::queue_rebuild(state, port_idx);
+            let pending = queue_rebuild(state, port_idx);
             if pending {
                 let port = &mut state.ports[port_idx];
                 port.was_matching = false; // the gap invalidates matching history
@@ -698,7 +656,7 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
                 crate::debug!(
                     state.log,
                     "{}: {} underruns accrued while paused",
-                    port.dsp.path,
+                    port.dsp.path(),
                     paused_underruns
                 );
             }
@@ -751,13 +709,16 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
 
             if skip_write {
                 // consumed; the device drains toward target meanwhile
-                crate::oss::PlaybackWrite::consumed(size as isize)
+                backend::WriteOutcome::consumed(size as usize)
             } else {
                 port.dsp.write(cycle_data)
             }
         };
         if port.ext.resuming && port.ext.pending_offset != 0 && !write_result.would_block() {
             port.ext.resuming = false;
+        }
+        if write_result.status.device_lost() {
+            port.device_eof = true;
         }
 
         // Rate-match only as a follower on a foreign clock: when driving, the
@@ -779,7 +740,7 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
             crate::debug!(
                 state.log,
                 "{}: playback ring full; retaining {}-byte graph buffer at offset {}",
-                port.dsp.path,
+                port.dsp.path(),
                 input_size,
                 port.ext.pending_offset
             );
@@ -793,7 +754,7 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
             crate::debug!(
                 state.log,
                 "{}: playback accepted {} of {} bytes; retaining {}-byte tail",
-                port.dsp.path,
+                port.dsp.path(),
                 nbytes,
                 size,
                 size - nbytes as u32
@@ -803,20 +764,20 @@ fn process_ports(state: &mut DataState<SinkDir>) -> c_int {
             continue;
         }
 
-        if nbytes < size as isize
+        if nbytes < size as usize
             && let Some(suppressed) = port.warn_limit.check(state.ext.cur_timestamp)
         {
             crate::warn!(
                 state.log,
-                "{}: dropped {} bytes (write returned {}, error {:?}) (+{} warnings suppressed)",
-                port.dsp.path,
+                "{}: dropped {} bytes (write returned {}, status {:?}) (+{} warnings suppressed)",
+                port.dsp.path(),
                 if nbytes > 0 {
                     size - nbytes as u32
                 } else {
                     size
                 },
                 nbytes,
-                write_result.error,
+                write_result.status,
                 suppressed
             );
         }
@@ -836,7 +797,7 @@ impl Direction for SinkDir {
     const READY_STATUS: i32 = SPA_STATUS_NEED_DATA as i32;
     const CMD_WARN_PREFIX: &'static str = "";
 
-    type Device = crate::oss::DspWriter;
+    type Device = backend::PlaybackStream;
     type MainExt = SinkMainExt;
     type DataExt = SinkDataExt;
     type PortExt = SinkPortExt;
@@ -868,20 +829,20 @@ impl Direction for SinkDir {
     fn build_node_param(state: &mut MainState<SinkDir>, id: u32, index: u32) -> ParamBuild {
         #[expect(non_upper_case_globals)]
         let pod = match (id, index) {
-            (SPA_PARAM_PropInfo, 0) => crate::spa::build_latency_offset_prop_info(),
-            (SPA_PARAM_PropInfo, 1) => crate::spa::build_params_prop_info(
+            (SPA_PARAM_PropInfo, 0) => spa::build_latency_offset_prop_info(),
+            (SPA_PARAM_PropInfo, 1) => spa::build_params_prop_info(
                 platform::PLAYBACK_DELAY,
-                "OSS buffer fill target (1/8ths of a period)",
+                "Playback buffer fill target (1/8ths of a period)",
                 state.ext.playback_delay_eighths,
                 1024,
             ),
-            (SPA_PARAM_PropInfo, 2) => crate::spa::build_params_prop_info(
+            (SPA_PARAM_PropInfo, 2) => spa::build_params_prop_info(
                 platform::FRAGMENT,
                 "OSS fragment size (bytes, power of two, 0 = automatic)",
                 state.fragment_bytes,
                 16384,
             ),
-            (SPA_PARAM_Props, 0) => crate::spa::build_latency_offset_props(
+            (SPA_PARAM_Props, 0) => spa::build_latency_offset_props(
                 state.process_latency.ns,
                 &[
                     (platform::PLAYBACK_DELAY, state.ext.playback_delay_eighths),
@@ -889,7 +850,7 @@ impl Direction for SinkDir {
                 ],
             ),
             (SPA_PARAM_ProcessLatency, 0) => {
-                crate::spa::build_process_latency_info(&state.process_latency)
+                spa::build_process_latency_info(&state.process_latency)
             }
             (SPA_PARAM_PropInfo | SPA_PARAM_Props | SPA_PARAM_ProcessLatency, _) => {
                 return ParamBuild::Exhausted;
@@ -901,22 +862,22 @@ impl Direction for SinkDir {
 
     // a NULL Props pod resets the props to their defaults and re-applies them
     fn reset_props(state: &mut MainState<SinkDir>, data: &DataControl<SinkDir>) -> c_int {
-        let delay = state.ext.playback_delay_eighths_default;
-        let fragment = state.fragment_bytes_default;
-        let old_delay = state.ext.playback_delay_eighths;
-        let old_fragment = state.fragment_bytes;
-        state.ext.playback_delay_eighths = delay;
-        state.fragment_bytes = fragment;
-        let res = crate::node::store_and_rebuild(state, data, move |state| {
-            state.ext.playback_delay_eighths = delay;
-            state.fragment_bytes = fragment;
+        let delay_eighths = state.ext.playback_delay_eighths_default;
+        let fragment_bytes = state.fragment_bytes_default;
+        let old_delay_eighths = state.ext.playback_delay_eighths;
+        let old_fragment_bytes = state.fragment_bytes;
+        state.ext.playback_delay_eighths = delay_eighths;
+        state.fragment_bytes = fragment_bytes;
+        let res = store_and_rebuild(state, data, move |state| {
+            state.ext.playback_delay_eighths = delay_eighths;
+            state.fragment_bytes = fragment_bytes;
         });
         if res != 0 {
-            state.ext.playback_delay_eighths = old_delay;
-            state.fragment_bytes = old_fragment;
+            state.ext.playback_delay_eighths = old_delay_eighths;
+            state.fragment_bytes = old_fragment_bytes;
             return res;
         }
-        crate::node::handle_process_latency(state, crate::spa::process_latency_default());
+        handle_process_latency(state, process_latency_default());
         0
     }
 
@@ -932,7 +893,7 @@ impl Direction for SinkDir {
         }
         let old_delay_eighths = state.ext.playback_delay_eighths;
         state.ext.playback_delay_eighths = new_delay_eighths;
-        let res = crate::node::apply_props_param(state, data, move |state| {
+        let res = apply_props_param(state, data, move |state| {
             state.ext.playback_delay_eighths = new_delay_eighths;
         });
         if res != 0 {
@@ -942,18 +903,18 @@ impl Direction for SinkDir {
     }
 
     fn try_open_configure(
-        dsp: &mut crate::oss::DspWriter,
+        stream: &mut backend::PlaybackStream,
         config: &PortConfig,
-        _fragment: u32,
-        log: &crate::spa::Log,
-    ) -> c_int {
+        _fragment_bytes: u32,
+        log: &Log,
+    ) -> Result<backend::ConfigureOutcome, c_int> {
         // the sink's SETFRAGMENT happens at prime time (process_ports), where
         // the graph period the layout depends on is known
-        try_open_configure(dsp, config, log)
+        backend::configure_playback(stream, config, log)
     }
 
     fn on_device_swapped(state: &mut DataState<SinkDir>, port_idx: usize) {
-        crate::node::reset_device_event(&mut state.ports[port_idx]);
+        reset_device_event(&mut state.ports[port_idx]);
         let ext = &mut state.ports[port_idx].ext;
         ext.xrun_timestamp = 0;
         ext.resuming = false;
@@ -964,7 +925,7 @@ impl Direction for SinkDir {
     fn on_buffers_swapped(state: &mut DataState<SinkDir>, port_idx: usize) {
         let port = &mut state.ports[port_idx];
         if port.dsp.end_buffer_sequence() {
-            crate::node::reset_device_event(port);
+            reset_device_event(port);
         }
         clear_pending_write(&mut port.ext);
     }
@@ -981,7 +942,7 @@ impl Direction for SinkDir {
                 crate::warn!(
                     state.log,
                     "{}: restoring paused playback: {}",
-                    port.dsp.path,
+                    port.dsp.path(),
                     err
                 );
                 // Do not append real audio behind a possibly full buffer
@@ -990,7 +951,7 @@ impl Direction for SinkDir {
                 // before process() may write again.
                 resume_running = false;
                 if port.dsp.suspend() {
-                    crate::node::reset_device_event(port);
+                    reset_device_event(port);
                 } else {
                     port.ext.rebuild_after_start = true;
                 }
@@ -1018,14 +979,14 @@ impl Direction for SinkDir {
                 crate::warn!(
                     state.log,
                     "{}: preserving playback for Pause: {}",
-                    port.dsp.path,
+                    port.dsp.path(),
                     err
                 );
                 // A failed SILENCE cannot provide pause semantics. Reset the
                 // ring so Start primes cleanly; if the device also refuses
                 // that, force replacement before another playback write.
                 if port.dsp.suspend() {
-                    crate::node::reset_device_event(port);
+                    reset_device_event(port);
                 } else {
                     port.ext.rebuild_after_start = true;
                 }
@@ -1064,7 +1025,7 @@ impl Direction for SinkDir {
         }
     }
 
-    fn servo_ready(_port: &crate::node::Port<SinkDir>) -> bool {
+    fn servo_ready(_port: &Port<SinkDir>) -> bool {
         true
     }
 
@@ -1072,22 +1033,22 @@ impl Direction for SinkDir {
     // pre-fills the hardware buffer at trigger and never counts it - so the
     // absolute delay is understated by bufhard; the servo only needs
     // cycle-to-cycle consistency and is unaffected.
-    fn servo_fill(port: &mut crate::node::Port<SinkDir>) -> u32 {
+    fn servo_fill(port: &mut Port<SinkDir>) -> u32 {
         let fill = measured_fill(port);
         let stride = port.stride_rate().map(|(stride, _)| stride).unwrap_or(1);
         settle_target(port, fill, stride);
         fill
     }
 
-    fn servo_hold(port: &crate::node::Port<SinkDir>) -> bool {
+    fn servo_hold(port: &Port<SinkDir>) -> bool {
         port.ext.xrun_timestamp != 0
     }
 
-    fn servo_err(port: &crate::node::Port<SinkDir>, fill: u32) -> f64 {
+    fn servo_err(port: &Port<SinkDir>, fill: u32) -> f64 {
         fill as f64 - port.ext.target_delay as f64
     }
 
-    fn wake_threshold(port: &crate::node::Port<SinkDir>) -> u32 {
+    fn wake_threshold(port: &Port<SinkDir>) -> u32 {
         // EVFILT_WRITE fires when free >= LOW_WATER. A healthy cycle wakes
         // with target_delay queued, writes one period, then goes inactive
         // until that period drains and the queue returns to the live target.
@@ -1112,9 +1073,9 @@ pub(crate) const OSS_SINK_FACTORY: spa_handle_factory = spa_handle_factory {
     version: SPA_VERSION_HANDLE_FACTORY,
     name: platform::SINK_FACTORY_NAME.as_ptr(),
     info: &OSS_SINK_FACTORY_INFO,
-    get_size: Some(crate::node::get_size::<SinkDir>),
-    init: Some(crate::node::init::<SinkDir>),
-    enum_interface_info: Some(crate::node::enum_interface_info),
+    get_size: Some(get_size::<SinkDir>),
+    init: Some(init::<SinkDir>),
+    enum_interface_info: Some(enum_interface_info),
 };
 
 // mut: the host logger writes level/has_custom_level back after registration

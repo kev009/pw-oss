@@ -2,66 +2,10 @@ use nix::errno::Errno;
 use std::collections::BTreeMap;
 use std::ffi::{CString, c_int, c_ulong, c_void};
 
-use crate::freebsd::{LibcFd, ioctl_int, ioctl_value, ioctl_zeroed};
+use crate::backend::{ConversionKind, StreamCaps, StreamConfiguration};
+use crate::freebsd::{LibcFd, NvList, NvRef, SysctlReader, ioctl_int, ioctl_value, ioctl_zeroed};
 
 use super::abi::*;
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct DspCaps {
-    pub formats: u32, // AFMT_* mask
-    pub min_channels: u32,
-    pub max_channels: u32,
-    pub min_rate: u32,
-    pub max_rate: u32,
-    pub preferred_rate: Option<u32>, // the parent's vchan mix rate, when known
-    pub rates: Vec<u32>,             // discrete native rates (exclusive devices); empty = the range
-    pub convertless: bool,           // bitperfect: no feeder, only native values negotiate
-}
-
-impl DspCaps {
-    // Used when the device can't be probed (e.g. busy): conservative geometry
-    // plus the PCM formats available through the FreeBSD feeder.
-    pub(crate) fn fallback() -> Self {
-        Self {
-            formats: AFMT_U8
-                | AFMT_S16_LE
-                | AFMT_S16_BE
-                | AFMT_S24_LE
-                | AFMT_S24_BE
-                | AFMT_S32_LE
-                | AFMT_S32_BE
-                | AFMT_F32_LE
-                | AFMT_F32_BE,
-            min_channels: 1,
-            max_channels: 2,
-            min_rate: 8000,
-            max_rate: 192000,
-            preferred_rate: None,
-            rates: vec![],
-            convertless: false,
-        }
-    }
-
-    // Lenient admission check for a host-requested format: rejects only clear
-    // violations of the advertised caps (staleness is handled by the caller's
-    // configure backstop). Rates within the feeder snap window pass.
-    pub(crate) fn admits(&self, oss_format: u32, channels: u32, rate: u32) -> bool {
-        // format only matters where no feeder converts (bitperfect): a
-        // non-native SETFMT there snaps and fails the strict grant check -
-        // after the EBUSY retire already killed the working fd
-        if self.convertless && self.formats & oss_format == 0 {
-            return false;
-        }
-        if channels < self.min_channels || channels > self.max_channels {
-            return false;
-        }
-        if !self.rates.is_empty() {
-            return self.rates.contains(&rate);
-        }
-        let slack = feeder_rate_round();
-        rate.saturating_add(slack) >= self.min_rate && rate <= self.max_rate.saturating_add(slack)
-    }
-}
 
 // Ask the device what it actually supports. Two sources, merged:
 // - empirical SETCHANNELS/SPEED probes at the extremes (OSS grants the nearest
@@ -94,7 +38,7 @@ pub(crate) struct SndstatDspInfo {
 }
 
 // one packed snapshot of every sound device from sndstat(4)
-fn sndstat_snapshot() -> Option<crate::freebsd::NvList> {
+fn sndstat_snapshot() -> Option<NvList> {
     let fd = LibcFd::open(c"/dev/sndstat", libc::O_RDONLY)?;
     let raw_fd = fd.raw();
 
@@ -123,7 +67,7 @@ fn sndstat_snapshot() -> Option<crate::freebsd::NvList> {
         buf = vec![0; arg.nbytes];
     }
 
-    crate::freebsd::NvList::unpack(&buf)
+    NvList::unpack(&buf)
 }
 
 // pcm unit numbers plus per-direction channel presence; user-registered
@@ -162,7 +106,7 @@ pub(crate) fn sndstat_dsp_info(devnode: &str, play: bool) -> Option<SndstatDspIn
         }
         // absent for a direction with no channels
         let info = dev.nvlist(if play { c"info_play" } else { c"info_rec" })?;
-        let num = |r: crate::freebsd::NvRef, k: &std::ffi::CStr| r.number(k).unwrap_or(0) as u32;
+        let num = |r: NvRef, k: &std::ffi::CStr| r.number(k).unwrap_or(0) as u32;
 
         let (mut exclusive, mut vchan_rate, mut bitperfect) = (None, 0, false);
         if let Some(p) = dev.nvlist(c"provider_info") {
@@ -194,16 +138,24 @@ pub(crate) fn sndstat_dsp_info(devnode: &str, play: bool) -> Option<SndstatDspIn
     None
 }
 
-fn caps_from_sndstat(nv: &SndstatDspInfo, rates: Vec<u32>) -> DspCaps {
-    DspCaps {
-        formats: nv.formats,
-        min_channels: nv.min_chn.max(1),
-        max_channels: nv.max_chn.max(nv.min_chn).max(1),
-        min_rate: nv.min_rate.max(1),
-        max_rate: nv.max_rate.max(nv.min_rate).max(1),
-        preferred_rate: None, // the native values are the preference
-        rates,
-        convertless: nv.bitperfect,
+fn caps_from_sndstat(nv: &SndstatDspInfo, rates: Vec<u32>) -> StreamCaps {
+    StreamCaps {
+        configurations: vec![StreamConfiguration {
+            formats: super::backend::formats_from_native_mask(nv.formats, nv.bitperfect),
+            min_channels: nv.min_chn.max(1),
+            max_channels: nv.max_chn.max(nv.min_chn).max(1),
+            min_rate: nv.min_rate.max(1),
+            max_rate: nv.max_rate.max(nv.min_rate).max(1),
+            preferred_rate: None, // the native values are the preference
+            rates,
+            rate_tolerance: feeder_rate_round(),
+        }],
+        preferred: 0,
+        conversion: if nv.bitperfect {
+            ConversionKind::None
+        } else {
+            ConversionKind::Backend
+        },
     }
 }
 
@@ -234,7 +186,7 @@ fn native_rates(path: &str, play: bool) -> Vec<u32> {
     rates
 }
 
-pub(crate) fn probe_caps(path: &str, play: bool) -> Option<DspCaps> {
+pub(crate) fn probe_caps(path: &str, play: bool) -> Option<StreamCaps> {
     let native = sndstat_dsp_info(path.trim_start_matches("/dev/"), play);
 
     // An exclusive channel (bitperfect or vchans off) negotiates the native
@@ -319,15 +271,19 @@ pub(crate) fn probe_caps(path: &str, play: bool) -> Option<DspCaps> {
         .map(|nv| nv.vchan_rate)
         .filter(|r| *r != 0 && (min_rate as u32..=max_rate as u32).contains(r));
 
-    Some(DspCaps {
-        formats: formats as u32,
-        min_channels: min_channels as u32,
-        max_channels: max_channels as u32,
-        min_rate: min_rate as u32,
-        max_rate: max_rate as u32,
-        preferred_rate,
-        rates: vec![], // the feeder converts; the range really is dense
-        convertless: false,
+    Some(StreamCaps {
+        configurations: vec![StreamConfiguration {
+            formats: super::backend::formats_from_native_mask(formats as u32, false),
+            min_channels: min_channels as u32,
+            max_channels: max_channels as u32,
+            min_rate: min_rate as u32,
+            max_rate: max_rate as u32,
+            preferred_rate,
+            rates: vec![], // the feeder converts; the range really is dense
+            rate_tolerance: feeder_rate_round(),
+        }],
+        preferred: 0,
+        conversion: ConversionKind::Backend,
     })
 }
 // The device's real drain quantum, as TIME: the hardware buffer blocksize of
@@ -389,10 +345,7 @@ pub(crate) struct PcmDevice {
     pub rec: bool,
 }
 
-pub(crate) fn read_pcm_device_description(
-    sysctl: &mut crate::freebsd::SysctlReader,
-    index: u32,
-) -> Option<String> {
+pub(crate) fn read_pcm_device_description(sysctl: &mut SysctlReader, index: u32) -> Option<String> {
     let parent = sysctl
         .read_string(format!("dev.pcm.{index}.%parent"), 1024)
         .ok()?; // the device can detach mid-enumeration
@@ -418,7 +371,7 @@ pub(crate) fn read_pcm_device_description(
 }
 
 pub(crate) fn group_pcm_devices_by_parent(indexes: &[u32]) -> BTreeMap<String, Vec<u32>> {
-    let mut sysctl = crate::freebsd::SysctlReader::new();
+    let mut sysctl = SysctlReader::new();
     let mut indexes_by_parent: BTreeMap<String, Vec<u32>> = BTreeMap::new();
     for index in indexes {
         if let Ok(parent) = sysctl.read_string(format!("dev.pcm.{index}.%parent"), 1024) {
@@ -431,7 +384,7 @@ pub(crate) fn group_pcm_devices_by_parent(indexes: &[u32]) -> BTreeMap<String, V
 
 pub(crate) fn list_pcm_devices(indexes: &[u32]) -> Vec<PcmDevice> {
     let mut result = Vec::with_capacity(indexes.len());
-    let mut sysctl = crate::freebsd::SysctlReader::new();
+    let mut sysctl = SysctlReader::new();
     // Direction support from the nvlist channel counts (vchans on or off);
     // dev.pcm.N.mode (1 = mixer, 2 = play, 4 = rec) only covers a transient
     // nvlist failure.

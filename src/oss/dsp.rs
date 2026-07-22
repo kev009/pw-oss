@@ -2,15 +2,37 @@ use libc::{size_t, ssize_t};
 use nix::errno::Errno;
 use std::ffi::{CString, c_int};
 
-use crate::freebsd::{LibcFd, ioctl_int, ioctl_read};
+use crate::{
+    backend::{BufferLayout, IoStatus, ReadOutcome, WriteOutcome},
+    freebsd::{LibcFd, ioctl_int, ioctl_read},
+};
 
 use super::abi::*;
 use super::buffer::{MAX_BUFFER_BYTES, MIN_BUFFER_BYTES};
 use super::devices::drain_quantum_ns;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct AppliedNativeConfig {
+    pub(super) format: u32,
+    pub(super) channels: u32,
+    pub(super) rate: u32,
+}
+
+fn io_status(error: Errno) -> IoStatus {
+    if error == Errno::EAGAIN || error == Errno::EWOULDBLOCK {
+        IoStatus::WouldBlock
+    } else {
+        match error {
+            Errno::EINTR => IoStatus::Interrupted,
+            Errno::EBADF | Errno::ENODEV | Errno::ENXIO | Errno::EPIPE => IoStatus::Disconnected,
+            _ => IoStatus::Failed,
+        }
+    }
+}
+
 pub(crate) struct Dsp {
     path: CString,
-    pub hw_quantum_ns: u64, // the hardware drain quantum (sndstat); 0 = fragment-accurate
+    hw_quantum_ns: u64, // the hardware drain quantum (sndstat); 0 = fragment-accurate
     fd: Option<LibcFd>,
     state: DspState,
     needs_trigger: bool, // trigger-suspended: NOTRIGGER must be cleared on restart
@@ -39,6 +61,10 @@ impl Dsp {
         self.path.to_str().unwrap_or("") // constructed from &str; always valid
     }
 
+    pub(crate) fn delivery_quantum_ns(&self) -> u64 {
+        self.hw_quantum_ns
+    }
+
     // on direct opens the hardware blocksize is per-session state; call after
     // configure so the snapshot reflects THIS session (see drain_quantum_ns)
     pub(crate) fn refresh_hw_quantum(&mut self) {
@@ -62,7 +88,7 @@ impl Dsp {
         self.fd.as_ref().map(LibcFd::raw)
     }
 
-    pub(crate) fn set_low_water(&self, bytes: u32) -> bool {
+    pub(crate) fn configure_wake_threshold(&self, bytes: u32) -> bool {
         self.fd.as_ref().is_some_and(|fd| {
             ioctl_int(
                 fd.raw(),
@@ -99,24 +125,29 @@ impl Dsp {
         self.skip = 0;
     }
 
-    pub(crate) fn configure(
+    pub(super) fn configure(
         &mut self,
         format: u32,
         channels: u32,
         rate: u32,
         channel_order: Option<u64>,
-    ) -> Result<(), Errno> {
+    ) -> Result<AppliedNativeConfig, Errno> {
         assert_eq!(self.state, DspState::Setup);
         // plain AFMT selector (no channel field), so this yields the sample width
         self.stride = afmt_frame_bytes(format)
             .max(1)
             .saturating_mul(channels.max(1));
-        set_value(self.raw_fd(), SNDCTL_DSP_SETFMT, format, 0)?;
-        set_value(self.raw_fd(), SNDCTL_DSP_CHANNELS, channels, 0)?;
+        let format = set_value(self.raw_fd(), SNDCTL_DSP_SETFMT, format, 0)?;
+        let channels = set_value(self.raw_fd(), SNDCTL_DSP_CHANNELS, channels, 0)?;
         if let Some(order) = channel_order {
             set_channel_order(self.raw_fd(), order)?;
         }
-        set_value(self.raw_fd(), SNDCTL_DSP_SPEED, rate, feeder_rate_round())
+        let rate = set_value(self.raw_fd(), SNDCTL_DSP_SPEED, rate, feeder_rate_round())?;
+        Ok(AppliedNativeConfig {
+            format,
+            channels,
+            rate,
+        })
     }
 
     // Size the capture ring into small fragments and make poll byte-accurate.
@@ -132,15 +163,14 @@ impl Dsp {
         if self.state != DspState::Setup {
             return; // triggered channels can't retune; the next re-prime will
         }
-        // max-then-min, not clamp: the kernel cap must win over the floor (and
-        // clamp panics if a future rate-dependent cap undercuts MIN_BUFFER_BYTES)
+        // max-then-min, not clamp: the kernel cap must win over the floor.
         let ring = ring.max(MIN_BUFFER_BYTES).min(MAX_BUFFER_BYTES as u32);
         if fragment == 0 {
             set_fragment(self.raw_fd(), (ring >> 10).min(u16::MAX as u32) as u16, 10);
         // 1 KiB fragments
         } else {
-            // fragment is normalized to a power of two in [64, 16384], so the
-            // selector stays inside the kernel's
+            // fragment is normalized by the backend to a power of two in
+            // [64, 16384], so the selector stays inside the kernel's
             // RANGE(fragln, 4, 16) (dsp.c:1251) and the count never drops under
             // the kernel minimum of 2 (dsp.c:1256)
             let count = (ring >> fragment.trailing_zeros()).max(2u32);
@@ -178,7 +208,7 @@ impl Dsp {
     /// returns short mid-frame (signals), the torn frame's tail is discarded on
     /// the next call and its consumed head hidden from this one - one frame
     /// dropped, alignment kept. Returns a frame-aligned count.
-    pub(crate) fn read(&mut self, buf: &mut [u8]) -> ssize_t {
+    pub(crate) fn read(&mut self, buf: &mut [u8]) -> ReadOutcome {
         if self.state == DspState::Setup {
             self.state = DspState::Running;
         }
@@ -193,20 +223,40 @@ impl Dsp {
                 )
             };
             if n <= 0 {
-                return n; // capture is running when reads happen; treat as the caller's error
+                return ReadOutcome {
+                    bytes: 0,
+                    status: if n < 0 {
+                        io_status(Errno::last())
+                    } else {
+                        IoStatus::Disconnected
+                    },
+                };
             }
             self.skip -= n as u32;
         }
         let n = unsafe { libc::read(self.raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
         if n <= 0 {
-            return n;
+            return ReadOutcome {
+                bytes: 0,
+                status: if n < 0 {
+                    io_status(Errno::last())
+                } else {
+                    IoStatus::Disconnected
+                },
+            };
         }
         let rem = n as usize % self.stride.max(1) as usize;
         if rem != 0 {
             self.skip = self.stride - rem as u32;
-            return (n as usize - rem) as ssize_t; // hide the torn frame's head
+            return ReadOutcome {
+                bytes: n as usize - rem,
+                status: IoStatus::Progress,
+            }; // hide the torn frame's head
         }
-        n
+        ReadOutcome {
+            bytes: n as usize,
+            status: IoStatus::Progress,
+        }
     }
 
     pub(crate) fn ready_for_reading(&mut self, timeout_ms: usize) -> bool {
@@ -237,28 +287,29 @@ impl Dsp {
         n > 0 && (pfd.revents & libc::POLLIN) != 0
     }
 
-    pub(crate) fn ispace_in_bytes(&self) -> c_int {
+    pub(crate) fn queued_bytes(&self) -> u32 {
         assert_eq!(self.state, DspState::Running);
         unsafe { ioctl_read::<audio_buf_info>(self.raw_fd(), SNDCTL_DSP_GETISPACE) }
-            .map_or(0, |info| info.bytes)
+            .map_or(0, |info| info.bytes.max(0) as u32)
     }
 
     // fill, granted fragment and total ring from ONE GETISPACE: the prime path
     // needs all three and they come from the same struct (fragsize/fragstotal
     // are layout constants after SETFRAGMENT; only `bytes` moves). (0, 0, 0) =
     // ioctl failed (e.g. device unplugged mid-stream).
-    pub(crate) fn ispace_layout(&mut self) -> (u32, u32, u32) {
+    pub(crate) fn buffer_layout(&mut self) -> BufferLayout {
         assert_eq!(self.state, DspState::Running);
         let Some(info) =
             (unsafe { ioctl_read::<audio_buf_info>(self.raw_fd(), SNDCTL_DSP_GETISPACE) })
         else {
-            return (0, 0, 0);
+            return BufferLayout::default();
         };
-        (
-            info.bytes.max(0) as u32,
-            info.fragsize.max(0) as u32,
-            (info.fragstotal.max(0) as u32).saturating_mul(info.fragsize.max(0) as u32),
-        )
+        BufferLayout {
+            queued_bytes: info.bytes.max(0) as u32,
+            quantum_bytes: info.fragsize.max(0) as u32,
+            capacity_bytes: (info.fragstotal.max(0) as u32)
+                .saturating_mul(info.fragsize.max(0) as u32),
+        }
     }
 
     pub(crate) fn overruns(&self) -> u32 {
@@ -304,26 +355,15 @@ fn now_ns_libc() -> u64 {
     (now.tv_sec * libspa::sys::SPA_NSEC_PER_SEC as i64 + now.tv_nsec) as u64
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct PlaybackWrite {
-    pub bytes: ssize_t,
-    pub error: Option<Errno>,
-}
-
-impl PlaybackWrite {
-    pub(crate) fn consumed(bytes: ssize_t) -> Self {
-        Self { bytes, error: None }
-    }
-
-    pub(crate) fn would_block(&self) -> bool {
-        (self.bytes < 0 && self.error == Some(Errno::EAGAIN))
-            || (self.bytes == 0 && (self.error.is_none() || self.error == Some(Errno::EAGAIN)))
-    }
+#[derive(Clone, Copy)]
+struct NativeWrite {
+    bytes: ssize_t,
+    error: Option<Errno>,
 }
 
 pub(crate) struct DspWriter {
-    pub path: String,
-    pub hw_quantum_ns: u64, // the hardware drain quantum (sndstat); 0 = fragment-accurate
+    path: String,
+    hw_quantum_ns: u64, // the hardware drain quantum (sndstat); 0 = fragment-accurate
     fd: Option<LibcFd>,
     state: DspState,
     needs_trigger: bool,  // trigger-suspended: writes buffer until armed
@@ -359,6 +399,18 @@ impl DspWriter {
         self.state == DspState::Closed
     }
 
+    pub(crate) fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub(crate) fn delivery_quantum_ns(&self) -> u64 {
+        self.hw_quantum_ns
+    }
+
+    pub(crate) fn refresh_delivery_quantum(&mut self) {
+        self.hw_quantum_ns = drain_quantum_ns(&self.path, true);
+    }
+
     pub(crate) fn is_running(&self) -> bool {
         self.state == DspState::Running
     }
@@ -374,7 +426,7 @@ impl DspWriter {
         self.fd.as_ref().map(LibcFd::raw)
     }
 
-    pub(crate) fn set_low_water(&self, bytes: u32) -> bool {
+    pub(crate) fn configure_wake_threshold(&self, bytes: u32) -> bool {
         self.fd.as_ref().is_some_and(|fd| {
             ioctl_int(
                 fd.raw(),
@@ -493,37 +545,42 @@ impl DspWriter {
         }
     }
 
-    pub(crate) fn configure(
+    pub(super) fn configure(
         &mut self,
         format: u32,
         channels: u32,
         rate: u32,
         silence_byte: u8,
         channel_order: Option<u64>,
-    ) -> Result<(), Errno> {
+    ) -> Result<AppliedNativeConfig, Errno> {
         assert_eq!(self.state, DspState::Setup);
         // plain AFMT selector (no channel field), so this yields the sample width
         self.stride = afmt_frame_bytes(format)
             .max(1)
             .saturating_mul(channels.max(1));
         self.silence_byte = silence_byte;
-        set_value(self.raw_fd(), SNDCTL_DSP_SETFMT, format, 0)?;
-        set_value(self.raw_fd(), SNDCTL_DSP_CHANNELS, channels, 0)?;
+        let format = set_value(self.raw_fd(), SNDCTL_DSP_SETFMT, format, 0)?;
+        let channels = set_value(self.raw_fd(), SNDCTL_DSP_CHANNELS, channels, 0)?;
         if let Some(order) = channel_order {
             set_channel_order(self.raw_fd(), order)?;
         }
-        set_value(self.raw_fd(), SNDCTL_DSP_SPEED, rate, feeder_rate_round())
+        let rate = set_value(self.raw_fd(), SNDCTL_DSP_SPEED, rate, feeder_rate_round())?;
+        Ok(AppliedNativeConfig {
+            format,
+            channels,
+            rate,
+        })
     }
 
-    /// Request a `len`-byte output buffer and return the size the device granted.
+    /// Request a `len`-byte output buffer and return the applied geometry.
     /// FreeBSD clamps the fragment count, so the grant can be much smaller than
     /// requested; size the target delay to the return value, not `len`.
     /// `fragment` is the normalized oss.fragment override (0 = 1 KiB default).
-    /// Returns 0 when the grant can't be read back (the device vanished): the
-    /// caller caches this value across period changes, and a fictitious
-    /// capacity would gate quantum changes onto the in-place retune path
-    /// forever with a fill target the real ring can't hold.
-    pub(crate) fn set_buffer_size(&self, len: u32, fragment: u32) -> u32 {
+    /// The returned capacity and quantum are zero when their readback fails
+    /// (for example, after detach). The caller caches the capacity across
+    /// period changes, so a fictitious value would gate later changes onto an
+    /// in-place retune path with a fill target the real ring cannot hold.
+    pub(crate) fn set_buffer_size(&self, len: u32, fragment: u32) -> BufferLayout {
         assert_eq!(self.state, DspState::Setup);
         if fragment == 0 {
             // the fragment count field is 16 bits; an extreme oss.delay x quantum
@@ -534,8 +591,8 @@ impl DspWriter {
                 10,
             );
         } else {
-            // fragment is normalized to a power of two in [64, 16384], keeping
-            // the selector inside the kernel's
+            // fragment is normalized by the backend to a power of two in
+            // [64, 16384], keeping the selector inside the kernel's
             // RANGE(fragln, 4, 16) (dsp.c:1251); the count clamp mirrors the
             // kernel's own bounds (min 2, total <= MAX_BUFFER_BYTES, dsp.c:1256-1259)
             let count = len
@@ -548,7 +605,11 @@ impl DspWriter {
             );
         }
         // nothing's written yet, so GETOSPACE reports the granted buffer size
-        ospace_in_bytes(self.raw_fd()).max(0) as u32
+        BufferLayout {
+            queued_bytes: 0,
+            quantum_bytes: blocksize(self.raw_fd()).max(0) as u32,
+            capacity_bytes: ospace_in_bytes(self.raw_fd()).max(0) as u32,
+        }
     }
 
     /// Write `count` bytes, keeping the device byte stream frame-aligned. The
@@ -561,7 +622,7 @@ impl DspWriter {
     /// bytes accepted from this slice and preserves errno at the write(2)
     /// boundary, before debug diagnostics can issue more ioctls. Callers retain
     /// the unaccepted suffix and pass it back on the next call.
-    pub(crate) fn write(&mut self, buf: &[u8]) -> PlaybackWrite {
+    pub(crate) fn write(&mut self, buf: &[u8]) -> WriteOutcome {
         let count = buf.len() as u32;
         if self.state == DspState::Setup {
             self.state = DspState::Running;
@@ -605,9 +666,17 @@ impl DspWriter {
 
         // a trigger-suspended channel starts once real data is buffered
         self.arm();
-        PlaybackWrite {
-            bytes: done as ssize_t,
-            error: if done < count { error } else { None },
+        WriteOutcome {
+            bytes: done as usize,
+            status: if done == 0 && error.is_none() {
+                IoStatus::WouldBlock
+            } else if done < count
+                && let Some(error) = error
+            {
+                io_status(error)
+            } else {
+                IoStatus::Progress
+            },
         }
     }
 
@@ -652,7 +721,7 @@ impl DspWriter {
     // briefly: at audio rates the ring frees a byte every few microseconds, so
     // the tail fits well inside the retry budget - unless the channel is
     // trigger-suspended and nothing drains, where waiting is pointless.
-    fn write_exact(&mut self, buf: &[u8]) -> PlaybackWrite {
+    fn write_exact(&mut self, buf: &[u8]) -> NativeWrite {
         let count = buf.len() as u32;
         let mut done = 0u32;
         let mut tries = 0;
@@ -682,13 +751,13 @@ impl DspWriter {
             };
             unsafe { libc::nanosleep(&ts, std::ptr::null_mut()) };
         }
-        PlaybackWrite {
+        NativeWrite {
             bytes: done as ssize_t,
             error: if done < count { error } else { None },
         }
     }
 
-    fn write_buffered(&mut self, buf: &[u8]) -> PlaybackWrite {
+    fn write_buffered(&mut self, buf: &[u8]) -> NativeWrite {
         let count = buf.len() as u32;
         if self.state == DspState::Setup {
             self.state = DspState::Running;
@@ -726,7 +795,7 @@ impl DspWriter {
             self.prev_ns = now;
         }
 
-        PlaybackWrite {
+        NativeWrite {
             bytes: nbytes,
             error,
         }
@@ -770,17 +839,13 @@ impl DspWriter {
         }
     }
 
-    pub(crate) fn odelay(&self) -> u32 {
+    pub(crate) fn queued_bytes(&self) -> u32 {
         assert_eq!(self.state, DspState::Running);
         odelay(self.raw_fd()).max(0) as u32
     }
 
     /// The fragment size the driver actually granted (may differ from what
     /// SETFRAGMENT asked for; some drivers force a fixed period).
-    pub(crate) fn blocksize(&self) -> u32 {
-        blocksize(self.raw_fd()).max(0) as u32
-    }
-
     pub(crate) fn underruns(&self) -> u32 {
         assert_eq!(self.state, DspState::Running);
         // Timer-driven and follower fallback. Enriched driver wakes consume
@@ -816,7 +881,26 @@ impl DspWriter {
 
 #[cfg(test)]
 mod playback_tests {
-    use crate::oss::test_util::{drain, pattern, pipe_pair};
+    use crate::backend::test_transport::{drain, fill_pipe, free_space, pattern, pipe_pair};
+
+    #[test]
+    fn native_errors_map_to_semantic_io_statuses() {
+        use crate::backend::IoStatus;
+
+        assert_eq!(
+            super::io_status(nix::errno::Errno::EAGAIN),
+            IoStatus::WouldBlock
+        );
+        assert_eq!(
+            super::io_status(nix::errno::Errno::EINTR),
+            IoStatus::Interrupted
+        );
+        assert_eq!(
+            super::io_status(nix::errno::Errno::ENODEV),
+            IoStatus::Disconnected
+        );
+        assert_eq!(super::io_status(nix::errno::Errno::EIO), IoStatus::Failed);
+    }
 
     #[test]
     fn write_silence_floors_to_frames() {
@@ -852,7 +936,7 @@ mod playback_tests {
         assert_eq!(dsp.frame_off, 0);
 
         let data = [0x91, 0x92];
-        assert_eq!(dsp.write(&data).bytes, data.len() as isize);
+        assert_eq!(dsp.write(&data).bytes, data.len());
         assert_eq!(drain(r), data);
         unsafe { libc::close(r) };
     }
@@ -888,8 +972,8 @@ mod playback_tests {
 
         // fill the pipe to capacity, then free a mid-frame hole: the next write
         // is forced short at an unaligned count, like a full OSS ring
-        let total_fill = crate::oss::test_util::fill_pipe(w);
-        crate::oss::test_util::free_space(r, 2046);
+        let total_fill = fill_pipe(w);
+        free_space(r, 2046);
 
         // 2046 = 255 frames + 6 bytes: the kernel takes all of it, the 2-byte
         // frame tail can't fit, and the split is recorded rather than dropped
@@ -924,8 +1008,8 @@ mod playback_tests {
         let (r, w) = pipe_pair(true, true);
         let mut dsp = super::DspWriter::test_on_fd(w, 8);
 
-        let total_fill = crate::oss::test_util::fill_pipe(w);
-        crate::oss::test_util::free_space(r, 2046);
+        let total_fill = fill_pipe(w);
+        free_space(r, 2046);
         let old = pattern(4096, 1);
         assert_eq!(dsp.write(&old).bytes, 2046);
         assert_eq!(dsp.frame_off, 6);
@@ -937,7 +1021,7 @@ mod playback_tests {
         assert_eq!(dsp.frame_off, 0);
 
         let new = pattern(4096, 2);
-        assert_eq!(dsp.write(&new).bytes, new.len() as isize);
+        assert_eq!(dsp.write(&new).bytes, new.len());
         let queued = drain(r);
         assert_eq!(&queued[..2], &[0, 0]);
         assert_eq!(&queued[2..], new);
@@ -955,7 +1039,7 @@ impl Drop for DspWriter {
 
 #[cfg(test)]
 mod capture_tests {
-    use crate::oss::test_util::{pattern, pipe_pair};
+    use crate::backend::test_transport::{pattern, pipe_pair};
     // capture mirror image: a read that lands mid-frame must hide the torn
     // frame's head and discard its tail, so every returned buffer starts on a
     // frame boundary
@@ -969,7 +1053,7 @@ mod capture_tests {
         // 2046 available < 4096 requested: the pipe returns it all, mid-frame
         let mut buf = vec![0u8; 4096];
         let n = dsp.read(&mut buf[..4096]);
-        assert_eq!(n, 2040);
+        assert_eq!(n.bytes, 2040);
         assert_eq!(&buf[..2040], &s[..2040]);
         assert_eq!(dsp.skip, 2);
 
@@ -980,7 +1064,7 @@ mod capture_tests {
             10
         );
         let n = dsp.read(&mut buf[..8]);
-        assert_eq!(n, 8);
+        assert_eq!(n.bytes, 8);
         assert_eq!(&buf[..8], &s[2048..2056]);
         assert_eq!(dsp.skip, 0);
         unsafe { libc::close(w) };

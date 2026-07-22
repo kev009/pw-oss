@@ -1,5 +1,6 @@
 use super::commands::{PORT_IO_AREAS, io_area_ok};
 use super::*;
+use crate::spa::{self, SendWrap};
 
 // PipeWire may drive process() from a different loop than the DataLoop that
 // owns the timer and marshaled state. Refuse processing when their thread
@@ -34,7 +35,7 @@ pub(super) fn queue_device_eof_rebuilds<D: Direction>(state: &mut DataState<D>) 
     for port_idx in 0..state.ports.len() {
         let port = &state.ports[port_idx];
         if port.device_eof && !port.rebuild_pending {
-            crate::node::queue_rebuild(state, port_idx);
+            queue_rebuild(state, port_idx);
         }
     }
 }
@@ -76,6 +77,10 @@ pub(super) unsafe extern "C" fn process<D: Direction>(object: *mut c_void) -> c_
             queue_device_eof_rebuilds(state);
 
             let result = D::process_ports(state);
+            // Timer-driven I/O can discover a dead descriptor without an
+            // enriched EV_EOF event. Semantic stream outcomes latch the same
+            // ownership transition during process_ports; submit it now.
+            queue_device_eof_rebuilds(state);
             // The event is one pre-I/O snapshot shared by the servo and this
             // process pass. Never let a host-initiated second process() reuse
             // it after the device has moved on.
@@ -145,7 +150,7 @@ pub(super) unsafe extern "C" fn port_use_buffers<D: Direction>(
     let _ = flags;
 
     let n_buffers = n_buffers as usize;
-    if !crate::spa::raw_slice_len_ok::<*mut spa_buffer>(n_buffers) {
+    if !spa::raw_slice_len_ok::<*mut spa_buffer>(n_buffers) {
         return -libc::EINVAL;
     }
     let new_buffers = if !buffers.is_null() && n_buffers > 0 {
@@ -159,7 +164,7 @@ pub(super) unsafe extern "C" fn port_use_buffers<D: Direction>(
     // SAFETY: the host keeps the buffer pointers valid until the next
     // use_buffers call (the port_use_buffers contract)
     let port_idx = port_id as usize;
-    let new_buffers = unsafe { crate::spa::SendWrap::new(new_buffers) };
+    let new_buffers = unsafe { SendWrap::new(new_buffers) };
     let control = unsafe { DataControl::from_raw(state) };
     if !control.invoke(move |state| {
         state.ports[port_idx].buffers = new_buffers.into_inner();
@@ -194,7 +199,7 @@ pub(super) unsafe extern "C" fn port_set_io<D: Direction>(
     // these pointers are dereferenced by process() on the data loop.
     // SAFETY: the host keeps the io areas valid while set (port_set_io
     // contract)
-    let data = unsafe { crate::spa::SendWrap::new(data) };
+    let data = unsafe { SendWrap::new(data) };
     let control = unsafe { DataControl::from_raw(state) };
     let applied = control.invoke(move |state| {
         let data = data.into_inner();
@@ -227,13 +232,14 @@ pub(super) unsafe extern "C" fn port_reuse_buffer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::spa::Log;
     #[test]
     fn unseeded_data_loop_gate_never_falls_back_to_first_process_caller() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let unseeded = DataThreadGate {
             thread: AtomicUsize::new(0),
-            log: crate::spa::Log::test_null(),
+            log: Log::test_null(),
         };
         assert!(!check_loop_identity(&unseeded));
         assert_eq!(
@@ -245,7 +251,7 @@ mod tests {
         let current = unsafe { libc::pthread_self() } as usize;
         let seeded = DataThreadGate {
             thread: AtomicUsize::new(current),
-            log: crate::spa::Log::test_null(),
+            log: Log::test_null(),
         };
         assert!(check_loop_identity(&seeded));
     }

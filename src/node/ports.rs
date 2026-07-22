@@ -1,5 +1,8 @@
 use super::events::{emit_param_result, emit_port_info};
 use super::*;
+use super::{build_buffers_info, build_enum_format_info, reset_device_event, snap_raw_to_caps};
+use crate::backend;
+use crate::spa::{self, Log, ParamStep, build_latency_info, latency_info_default};
 
 pub(super) unsafe extern "C" fn add_port(
     _object: *mut c_void,
@@ -77,27 +80,26 @@ pub(super) unsafe extern "C" fn port_enum_params<D: Direction>(
     let control = unsafe { DataControl::from_raw(state) };
 
     unsafe {
-        crate::spa::enum_params_loop(
+        spa::enum_params_loop(
             main,
             (start, max),
             filter,
             |state, index| {
-                use crate::spa::ParamStep;
+                use ParamStep;
                 #[expect(non_upper_case_globals)]
                 match (id, index) {
                     (SPA_PARAM_EnumFormat, i) => {
                         if state.caps_fallback {
                             // the init-time probe hit a busy device and baked in fallback
                             // caps; retry now (main thread, transient open)
-                            if let Some(caps) =
-                                crate::oss::probe_caps(&state.stream_path, D::PLAYBACK)
+                            if let Some(caps) = backend::probe_caps(&state.stream_path, D::PLAYBACK)
                             {
                                 crate::info!(state.log, "re-probed caps: {:?}", caps);
                                 state.caps = caps;
                                 state.caps_fallback = false;
                             }
                         }
-                        match crate::node::build_enum_format_info(&state.caps, i) {
+                        match build_enum_format_info(&state.caps, i) {
                             Some(pod) => ParamStep::Built(pod),
                             None => ParamStep::Stop(0),
                         }
@@ -115,9 +117,7 @@ pub(super) unsafe extern "C" fn port_enum_params<D: Direction>(
                     (SPA_PARAM_Buffers, 0) => {
                         match control.query(move |data| data.ports[port_id as usize].config.clone())
                         {
-                            Some(Some(cfg)) => {
-                                ParamStep::Built(crate::node::build_buffers_info(cfg.stride))
-                            }
+                            Some(Some(cfg)) => ParamStep::Built(build_buffers_info(cfg.stride)),
                             Some(None) => ParamStep::Stop(-libc::ENOENT),
                             None => ParamStep::Stop(-libc::EIO),
                         }
@@ -127,9 +127,9 @@ pub(super) unsafe extern "C" fn port_enum_params<D: Direction>(
                         // the process latency shifts what we report toward the peer (upstream
                         // for the sink, downstream for the source)
                         if info.direction == D::DIRECTION {
-                            crate::spa::process_latency_info_add(&state.process_latency, &mut info);
+                            spa::process_latency_info_add(&state.process_latency, &mut info);
                         }
-                        ParamStep::Built(crate::spa::build_latency_info(&info))
+                        ParamStep::Built(build_latency_info(&info))
                     }
                     // a known id whose indices are exhausted ends the enumeration
                     (SPA_PARAM_Format | SPA_PARAM_Buffers | SPA_PARAM_Latency, _) => {
@@ -152,7 +152,7 @@ pub(super) fn parse_config<D: Direction>(
     let format = libspa::param::audio::AudioFormat(raw.format);
 
     // only formats from our EnumFormat are expected; reject the rest
-    let Some((_, bytes_per_sample)) = crate::node::oss_format_info(raw.format) else {
+    let Some(bytes_per_sample) = backend::bytes_per_sample(raw.format) else {
         crate::warn!(state.log, "rejecting unsupported format {:?}", format);
         return Err(-libc::ENOTSUP);
     };
@@ -166,8 +166,8 @@ pub(super) fn parse_config<D: Direction>(
         stride: bytes_per_sample * raw.channels, // bytes per interleaved frame
     };
 
-    match config.oss_channel_order() {
-        Err(_) => {
+    match backend::validate_config(&state.caps, &config) {
+        Err(backend::ChannelMapError::Unsupported) => {
             crate::warn!(
                 state.log,
                 "rejecting unsupported channel map: {:?}",
@@ -175,7 +175,7 @@ pub(super) fn parse_config<D: Direction>(
             );
             return Err(-libc::EINVAL);
         }
-        Ok(Some(_)) if state.caps.convertless => {
+        Err(backend::ChannelMapError::ConvertlessReorder) => {
             // Bitperfect skips the matrix feeder: SET_CHNORDER would update
             // only the reported matrix while hardware kept its native order.
             crate::warn!(
@@ -185,7 +185,7 @@ pub(super) fn parse_config<D: Direction>(
             );
             return Err(-libc::EINVAL);
         }
-        _ => (),
+        Ok(()) => (),
     }
 
     crate::debug!(state.log, "reconfiguring with {:?}", config);
@@ -207,7 +207,7 @@ pub(crate) struct RequestedFormat {
 // contract). This is the only raw-pod consumer on the Format path.
 pub(super) unsafe fn decode_format(
     param: *const spa_pod,
-    log: &crate::spa::Log,
+    log: &Log,
 ) -> Result<RequestedFormat, c_int> {
     use libspa::param::audio::AudioInfoRaw;
     use libspa::param::format::{MediaSubtype, MediaType};
@@ -264,13 +264,13 @@ pub(super) fn set_format_param<D: Direction>(
     // audioadapter always sets the follower format with NEAREST
     // (audioadapter.c:758, :1059); snap only what the exact path
     // below would reject, so in-caps requests stay untouched
-    let admitted = |caps: &crate::oss::DspCaps, raw: &spa_audio_info_raw| {
-        crate::node::oss_format_info(raw.format)
-            .is_some_and(|(m, _)| caps.admits(m, raw.channels, raw.rate))
+    let admitted = |caps: &backend::StreamCaps, raw: &spa_audio_info_raw| {
+        backend::bytes_per_sample(raw.format)
+            .is_some_and(|_| caps.admits(raw.format, raw.channels, raw.rate))
     };
     let mut snapped = false;
-    if flags & crate::spa::SPA_NODE_PARAM_FLAG_NEAREST != 0 && !admitted(&state.caps, &raw) {
-        snapped = crate::node::snap_raw_to_caps(&state.caps, &mut raw);
+    if flags & spa::SPA_NODE_PARAM_FLAG_NEAREST != 0 && !admitted(&state.caps, &raw) {
+        snapped = snap_raw_to_caps(&state.caps, &mut raw);
         if snapped {
             crate::info!(
                 state.log,
@@ -289,10 +289,7 @@ pub(super) fn set_format_param<D: Direction>(
     // fd and then fail configure, killing the stream for nothing.
     // configure() stays as the backstop for stale caps (a rejection
     // there re-probes and re-announces).
-    if !state
-        .caps
-        .admits(config.oss_format(), raw.channels, raw.rate)
-    {
+    if !state.caps.admits(config.format.0, raw.channels, raw.rate) {
         crate::warn!(
             state.log,
             "rejecting out-of-caps format: rate={} channels={}",
@@ -303,14 +300,14 @@ pub(super) fn set_format_param<D: Direction>(
     }
 
     let mut res = install_device(state, data, port_idx, config);
-    if res == 0 && snapped {
+    if res >= 0 && snapped {
         res = 1;
     }
     if res == -libc::EINVAL || res == -libc::ENOTSUP {
         // the device rejected caps-derived values: the snapshot may be
         // stale (vchans/bitperfect toggled at runtime); re-probe and
         // re-announce EnumFormat so the host renegotiates from reality
-        if let Some(caps) = crate::oss::probe_caps(&state.stream_path, D::PLAYBACK) {
+        if let Some(caps) = backend::probe_caps(&state.stream_path, D::PLAYBACK) {
             state.caps_fallback = false;
             // bump only on a real change: the serial flip re-triggers the
             // adapter's negotiation, and an unchanged snapshot would loop
@@ -339,11 +336,11 @@ pub(super) fn release_format<D: Direction>(
     let Some((retired, deferred)) = data.query(move |state| {
         debug_assert!(!state.rebuild_takeover, "format releases serialize");
         state.rebuild_takeover = true;
-        crate::node::timing::invalidate_device_wake(state);
+        super::timing::invalidate_device_wake(state);
         let deferred = state.deferred_work.take();
         let port = &mut state.ports[port_idx];
         let retired = std::mem::replace(&mut port.dsp, placeholder);
-        crate::node::reset_device_event(port);
+        reset_device_event(port);
         port.buffers.clear();
         port.config = None;
         // retire any in-flight background rebuild, and drop its pending
@@ -418,8 +415,8 @@ pub(super) fn decode_latency_request(
 ) -> Result<LatencyRequest, c_int> {
     let other = direction ^ 1;
     let info = match value {
-        None => crate::spa::latency_info_default(other),
-        Some(v) => match crate::spa::parse_latency_info(Some(v)) {
+        None => latency_info_default(other),
+        Some(v) => match spa::parse_latency_info(Some(v)) {
             Some(info) if info.direction == other => info,
             _ => return Err(-libc::EINVAL),
         },
@@ -517,7 +514,7 @@ pub(super) unsafe fn port_set_param_inner<D: Direction>(
             let value = if param.is_null() {
                 None
             } else {
-                match unsafe { crate::spa::deserialize_pod(param) } {
+                match unsafe { spa::deserialize_pod(param) } {
                     Some(value) => Some(value),
                     None => return -libc::EINVAL,
                 }
@@ -547,8 +544,8 @@ mod tests {
         assert_eq!(dir(SPA_DIRECTION_INPUT, None), Ok(SPA_DIRECTION_OUTPUT));
         assert_eq!(dir(SPA_DIRECTION_OUTPUT, None), Ok(SPA_DIRECTION_INPUT));
 
-        let info = crate::spa::latency_info_default(SPA_DIRECTION_OUTPUT);
-        let value = crate::spa::parse_back(&crate::spa::build_latency_info(&info));
+        let info = latency_info_default(SPA_DIRECTION_OUTPUT);
+        let value = spa::parse_back(&build_latency_info(&info));
         assert_eq!(
             dir(SPA_DIRECTION_INPUT, Some(&value)),
             Ok(SPA_DIRECTION_OUTPUT)
@@ -563,7 +560,7 @@ mod tests {
     // Format decoding accepts readback pods and rejects degenerate values.
     #[test]
     fn decode_format_roundtrips_and_rejects_degenerate_values() {
-        let log = crate::spa::Log::test_null();
+        let log = Log::test_null();
         let config = PortConfig {
             format: libspa::param::audio::AudioFormat::S16LE,
             rate: 48000,

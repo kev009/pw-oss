@@ -24,6 +24,7 @@ mod node;
 mod platform;
 mod spa;
 
+mod backend;
 mod freebsd;
 
 mod oss;

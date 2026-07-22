@@ -1,38 +1,14 @@
 use super::enum_format_widths;
-
-#[test]
-fn max_ring_period_policy() {
-    // stereo S32, device rate == graph rate: the 2048-frame default
-    assert_eq!(super::max_ring_period_bytes(8, 48000, 48000), 16384);
-    // a 96k device under a 48k graph needs twice the device frames per cycle
-    assert_eq!(super::max_ring_period_bytes(8, 96000, 48000), 32768);
-    // fat stride: the kernel ring cap binds (ring/4, frame-aligned)
-    assert_eq!(super::max_ring_period_bytes(40, 48000, 48000), 819 * 40);
-    // unknown graph rate falls back to device frames
-    assert_eq!(super::max_ring_period_bytes(8, 48000, 0), 16384);
-}
-
-#[test]
-fn advertised_quantum_cap() {
-    // stride 8 @48k: ring/4 = 4096 device frames >= the 2048 default - no cap
-    assert_eq!(super::advertised_quantum_cap_frames(8, 48000), None);
-    // 192k device: 4096 device frames is only 1024 frames at a 48k graph
-    assert_eq!(super::advertised_quantum_cap_frames(8, 192000), Some(4096));
-    // 96k device: on the 42.7ms boundary - published for a 44.1k clock.rate
-    // (inert at the 48k default, where the cap equals the max quantum)
-    assert_eq!(super::advertised_quantum_cap_frames(8, 96000), Some(4096));
-    // fat stride @48k: 819 device frames < 2048 - the original case
-    assert_eq!(super::advertised_quantum_cap_frames(40, 48000), Some(819));
-    // 44.1k stereo: 4096 device frames is ~4458 graph frames - no cap
-    assert_eq!(super::advertised_quantum_cap_frames(8, 44100), None);
-}
+use crate::backend;
+use crate::spa::parse_back;
 
 #[test]
 fn fallback_formats_cover_the_supported_surface() {
-    let mapped = super::FORMAT_MAP
-        .iter()
-        .fold(0, |formats, (oss, _, _)| formats | oss);
-    assert_eq!(crate::oss::DspCaps::fallback().formats, mapped);
+    let caps = backend::fallback_caps();
+    assert_eq!(
+        caps.preferred_configuration().unwrap().formats,
+        backend::all_formats()
+    );
 }
 
 #[test]
@@ -68,7 +44,7 @@ fn default_channel_orders_need_no_ioctl() {
             SPA_AUDIO_CHANNEL_SR,
         ],
     ] {
-        assert_eq!(super::oss_channel_order(0, positions), Ok(None));
+        assert_eq!(backend::test_native_channel_order(0, positions), Ok(None));
     }
 }
 
@@ -78,12 +54,12 @@ fn alternate_named_channel_orders_encode_oss_chid_nibbles() {
 
     // Reversed stereo: CHID_R, CHID_L.
     assert_eq!(
-        super::oss_channel_order(0, &[SPA_AUDIO_CHANNEL_FR, SPA_AUDIO_CHANNEL_FL]),
+        backend::test_native_channel_order(0, &[SPA_AUDIO_CHANNEL_FR, SPA_AUDIO_CHANNEL_FL],),
         Ok(Some(0x12))
     );
     // Conventional WAV/ALSA 5.1: FL, FR, FC, LFE, RL, RR.
     assert_eq!(
-        super::oss_channel_order(
+        backend::test_native_channel_order(
             0,
             &[
                 SPA_AUDIO_CHANNEL_FL,
@@ -98,7 +74,7 @@ fn alternate_named_channel_orders_encode_oss_chid_nibbles() {
     );
     // Conventional 7.1 extends that order with side left/right.
     assert_eq!(
-        super::oss_channel_order(
+        backend::test_native_channel_order(
             0,
             &[
                 SPA_AUDIO_CHANNEL_FL,
@@ -120,7 +96,7 @@ fn opaque_and_unpositioned_channel_orders_stay_opaque() {
     use libspa::sys::*;
 
     assert_eq!(
-        super::oss_channel_order(
+        backend::test_native_channel_order(
             0,
             &[
                 SPA_AUDIO_CHANNEL_AUX0,
@@ -131,7 +107,7 @@ fn opaque_and_unpositioned_channel_orders_stay_opaque() {
         Ok(None)
     );
     assert_eq!(
-        super::oss_channel_order(
+        backend::test_native_channel_order(
             SPA_AUDIO_FLAG_UNPOSITIONED,
             &[SPA_AUDIO_CHANNEL_FR, SPA_AUDIO_CHANNEL_FL],
         ),
@@ -167,29 +143,37 @@ fn malformed_channel_orders_are_rejected() {
         ],
     ] {
         assert_eq!(
-            super::oss_channel_order(0, positions),
-            Err(super::UnsupportedChannelOrder)
+            backend::test_native_channel_order(0, positions),
+            Err(backend::ChannelMapError::Unsupported)
         );
     }
 }
 
 fn caps(
-    formats: u32,
+    formats: &[u32],
     channels: (u32, u32),
     rate_range: (u32, u32),
     rates: &[u32],
     preferred_rate: Option<u32>,
     convertless: bool,
-) -> crate::oss::DspCaps {
-    crate::oss::DspCaps {
-        formats,
-        min_channels: channels.0,
-        max_channels: channels.1,
-        min_rate: rate_range.0,
-        max_rate: rate_range.1,
-        preferred_rate,
-        rates: rates.to_vec(),
-        convertless,
+) -> backend::StreamCaps {
+    backend::StreamCaps {
+        configurations: vec![backend::StreamConfiguration {
+            formats: formats.to_vec(),
+            min_channels: channels.0,
+            max_channels: channels.1,
+            min_rate: rate_range.0,
+            max_rate: rate_range.1,
+            preferred_rate,
+            rates: rates.to_vec(),
+            rate_tolerance: 50,
+        }],
+        preferred: 0,
+        conversion: if convertless {
+            backend::ConversionKind::None
+        } else {
+            backend::ConversionKind::Backend
+        },
     }
 }
 
@@ -197,15 +181,9 @@ fn caps(
 // audio adapter parse off the wire back through the same libspa
 // PodDeserializer those consumers use, and pin what they depend on -
 // property keys and order, values, choice types, array contents and
-// per-property flags. (A byte-identical old-vs-new comparison proved the
-// serializer migration once; the lasting invariant is the parsed
-// meaning, not the encoding.)
+// per-property flags. The invariant is the parsed meaning, not the encoding.
 #[test]
 fn enum_format_parses_back_with_expected_choices() {
-    use crate::oss::{
-        AFMT_F32_BE, AFMT_F32_LE, AFMT_S16_BE, AFMT_S16_LE, AFMT_S24_BE, AFMT_S24_LE, AFMT_S32_BE,
-        AFMT_S32_LE, AFMT_U8,
-    };
     use libspa::pod::{ChoiceValue, Object, Value, ValueArray};
     use libspa::sys::*;
     use libspa::utils::{Choice, ChoiceEnum, ChoiceFlags, Id};
@@ -213,15 +191,17 @@ fn enum_format_parses_back_with_expected_choices() {
     // a multi-format device with a rate range: choice-enum of formats,
     // choice-range of rates, ids, ints and the id-array of positions
     let caps = caps(
-        AFMT_U8
-            | AFMT_S16_LE
-            | AFMT_S16_BE
-            | AFMT_S24_LE
-            | AFMT_S24_BE
-            | AFMT_S32_LE
-            | AFMT_S32_BE
-            | AFMT_F32_LE
-            | AFMT_F32_BE,
+        &[
+            SPA_AUDIO_FORMAT_S32_LE,
+            SPA_AUDIO_FORMAT_S32_BE,
+            SPA_AUDIO_FORMAT_F32_LE,
+            SPA_AUDIO_FORMAT_F32_BE,
+            SPA_AUDIO_FORMAT_S24_LE,
+            SPA_AUDIO_FORMAT_S24_BE,
+            SPA_AUDIO_FORMAT_S16_LE,
+            SPA_AUDIO_FORMAT_S16_BE,
+            SPA_AUDIO_FORMAT_U8,
+        ],
         (1, 2),
         (8000, 192000),
         &[],
@@ -230,7 +210,7 @@ fn enum_format_parses_back_with_expected_choices() {
     );
     let pod = super::build_enum_format_info(&caps, 0).unwrap();
     assert_eq!(
-        crate::spa::parse_back(&pod),
+        parse_back(&pod),
         Value::Object(Object {
             type_: SPA_TYPE_OBJECT_Format,
             id: SPA_PARAM_EnumFormat,
@@ -286,6 +266,72 @@ fn enum_format_parses_back_with_expected_choices() {
     );
 }
 
+fn enum_format_summary(caps: &backend::StreamCaps, index: u32) -> (u32, i32, i32) {
+    use libspa::pod::Value;
+    use libspa::sys::{SPA_FORMAT_AUDIO_channels, SPA_FORMAT_AUDIO_format, SPA_FORMAT_AUDIO_rate};
+
+    let Value::Object(object) = parse_back(
+        &super::build_enum_format_info(caps, index).expect("configuration should enumerate"),
+    ) else {
+        panic!("EnumFormat did not parse as an object");
+    };
+    let mut summary = (0, 0, 0);
+    for property in object.properties {
+        #[expect(non_upper_case_globals)]
+        match (property.key, property.value) {
+            (SPA_FORMAT_AUDIO_format, Value::Id(format)) => summary.0 = format.0,
+            (SPA_FORMAT_AUDIO_rate, Value::Int(rate)) => summary.1 = rate,
+            (SPA_FORMAT_AUDIO_channels, Value::Int(channels)) => summary.2 = channels,
+            _ => (),
+        }
+    }
+    summary
+}
+
+#[test]
+fn configurations_enumerate_preferred_first_without_crossing_constraints() {
+    use crate::backend::{ConversionKind, StreamCaps, StreamConfiguration};
+    use libspa::sys::{SPA_AUDIO_FORMAT_S16_LE, SPA_AUDIO_FORMAT_U8};
+
+    let caps = StreamCaps {
+        configurations: vec![
+            StreamConfiguration {
+                formats: vec![SPA_AUDIO_FORMAT_U8],
+                min_channels: 1,
+                max_channels: 1,
+                min_rate: 44100,
+                max_rate: 44100,
+                preferred_rate: None,
+                rates: vec![],
+                rate_tolerance: 0,
+            },
+            StreamConfiguration {
+                formats: vec![SPA_AUDIO_FORMAT_S16_LE],
+                min_channels: 2,
+                max_channels: 2,
+                min_rate: 48000,
+                max_rate: 48000,
+                preferred_rate: None,
+                rates: vec![],
+                rate_tolerance: 0,
+            },
+        ],
+        preferred: 1,
+        conversion: ConversionKind::None,
+    };
+
+    assert_eq!(
+        enum_format_summary(&caps, 0),
+        (SPA_AUDIO_FORMAT_S16_LE, 48000, 2)
+    );
+    assert_eq!(
+        enum_format_summary(&caps, 1),
+        (SPA_AUDIO_FORMAT_U8, 44100, 1)
+    );
+    assert!(super::build_enum_format_info(&caps, 2).is_none());
+    assert!(!caps.admits(SPA_AUDIO_FORMAT_U8, 2, 48000));
+}
+
 fn raw_format(format: u32) -> libspa::sys::spa_audio_info_raw {
     let mut raw: libspa::sys::spa_audio_info_raw = unsafe { std::mem::zeroed() };
     raw.format = format;
@@ -298,14 +344,13 @@ fn raw_format(format: u32) -> libspa::sys::spa_audio_info_raw {
 
 #[test]
 fn format_snap_preserves_and_selects_float_three_byte_24_and_u8() {
-    use crate::oss::{AFMT_F32_LE, AFMT_S16_LE, AFMT_S24_BE, AFMT_U8};
     use libspa::sys::{
         SPA_AUDIO_FORMAT_F32_LE, SPA_AUDIO_FORMAT_S16_LE, SPA_AUDIO_FORMAT_S24_BE,
         SPA_AUDIO_FORMAT_U8,
     };
 
     let float_caps = caps(
-        AFMT_F32_LE | AFMT_S16_LE,
+        &[SPA_AUDIO_FORMAT_F32_LE, SPA_AUDIO_FORMAT_S16_LE],
         (1, 2),
         (8000, 192000),
         &[],
@@ -320,7 +365,14 @@ fn format_snap_preserves_and_selects_float_three_byte_24_and_u8() {
     assert!(super::snap_raw_to_caps(&float_caps, &mut snapped_float));
     assert_eq!(snapped_float.format, SPA_AUDIO_FORMAT_F32_LE);
 
-    let three_byte_caps = caps(AFMT_S24_BE, (1, 2), (8000, 192000), &[], None, false);
+    let three_byte_caps = caps(
+        &[SPA_AUDIO_FORMAT_S24_BE],
+        (1, 2),
+        (8000, 192000),
+        &[],
+        None,
+        false,
+    );
     let mut snapped_three_byte = raw_format(SPA_AUDIO_FORMAT_F32_LE);
     assert!(super::snap_raw_to_caps(
         &three_byte_caps,
@@ -328,36 +380,34 @@ fn format_snap_preserves_and_selects_float_three_byte_24_and_u8() {
     ));
     assert_eq!(snapped_three_byte.format, SPA_AUDIO_FORMAT_S24_BE);
 
-    let u8_caps = caps(AFMT_U8, (1, 2), (8000, 192000), &[], None, false);
+    let u8_caps = caps(
+        &[SPA_AUDIO_FORMAT_U8],
+        (1, 2),
+        (8000, 192000),
+        &[],
+        None,
+        false,
+    );
     let mut snapped_u8 = raw_format(SPA_AUDIO_FORMAT_S16_LE);
     assert!(super::snap_raw_to_caps(&u8_caps, &mut snapped_u8));
     assert_eq!(snapped_u8.format, SPA_AUDIO_FORMAT_U8);
 
-    assert_eq!(
-        super::oss_format_info(SPA_AUDIO_FORMAT_F32_LE),
-        Some((AFMT_F32_LE, 4))
-    );
-    assert_eq!(
-        super::oss_format_info(SPA_AUDIO_FORMAT_S24_BE),
-        Some((AFMT_S24_BE, 3))
-    );
-    assert_eq!(
-        super::oss_format_info(SPA_AUDIO_FORMAT_S16_LE),
-        Some((AFMT_S16_LE, 2))
-    );
-    assert_eq!(
-        super::oss_format_info(SPA_AUDIO_FORMAT_U8),
-        Some((AFMT_U8, 1))
-    );
+    assert_eq!(backend::bytes_per_sample(SPA_AUDIO_FORMAT_F32_LE), Some(4));
+    assert_eq!(backend::bytes_per_sample(SPA_AUDIO_FORMAT_S24_BE), Some(3));
+    assert_eq!(backend::bytes_per_sample(SPA_AUDIO_FORMAT_S16_LE), Some(2));
+    assert_eq!(backend::bytes_per_sample(SPA_AUDIO_FORMAT_U8), Some(1));
 }
 
 #[test]
 fn convertless_format_offers_are_native_only() {
-    use crate::oss::{AFMT_F32_LE, AFMT_S24_BE, AFMT_U8};
     use libspa::sys::{SPA_AUDIO_FORMAT_F32_LE, SPA_AUDIO_FORMAT_S24_BE, SPA_AUDIO_FORMAT_U8};
 
     let native = caps(
-        AFMT_F32_LE | AFMT_S24_BE | AFMT_U8,
+        &[
+            SPA_AUDIO_FORMAT_F32_LE,
+            SPA_AUDIO_FORMAT_S24_BE,
+            SPA_AUDIO_FORMAT_U8,
+        ],
         (1, 2),
         (8000, 192000),
         &[],
@@ -365,7 +415,7 @@ fn convertless_format_offers_are_native_only() {
         true,
     );
     assert_eq!(
-        super::offered_formats(&native),
+        backend::offered_formats(native.preferred_configuration().unwrap()),
         [
             SPA_AUDIO_FORMAT_F32_LE,
             SPA_AUDIO_FORMAT_S24_BE,
@@ -373,16 +423,20 @@ fn convertless_format_offers_are_native_only() {
         ]
     );
 
-    let unmatched = caps(0, (1, 2), (8000, 192000), &[], None, true);
-    assert!(super::offered_formats(&unmatched).is_empty());
+    let unmatched = caps(&[], (1, 2), (8000, 192000), &[], None, true);
+    assert!(backend::offered_formats(unmatched.preferred_configuration().unwrap()).is_empty());
 
-    let feeder = caps(0, (1, 2), (8000, 192000), &[], None, false);
+    let feeder = caps(
+        &backend::all_formats(),
+        (1, 2),
+        (8000, 192000),
+        &[],
+        None,
+        false,
+    );
     assert_eq!(
-        super::offered_formats(&feeder),
-        super::FORMAT_MAP
-            .iter()
-            .map(|(_, spa, _)| *spa)
-            .collect::<Vec<_>>()
+        backend::offered_formats(feeder.preferred_configuration().unwrap()),
+        backend::all_formats()
     );
 }
 

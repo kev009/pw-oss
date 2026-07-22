@@ -1,5 +1,7 @@
 use super::events::emit_node_info;
 use super::*;
+use crate::backend;
+use crate::spa::{self, Log, Loop};
 
 mod worker;
 
@@ -10,7 +12,7 @@ pub(in crate::node) use worker::{
 };
 pub(crate) use worker::{NodeShared, queue_rebuild};
 
-// The oss.* tunable live re-apply path: store the new loop-owned value on the
+// The backend-tunable live re-apply path: store the new loop-owned value on the
 // data loop (the prime paths read it there), then rebuild any running port
 // from this (main) thread so the next cycle re-primes with the new layout.
 // Synchronous contract (see install_device): main-thread entry, blocking
@@ -35,7 +37,7 @@ pub(crate) fn store_and_rebuild<D: Direction>(
     };
     for (port_idx, config) in configs.into_iter().enumerate() {
         if let Some(config) = config
-            && install_device(state, data, port_idx, config) != 0
+            && install_device(state, data, port_idx, config) < 0
         {
             // the host didn't initiate this rebuild; without a re-announce it
             // keeps believing a format is set on a dead port
@@ -46,7 +48,7 @@ pub(crate) fn store_and_rebuild<D: Direction>(
 }
 
 // announce a Props change (so readback stays fresh), then apply it through
-// store_and_rebuild; shared by the oss.* prop appliers of both directions
+// store_and_rebuild; shared by both directions' backend property appliers
 pub(crate) fn apply_props_param<D: Direction>(
     state: &mut MainState<D>,
     data: &DataControl<D>,
@@ -120,9 +122,10 @@ pub(in crate::node) fn install_device<D: Direction>(
 
     let mut new_dsp = D::Device::new(&state.stream_path);
     // fragment_bytes only mutates from main-thread calls, serialized with us
-    let mut res = D::try_open_configure(&mut new_dsp, &config, state.fragment_bytes, &state.log);
+    let mut configured =
+        D::try_open_configure(&mut new_dsp, &config, state.fragment_bytes, &state.log);
 
-    if res == -libc::EBUSY {
+    if matches!(configured, Err(error) if error == -libc::EBUSY) {
         let closed = D::Device::new(&state.stream_path);
         let Some(retired) =
             data.query(move |state| std::mem::replace(&mut state.ports[port_idx].dsp, closed))
@@ -131,17 +134,20 @@ pub(in crate::node) fn install_device<D: Direction>(
             return -libc::EIO;
         };
         drop(retired); // closes the old fd here, off the RT path
-        res = D::try_open_configure(&mut new_dsp, &config, state.fragment_bytes, &state.log);
+        configured = D::try_open_configure(&mut new_dsp, &config, state.fragment_bytes, &state.log);
     }
 
-    let ok = res == 0;
-    let cap_config = config.clone();
+    let (res, installed_config) = match configured {
+        Ok(outcome) => (c_int::from(outcome.adjusted), Some(outcome.actual_config)),
+        Err(err) => (err, None),
+    };
+    let cap_config = installed_config.clone();
     let old_dsp = data.query(move |state| {
-        crate::node::timing::invalidate_device_wake(state);
+        super::timing::invalidate_device_wake(state);
         let port = &mut state.ports[port_idx];
         // new_dsp is a closed writer/reader when negotiation failed above
         let old = std::mem::replace(&mut port.dsp, new_dsp);
-        port.config = if ok { Some(config) } else { None };
+        port.config = installed_config;
         // Retire any in-flight background rebuild.
         port.generation = port.generation.wrapping_add(1);
         state
@@ -164,13 +170,13 @@ pub(in crate::node) fn install_device<D: Direction>(
         release_rebuild_takeover(data, port_idx);
         return -libc::EIO; // the swap never ran; the port keeps its old state
     }
-    if res == 0 {
+    if let Some(cap_config) = cap_config {
         publish_ring_quantum_cap(state, &cap_config); // stride is known now
     }
     res
 }
 
-// FreeBSD caps every soft ring at CHN_2NDBUFMAXSIZE (131 KiB); at fat strides
+// FreeBSD caps every PCM soft ring; at fat strides
 // (a 20-channel S32 interface is 80 bytes/frame) the ring holds only ~1.6
 // periods at quantum 1024 and both directions glitch structurally - the
 // capture side has no room for arrival jitter, the playback side can't hold
@@ -186,9 +192,9 @@ pub(in crate::node) fn install_device<D: Direction>(
 fn publish_ring_quantum_cap<D: Direction>(state: &mut MainState<D>, config: &PortConfig) {
     let stride = config.stride.max(1);
     let rate = config.rate;
-    // the shared ring policy (node::format); the published fraction is time-based
-    // (frames/device rate), so it needs no graph-rate scaling
-    let Some(frames) = crate::oss::advertised_quantum_cap_frames(stride, rate) else {
+    // The published fraction is time-based (frames/device rate), so it needs
+    // no graph-rate scaling.
+    let Some(frames) = backend::advertised_quantum_cap_frames(stride, rate) else {
         return;
     };
     if state.ring_cap_published {
@@ -197,9 +203,9 @@ fn publish_ring_quantum_cap<D: Direction>(state: &mut MainState<D>, config: &Por
     state.ring_cap_published = true;
     crate::info!(
         state.log,
-        "kernel ring ({} bytes) at stride {} holds 4 periods only up to \
+        "backend ring ({} bytes) at stride {} holds 4 periods only up to \
     quantum {}; publishing node.max-latency",
-        crate::oss::buffer_capacity_limit(stride, rate),
+        backend::buffer_capacity_limit(stride, rate),
         stride,
         frames
     );
@@ -231,9 +237,9 @@ fn emit_format_lost<D: Direction>(state: &MainState<D>) {
 // so callers collect the event first and call here only after dropping every
 // State reference.
 pub(in crate::node) fn queue_main_event<D: Direction>(
-    main_loop: Option<crate::spa::Loop>,
+    main_loop: Option<Loop>,
     target: MainEventTarget<D>,
-    log: crate::spa::Log,
+    log: Log,
     event: MainEvent,
 ) {
     let Some(main_loop) = main_loop else {
@@ -241,7 +247,7 @@ pub(in crate::node) fn queue_main_event<D: Direction>(
     };
     // SAFETY: host loops outlive the queued item (queue_task's contract)
     let queued = unsafe {
-        crate::spa::queue_task(&main_loop, move || {
+        spa::queue_task(&main_loop, move || {
             // SAFETY: queue_task invokes this closure through `main_loop`.
             target.deliver_on_main(event);
         })
@@ -299,7 +305,7 @@ fn poll_rebuild_completion<D: Direction>(state: &mut DataState<D>, port_idx: usi
     }
     match swap.outcome {
         SwapOutcome::Installed { dsp, config } => {
-            crate::node::timing::invalidate_device_wake(state);
+            super::timing::invalidate_device_wake(state);
             let port = &mut state.ports[port_idx];
             let old = std::mem::replace(&mut port.dsp, dsp);
             port.config = Some(config);
@@ -337,7 +343,7 @@ fn poll_rebuild_completion<D: Direction>(state: &mut DataState<D>, port_idx: usi
             // request as retire_first, so close-then-retry runs as one
             // worker command (ordering holds) under the task's unwind guard
             let port = &mut state.ports[port_idx];
-            crate::node::reset_device_event(port);
+            reset_device_event(port);
             let old = std::mem::replace(&mut port.dsp, placeholder);
             request.retire_first = Some(old);
             if state.started {
@@ -350,7 +356,7 @@ fn poll_rebuild_completion<D: Direction>(state: &mut DataState<D>, port_idx: usi
             // mirror install_device's failure shape: closed device, cleared
             // config, and a re-announce so the host renegotiates instead of
             // believing a format is set on a dead port
-            crate::node::timing::invalidate_device_wake(state);
+            super::timing::invalidate_device_wake(state);
             let port = &mut state.ports[port_idx];
             let old = std::mem::replace(&mut port.dsp, placeholder);
             port.config = None;

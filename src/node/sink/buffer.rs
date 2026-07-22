@@ -1,12 +1,5 @@
 use super::*;
 
-#[cfg(test)]
-pub(super) use crate::oss::playback_buffer_request as buffer_request;
-pub(super) use crate::oss::{
-    playback_buffer_required as buffer_required, playback_desired_delay as desired_delay,
-    playback_fill_floor as fill_floor, playback_target_delay as target_delay,
-};
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum RetuneOutcome {
     /// The current period remains in effect.
@@ -27,20 +20,16 @@ pub(super) fn retune_seed(target_goal: u32, fill: u32, write_now: u32, period: u
 
 // the resampler's per-cycle output can exceed a quantum; its size bounds the
 // largest single write and so the headroom the fill ceiling must reserve
-pub(super) fn rate_match_bytes(
-    rate_match: &crate::spa::IoArea<spa_io_rate_match>,
-    stride: u32,
-) -> u32 {
+pub(super) fn rate_match_bytes(rate_match: &spa::IoArea<spa_io_rate_match>, stride: u32) -> u32 {
     rate_match
         .with_ref(|rm| rm.size.saturating_mul(stride))
         .unwrap_or(0)
 }
 
-// the shared geometry-commit tail of the prime and in-place retune paths:
-// apply the fill target for a `granted`-byte ring at `period` and relock the
-// servo. Returns whether the oss.delay target was capped by the ring.
+// Apply the fill target for a `granted`-byte ring and relock the servo. Returns
+// whether the playback-delay target was capped by the ring.
 pub(super) fn commit_geometry(
-    port: &mut crate::node::Port<SinkDir>,
+    port: &mut Port<SinkDir>,
     granted: u32,
     period: u32,
     blocksize: u32,
@@ -67,11 +56,12 @@ pub(super) fn commit_geometry(
     delay_capped
 }
 
-pub(super) fn log_delay_capped(log: &crate::spa::Log, path: &str, granted: u32) {
+pub(super) fn log_delay_capped(log: &Log, path: &str, granted: u32) {
     crate::info!(
         log,
-        "{}: the oss.delay target is capped by the granted buffer ({})",
+        "{}: the {} target is capped by the granted buffer ({})",
         path,
+        platform::PLAYBACK_DELAY,
         granted
     );
 }
@@ -85,13 +75,13 @@ pub(super) fn log_delay_capped(log: &crate::spa::Log, path: &str, granted: u32) 
 // committed new geometry, so followers do not immediately overwrite its
 // predicted live target with a pre-write fill sample.
 pub(super) fn retune_period(
-    port: &mut crate::node::Port<SinkDir>,
+    port: &mut Port<SinkDir>,
     period_in_bytes: u32,
     stride: u32,
     write_now: u32,
     playback_delay_eighths: u32,
     now: u64,
-    log: &crate::spa::Log,
+    log: &Log,
 ) -> RetuneOutcome {
     if !port.dsp.is_running()
         || port.setup_period == 0
@@ -142,7 +132,7 @@ pub(super) fn retune_period(
         crate::info!(
             log,
             "{}: period {} -> {} bytes; retuned in place (granted {}, target delay {} -> {})",
-            port.dsp.path,
+            port.dsp.path(),
             old_period,
             period_in_bytes,
             port.ext.buffer_size,
@@ -150,7 +140,7 @@ pub(super) fn retune_period(
             target_goal
         );
         if delay_capped {
-            log_delay_capped(log, &port.dsp.path, port.ext.buffer_size);
+            log_delay_capped(log, port.dsp.path(), port.ext.buffer_size);
         }
         RetuneOutcome::Retuned
     } else if port.dsp.suspend() {
@@ -164,7 +154,7 @@ pub(super) fn retune_period(
         crate::info!(
             log,
             "{}: period {} -> {} bytes exceeds the ring ({}); re-priming",
-            port.dsp.path,
+            port.dsp.path(),
             port.setup_period,
             period_in_bytes,
             port.ext.buffer_size
@@ -174,7 +164,7 @@ pub(super) fn retune_period(
         port.was_matching = false;
         // SETTRIGGER starts a new kernel xrun epoch; SETFRAGMENT also resets
         // the low-water mark during the prime that follows.
-        crate::node::reset_device_event(port);
+        reset_device_event(port);
         RetuneOutcome::Retuned
     } else {
         // period_mismatch stays >= 2 on purpose: if the caller can't queue the
@@ -186,7 +176,7 @@ pub(super) fn retune_period(
             crate::info!(
                 log,
                 "{}: period {} -> {} bytes; reconfiguring (+{} messages suppressed)",
-                port.dsp.path,
+                port.dsp.path(),
                 port.setup_period,
                 period_in_bytes,
                 suppressed
@@ -199,7 +189,7 @@ pub(super) fn retune_period(
 // debug-build diagnostics: the scheduling class/priority the data loop
 // actually runs at (RT setup problems show up here first)
 #[cfg(debug_assertions)]
-pub(super) fn debug_log_priorities(log: &crate::spa::Log) {
+pub(super) fn debug_log_priorities(log: &Log) {
     fn prio_type(type_: std::ffi::c_ushort) -> &'static str {
         match type_ {
             libc::RTP_PRIO_REALTIME => "realtime",
@@ -249,12 +239,12 @@ pub(super) fn debug_log_priorities(log: &crate::spa::Log) {
 // Size the ring, commit the fill geometry and pre-fill to target; the
 // cycle's real write then arms the channel.
 pub(super) fn prime_playback(
-    port: &mut crate::node::Port<SinkDir>,
+    port: &mut Port<SinkDir>,
     period_in_bytes: u32,
     graph_rate: u32,
     playback_delay_eighths: u32,
     fragment_bytes: u32,
-    log: &crate::spa::Log,
+    log: &Log,
 ) {
     #[cfg(debug_assertions)]
     debug_log_priorities(log);
@@ -277,10 +267,10 @@ pub(super) fn prime_playback(
     // include it, or a device that honors the request grants no room for
     // the ceiling above the floor.
     let desired = desired_delay(period_in_bytes, playback_delay_eighths);
-    let chunk = crate::node::ns_to_frame_bytes(port.dsp.hw_quantum_ns, cfg_rate, stride);
+    let chunk = ns_to_frame_bytes(port.dsp.delivery_quantum_ns(), cfg_rate, stride);
     let write_max = period_in_bytes.max(rate_match_bytes(&port.rate_match, stride));
-    let max_period = crate::oss::max_buffer_period_bytes(stride, cfg_rate, graph_rate);
-    let request = crate::oss::playback_buffer_request(
+    let max_period = backend::max_buffer_period_bytes(stride, cfg_rate, graph_rate);
+    let request = buffer_request(
         period_in_bytes,
         max_period,
         stride,
@@ -290,8 +280,9 @@ pub(super) fn prime_playback(
         write_max,
         playback_delay_eighths,
     );
-    let granted = port.dsp.set_buffer_size(request, fragment_bytes);
-    let blocksize = port.dsp.blocksize().max(chunk);
+    let applied = backend::configure_playback_buffer(&port.dsp, request, fragment_bytes);
+    let granted = applied.capacity_bytes;
+    let blocksize = applied.quantum_bytes.max(chunk);
 
     // saturating arithmetic: blocksize/rate_match.size are device-provided and
     // an overflow here would abort the data loop.
@@ -308,14 +299,14 @@ pub(super) fn prime_playback(
     crate::warn!(
         log,
         "{}: granted {}, blocksize {}, period {}, target delay {}",
-        port.dsp.path,
+        port.dsp.path(),
         granted,
         blocksize,
         period_in_bytes,
         port.ext.target_delay
     );
     if delay_capped {
-        log_delay_capped(log, &port.dsp.path, granted);
+        log_delay_capped(log, port.dsp.path(), granted);
     }
     if granted < period_in_bytes.saturating_mul(2) {
         crate::warn!(
@@ -323,7 +314,7 @@ pub(super) fn prime_playback(
             "{}: granted OSS buffer ({}) is smaller than two quanta ({}); \
       audio will glitch. Lower the PipeWire quantum; we set the fragment size \
       explicitly, so hw.snd.latency has no effect",
-            port.dsp.path,
+            port.dsp.path(),
             granted,
             period_in_bytes.saturating_mul(2)
         );

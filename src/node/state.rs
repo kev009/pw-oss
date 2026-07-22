@@ -1,6 +1,8 @@
 use std::mem::offset_of;
 
-use super::*;
+use super::{BwAdapt, RateLimit, SpaDLL, *};
+use crate::backend;
+use crate::spa::{self, IoArea, Log, Loop, LoopSource, System, TimerFd, block_on_loop};
 
 #[repr(C)]
 // The pinned FFI shell. Runtime entry points project only one disjoint field
@@ -47,17 +49,17 @@ pub(super) unsafe fn main_ptr<D: Direction>(state: *mut State<D>) -> *mut MainSt
 
 pub(super) struct DataThreadGate {
     pub(super) thread: std::sync::atomic::AtomicUsize,
-    pub(super) log: crate::spa::Log,
+    pub(super) log: Log,
 }
 
 pub(crate) struct MainState<D: Direction> {
     pub(super) events: std::rc::Rc<NodeEvents<D>>,
     // A copyable host-loop endpoint plus the stable address of State::data are
     // combined into DataControl at each control entry point.
-    pub data_loop: crate::spa::Loop,
-    pub log: crate::spa::Log,
+    pub data_loop: Loop,
+    pub log: Log,
     pub stream_path: String,
-    pub caps: crate::oss::DspCaps,
+    pub caps: backend::StreamCaps,
     pub caps_fallback: bool,
     pub fragment_bytes: u32,
     pub fragment_bytes_default: u32,
@@ -73,23 +75,24 @@ pub(crate) struct MainState<D: Direction> {
 }
 
 pub(crate) struct DataState<D: Direction> {
-    pub data_loop: crate::spa::Loop,
-    pub data_system: crate::spa::System,
-    pub log: crate::spa::Log,
-    pub clock: crate::spa::IoArea<spa_io_clock>,
-    pub position: crate::spa::IoArea<spa_io_position>,
+    pub data_loop: Loop,
+    pub data_system: System,
+    pub log: Log,
+    pub clock: IoArea<spa_io_clock>,
+    pub position: IoArea<spa_io_position>,
     pub clock_name: std::ffi::CString, // stamped into spa_io_clock.name
-    pub main_loop: Option<crate::spa::Loop>, // for endpoint-only notifications
+    pub main_loop: Option<Loop>,       // for endpoint-only notifications
     pub stream_path: String,
     // Exactly one wake descriptor owns wake_source.fd: the portable SPA
     // timer, or the enriched OSS kqueue on sufficiently new kernels.
-    pub(super) timer_fd: Option<crate::spa::TimerFd>,
-    pub(super) sound_queue: Option<crate::oss::SoundKqueue>,
-    // Registration/LOW_WATER failed for this descriptor. Audio cycles stay
-    // on the kqueue's timer filter; an explicit driver update gives the same
-    // fd one bounded retry without repeating the warning until one succeeds.
+    pub(super) timer_fd: Option<TimerFd>,
+    pub(super) sound_queue: Option<backend::WakeQueue>,
+    // Native wake registration or threshold setup failed for this descriptor.
+    // Audio cycles stay on the kqueue's timer filter; an explicit driver
+    // update gives the same fd one bounded retry without repeating the warning
+    // until one succeeds.
     pub(super) sound_failed_fd: Option<c_int>,
-    pub(super) wake_source: crate::spa::LoopSource,
+    pub(super) wake_source: LoopSource,
     // True only while on_wake is inside the host's ready callback. An inline
     // process() leaves next-wake selection to the callback epilogue; a
     // deferred process() performs it itself.
@@ -97,7 +100,7 @@ pub(crate) struct DataState<D: Direction> {
     pub next_time: u64,
     pub callbacks: NodeCallbacks,
     pub ports: [Port<D>; MAX_PORTS],
-    pub fragment_bytes: u32, // normalized fragment size in bytes (0 = automatic); read by the prime paths
+    pub fragment_bytes: u32, // normalized override (0 = automatic); read by the prime paths
     // the Arc'd rendezvous with the owned rebuild worker and
     // clear(); outlives the FFI shell by construction (see NodeShared)
     pub shared: std::sync::Arc<NodeShared<D>>,
@@ -133,7 +136,7 @@ impl<D: Direction> DataState<D> {
 // the disjoint data-loop state. The host serializes control methods on the
 // main loop; callers must not retain this past State teardown.
 pub(crate) struct DataControl<D: Direction> {
-    loop_: crate::spa::Loop,
+    loop_: Loop,
     data: *mut DataState<D>,
 }
 
@@ -146,7 +149,7 @@ impl<D: Direction> DataControl<D> {
     }
 
     pub(super) fn invoke(&self, f: impl FnOnce(&mut DataState<D>) + Send) -> bool {
-        unsafe { crate::spa::block_on_loop(&self.loop_, self.data, f) }
+        unsafe { block_on_loop(&self.loop_, self.data, f) }
     }
 
     pub(super) fn query<R: Send>(
@@ -166,12 +169,12 @@ impl<D: Direction> DataControl<D> {
 pub(crate) struct Port<D: Direction> {
     pub config: Option<PortConfig>,
     pub buffers: Vec<*mut spa_buffer>,
-    pub io: crate::spa::IoArea<spa_io_buffers>,
-    pub rate_match: crate::spa::IoArea<spa_io_rate_match>, // per-port io area (port_set_io)
+    pub io: IoArea<spa_io_buffers>,
+    pub rate_match: IoArea<spa_io_rate_match>, // per-port io area (port_set_io)
     pub dsp: D::Device,
-    pub dll: crate::node::SpaDLL,
+    pub dll: SpaDLL,
     pub setup_period: u32, // device bytes per graph cycle the stream/servo was set up for
-    pub bw_adapt: crate::node::BwAdapt, // variance-adaptive bandwidth (ALSA scheme)
+    pub bw_adapt: BwAdapt, // variance-adaptive bandwidth (ALSA scheme)
     pub setup_blocksize: u32, // device fragment size (measurement quantization)
     // A main-loop device rebuild is in flight; skip cycles until poll_rebuild
     // consumes its completion. Data-loop-owned: set when the order is queued,
@@ -183,7 +186,7 @@ pub(crate) struct Port<D: Direction> {
     // still matches; wrapping is safe because the fence uses equality only.
     pub generation: u64,
     pub was_matching: bool, // rate matching active last cycle (relock on transition)
-    pub warn_limit: crate::node::RateLimit,
+    pub warn_limit: RateLimit,
     // Data-loop-owned xrun detected this cycle (trigger time in
     // µs). detect_underrun/recover_overrun deposit it instead of calling the
     // host back mid-cycle; process() drains it and invokes the copied xrun
@@ -191,13 +194,13 @@ pub(crate) struct Port<D: Direction> {
     pub pending_xrun: Option<u64>,
     // Latest enriched sound kevent, valid until this cycle's device I/O.
     // Timer-driven/follower paths leave it empty and use the ioctl fallback.
-    pub device_event: Option<crate::oss::DeviceEvent>,
+    pub device_event: Option<backend::DeviceEvent>,
     // EV_EOF is ownership state, not a cycle measurement. Keep it latched
     // across timer wakes and failed rebuild submissions until the device or
     // trigger epoch is reset.
     pub device_eof: bool,
     pub event_xruns_seen: u32,
-    // Last SNDCTL_DSP_LOW_WATER value installed for the registered device.
+    // Last native wake threshold installed for the registered device.
     pub wake_threshold: u32,
     pub ext: D::PortExt, // direction-specific fields (see sink/source)
 }
@@ -209,12 +212,9 @@ pub(crate) fn device_event_fill<D: Direction>(port: &Port<D>) -> Option<u32> {
     }
     if D::PLAYBACK {
         let stride = port.stride_rate().map(|(stride, _)| stride).unwrap_or(1);
-        Some(
-            event
-                .ready_frames
-                .saturating_mul(stride as u64)
-                .min(u32::MAX as u64) as u32,
-        )
+        event
+            .queued_frames
+            .map(|frames| frames.saturating_mul(stride as u64).min(u32::MAX as u64) as u32)
     } else {
         Some(event.available_bytes)
     }
@@ -337,7 +337,7 @@ impl DataBlock {
 pub(crate) unsafe fn valid_data_block<D: Direction>(
     port: &Port<D>,
     buffer_id: u32,
-    log: &crate::spa::Log,
+    log: &Log,
 ) -> Option<DataBlock> {
     let buffer: &spa_buffer = match port
         .buffers
@@ -431,7 +431,7 @@ impl NodeCallbacks {
             return;
         }
         let version = unsafe { funcs.cast::<u32>().read() };
-        if !crate::spa::version_ok(version, SPA_VERSION_NODE_CALLBACKS) {
+        if !spa::version_ok(version, SPA_VERSION_NODE_CALLBACKS) {
             self.cb = None;
             return;
         }
@@ -452,15 +452,15 @@ impl NodeCallbacks {
 
 #[cfg(test)]
 mod tests {
+    use super::super::sink::SinkDir;
     use super::*;
-    use crate::node::sink::SinkDir;
     fn test_port(fd: c_int) -> Port<SinkDir> {
         Port {
             config: None,
             buffers: vec![],
-            io: crate::spa::IoArea::null(),
-            rate_match: crate::spa::IoArea::null(),
-            dsp: crate::oss::DspWriter::test_on_fd(fd, 8),
+            io: IoArea::null(),
+            rate_match: IoArea::null(),
+            dsp: backend::PlaybackStream::test_on_fd(fd, 8),
             dll: Default::default(),
             setup_period: 0,
             bw_adapt: Default::default(),
@@ -468,7 +468,7 @@ mod tests {
             rebuild_pending: false,
             generation: 0,
             was_matching: false,
-            warn_limit: crate::node::RateLimit::new(),
+            warn_limit: RateLimit::new(),
             pending_xrun: None,
             device_event: None,
             device_eof: false,
@@ -497,9 +497,9 @@ mod tests {
     // faults - buffer_id and the block layout come from the peer
     #[test]
     fn valid_data_block_admits_only_a_usable_memptr_block() {
-        let (r, w) = crate::oss::test_util::pipe_pair(true, true);
+        let (r, w) = backend::test_transport::pipe_pair(true, true);
         let mut port = test_port(w);
-        let log = crate::spa::Log::test_null();
+        let log = Log::test_null();
         let mut payload = [0u8; 64];
         let mut chunk: spa_chunk = unsafe { std::mem::zeroed() };
 

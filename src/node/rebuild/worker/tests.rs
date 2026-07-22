@@ -1,5 +1,7 @@
+use super::super::super::sink::SinkDir;
 use super::*;
-use crate::node::sink::SinkDir;
+use crate::backend::PlaybackStream;
+use crate::spa::Log;
 #[test]
 fn rebuild_worker_runs_off_caller_and_survives_a_panicking_job() {
     let mut worker = RebuildWorker::<SinkDir>::start().expect("worker starts");
@@ -251,7 +253,7 @@ fn rebuild_mailbox_delivers_replaces_and_discards() {
         port_idx: 0,
         generation: 4,
         outcome: SwapOutcome::Failed {
-            placeholder: crate::oss::DspWriter::new("/nonexistent/dsp"),
+            placeholder: PlaybackStream::new("/nonexistent/dsp"),
         },
     });
     assert!(shared.swap_ready());
@@ -294,7 +296,7 @@ fn rebuild_task_deposits_and_respects_the_gates() {
         fragment_bytes: 0,
         retried: false,
         retire_first: None,
-        log: crate::spa::Log::test_null(),
+        log: Log::test_null(),
         shared: std::sync::Arc::downgrade(shared),
     };
 
@@ -387,7 +389,7 @@ fn a_panicking_rebuild_path_still_deposits_aborted() {
         armed: true,
     };
     guard.complete(SwapOutcome::Failed {
-        placeholder: crate::oss::DspWriter::new("/nonexistent/dsp"),
+        placeholder: PlaybackStream::new("/nonexistent/dsp"),
     });
     let swap = shared.take_swap().expect("the completed outcome");
     assert_eq!(swap.generation, 10);

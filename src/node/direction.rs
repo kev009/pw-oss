@@ -5,6 +5,9 @@ use std::ffi::c_int;
 
 use libspa::sys::*;
 
+use crate::backend;
+use crate::spa::Log;
+
 use super::commands::{send_command, set_io};
 use super::events::{add_listener, enum_params, set_callbacks, sync};
 use super::params::set_param;
@@ -25,111 +28,73 @@ impl<T> MutexExt<T> for std::sync::Mutex<T> {
     }
 }
 
-// the shared surface of oss::Dsp/oss::DspWriter used by the generic core;
-// the direction-specific ops (write/odelay vs read/ispace) stay on the
-// concrete types and are used from the Direction hooks
+// Operations common to capture and playback devices.
 pub(crate) trait DeviceOps {
     fn new(path: &str) -> Self;
     fn path(&self) -> &str;
     fn fd(&self) -> Option<c_int>;
     fn is_closed(&self) -> bool;
     fn is_running(&self) -> bool;
-    fn set_low_water(&self, bytes: u32) -> bool;
+    fn configure_wake_threshold(&self, bytes: u32) -> bool;
     fn close(&mut self);
     fn suspend(&mut self) -> bool;
 }
 
-impl DeviceOps for crate::oss::Dsp {
+impl DeviceOps for backend::CaptureStream {
     fn new(path: &str) -> Self {
-        crate::oss::Dsp::new(path)
+        Self::new(path)
     }
     fn path(&self) -> &str {
-        crate::oss::Dsp::path(self)
+        Self::path(self)
     }
     fn fd(&self) -> Option<c_int> {
-        crate::oss::Dsp::fd(self)
+        Self::fd(self)
     }
     fn is_closed(&self) -> bool {
-        crate::oss::Dsp::is_closed(self)
+        Self::is_closed(self)
     }
     fn is_running(&self) -> bool {
-        crate::oss::Dsp::is_running(self)
+        Self::is_running(self)
     }
-    fn set_low_water(&self, bytes: u32) -> bool {
-        crate::oss::Dsp::set_low_water(self, bytes)
+    fn configure_wake_threshold(&self, bytes: u32) -> bool {
+        Self::configure_wake_threshold(self, bytes)
     }
     fn close(&mut self) {
-        crate::oss::Dsp::close(self);
+        Self::close(self);
     }
     fn suspend(&mut self) -> bool {
-        crate::oss::Dsp::suspend(self)
+        Self::suspend(self)
     }
 }
 
-impl DeviceOps for crate::oss::DspWriter {
+impl DeviceOps for backend::PlaybackStream {
     fn new(path: &str) -> Self {
-        crate::oss::DspWriter::new(path)
+        Self::new(path)
     }
     fn path(&self) -> &str {
-        &self.path
+        Self::path(self)
     }
     fn fd(&self) -> Option<c_int> {
-        crate::oss::DspWriter::fd(self)
+        Self::fd(self)
     }
     fn is_closed(&self) -> bool {
-        crate::oss::DspWriter::is_closed(self)
+        Self::is_closed(self)
     }
     fn is_running(&self) -> bool {
-        crate::oss::DspWriter::is_running(self)
+        Self::is_running(self)
     }
-    fn set_low_water(&self, bytes: u32) -> bool {
-        crate::oss::DspWriter::set_low_water(self, bytes)
+    fn configure_wake_threshold(&self, bytes: u32) -> bool {
+        Self::configure_wake_threshold(self, bytes)
     }
     fn close(&mut self) {
-        crate::oss::DspWriter::close(self);
+        Self::close(self);
     }
     fn suspend(&mut self) -> bool {
-        crate::oss::DspWriter::suspend(self)
+        Self::suspend(self)
     }
 }
 
-// the negotiated format, shared by both directions (the stride is derived
-// from the format map at parse time and stored)
-#[derive(Debug, Clone)]
-pub(crate) struct PortConfig {
-    pub format: libspa::param::audio::AudioFormat,
-    pub rate: u32,
-    pub channels: u32,
-    pub positions: Vec<u32>, // the negotiated channel positions, replayed in the Format readback
-    pub flags: u32,
-    pub stride: u32, // bytes per interleaved frame
-}
-
-impl PortConfig {
-    pub(crate) fn oss_format(&self) -> u32 {
-        // parse_config admits only formats from the map, so the lookup can't
-        // miss; 0 (matching no AFMT) beats a panic across extern "C"
-        super::format::oss_format_info(self.format.0)
-            .map(|(m, _)| m)
-            .unwrap_or(0)
-    }
-
-    pub(crate) fn silence_byte(&self) -> u8 {
-        // Every supported signed integer and float format represents silence
-        // with all-zero bits. Unsigned 8-bit PCM is biased around 0x80.
-        if self.format.0 == SPA_AUDIO_FORMAT_U8 {
-            0x80
-        } else {
-            0
-        }
-    }
-
-    pub(crate) fn oss_channel_order(
-        &self,
-    ) -> Result<Option<u64>, super::format::UnsupportedChannelOrder> {
-        super::format::oss_channel_order(self.flags, &self.positions)
-    }
-}
+pub(crate) use backend::StreamConfig as PortConfig;
 
 // outcome of a per-(id, index) node param build (the enum_params hook)
 pub(crate) enum ParamBuild {
@@ -179,16 +144,16 @@ pub(crate) trait Direction: Sized + 'static {
         delay_eighths: u32,
     ) -> c_int;
 
-    // used from the main thread only; returns 0 or -errno with the device
-    // closed. `fragment_bytes` is the normalized fragment override
-    // (0 = automatic); the source applies it at open time, the sink at prime
-    // time (the period is only known then).
+    // Used from the main thread only; returns the applied configuration or a
+    // negative errno with the device closed. `fragment_bytes` is the
+    // normalized fragment override (0 = automatic); the source applies it at
+    // open time, the sink at prime time (the period is only known then).
     fn try_open_configure(
-        dsp: &mut Self::Device,
+        stream: &mut Self::Device,
         config: &PortConfig,
-        fragment: u32,
-        log: &crate::spa::Log,
-    ) -> c_int;
+        fragment_bytes: u32,
+        log: &Log,
+    ) -> Result<backend::ConfigureOutcome, c_int>;
     // Reset direction-specific state during a device swap.
     fn on_device_swapped(state: &mut DataState<Self>, port_idx: usize);
     // port_use_buffers: direction-specific resets inside the loop-side swap
