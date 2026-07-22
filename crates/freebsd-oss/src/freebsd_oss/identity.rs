@@ -37,16 +37,20 @@ pub(crate) const FRAGMENT: &str = "oss.fragment";
 
 pub(crate) const fn hotplug_diagnostic(kind: HotplugDiagnostic) -> &'static str {
     match kind {
-        HotplugDiagnostic::MonitorDetachAbort => "can't detach the monitor devd source; aborting",
-        HotplugDiagnostic::MonitorLost => "devd connection lost; hotplug disabled",
-        HotplugDiagnostic::MonitorOpen => "can't connect to devd, hotplug disabled",
-        HotplugDiagnostic::MonitorWatch => "can't watch devd",
-        HotplugDiagnostic::RouteDetachAbort => "can't detach the devd source; aborting",
+        HotplugDiagnostic::MonitorDetachAbort => {
+            "can't detach the monitor hotplug source; aborting"
+        }
+        HotplugDiagnostic::MonitorLost => "hotplug event queue lost; hotplug disabled",
+        HotplugDiagnostic::MonitorOpen => {
+            "can't initialize the hotplug event queue; hotplug disabled"
+        }
+        HotplugDiagnostic::MonitorWatch => "can't watch the hotplug event queue",
+        HotplugDiagnostic::RouteDetachAbort => "can't detach the hotplug source; aborting",
         HotplugDiagnostic::RouteLost => {
-            "devd connection lost; falling back to the mixer poll alone"
+            "hotplug event queue lost; falling back to the mixer poll alone"
         }
         HotplugDiagnostic::RouteNudge => "SND CONN event; re-polling the mixers",
-        HotplugDiagnostic::RouteOpen => "no devd connection",
+        HotplugDiagnostic::RouteOpen => "no hotplug event queue",
         HotplugDiagnostic::RouteOpenFallback => "jack events will wait for the mixer poll",
         HotplugDiagnostic::RouteTimerDetachAbort => "can't detach the mixer timer source; aborting",
         HotplugDiagnostic::RouteTimerArm => "can't arm the mixer poll timer",
@@ -57,7 +61,7 @@ pub(crate) const fn hotplug_diagnostic(kind: HotplugDiagnostic) -> &'static str 
             "can't watch the mixer; external volume changes won't be noticed"
         }
         HotplugDiagnostic::RouteWatch => {
-            "can't watch devd; jack events will wait for the mixer poll"
+            "can't watch the hotplug event queue; jack events will wait for the mixer poll"
         }
     }
 }
@@ -445,30 +449,33 @@ mod tests {
         let hotplug = [
             (
                 HotplugDiagnostic::MonitorDetachAbort,
-                "can't detach the monitor devd source; aborting",
+                "can't detach the monitor hotplug source; aborting",
             ),
             (
                 HotplugDiagnostic::MonitorLost,
-                "devd connection lost; hotplug disabled",
+                "hotplug event queue lost; hotplug disabled",
             ),
             (
                 HotplugDiagnostic::MonitorOpen,
-                "can't connect to devd, hotplug disabled",
+                "can't initialize the hotplug event queue; hotplug disabled",
             ),
-            (HotplugDiagnostic::MonitorWatch, "can't watch devd"),
+            (
+                HotplugDiagnostic::MonitorWatch,
+                "can't watch the hotplug event queue",
+            ),
             (
                 HotplugDiagnostic::RouteDetachAbort,
-                "can't detach the devd source; aborting",
+                "can't detach the hotplug source; aborting",
             ),
             (
                 HotplugDiagnostic::RouteLost,
-                "devd connection lost; falling back to the mixer poll alone",
+                "hotplug event queue lost; falling back to the mixer poll alone",
             ),
             (
                 HotplugDiagnostic::RouteNudge,
                 "SND CONN event; re-polling the mixers",
             ),
-            (HotplugDiagnostic::RouteOpen, "no devd connection"),
+            (HotplugDiagnostic::RouteOpen, "no hotplug event queue"),
             (
                 HotplugDiagnostic::RouteOpenFallback,
                 "jack events will wait for the mixer poll",
@@ -491,7 +498,7 @@ mod tests {
             ),
             (
                 HotplugDiagnostic::RouteWatch,
-                "can't watch devd; jack events will wait for the mixer poll",
+                "can't watch the hotplug event queue; jack events will wait for the mixer poll",
             ),
         ];
         for (kind, expected) in hotplug {
