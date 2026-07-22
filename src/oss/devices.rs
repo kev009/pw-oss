@@ -6,22 +6,6 @@ use crate::freebsd::{LibcFd, ioctl_int, ioctl_value, ioctl_zeroed};
 
 use super::abi::*;
 
-// sys/dev/sound/pcm/channel.h
-pub(crate) const CHN_2NDBUFMAXSIZE: usize = 131072;
-
-// every ring request keeps at least this byte budget, both directions
-pub(crate) const MIN_RING_BYTES: u32 = 65536;
-
-// The kernel's per-channel soft-ring byte budget. Today the fixed
-// CHN_2NDBUFMAXSIZE; the pending hw.snd.secondary_buffer_max kernel change
-// makes it rate-dependent (stride x rate x 200ms, clamped to the sysctl).
-// Adapt HERE and every ring request, retune gate and advertised quantum cap
-// follows. Note the cap always wins over MIN_RING_BYTES at the use sites (a
-// future cap can undercut the floor).
-pub(crate) fn ring_byte_cap(_stride: u32, _rate: u32) -> u32 {
-    CHN_2NDBUFMAXSIZE as u32
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DspCaps {
     pub formats: u32, // AFMT_* mask

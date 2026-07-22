@@ -240,8 +240,11 @@ fn follower_servo_locks_in_band_and_relocks_on_snap() {
 fn ring_request_floors_and_caps() {
     // four periods of the largest negotiable quantum, floored at the byte
     // budget, and the kernel cap always wins
-    assert_eq!(ring_request(1024, 16384, 1 << 20), 16384 * 4);
-    assert_eq!(ring_request(32768, 16384, 1 << 20), 32768 * 4);
-    assert!(ring_request(64, 64, 1 << 20) >= crate::oss::MIN_RING_BYTES);
-    assert_eq!(ring_request(65536, 65536, 4096), 4096);
+    assert_eq!(ring_request(1024, 16384, 8, 48_000), 16384 * 4);
+    assert_eq!(ring_request(32768, 16384, 8, 48_000), 32768 * 4);
+    assert!(ring_request(64, 64, 8, 48_000) >= crate::oss::MIN_BUFFER_BYTES);
+    assert_eq!(
+        ring_request(65536, 65536, 8, 48_000),
+        crate::oss::buffer_capacity_limit(8, 48_000)
+    );
 }

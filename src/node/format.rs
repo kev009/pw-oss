@@ -1,46 +1,6 @@
+#[cfg(test)]
+use crate::oss::{advertised_quantum_cap_frames, max_buffer_period_bytes as max_ring_period_bytes};
 use crate::spa::{pod_int_range, pod_prop, serialize_pod};
-
-// One graph cycle of the LARGEST quantum the graph commonly drives (the
-// 2048-frame default), in DEVICE bytes - a device running above the graph
-// rate needs proportionally more device frames per cycle - clamped so four
-// such periods still fit the ring cap. This is the shared policy behind the
-// sink's stable ring floor, the capture ring request and the advertised
-// node.max-latency (node::rebuild::publish_ring_quantum_cap): ring requests
-// floor on it so quantum changes retune in place instead of resizing the
-// device. graph_rate 0 (no position mapped yet) falls back to device frames.
-pub(crate) fn max_ring_period_bytes(stride: u32, device_rate: u32, graph_rate: u32) -> u32 {
-    let stride = stride.max(1);
-    let default_max = if graph_rate == 0 {
-        2048u32.saturating_mul(stride)
-    } else {
-        super::timing::device_period_bytes(2048, device_rate, graph_rate, stride)
-    };
-    let cap_frames = crate::oss::ring_byte_cap(stride, device_rate) / stride / 4;
-    default_max.min(cap_frames.saturating_mul(stride))
-}
-
-// The ring-derived quantum cap worth ADVERTISING as node.max-latency:
-// ring/4 in device frames, published only when that is shorter in TIME than
-// the common 2048-frame default max quantum. Raw device frames would
-// suppress the cap on high-rate devices whose ring is short in time
-// (192 kHz stereo: 4096 device frames is only 1024 graph frames at 48 kHz).
-// PipeWire scales its quantum limits with the graph rate (context.c,
-// SPA_SCALE32(max_quantum, rate, clock.rate)), so the default is a fixed
-// 2048/clock.rate of TIME - but clock.rate is host config we can't see from
-// here, so compare against the lowest common one (44100): max-latency only
-// ever LOWERS the quantum, so an over-published cap is inert, while an
-// under-published one leaves a structurally glitching ring unprotected. The
-// published fraction itself is time-based (frames / device rate) and thus
-// correct at whatever rate the graph actually runs. None = the cap can't
-// bite below the default, nothing worth publishing.
-pub(crate) fn advertised_quantum_cap_frames(stride: u32, rate: u32) -> Option<u32> {
-    let stride = stride.max(1);
-    let frames = crate::oss::ring_byte_cap(stride, rate) / stride / 4;
-    if rate == 0 || frames as u64 * 44100 >= 2048 * rate as u64 {
-        return None;
-    }
-    Some(frames)
-}
 
 // sys/dev/sound/pcm/matrix.h interleave order; note 5.1/7.1 put FC/LF after
 // the rears, unlike WAV/ALSA

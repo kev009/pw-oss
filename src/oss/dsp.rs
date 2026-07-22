@@ -5,7 +5,8 @@ use std::ffi::{CString, c_int};
 use crate::freebsd::{LibcFd, ioctl_int, ioctl_read};
 
 use super::abi::*;
-use super::devices::{CHN_2NDBUFMAXSIZE, MIN_RING_BYTES, drain_quantum_ns};
+use super::buffer::{MAX_BUFFER_BYTES, MIN_BUFFER_BYTES};
+use super::devices::drain_quantum_ns;
 
 pub(crate) struct Dsp {
     path: CString,
@@ -126,20 +127,20 @@ impl Dsp {
     // resets to blksz (channel.c:1980) - so the order here matters, and the
     // mark survives a trigger suspend since chn_resetbuf doesn't touch it).
     // `fragment` is the normalized oss.fragment override (0 = the 1 KiB
-    // default); either way the ring keeps the MIN_RING_BYTES budget.
+    // default); either way the ring keeps the MIN_BUFFER_BYTES budget.
     pub(crate) fn set_small_fragments(&self, fragment: u32, ring: u32) {
         if self.state != DspState::Setup {
             return; // triggered channels can't retune; the next re-prime will
         }
         // max-then-min, not clamp: the kernel cap must win over the floor (and
-        // clamp panics if a future rate-dependent cap undercuts MIN_RING_BYTES)
-        let ring = ring.max(MIN_RING_BYTES).min(CHN_2NDBUFMAXSIZE as u32);
+        // clamp panics if a future rate-dependent cap undercuts MIN_BUFFER_BYTES)
+        let ring = ring.max(MIN_BUFFER_BYTES).min(MAX_BUFFER_BYTES as u32);
         if fragment == 0 {
             set_fragment(self.raw_fd(), (ring >> 10).min(u16::MAX as u32) as u16, 10);
         // 1 KiB fragments
         } else {
-            // fragment is a power of two in [64, 16384] (node::normalize_fragment
-            // normalize_fragment), so the selector stays inside the kernel's
+            // fragment is normalized to a power of two in [64, 16384], so the
+            // selector stays inside the kernel's
             // RANGE(fragln, 4, 16) (dsp.c:1251) and the count never drops under
             // the kernel minimum of 2 (dsp.c:1256)
             let count = (ring >> fragment.trailing_zeros()).max(2u32);
@@ -334,8 +335,8 @@ pub(crate) struct DspWriter {
     prev_ns: u64,
 }
 
-static ZERO_SILENCE: [u8; CHN_2NDBUFMAXSIZE] = [0; CHN_2NDBUFMAXSIZE];
-static U8_SILENCE: [u8; CHN_2NDBUFMAXSIZE] = [0x80; CHN_2NDBUFMAXSIZE];
+static ZERO_SILENCE: [u8; MAX_BUFFER_BYTES] = [0; MAX_BUFFER_BYTES];
+static U8_SILENCE: [u8; MAX_BUFFER_BYTES] = [0x80; MAX_BUFFER_BYTES];
 
 impl DspWriter {
     pub(crate) fn new(path: &str) -> Self {
@@ -384,7 +385,7 @@ impl DspWriter {
         })
     }
 
-    fn silence_buffer(&self) -> &'static [u8; CHN_2NDBUFMAXSIZE] {
+    fn silence_buffer(&self) -> &'static [u8; MAX_BUFFER_BYTES] {
         if self.silence_byte == 0x80 {
             &U8_SILENCE
         } else {
@@ -533,13 +534,13 @@ impl DspWriter {
                 10,
             );
         } else {
-            // fragment is a power of two in [64, 16384] (node::normalize_fragment
-            // normalize_fragment), keeping the selector inside the kernel's
+            // fragment is normalized to a power of two in [64, 16384], keeping
+            // the selector inside the kernel's
             // RANGE(fragln, 4, 16) (dsp.c:1251); the count clamp mirrors the
-            // kernel's own bounds (min 2, total <= CHN_2NDBUFMAXSIZE, dsp.c:1256-1259)
+            // kernel's own bounds (min 2, total <= MAX_BUFFER_BYTES, dsp.c:1256-1259)
             let count = len
                 .div_ceil(fragment)
-                .clamp(2, CHN_2NDBUFMAXSIZE as u32 / fragment);
+                .clamp(2, MAX_BUFFER_BYTES as u32 / fragment);
             set_fragment(
                 self.raw_fd(),
                 count as u16,

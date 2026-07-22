@@ -1,4 +1,5 @@
 mod abi;
+mod buffer;
 mod devices;
 mod dsp;
 mod event;
@@ -8,9 +9,15 @@ pub(crate) use abi::{
     AFMT_F32_BE, AFMT_F32_LE, AFMT_S16_BE, AFMT_S16_LE, AFMT_S24_BE, AFMT_S24_LE, AFMT_S32_BE,
     AFMT_S32_LE, AFMT_U8,
 };
+pub(crate) use buffer::{
+    MIN_BUFFER_BYTES, advertised_quantum_cap_frames, buffer_capacity_limit, capture_buffer_request,
+    capture_buffer_required, capture_fill_targets, max_buffer_period_bytes, normalize_fragment,
+    playback_buffer_request, playback_buffer_required, playback_desired_delay, playback_fill_floor,
+    playback_target_delay,
+};
 pub(crate) use devices::{
-    DspCaps, MIN_RING_BYTES, PcmDevice, drain_quantum_ns, group_pcm_devices_by_parent,
-    list_pcm_devices, probe_caps, read_sndstat, ring_byte_cap,
+    DspCaps, PcmDevice, drain_quantum_ns, group_pcm_devices_by_parent, list_pcm_devices,
+    probe_caps, read_sndstat,
 };
 pub(crate) use dsp::{Dsp, DspWriter, PlaybackWrite};
 pub(crate) use event::{DeviceEvent, SoundKqueue, WakeEvent, enriched_sound_kqueue_available};

@@ -262,7 +262,7 @@ fn try_open_configure(
     // on direct opens the hardware blocksize is per-session state; re-read it
     // now that THIS configuration is in effect (vchan/uaudio values are stable)
     dsp.refresh_hw_quantum();
-    dsp.set_small_fragments(fragment, crate::oss::MIN_RING_BYTES); // normalized oss.fragment (0 = 1 KiB default)
+    dsp.set_small_fragments(fragment, crate::oss::MIN_BUFFER_BYTES); // normalized fragment override (0 = 1 KiB default)
     0
 }
 

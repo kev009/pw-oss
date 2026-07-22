@@ -1,5 +1,12 @@
 use super::*;
 
+#[cfg(test)]
+pub(super) use crate::oss::playback_buffer_request as buffer_request;
+pub(super) use crate::oss::{
+    playback_buffer_required as buffer_required, playback_desired_delay as desired_delay,
+    playback_fill_floor as fill_floor, playback_target_delay as target_delay,
+};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum RetuneOutcome {
     /// The current period remains in effect.
@@ -18,10 +25,6 @@ pub(super) fn retune_seed(target_goal: u32, fill: u32, write_now: u32, period: u
     target_goal.min(predicted_next_fill(fill, write_now, period))
 }
 
-pub(super) fn desired_delay(period: u32, playback_delay_eighths: u32) -> u32 {
-    (period / 8).saturating_mul(playback_delay_eighths)
-}
-
 // the resampler's per-cycle output can exceed a quantum; its size bounds the
 // largest single write and so the headroom the fill ceiling must reserve
 pub(super) fn rate_match_bytes(
@@ -31,92 +34,6 @@ pub(super) fn rate_match_bytes(
     rate_match
         .with_ref(|rm| rm.size.saturating_mul(stride))
         .unwrap_or(0)
-}
-
-// the fill target's floor: one period plus a jitter margin (a quarter period,
-// or one device fragment when the fragment dwarfs the quantum), so a small
-// oss.delay or a tiny quantum can't starve the wakeup fill. buffer_required()
-// and target_delay() must derive this identically: the in-place retune gate
-// (buffer_size >= required) guarantees the fill ceiling clears this floor
-// only while the two agree.
-pub(super) fn fill_floor(period: u32, blocksize: u32) -> u32 {
-    period.saturating_add((period / 4).max(blocksize))
-}
-
-pub(super) fn buffer_required(period: u32, desired: u32, blocksize: u32, write_max: u32) -> u32 {
-    period.saturating_mul(2).saturating_add(desired).max(
-        fill_floor(period, blocksize)
-            .saturating_add(write_max)
-            .saturating_add(blocksize),
-    )
-}
-
-// The prime-time ring request: what the current period needs, floored at
-// what the LARGEST negotiable quantum needs (max_period comes from
-// node::max_ring_period_bytes - the shared policy behind this floor, the
-// capture ring request and the advertised node.max-latency), never below
-// MIN_RING_BYTES, never above the kernel cap (which always wins). Capacity
-// is not latency: the fill target below still controls queued audio, while
-// a ring sized for every negotiable quantum lets period changes retune in
-// place instead of resizing the device.
-pub(super) fn buffer_request(
-    period: u32,
-    max_period: u32,
-    cap: u32,
-    fragment: u32,
-    chunk: u32,
-    write_max: u32,
-    playback_delay_eighths: u32,
-) -> u32 {
-    let frag_est = if fragment == 0 { 1024 } else { fragment };
-    let transfer = frag_est.max(chunk);
-    let stable = buffer_required(
-        max_period,
-        desired_delay(max_period, playback_delay_eighths),
-        transfer,
-        max_period,
-    );
-    buffer_required(
-        period,
-        desired_delay(period, playback_delay_eighths),
-        transfer,
-        write_max,
-    )
-    .max(stable)
-    .max(crate::oss::MIN_RING_BYTES)
-    .min(cap)
-}
-
-pub(super) fn target_delay(
-    granted: u32,
-    period: u32,
-    blocksize: u32,
-    write_max: u32,
-    desired: u32,
-) -> (u32, bool) {
-    if granted >= period.saturating_mul(2) {
-        // Calibrated: period/8 per oss.delay step, floored per fill_floor().
-        // The ceiling always leaves room above target for the largest expected
-        // write (write_max: a quantum, or the resampler's size if larger) plus
-        // one fragment of servo wander: the OSS write is non-blocking, so a
-        // write that doesn't fit must retain and retry its tail. A driver that
-        // grants many small fragments in a large buffer (uaudio) must
-        // not be fill-targeted near-full - that both adds 100+ ms of
-        // latency and leaves one fragment of headroom, dropping a chunk on
-        // every normal servo excursion. (uaudio drains buffer_ms-sized
-        // transfers, folded into blocksize above.) On a genuinely small grant
-        // (snd_hdspe forces both the fragment and the total) the ceiling
-        // lands just under near-full, which is the best a two-quanta
-        // buffer can do.
-        let floor = fill_floor(period, blocksize);
-        let ceil = granted
-            .saturating_sub(write_max.saturating_add(blocksize))
-            .max(period);
-        let want = desired.max(floor);
-        (want.min(ceil).max(period), want > ceil)
-    } else {
-        (granted / 2, false) // buffer too small for two quanta; best-effort, will drop (prime_playback warns)
-    }
 }
 
 // the shared geometry-commit tail of the prime and in-place retune paths:
@@ -362,11 +279,12 @@ pub(super) fn prime_playback(
     let desired = desired_delay(period_in_bytes, playback_delay_eighths);
     let chunk = crate::node::ns_to_frame_bytes(port.dsp.hw_quantum_ns, cfg_rate, stride);
     let write_max = period_in_bytes.max(rate_match_bytes(&port.rate_match, stride));
-    let max_period = crate::node::max_ring_period_bytes(stride, cfg_rate, graph_rate);
-    let request = buffer_request(
+    let max_period = crate::oss::max_buffer_period_bytes(stride, cfg_rate, graph_rate);
+    let request = crate::oss::playback_buffer_request(
         period_in_bytes,
         max_period,
-        crate::oss::ring_byte_cap(stride, cfg_rate),
+        stride,
+        cfg_rate,
         fragment_bytes,
         chunk,
         write_max,

@@ -27,10 +27,7 @@ mod timing;
 use dll::{BwAdapt, SpaDLL};
 pub(crate) use events::handle_process_latency;
 use events::{FormatPublication, MainEventTarget, NodeEvents};
-use format::{
-    advertised_quantum_cap_frames, build_buffers_info, build_enum_format_info,
-    max_ring_period_bytes, oss_format_info, snap_raw_to_caps,
-};
+use format::{build_buffers_info, build_enum_format_info, oss_format_info, snap_raw_to_caps};
 use rebuild::{
     MainEvent, NodeShared, RebuildWork, RebuildWorkSlot, RebuildWorker, install_device,
     queue_main_event, release_rebuild_takeover,
@@ -44,10 +41,9 @@ use timing::{
 };
 use timing::{on_wake, update_driver_wake};
 
+use crate::oss::normalize_fragment;
 use factory::{enum_interface_info, get_size, init};
-use rebuild::{
-    apply_props_param, normalize_fragment, poll_rebuild, queue_rebuild, store_and_rebuild,
-};
+use rebuild::{apply_props_param, poll_rebuild, queue_rebuild, store_and_rebuild};
 use state::{DataControl, DataState, MainState, Port, valid_data_block};
 
 use direction::MutexExt;

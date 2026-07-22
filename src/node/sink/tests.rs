@@ -830,9 +830,9 @@ fn zero_period_is_never_committed() {
 fn request_covers_the_largest_negotiable_quantum() {
     // the prime-time request holds the stable floor so later period changes
     // retune in place; the kernel cap always wins
-    let cap = crate::oss::ring_byte_cap(8, 48000);
-    let req = buffer_request(4096, 16384, cap, 0, 2048, 4096, 4);
+    let cap = crate::oss::buffer_capacity_limit(8, 48000);
+    let req = buffer_request(4096, 16384, 8, 48000, 0, 2048, 4096, 4);
     assert!(req >= buffer_required(16384, desired_delay(16384, 4), 2048, 16384));
-    assert!(req >= crate::oss::MIN_RING_BYTES.min(cap));
+    assert!(req >= crate::oss::MIN_BUFFER_BYTES.min(cap));
     assert!(req <= cap);
 }

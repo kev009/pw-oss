@@ -1,65 +1,9 @@
 use super::*;
 
-// The servo fill target and the catch-up threshold, shared by the prime and
-// re-tune paths.
-//
-// Target: one period plus HALF AN ARRIVAL of bottom margin. Queued readings
-// move in whole arrivals (the granted fragment, or the parent channel's
-// hardware drain quantum on vchans - 4 ms lumps on a RODECaster), so a bare
-// one-period target bottoms the sawtooth at exactly zero and any negative
-// wakeup jitter finds an empty ring: a silent one-period hole in the
-// recording (the EMPTY_CYCLE path). The added latency is physics - data
-// arriving every N ms can't be delivered with a sub-N/2 margin.
-//
-// Peak: half an arrival plus half a period of slack above target, but capped
-// one arrival under the granted ring. The kernel silently clamps the ring at
-// CHN_2NDBUFMAXSIZE; on fat strides the uncapped peak lands past the ring
-// end and the catch-up read goes dead - any excess then parks at the ceiling
-// (the bounded read only ever takes a period, and the +/-1% rate match needs
-// ~a second to bleed one period), where every late cycle overruns again. The
-// floor keeps routine arrival wander (one lump) from triggering catch-up
-// reads that fight the servo.
-pub(super) fn fill_targets(period: u32, blocksize: u32, ring: u32) -> (u32, u32) {
-    let target = period.saturating_add(blocksize / 2);
-    let mut peak = target
-        .saturating_add(blocksize / 2)
-        .saturating_add(period / 2);
-    if ring > 0 {
-        let ring_peak = ring.saturating_sub(blocksize);
-        let min_peak = target.saturating_add(blocksize).min(ring_peak);
-        peak = peak.min(ring_peak).max(min_peak);
-    }
-    (target, peak)
-}
-
-// The prime-time ring request: four periods of overrun slack, floored at
-// four periods of the LARGEST negotiable quantum (max_period comes from
-// node::max_ring_period_bytes - the shared policy behind the sink's stable
-// floor and the advertised node.max-latency), never below MIN_RING_BYTES,
-// never above the kernel cap (which always wins). Capacity is not latency:
-// target_fill still controls capture latency, while a ring sized for every
-// negotiable quantum lets period changes retune in place instead of
-// stopping the channel to resize.
-pub(super) fn ring_request(period: u32, max_period: u32, cap: u32) -> u32 {
-    period
-        .saturating_mul(4)
-        .max(max_period.saturating_mul(4))
-        .max(crate::oss::MIN_RING_BYTES)
-        .min(cap)
-}
-
-// the ring a non-degenerate capture geometry needs: the fill target plus a
-// catch-up band (peak >= target + one arrival) plus one arrival of top
-// headroom, floored at the two-quanta structural bound. The prime warning
-// and the in-place retune gate both key on this; below it fill_targets
-// pins the peak at (or under) the target and the catch-up read fights the
-// servo on every arrival.
-pub(super) fn ring_required(period: u32, blocksize: u32) -> u32 {
-    let (target, _) = fill_targets(period, blocksize, 0);
-    target
-        .saturating_add(blocksize.saturating_mul(2))
-        .max(period.saturating_mul(2))
-}
+pub(super) use crate::oss::{
+    capture_buffer_request as ring_request, capture_buffer_required as ring_required,
+    capture_fill_targets as fill_targets,
+};
 
 // the shared geometry-commit tail of the prime and in-place retune paths:
 // fill targets for `period` against the granted ring, and a servo relock
@@ -181,8 +125,9 @@ pub(super) fn prime_capture(
             frag,
             ring_request(
                 period_in_bytes,
-                crate::node::max_ring_period_bytes(stride, rate, graph_rate),
-                crate::oss::ring_byte_cap(stride, rate),
+                crate::oss::max_buffer_period_bytes(stride, rate, graph_rate),
+                stride,
+                rate,
             ),
         );
     }

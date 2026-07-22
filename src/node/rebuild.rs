@@ -10,18 +10,6 @@ pub(in crate::node) use worker::{
 };
 pub(crate) use worker::{NodeShared, queue_rebuild};
 
-// oss.fragment: 0 = automatic; otherwise round DOWN to a power of two and
-// clamp to [64, 16384] bytes. The kernel would take 16..65536 (dsp.c:1251
-// RANGE(fragln, 4, 16)); staying well inside keeps the request grantable
-// verbatim and the buffer budget sane (CHN_2NDBUFMAXSIZE, channel.h:442).
-pub(crate) fn normalize_fragment(v: u32) -> u32 {
-    if v == 0 {
-        0
-    } else {
-        (1u32 << (31 - v.leading_zeros())).clamp(64, 16384)
-    }
-}
-
 // The oss.* tunable live re-apply path: store the new loop-owned value on the
 // data loop (the prime paths read it there), then rebuild any running port
 // from this (main) thread so the next cycle re-primes with the new layout.
@@ -200,7 +188,7 @@ fn publish_ring_quantum_cap<D: Direction>(state: &mut MainState<D>, config: &Por
     let rate = config.rate;
     // the shared ring policy (node::format); the published fraction is time-based
     // (frames/device rate), so it needs no graph-rate scaling
-    let Some(frames) = crate::node::advertised_quantum_cap_frames(stride, rate) else {
+    let Some(frames) = crate::oss::advertised_quantum_cap_frames(stride, rate) else {
         return;
     };
     if state.ring_cap_published {
@@ -211,7 +199,7 @@ fn publish_ring_quantum_cap<D: Direction>(state: &mut MainState<D>, config: &Por
         state.log,
         "kernel ring ({} bytes) at stride {} holds 4 periods only up to \
     quantum {}; publishing node.max-latency",
-        crate::oss::ring_byte_cap(stride, rate),
+        crate::oss::buffer_capacity_limit(stride, rate),
         stride,
         frames
     );
@@ -386,26 +374,5 @@ fn poll_rebuild_completion<D: Direction>(state: &mut DataState<D>, port_idx: usi
             });
             true
         }
-    }
-}
-
-#[cfg(test)]
-mod install_tests {
-    use super::*;
-    // the oss.fragment normalization contract: 0 stays automatic, everything
-    // else rounds DOWN to a power of two and clamps into [64, 16384]
-    #[test]
-    fn normalize_fragment_rounds_down_and_clamps() {
-        assert_eq!(normalize_fragment(0), 0); // automatic
-        assert_eq!(normalize_fragment(1), 64); // clamps up to the floor
-        assert_eq!(normalize_fragment(63), 64); // rounds to 32, clamps to 64
-        assert_eq!(normalize_fragment(64), 64);
-        assert_eq!(normalize_fragment(65), 64); // round-down, then in range
-        assert_eq!(normalize_fragment(1000), 512); // non-pow2 rounds down
-        assert_eq!(normalize_fragment(4096), 4096); // pow2 passes through
-        assert_eq!(normalize_fragment(16384), 16384);
-        assert_eq!(normalize_fragment(30000), 16384); // clamps to the ceiling
-        assert_eq!(normalize_fragment(1 << 31), 16384);
-        assert_eq!(normalize_fragment(u32::MAX), 16384);
     }
 }
