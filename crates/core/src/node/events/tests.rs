@@ -272,7 +272,7 @@ fn published_port_param_flags(events: &NodeEvents<SinkDir>, id: u32) -> u32 {
 }
 
 #[test]
-fn format_loss_epoch_rejects_stale_delivery_but_survives_suspend() {
+fn format_loss_epoch_rejects_stale_delivery_but_accepts_current() {
     let events = NodeEvents::<SinkDir>::new();
     events.with_port_info(|port| {
         port.fix_pointers();
@@ -302,8 +302,7 @@ fn format_loss_epoch_rejects_stale_delivery_but_survives_suspend() {
         SPA_PARAM_INFO_READ
     );
 
-    // Suspend changes the device generation but not this publication
-    // epoch. A current loss must therefore still be applied.
+    // A loss carrying the current publication epoch must still be applied.
     let current_epoch = events.format_publication_epoch();
     unsafe {
         target.deliver_on_main(MainEvent::FormatLost {

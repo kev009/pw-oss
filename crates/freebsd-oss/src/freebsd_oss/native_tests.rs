@@ -845,3 +845,20 @@ fn native_snd_dummy_spa_factory_and_sink_process_smoke() {
     let (_, path) = assert_dummy_available();
     spa_host::run_sink_smoke(&path);
 }
+
+#[test]
+#[ignore = "requires root and the FreeBSD snd_dummy kernel module"]
+fn native_snd_dummy_spa_suspend_releases_exclusive_device() {
+    let (unit, path) = assert_dummy_available();
+    let mode = PcmModeGuard::new(unit);
+    mode.enable_direct_bitperfect();
+
+    let devnode = path.trim_start_matches("/dev/");
+    wait_until(Duration::from_secs(2), || {
+        let playback = sndstat_dsp_info(devnode, true)?;
+        (playback.bitperfect && playback.exclusive == Some(true)).then_some(())
+    })
+    .expect("sndstat did not publish direct exclusive playback state");
+
+    spa_host::run_sink_smoke_at(&path, 8_000);
+}

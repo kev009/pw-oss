@@ -5,6 +5,8 @@ use libspa::pod::{Object, Property, Value, ValueArray};
 use libspa::sys::*;
 use libspa::utils::Id;
 
+use crate::freebsd_oss::DspWriter;
+
 struct TestLoopState {
     loop_: *mut spa_loop,
     source: *mut spa_source,
@@ -332,7 +334,7 @@ struct AlignedPod {
 }
 
 impl AlignedPod {
-    fn format() -> Self {
+    fn format(rate: i32) -> Self {
         use libspa::pod::serialize::PodSerializer;
 
         let value = Value::Object(Object {
@@ -348,7 +350,7 @@ impl AlignedPod {
                     SPA_FORMAT_AUDIO_format,
                     Value::Id(Id(SPA_AUDIO_FORMAT_S16_LE)),
                 ),
-                Property::new(SPA_FORMAT_AUDIO_rate, Value::Int(48_000)),
+                Property::new(SPA_FORMAT_AUDIO_rate, Value::Int(rate)),
                 Property::new(SPA_FORMAT_AUDIO_channels, Value::Int(2)),
                 Property::new(
                     SPA_FORMAT_AUDIO_position,
@@ -471,6 +473,10 @@ fn monotonic_ns() -> u64 {
 }
 
 pub(super) fn run_sink_smoke(path: &str) {
+    run_sink_smoke_at(path, 48_000);
+}
+
+pub(super) fn run_sink_smoke_at(path: &str, rate: u32) {
     let mut index = 0;
     let mut sink_factory = std::ptr::null();
     let mut names = Vec::new();
@@ -521,7 +527,7 @@ pub(super) fn run_sink_smoke(path: &str) {
     let methods = unsafe { (*node).iface.cb.funcs.cast::<spa_node_methods>() };
     let object = unsafe { (*node).iface.cb.data };
 
-    let format = AlignedPod::format();
+    let format = AlignedPod::format(rate as i32);
     let set_format = unsafe { (*methods).port_set_param }.expect("node must set port params");
     assert_eq!(
         unsafe {
@@ -572,7 +578,7 @@ pub(super) fn run_sink_smoke(path: &str) {
     clock.id = 7;
     clock.rate = spa_fraction {
         num: 1,
-        denom: 48_000,
+        denom: rate,
     };
     clock.target_rate = clock.rate;
     clock.target_duration = 1_024;
@@ -626,6 +632,62 @@ pub(super) fn run_sink_smoke(path: &str) {
     assert_ne!(status & SPA_STATUS_NEED_DATA as i32, 0);
     assert_eq!(fixture.io.status, SPA_STATUS_NEED_DATA as i32);
 
+    assert_eq!(unsafe { send_command(object, &raw const suspend) }, 0);
+
+    // Suspend is not Pause: it releases the native descriptor and removes
+    // both Format and Buffers. The open also becomes an exclusive-release
+    // assertion when this smoke test runs in direct bitperfect mode.
+    let mut contender = DspWriter::new(
+        path.as_c_str()
+            .to_str()
+            .expect("the test device path must be UTF-8"),
+    );
+    contender
+        .open()
+        .expect("SPA Suspend must release the playback descriptor");
+    contender.close();
+    assert_eq!(
+        unsafe { send_command(object, &raw const start) },
+        -libc::EIO,
+        "Suspend must remove the negotiated format and buffers"
+    );
+
+    assert_eq!(
+        unsafe {
+            set_format(
+                object,
+                SPA_DIRECTION_INPUT,
+                0,
+                SPA_PARAM_Format,
+                0,
+                format.as_pod(),
+            )
+        },
+        0
+    );
+    assert_eq!(
+        unsafe { send_command(object, &raw const start) },
+        -libc::EIO,
+        "renegotiating Format alone must not resurrect released buffers"
+    );
+    assert_eq!(
+        unsafe {
+            use_buffers(
+                object,
+                SPA_DIRECTION_INPUT,
+                0,
+                0,
+                buffers.as_mut_ptr(),
+                buffers.len() as u32,
+            )
+        },
+        0
+    );
+    fixture.requeue();
+    position.clock.nsec = monotonic_ns();
+    assert_eq!(unsafe { send_command(object, &raw const start) }, 0);
+    let status = unsafe { process(object) };
+    assert_ne!(status & SPA_STATUS_NEED_DATA as i32, 0);
     assert_eq!(unsafe { send_command(object, &raw const suspend) }, 0);
     drop(handle);
 }

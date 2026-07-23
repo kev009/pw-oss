@@ -12,6 +12,7 @@ pub(crate) fn spa_command_to_str(body: &libspa::sys::spa_pod_object_body) -> &'s
     }
 }
 
+use super::ports::publish_format_state;
 use super::*;
 use crate::backend::StreamLifecycle as _;
 use crate::spa::SendWrap;
@@ -129,35 +130,27 @@ pub(super) unsafe extern "C" fn set_io<D: Direction>(
     0
 }
 
-pub(super) type ExtractedDevices<D> = [(usize, <D as Direction>::Device); MAX_PORTS];
-
-pub(super) fn replace_port_devices<D: Direction>(
-    ports: &mut [Port<D>; MAX_PORTS],
-    devices: ExtractedDevices<D>,
-) -> [D::Device; MAX_PORTS] {
-    devices.map(|(index, device)| {
-        ports[index].rebuild_pending = false;
-        reset_stream_epoch(&mut ports[index]);
-        std::mem::replace(&mut ports[index].dsp, device)
-    })
-}
-
-// Return devices extracted by Suspend without transferring their ownership
-// into the loop closure. If the invoke cannot run, the caller still owns them
-// and can retry or release them only after the loop is known unavailable.
-pub(super) fn restore_extracted_devices<D: Direction>(
-    control: &DataControl<D>,
-    devices: &mut Option<ExtractedDevices<D>>,
-) -> Option<[D::Device; MAX_PORTS]> {
-    devices.as_ref()?;
-    control.query(|state| {
-        let devices = devices
-            .take()
-            .expect("the caller retains extracted devices until this invoke runs");
-        let placeholders = replace_port_devices(&mut state.ports, devices);
-        state.rebuild_takeover = false;
-        placeholders
-    })
+// Suspend is stronger than Pause: SPA requires it to remove all negotiated
+// formats and close the devices. Do the pointer-bearing teardown on the data
+// loop while swapping the live descriptor behind a closed placeholder. The
+// caller owns and closes the returned device on the non-RT main thread.
+pub(super) fn take_suspended_device<D: Direction>(
+    port: &mut Port<D>,
+    placeholder: D::Device,
+) -> D::Device {
+    let retired = std::mem::replace(&mut port.dsp, placeholder);
+    reset_stream_epoch(port);
+    port.buffers.clear();
+    port.config = None;
+    port.setup_period = 0;
+    port.delivery_quantum_bytes = 0;
+    port.dll.init();
+    port.bw_adapt.reset();
+    port.was_matching = false;
+    port.pending_xrun = None;
+    port.generation = port.generation.wrapping_add(1);
+    port.rebuild_pending = true;
+    retired
 }
 
 pub(super) fn restore_started_if_stop_unobserved(
@@ -177,12 +170,13 @@ pub(super) unsafe extern "C" fn send_command<D: Direction>(
     let state = object.cast::<State<D>>();
     assert!(!state.is_null(), "object is not supposed to be null");
     let control = unsafe { DataControl::from_raw(state) };
-    let (log, shared, rebuild_work) = {
+    let (log, shared, rebuild_work, events) = {
         let main = unsafe { main_ref(state) };
         (
             main.log.clone(),
             main.shared.clone(),
             main.rebuild_worker.endpoint(),
+            main.events.clone(),
         )
     };
 
@@ -288,83 +282,63 @@ pub(super) unsafe extern "C" fn send_command<D: Direction>(
             let stream_path = unsafe { &main_ref(state).stream_path };
             let placeholders: [D::Device; MAX_PORTS] =
                 std::array::from_fn(|_| D::Device::new(stream_path));
-            // Quiesce and transfer device ownership out of DataState. Potentially
-            // sleeping suspend/close operations then run on this thread while
-            // the data loop sees only closed placeholders.
+            // Quiesce, unconfigure, and transfer device ownership out of
+            // DataState. Potentially sleeping closes then run on this thread
+            // while the data loop sees only closed placeholders.
             let Some((devices, deferred)) = control.query(move |state| {
                 state.started = false;
                 data_stopped_ref.store(true, std::sync::atomic::Ordering::Release);
+                super::timing::invalidate_device_wake(state);
                 update_driver_wake(state);
                 D::on_suspend_loop(state);
                 state.rebuild_takeover = true;
                 let deferred = state.deferred_work.take();
                 let mut placeholders = placeholders.into_iter();
-                let devices: [(usize, D::Device); MAX_PORTS] = std::array::from_fn(|index| {
-                    let port = &mut state.ports[index];
-                    port.rebuild_pending = true;
-                    reset_stream_epoch(port);
-                    port.generation = port.generation.wrapping_add(1);
-                    state
-                        .shared
-                        .generation
-                        .store(port.generation, std::sync::atomic::Ordering::Release);
+                let devices: [D::Device; MAX_PORTS] = std::array::from_fn(|index| {
                     let placeholder = placeholders
                         .next()
                         .expect("one prebuilt placeholder per port");
-                    (index, std::mem::replace(&mut port.dsp, placeholder))
+                    let retired = take_suspended_device(&mut state.ports[index], placeholder);
+                    state.shared.generation.store(
+                        state.ports[index].generation,
+                        std::sync::atomic::Ordering::Release,
+                    );
+                    D::on_device_swapped(state, index);
+                    retired
                 });
                 (devices, deferred)
             }) else {
                 restore_started_if_stop_unobserved(&shared.started, was_started, &data_stopped);
                 return -libc::EIO;
             };
-            let mut devices = Some(devices);
             drop(deferred);
             // a deposited-but-unconsumed rebuild would hold an open
             // (possibly exclusive) device across the whole suspended stretch
             // (nothing polls while stopped); close it now, off the RT path.
             shared.discard_swap();
-            if !rebuild_work.wait_idle() {
-                let mut placeholders = restore_extracted_devices(&control, &mut devices);
-                if placeholders.is_none() && devices.is_some() {
-                    placeholders = restore_extracted_devices(&control, &mut devices);
-                }
-                if placeholders.is_none() && devices.is_some() {
-                    crate::warn!(
-                        log,
-                        "can't restore devices after rebuild worker shutdown: data loop is unavailable"
-                    );
-                }
-                drop(placeholders);
-                return -libc::EIO;
-            }
+            let worker_idle = rebuild_work.wait_idle();
             shared.discard_swap();
-            for (_, dsp) in devices
-                .as_mut()
-                .expect("Suspend retains the extracted devices until restoration")
-            {
-                if !dsp.is_closed() && !dsp.suspend() {
+            for mut dsp in devices {
+                // SPA Suspend closes the device; a native trigger stop is
+                // only the weaker Pause operation.
+                if !dsp.is_closed() {
                     dsp.close();
                 }
             }
-            let placeholders = restore_extracted_devices(&control, &mut devices);
-            let Some(placeholders) = placeholders else {
-                // The first invoke retained ownership on failure. Retry once
-                // so a transient handoff error does not release live or
-                // suspended descriptors while placeholders remain installed.
-                let restored = devices.is_none()
-                    || restore_extracted_devices(&control, &mut devices).is_some();
-                if !restored {
-                    crate::warn!(
-                        log,
-                        "can't restore suspended devices: data loop is unavailable"
-                    );
-                }
-                return -libc::EIO;
-            };
-            // Closed placeholders still own heap fields; destroy them on main.
-            drop(placeholders);
-            0
+            let takeover_released = release_rebuild_takeover(&control, 0);
+            // Advertise the transition only after the old descriptor is gone.
+            // Keep the callback boundary last: listeners may synchronously
+            // re-enter or destroy the node.
+            {
+                let main = unsafe { main_ref(state) };
+                publish_format_state(main, None);
+            }
+            unsafe { events.flush() };
+            if worker_idle && takeover_released {
+                0
+            } else {
+                -libc::EIO
+            }
         }
         (SPA_TYPE_COMMAND_Node, SPA_NODE_COMMAND_ParamBegin | SPA_NODE_COMMAND_ParamEnd) => 0, // we don't care
         (cmd_type, cmd_id) => {
@@ -491,24 +465,44 @@ mod tests {
     }
 
     #[test]
-    fn extracted_devices_restore_ports_and_clear_pending_claims() {
+    fn suspend_port_teardown_clears_negotiation_and_returns_live_device() {
         let (old_read, old_write) = backend::test_transport::pipe_pair(true, true);
-        let (new_read, new_write) = backend::test_transport::pipe_pair(true, true);
-        let mut ports = [test_port(old_write)];
-        ports[0].rebuild_pending = true;
+        let mut port = test_port(old_write);
+        port.config = Some(backend::StreamConfig {
+            format: libspa::param::audio::AudioFormat(SPA_AUDIO_FORMAT_S16_LE),
+            rate: 48_000,
+            channels: 2,
+            positions: vec![SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR],
+            flags: 0,
+            stride: 4,
+        });
+        port.buffers.push(std::ptr::dangling_mut());
+        port.setup_period = 1_920;
+        port.delivery_quantum_bytes = 1_024;
+        port.was_matching = true;
+        port.pending_xrun = Some(PendingXrun {
+            trigger_us: 1,
+            delay_us: 2,
+            quality: None,
+        });
 
-        let devices = [(0, backend::fake::FakeStream::test_on_fd(new_write, 8))];
-        let mut placeholders = replace_port_devices(&mut ports, devices);
+        let placeholder = backend::fake::FakeStream::new("closed");
+        let mut retired = take_suspended_device(&mut port, placeholder);
 
-        assert!(!ports[0].rebuild_pending);
-        assert_eq!(ports[0].dsp.write(&[2; 8]).bytes, 8);
-        assert_eq!(placeholders[0].write(&[1; 8]).bytes, 8);
-        assert_eq!(backend::test_transport::drain(new_read), [2; 8]);
+        assert!(port.config.is_none());
+        assert!(port.buffers.is_empty());
+        assert_eq!(port.setup_period, 0);
+        assert_eq!(port.delivery_quantum_bytes, 0);
+        assert!(!port.was_matching);
+        assert!(port.pending_xrun.is_none());
+        assert!(port.rebuild_pending);
+        assert_eq!(port.generation, 1);
+        assert_eq!(retired.write(&[1; 8]).bytes, 8);
         assert_eq!(backend::test_transport::drain(old_read), [1; 8]);
+        retired.close();
 
         unsafe {
             libc::close(old_read);
-            libc::close(new_read);
         }
     }
 }
