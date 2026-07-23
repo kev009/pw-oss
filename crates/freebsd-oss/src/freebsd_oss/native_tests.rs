@@ -754,6 +754,15 @@ fn native_snd_dummy_queue_xrun_and_reprime_recovery() {
 fn native_snd_dummy_hotplug_and_devd_reconnect() {
     let (unit, _) = assert_dummy_available();
     let _restore_dummy = DummyModuleGuard;
+    // Keep the mixer's open control descriptor alive across detach. FreeBSD
+    // 14.1+ permits cdev destruction with live descriptors; this guards
+    // against regressing to the old unload-blocking assumption.
+    let snapshot = device_snapshot(&[unit]).expect("snd_dummy must have a route snapshot");
+    let (mut detached_route_controller, mut detached_routes) = RouteController::probe(&snapshot);
+    assert!(
+        !detached_routes.is_empty(),
+        "snd_dummy must expose a live mixer route for the detach regression"
+    );
     let mut catalog = DeviceCatalog::scan().expect("the initial sndstat catalog must scan");
     assert!(catalog_contains_unit(&catalog, unit));
     let initial_object = catalog
@@ -799,6 +808,8 @@ fn native_snd_dummy_hotplug_and_devd_reconnect() {
         },
     );
     assert!(!catalog_contains_unit(&catalog, unit));
+    let _ = detached_route_controller.poll(&mut detached_routes);
+    detached_route_controller.refresh_all(&mut detached_routes);
 
     command_succeeds("/sbin/kldload", &["snd_dummy"]);
     wait_until(Duration::from_secs(5), || {
@@ -824,6 +835,8 @@ fn native_snd_dummy_hotplug_and_devd_reconnect() {
     );
     assert!(catalog_contains_unit(&catalog, reloaded_unit));
     assert_eq!(monitor.fd(), stable_queue);
+    let _ = detached_route_controller.poll(&mut detached_routes);
+    drop(detached_route_controller);
 }
 
 #[test]

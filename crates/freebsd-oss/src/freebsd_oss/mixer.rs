@@ -232,7 +232,6 @@ struct RouteBinding {
 struct MixerHandle {
     mixer: Mixer,
     counter: c_int,
-    recsrc: u32,
 }
 
 pub(crate) struct RouteController {
@@ -283,18 +282,53 @@ fn set_native_levels(volume: &mut RouteVolume, levels: (u32, u32)) {
     volume.values = vec![level_to_volume(levels.0), level_to_volume(levels.1)];
 }
 
+fn selected_recording_sources(recmask: u32, recsrc: u32) -> u32 {
+    let selected = recsrc & recmask;
+    if selected != 0 || recmask == 0 {
+        selected
+    } else {
+        // Match the kernel's non-empty fallback for a non-empty recmask.
+        1 << recmask.trailing_zeros()
+    }
+}
+
+fn sync_source_routes(
+    routes: &mut [RouteSnapshot],
+    bindings: &[RouteBinding],
+    mixer_index: usize,
+    selected: u32,
+) -> Vec<usize> {
+    let mut changed = Vec::new();
+    for (pos, (route, binding)) in routes.iter_mut().zip(bindings).enumerate() {
+        let Some(source) = binding.source else {
+            continue;
+        };
+        if binding.mixer != mixer_index {
+            continue;
+        }
+        let active = selected & (1 << source) != 0;
+        if route.active != active {
+            route.active = active;
+            changed.push(pos);
+        }
+    }
+    changed
+}
+
 fn external_selection_change(route: &RouteSnapshot) -> RouteChange {
     RouteChange {
         key: Some(route.key),
         selection: RouteSelectionOutcome::Applied,
         // A control-less source route is soft volume. Re-announcing hardware
         // ObjectConfig for it would overwrite the session manager's softvol.
-        volume: route.volume.hardware,
-        mute: route.mute.hardware,
+        // A route which just became inactive needs only the Route serial.
+        volume: route.active && route.volume.hardware,
+        mute: route.active && route.mute.hardware,
         refresh: true,
         diagnostic: Some(RouteDiagnostic::info(format!(
-            "recording source changed externally: route {}",
-            route.name
+            "recording source changed externally: route {} {}",
+            route.name,
+            if route.active { "enabled" } else { "disabled" }
         ))),
     }
 }
@@ -359,12 +393,7 @@ impl RouteController {
                 }
                 if direction == StreamDirection::Capture && mixer.recmask().count_ones() >= 2 {
                     let recmask = mixer.recmask();
-                    let selected = probe_recsrc & recmask;
-                    let current = if selected != 0 {
-                        selected.trailing_zeros()
-                    } else {
-                        recmask.trailing_zeros()
-                    };
+                    let selected = selected_recording_sources(recmask, probe_recsrc);
                     for source in 0..MIXER_SOURCE_COUNT {
                         if recmask & (1 << source) == 0 {
                             continue;
@@ -396,7 +425,7 @@ impl RouteController {
                             // a jack, so retain the established compatibility
                             // value instead of fabricating availability.
                             availability: RouteAvailability::Yes,
-                            active: source == current,
+                            active: selected & (1 << source) != 0,
                             volume: route_volume(levels, volume_control.is_some()),
                             mute: RouteMute {
                                 value: mute_readback.unwrap_or(false),
@@ -478,7 +507,6 @@ impl RouteController {
                 mixers.push(MixerHandle {
                     counter: mixer.modify_counter().unwrap_or(0),
                     mixer,
-                    recsrc: probe_recsrc,
                 });
             }
         }
@@ -519,7 +547,11 @@ impl RouteController {
         }
     }
 
-    fn sync_source(&mut self, routes: &mut [RouteSnapshot], mixer_index: usize) -> Option<usize> {
+    fn sync_source(
+        &mut self,
+        routes: &mut [RouteSnapshot],
+        mixer_index: usize,
+    ) -> Option<Vec<usize>> {
         if !self
             .bindings
             .iter()
@@ -528,29 +560,14 @@ impl RouteController {
             return None;
         }
         let recsrc = self.mixers[mixer_index].mixer.recsrc()?;
-        if recsrc == self.mixers[mixer_index].recsrc {
-            return None;
-        }
-        self.mixers[mixer_index].recsrc = recsrc;
-        let masked = recsrc & self.mixers[mixer_index].mixer.recmask();
-        if masked == 0 {
-            return None;
-        }
-        let source = masked.trailing_zeros();
-        let pos = self
-            .bindings
-            .iter()
-            .position(|binding| binding.mixer == mixer_index && binding.source == Some(source))?;
-        if routes[pos].active {
-            return None;
-        }
-        for (route, binding) in routes.iter_mut().zip(&self.bindings) {
-            if binding.mixer == mixer_index && binding.source.is_some() {
-                route.active = binding.source == Some(source);
+        let selected = selected_recording_sources(self.mixers[mixer_index].mixer.recmask(), recsrc);
+        let changed = sync_source_routes(routes, &self.bindings, mixer_index, selected);
+        for &pos in &changed {
+            if routes[pos].active {
+                self.refresh(routes, pos);
             }
         }
-        self.refresh(routes, pos);
-        Some(pos)
+        Some(changed)
     }
 
     pub(crate) fn refresh_all(&mut self, routes: &mut [RouteSnapshot]) {
@@ -573,8 +590,12 @@ impl RouteController {
             // land inside our write/readback window. Always diff the values;
             // that is also what suppresses spurious notifications.
             self.mixers[mixer_index].counter = counter;
-            if let Some(pos) = self.sync_source(routes, mixer_index) {
-                changes.push(external_selection_change(&routes[pos]));
+            if let Some(changed) = self.sync_source(routes, mixer_index) {
+                changes.extend(
+                    changed
+                        .into_iter()
+                        .map(|pos| external_selection_change(&routes[pos])),
+                );
             }
             for pos in 0..routes.len() {
                 if self.bindings[pos].mixer != mixer_index {
@@ -619,7 +640,21 @@ impl RouteController {
             let binding = &self.bindings[pos];
             if let Some(source) = binding.source {
                 if self.mixers[binding.mixer].mixer.set_recsrc(1 << source) {
-                    selected = self.sync_source(routes, binding.mixer);
+                    let mixer_index = binding.mixer;
+                    let _ = self.sync_source(routes, mixer_index);
+                    selected = if routes[pos].active {
+                        Some(pos)
+                    } else {
+                        self.bindings
+                            .iter()
+                            .enumerate()
+                            .find_map(|(candidate, binding)| {
+                                (binding.mixer == mixer_index
+                                    && binding.source.is_some()
+                                    && routes[candidate].active)
+                                    .then_some(candidate)
+                            })
+                    };
                     // The session manager applies a requested route
                     // optimistically. A kernel-deflected RECSRC must therefore
                     // be re-announced even when no level or mute changed.
@@ -640,16 +675,25 @@ impl RouteController {
         let mute_control = binding.mute_control;
         let mut volume = false;
         let mut mute = false;
+        let mut volume_write_failed = false;
+        let mut mute_write_failed = false;
         for value in update.values {
             match value {
                 RouteValueUpdate::Mute(requested) if requested != routes[pos].mute.value => {
-                    if mute_control.is_none_or(|control| {
-                        self.mixers[binding.mixer]
-                            .mixer
-                            .set_muted(control, requested)
-                    }) {
-                        routes[pos].mute.value = requested;
-                        mute = true;
+                    match mute_control {
+                        None => {
+                            routes[pos].mute.value = requested;
+                            mute = true;
+                        }
+                        Some(control)
+                            if self.mixers[binding.mixer]
+                                .mixer
+                                .set_muted(control, requested) =>
+                        {
+                            routes[pos].mute.value = requested;
+                            mute = true;
+                        }
+                        Some(_) => mute_write_failed = true,
                     }
                 }
                 RouteValueUpdate::Volume(values) if !values.is_empty() => {
@@ -657,15 +701,22 @@ impl RouteController {
                     let right = values.get(1).copied().unwrap_or(left);
                     let levels = (volume_to_level(left), volume_to_level(right));
                     let current = native_levels(&routes[pos].volume);
-                    if levels != current
-                        && volume_control.is_none_or(|control| {
-                            self.mixers[binding.mixer]
-                                .mixer
-                                .set_level(control, levels.0, levels.1)
-                        })
-                    {
-                        set_native_levels(&mut routes[pos].volume, levels);
-                        volume = true;
+                    if levels != current {
+                        match volume_control {
+                            None => {
+                                set_native_levels(&mut routes[pos].volume, levels);
+                                volume = true;
+                            }
+                            Some(control)
+                                if self.mixers[binding.mixer]
+                                    .mixer
+                                    .set_level(control, levels.0, levels.1) =>
+                            {
+                                set_native_levels(&mut routes[pos].volume, levels);
+                                volume = true;
+                            }
+                            Some(_) => volume_write_failed = true,
+                        }
                     }
                 }
                 _ => {}
@@ -676,6 +727,36 @@ impl RouteController {
         }
         let (changed_pos, volume, mute) =
             selection_notification_flags(routes, pos, selected, volume, mute);
+        let mut diagnostics = Vec::new();
+        let mut warning = false;
+        match selection {
+            RouteSelectionOutcome::Failed => {
+                warning = true;
+                diagnostics.push(format!(
+                    "can't select the recording source for route {}",
+                    routes[pos].name
+                ));
+            }
+            RouteSelectionOutcome::Deflected => diagnostics.push(format!(
+                "kernel did not move the recording source to route {}",
+                routes[pos].name
+            )),
+            RouteSelectionOutcome::Unchanged | RouteSelectionOutcome::Applied => {}
+        }
+        if volume_write_failed {
+            warning = true;
+            diagnostics.push(format!(
+                "can't set hardware volume for route {}",
+                routes[pos].name
+            ));
+        }
+        if mute_write_failed {
+            warning = true;
+            diagnostics.push(format!(
+                "can't set hardware mute for route {}",
+                routes[pos].name
+            ));
+        }
         RouteChange {
             key: Some(routes[changed_pos].key),
             volume,
@@ -686,17 +767,14 @@ impl RouteController {
                 RouteSelectionOutcome::Applied | RouteSelectionOutcome::Deflected
             ) || volume
                 || mute,
-            diagnostic: match selection {
-                RouteSelectionOutcome::Failed => Some(RouteDiagnostic::warning(format!(
-                    "can't select the recording source for route {}",
-                    routes[pos].name
-                ))),
-                RouteSelectionOutcome::Deflected => Some(RouteDiagnostic::info(format!(
-                    "kernel did not move the recording source to route {}",
-                    routes[pos].name
-                ))),
-                RouteSelectionOutcome::Unchanged | RouteSelectionOutcome::Applied => None,
-            },
+            diagnostic: (!diagnostics.is_empty()).then(|| {
+                let message = diagnostics.join("; ");
+                if warning {
+                    RouteDiagnostic::warning(message)
+                } else {
+                    RouteDiagnostic::info(message)
+                }
+            }),
         }
     }
 
@@ -804,11 +882,7 @@ mod tests {
                 follows_recsrc: false,
                 source: Some(0),
             }],
-            mixers: vec![MixerHandle {
-                mixer,
-                counter: 0,
-                recsrc: 0,
-            }],
+            mixers: vec![MixerHandle { mixer, counter: 0 }],
         };
         let mut routes = [route(false)];
 
@@ -862,6 +936,114 @@ mod tests {
         let mute_only = external_selection_change(&mute_only);
         assert!(!mute_only.volume);
         assert!(mute_only.mute);
+
+        let mut inactive = route(false);
+        inactive.volume.hardware = true;
+        inactive.mute.hardware = true;
+        let inactive = external_selection_change(&inactive);
+        assert!(inactive.refresh);
+        assert!(!inactive.volume);
+        assert!(!inactive.mute);
+    }
+
+    #[test]
+    fn recording_source_masks_preserve_every_active_bit() {
+        assert_eq!(selected_recording_sources(0b1110, 0b1010), 0b1010);
+        assert_eq!(
+            selected_recording_sources(0b1110, 0),
+            0b0010,
+            "a missing readback retains the kernel-compatible lowest-bit fallback"
+        );
+
+        let mut first = route(true);
+        first.key = RouteKey(1);
+        let mut second = route(false);
+        second.key = RouteKey(2);
+        let mut third = route(true);
+        third.key = RouteKey(3);
+        let mut routes = [first, second, third];
+        let bindings = [
+            RouteBinding {
+                mixer: 0,
+                volume_control: None,
+                mute_control: None,
+                follows_recsrc: false,
+                source: Some(1),
+            },
+            RouteBinding {
+                mixer: 0,
+                volume_control: None,
+                mute_control: None,
+                follows_recsrc: false,
+                source: Some(2),
+            },
+            RouteBinding {
+                mixer: 0,
+                volume_control: None,
+                mute_control: None,
+                follows_recsrc: false,
+                source: Some(3),
+            },
+        ];
+
+        let changed = sync_source_routes(&mut routes, &bindings, 0, 0b0110);
+        assert_eq!(changed, [1, 2]);
+        assert_eq!(
+            routes.map(|route| route.active),
+            [true, true, false],
+            "the mask must not collapse to its lowest set bit"
+        );
+    }
+
+    #[test]
+    fn failed_hardware_volume_and_mute_writes_are_logged_without_fake_state() {
+        let (read_fd, write_fd) = crate::backend::test_transport::pipe_pair(false, false);
+        let mixer = Mixer {
+            // SAFETY: pipe_pair transfers the open descriptor to this owner.
+            fd: unsafe { LibcFd::from_raw(write_fd) },
+            devmask: 1,
+            recmask: 0,
+        };
+        let mut controller = RouteController {
+            bindings: vec![RouteBinding {
+                mixer: 0,
+                volume_control: Some(0),
+                mute_control: Some(0),
+                follows_recsrc: false,
+                source: None,
+            }],
+            mixers: vec![MixerHandle { mixer, counter: 0 }],
+        };
+        let mut routes = [route(true)];
+        routes[0].volume.hardware = true;
+        routes[0].mute.hardware = true;
+        let before = (routes[0].volume.clone(), routes[0].mute);
+
+        let change = controller.apply(
+            &mut routes,
+            RouteKey(1),
+            RouteUpdate {
+                activate: false,
+                values: vec![
+                    RouteValueUpdate::Volume(vec![0.125, 0.125]),
+                    RouteValueUpdate::Mute(true),
+                ],
+            },
+        );
+
+        assert_eq!(routes[0].volume, before.0);
+        assert_eq!(routes[0].mute, before.1);
+        assert!(!change.volume);
+        assert!(!change.mute);
+        assert!(!change.refresh);
+        assert_eq!(
+            change.diagnostic,
+            Some(RouteDiagnostic::warning(
+                "can't set hardware volume for route mic; can't set hardware mute for route mic"
+            ))
+        );
+        // SAFETY: ownership of the read end stayed with this test.
+        unsafe { libc::close(read_fd) };
     }
 
     #[test]
@@ -881,11 +1063,7 @@ mod tests {
                 follows_recsrc: false,
                 source: None,
             }],
-            mixers: vec![MixerHandle {
-                mixer,
-                counter: 0,
-                recsrc: 0,
-            }],
+            mixers: vec![MixerHandle { mixer, counter: 0 }],
         };
         let mut routes = [route(true)];
         routes[0].volume.hardware = true;
