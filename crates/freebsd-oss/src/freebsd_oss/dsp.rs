@@ -195,7 +195,13 @@ impl Dsp {
         // O_RDONLY, not O_RDWR: on devices with asymmetric play/rec channel
         // counts (e.g. RODECaster) the kernel won't take per-direction counts on
         // one fd (shkhln/pw-oss#3)
-        let fd = LibcFd::open(&self.path, libc::O_RDONLY).ok_or_else(Errno::last)?;
+        // This descriptor is consumed on the graph/data loop. GETISPACE
+        // normally bounds each read to queued bytes, but a signal-shortened
+        // frame leaves a realignment tail which is consumed before the next
+        // bounded read. CHN_F_NBIO is the hard guarantee that neither phase
+        // can sleep in chn_read.
+        let fd =
+            LibcFd::open(&self.path, libc::O_RDONLY | libc::O_NONBLOCK).ok_or_else(Errno::last)?;
 
         self.fd = Some(fd);
         self.state = DspState::Setup;
@@ -216,6 +222,12 @@ impl Dsp {
         self.skip = 0;
         self.buffer = CaptureBufferState::default();
         self.wake_threshold.set(0);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_nonblocking(&self) -> bool {
+        let flags = unsafe { libc::fcntl(self.raw_fd(), libc::F_GETFL) };
+        flags >= 0 && flags & libc::O_NONBLOCK != 0
     }
 
     pub(crate) fn clear_overrun_observation(&mut self) {
@@ -1890,7 +1902,7 @@ mod capture_tests {
     // frame boundary
     #[test]
     fn read_hides_torn_frame_and_realigns() {
-        let (r, w) = pipe_pair(false, false);
+        let (r, w) = pipe_pair(true, false);
         let mut dsp = super::Dsp::test_on_fd(r, 8);
         let s = pattern(2056, 3);
         assert_eq!(unsafe { libc::write(w, s.as_ptr().cast(), 2046) }, 2046);

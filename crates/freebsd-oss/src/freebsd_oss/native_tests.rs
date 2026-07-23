@@ -416,6 +416,10 @@ fn native_snd_dummy_kernel_pcm_lifecycle() {
     let applied = configure_capture(&mut capture, &config, &OssNodeProperties::new(false), &log)
         .expect("snd_dummy capture must configure");
     assert_eq!(applied.actual_config, config);
+    assert!(
+        capture.is_nonblocking(),
+        "capture I/O must never sleep on the graph thread"
+    );
     let capture_request = CaptureBufferRequest {
         period_bytes: 4_096,
         graph_rate: 48_000,

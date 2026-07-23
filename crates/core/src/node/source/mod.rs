@@ -109,8 +109,8 @@ fn follower_servo<B: backend::Backend>(
 // latency (an oversized chunk holds io.status HAVE_DATA, we skip the device
 // next cycle, it queues 2 periods, repeat) and pollutes the servo error. If
 // the device is late, keep the graph timeline stable: read only queued
-// bytes from the blocking fd and silence-pad the rest of the period instead of
-// returning an empty or short cycle.
+// bytes from the nonblocking fd and silence-pad the rest of the period instead
+// of returning an empty or short cycle.
 fn bounded_read<B: backend::Backend>(
     port: &mut Port<SourceDir<B>>,
     queued: u32,
