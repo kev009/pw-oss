@@ -3,13 +3,22 @@ use std::ffi::{c_char, c_int, c_long, c_uint, c_ulong, c_void};
 
 use super::sys::{IoctlPod, SysctlReader, ioctl_int, ioctl_read, ioctl_value, ioctl_zeroed};
 
+pub(crate) const AFMT_MU_LAW: u32 = 0x00000001;
+pub(crate) const AFMT_A_LAW: u32 = 0x00000002;
 pub(crate) const AFMT_U8: u32 = 0x00000008;
 pub(crate) const AFMT_S16_LE: u32 = 0x00000010;
 pub(crate) const AFMT_S16_BE: u32 = 0x00000020;
+pub(crate) const AFMT_S8: u32 = 0x00000040;
+pub(crate) const AFMT_U16_LE: u32 = 0x00000080;
+pub(crate) const AFMT_U16_BE: u32 = 0x00000100;
 pub(crate) const AFMT_S32_LE: u32 = 0x00001000;
 pub(crate) const AFMT_S32_BE: u32 = 0x00002000;
+pub(crate) const AFMT_U32_LE: u32 = 0x00004000;
+pub(crate) const AFMT_U32_BE: u32 = 0x00008000;
 pub(crate) const AFMT_S24_LE: u32 = 0x00010000;
 pub(crate) const AFMT_S24_BE: u32 = 0x00020000;
+pub(crate) const AFMT_U24_LE: u32 = 0x00040000;
+pub(crate) const AFMT_U24_BE: u32 = 0x00080000;
 pub(crate) const AFMT_F32_LE: u32 = 0x10000000;
 pub(crate) const AFMT_F32_BE: u32 = 0x20000000;
 
@@ -340,25 +349,23 @@ pub(super) fn restore_shadow(fd: c_int) -> bool {
     unsafe { libc::ioctl(fd, SNDCTL_DSP_SKIP) != -1 }
 }
 
-// frame bytes for a sound4 AFMT value (width by encoding bit, channels from
-// the AFMT_CHANNEL field, sound.h:344); approximate widths are fine - the
-// quantum this feeds is a floor, and overstating errs toward more margin
+// Exact frame storage for a sound4 AFMT value: bytes per encoded sample times
+// the channel count carried in AFMT_CHANNEL (sound.h:344). This supplies both
+// negotiated stream stride and delivery-quantum geometry.
 pub(super) fn afmt_frame_bytes(format: u32) -> u32 {
-    const AFMT_U16_MASK: u32 = 0x00000180;
-    const AFMT_U24_MASK: u32 = 0x000c0000;
-    const AFMT_U32_MASK: u32 = 0x0000c000;
-
-    let width: u32 =
-        if format & (AFMT_S32_LE | AFMT_S32_BE | AFMT_F32_LE | AFMT_F32_BE | AFMT_U32_MASK) != 0 {
-            4 // S32/U32/F32
-        } else if format & (AFMT_S24_LE | AFMT_S24_BE | AFMT_U24_MASK) != 0 {
-            // 3-byte S24/U24
-            3
-        } else if format & (AFMT_S16_LE | AFMT_S16_BE | AFMT_U16_MASK) != 0 {
-            2
-        } else {
-            1
-        };
+    let width: u32 = if format
+        & (AFMT_S32_LE | AFMT_S32_BE | AFMT_U32_LE | AFMT_U32_BE | AFMT_F32_LE | AFMT_F32_BE)
+        != 0
+    {
+        4 // S32/U32/F32
+    } else if format & (AFMT_S24_LE | AFMT_S24_BE | AFMT_U24_LE | AFMT_U24_BE) != 0 {
+        // 3-byte S24/U24
+        3
+    } else if format & (AFMT_S16_LE | AFMT_S16_BE | AFMT_U16_LE | AFMT_U16_BE) != 0 {
+        2
+    } else {
+        1
+    };
     let channels = ((format & 0x07f00000) >> 20).max(1); // AFMT_CHANNEL (sound.h:344)
     width * channels
 }
@@ -485,13 +492,22 @@ mod tests {
             abi_offset!("oss_audioinfo", oss_audioinfo, filler),
             abi_size!("OssChannelOrder", OssChannelOrder),
             abi_align!("OssChannelOrder", OssChannelOrder),
+            abi_const!(AFMT_MU_LAW),
+            abi_const!(AFMT_A_LAW),
             abi_const!(AFMT_U8),
             abi_const!(AFMT_S16_LE),
             abi_const!(AFMT_S16_BE),
+            abi_const!(AFMT_S8),
+            abi_const!(AFMT_U16_LE),
+            abi_const!(AFMT_U16_BE),
             abi_const!(AFMT_S32_LE),
             abi_const!(AFMT_S32_BE),
+            abi_const!(AFMT_U32_LE),
+            abi_const!(AFMT_U32_BE),
             abi_const!(AFMT_S24_LE),
             abi_const!(AFMT_S24_BE),
+            abi_const!(AFMT_U24_LE),
+            abi_const!(AFMT_U24_BE),
             abi_const!(AFMT_F32_LE),
             abi_const!(AFMT_F32_BE),
             abi_const!(PCM_ENABLE_INPUT),

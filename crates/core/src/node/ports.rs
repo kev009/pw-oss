@@ -155,7 +155,7 @@ pub(super) fn parse_config<D: Direction>(
     let format = libspa::param::audio::AudioFormat(raw.format);
 
     // only formats from our EnumFormat are expected; reject the rest
-    let Some(bytes_per_sample) = BackendOf::<D>::bytes_per_sample(raw.format) else {
+    let Some(bytes_per_sample) = backend::bytes_per_sample(raw.format) else {
         crate::warn!(state.log, "rejecting unsupported format {:?}", format);
         return Err(-libc::ENOTSUP);
     };
@@ -271,7 +271,7 @@ pub(super) fn set_format_param<D: Direction>(
     let admitted = |caps: &backend::StreamCaps, raw: &spa_audio_info_raw| {
         let positions = (raw.flags & SPA_AUDIO_FLAG_UNPOSITIONED == 0)
             .then(|| &raw.position[..raw.channels.min(SPA_AUDIO_MAX_CHANNELS) as usize]);
-        BackendOf::<D>::bytes_per_sample(raw.format)
+        backend::bytes_per_sample(raw.format)
             .is_some_and(|_| caps.admits(raw.format, raw.channels, positions, raw.rate))
     };
     let mut snapped = false;

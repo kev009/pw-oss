@@ -25,8 +25,10 @@ use crate::backend::{
 };
 use crate::spa::Log;
 use libspa::sys::{
-    SPA_AUDIO_FORMAT_F32_LE, SPA_AUDIO_FORMAT_S16_LE, SPA_AUDIO_FORMAT_S24_LE,
-    SPA_AUDIO_FORMAT_S32_LE,
+    SPA_AUDIO_FORMAT_ALAW, SPA_AUDIO_FORMAT_F32_LE, SPA_AUDIO_FORMAT_S8, SPA_AUDIO_FORMAT_S16_LE,
+    SPA_AUDIO_FORMAT_S24_LE, SPA_AUDIO_FORMAT_S32_LE, SPA_AUDIO_FORMAT_U16_BE,
+    SPA_AUDIO_FORMAT_U16_LE, SPA_AUDIO_FORMAT_U24_BE, SPA_AUDIO_FORMAT_U24_LE,
+    SPA_AUDIO_FORMAT_U32_BE, SPA_AUDIO_FORMAT_U32_LE, SPA_AUDIO_FORMAT_ULAW,
 };
 
 fn config(format: u32, rate: u32, stride: u32) -> StreamConfig {
@@ -44,6 +46,22 @@ fn config(format: u32, rate: u32, stride: u32) -> StreamConfig {
 
 fn default_config() -> StreamConfig {
     config(SPA_AUDIO_FORMAT_S16_LE, 48_000, 4)
+}
+
+fn contains_only_silence(config: &StreamConfig, bytes: &[u8]) -> bool {
+    match config.format.0 {
+        // G.711 has positive/negative zero codes, and FreeBSD's table-based
+        // vchan conversion can emit the adjacent +/-8 code for signed zero.
+        SPA_AUDIO_FORMAT_ULAW => bytes
+            .iter()
+            .all(|byte| matches!(byte, 0x7e | 0x7f | 0xfe | 0xff)),
+        SPA_AUDIO_FORMAT_ALAW => bytes.iter().all(|byte| matches!(byte, 0x55 | 0xd5)),
+        _ => {
+            let mut expected = vec![0; bytes.len()];
+            config.silence_pattern().fill(&mut expected);
+            bytes == expected
+        }
+    }
 }
 
 fn wait_until<T>(timeout: Duration, mut observe: impl FnMut() -> Option<T>) -> Option<T> {
@@ -516,6 +534,15 @@ fn native_snd_dummy_format_geometry_and_duplex_matrix() {
     let log = Log::test_null();
 
     for config in [
+        config(SPA_AUDIO_FORMAT_ULAW, 8_000, 2),
+        config(SPA_AUDIO_FORMAT_ALAW, 8_000, 2),
+        config(SPA_AUDIO_FORMAT_S8, 8_000, 2),
+        config(SPA_AUDIO_FORMAT_U16_LE, 48_000, 4),
+        config(SPA_AUDIO_FORMAT_U16_BE, 48_000, 4),
+        config(SPA_AUDIO_FORMAT_U24_LE, 48_000, 6),
+        config(SPA_AUDIO_FORMAT_U24_BE, 48_000, 6),
+        config(SPA_AUDIO_FORMAT_U32_LE, 48_000, 8),
+        config(SPA_AUDIO_FORMAT_U32_BE, 48_000, 8),
         config(SPA_AUDIO_FORMAT_S16_LE, 8_000, 4),
         config(SPA_AUDIO_FORMAT_S24_LE, 48_000, 6),
         config(SPA_AUDIO_FORMAT_S32_LE, 96_000, 8),
@@ -581,7 +608,12 @@ fn native_snd_dummy_format_geometry_and_duplex_matrix() {
         let read = capture.read(&mut input);
         assert!(read.bytes > 0);
         assert_eq!(read.bytes % config.stride as usize, 0);
-        assert!(input[..read.bytes].iter().all(|byte| *byte == 0));
+        assert!(
+            contains_only_silence(&config, &input[..read.bytes]),
+            "format {} returned non-silence bytes {:?}",
+            config.format.0,
+            &input[..read.bytes.min(16)]
+        );
 
         capture.close();
         playback.close();

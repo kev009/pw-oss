@@ -932,13 +932,22 @@ mod tests {
     }
 
     #[test]
-    fn pcm_format_widths_cover_u8_float_and_three_byte_24() {
+    fn pcm_format_widths_cover_every_supported_storage_width() {
         const STEREO: u32 = 2 << 20;
 
+        assert_eq!(super::afmt_frame_bytes(super::AFMT_MU_LAW), 1);
+        assert_eq!(super::afmt_frame_bytes(super::AFMT_A_LAW | STEREO), 2);
         assert_eq!(super::afmt_frame_bytes(super::AFMT_U8), 1);
         assert_eq!(super::afmt_frame_bytes(super::AFMT_U8 | STEREO), 2);
+        assert_eq!(super::afmt_frame_bytes(super::AFMT_S8 | STEREO), 2);
+        assert_eq!(super::afmt_frame_bytes(super::AFMT_U16_LE), 2);
+        assert_eq!(super::afmt_frame_bytes(super::AFMT_U16_BE | STEREO), 4);
         assert_eq!(super::afmt_frame_bytes(super::AFMT_S24_LE), 3);
         assert_eq!(super::afmt_frame_bytes(super::AFMT_S24_BE | STEREO), 6);
+        assert_eq!(super::afmt_frame_bytes(super::AFMT_U24_LE), 3);
+        assert_eq!(super::afmt_frame_bytes(super::AFMT_U24_BE | STEREO), 6);
+        assert_eq!(super::afmt_frame_bytes(super::AFMT_U32_LE), 4);
+        assert_eq!(super::afmt_frame_bytes(super::AFMT_U32_BE | STEREO), 8);
         assert_eq!(super::afmt_frame_bytes(super::AFMT_F32_LE), 4);
         assert_eq!(super::afmt_frame_bytes(super::AFMT_F32_BE | STEREO), 8);
     }

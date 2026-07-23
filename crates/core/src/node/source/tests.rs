@@ -156,6 +156,29 @@ fn bounded_read_uses_biased_u8_silence() {
     unsafe { libc::close(w) };
 }
 
+#[test]
+fn bounded_read_uses_companded_silence() {
+    for (format, silence) in [
+        (libspa::sys::SPA_AUDIO_FORMAT_ULAW, 0xff),
+        (libspa::sys::SPA_AUDIO_FORMAT_ALAW, 0x55),
+    ] {
+        let (r, w) = pipe_pair(false, false);
+        let mut port = test_port(r, 16, 32);
+        port.config = Some(PortConfig {
+            format: libspa::param::audio::AudioFormat(format),
+            rate: 8_000,
+            channels: 8,
+            positions: vec![],
+            flags: 0,
+            stride: 8,
+        });
+        let mut buf = [0u8; 16];
+        assert_eq!(bounded_read(&mut port, 0, &mut buf, 8), 16);
+        assert_eq!(buf, [silence; 16]);
+        unsafe { libc::close(w) };
+    }
+}
+
 // the in-place retune: enough ring for the new period recommits the
 // fill geometry without touching the device
 #[test]

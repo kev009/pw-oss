@@ -15,12 +15,13 @@ Devices in bitperfect mode (`sysctl dev.pcm.X.bitperfect=1`, usually together
 with `dev.pcm.X.play.vchans=0` or `hw.snd.vchans_enable=0`) are fully
 supported: the plugin probes and advertises the device's native formats,
 rates and channel widths (including >8-channel interfaces), and handles the
-single exclusive channel across renegotiation. Supported interleaved PCM
-formats are unsigned 8-bit, signed 16-bit, three-byte signed 24-bit, signed
-32-bit and 32-bit float, with both byte orders for multibyte samples. Note that
-the kernel is only half of the story - for the samples to remain untouched end
-to end, the PipeWire graph must also run at the device's native rate and avoid
-volume scaling. Pin the graph rate in `pipewire.conf.d`:
+single exclusive channel across renegotiation. Supported interleaved audio
+formats are G.711 mu-law and A-law; signed and unsigned 8- and 16-bit, packed
+three-byte 24-bit, and four-byte 32-bit-container integer PCM; and 32-bit
+float, with both byte orders for multibyte samples. Note that the kernel is
+only half of the story - for the samples to remain untouched end to end, the
+PipeWire graph must also run at the device's native rate and avoid volume
+scaling. Pin the graph rate in `pipewire.conf.d`:
 
 ```
 context.properties = {

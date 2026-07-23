@@ -286,7 +286,6 @@ pub trait Backend: Sized + 'static {
     const SINK_FACTORY_NAME: &'static std::ffi::CStr;
     const SOURCE_FACTORY_NAME: &'static std::ffi::CStr;
 
-    fn bytes_per_sample(format: u32) -> Option<u32>;
     fn clock_name(stream_path: &str) -> std::ffi::CString;
     fn fallback_caps() -> StreamCaps;
     fn hotplug_diagnostic(kind: HotplugDiagnostic) -> &'static str;
@@ -897,6 +896,14 @@ pub enum PlaybackRetune {
     Rebuild,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PauseOutcome {
+    /// The device queue was empty or was preserved for a later resume.
+    Preserved,
+    /// Queue preservation is unavailable; reset and prime again on Start.
+    Reprime,
+}
+
 pub trait CaptureOperations: StreamLifecycle {
     type Properties: BackendProperties;
 
@@ -919,6 +926,10 @@ pub trait CaptureOperations: StreamLifecycle {
         primed: bool,
         log: &Log,
     ) -> CaptureRetune;
+    /// Read interleaved data. A successful outcome must report a whole number
+    /// of negotiated frames. If native I/O consumes the head of a torn frame,
+    /// the backend must hide it and discard the tail before returning later
+    /// data so the graph never observes a shifted sample boundary.
     fn read(&mut self, data: &mut [u8]) -> ReadOutcome;
     /// Observe the live capture queue. The stream must be running.
     fn queued_bytes(&self) -> u32;
@@ -971,7 +982,7 @@ pub trait PlaybackOperations: StreamLifecycle {
         recovery_threshold_bytes: u32,
         log: &Log,
     );
-    fn pause(&mut self) -> Result<(), StreamError>;
+    fn pause(&mut self) -> Result<PauseOutcome, StreamError>;
     fn resume(&mut self) -> Result<(), StreamError>;
     fn underrun_low(
         target_fill: u32,
@@ -1021,6 +1032,46 @@ pub struct ConfigureOutcome {
 }
 
 pub type AppliedStreamConfig = StreamConfig;
+
+/// Storage width of one sample for the interleaved raw formats understood by
+/// the shared graph path. Backend capability sets still decide which of these
+/// formats a concrete stream may negotiate.
+pub const fn bytes_per_sample(format: u32) -> Option<u32> {
+    match format {
+        SPA_AUDIO_FORMAT_S8
+        | SPA_AUDIO_FORMAT_U8
+        | SPA_AUDIO_FORMAT_ULAW
+        | SPA_AUDIO_FORMAT_ALAW => Some(1),
+        SPA_AUDIO_FORMAT_S16_LE
+        | SPA_AUDIO_FORMAT_S16_BE
+        | SPA_AUDIO_FORMAT_U16_LE
+        | SPA_AUDIO_FORMAT_U16_BE => Some(2),
+        SPA_AUDIO_FORMAT_S24_LE
+        | SPA_AUDIO_FORMAT_S24_BE
+        | SPA_AUDIO_FORMAT_U24_LE
+        | SPA_AUDIO_FORMAT_U24_BE
+        | SPA_AUDIO_FORMAT_S20_LE
+        | SPA_AUDIO_FORMAT_S20_BE
+        | SPA_AUDIO_FORMAT_U20_LE
+        | SPA_AUDIO_FORMAT_U20_BE
+        | SPA_AUDIO_FORMAT_S18_LE
+        | SPA_AUDIO_FORMAT_S18_BE
+        | SPA_AUDIO_FORMAT_U18_LE
+        | SPA_AUDIO_FORMAT_U18_BE => Some(3),
+        SPA_AUDIO_FORMAT_S24_32_LE
+        | SPA_AUDIO_FORMAT_S24_32_BE
+        | SPA_AUDIO_FORMAT_U24_32_LE
+        | SPA_AUDIO_FORMAT_U24_32_BE
+        | SPA_AUDIO_FORMAT_S32_LE
+        | SPA_AUDIO_FORMAT_S32_BE
+        | SPA_AUDIO_FORMAT_U32_LE
+        | SPA_AUDIO_FORMAT_U32_BE
+        | SPA_AUDIO_FORMAT_F32_LE
+        | SPA_AUDIO_FORMAT_F32_BE => Some(4),
+        SPA_AUDIO_FORMAT_F64_LE | SPA_AUDIO_FORMAT_F64_BE => Some(8),
+        _ => None,
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct AppliedBufferGeometry {
@@ -1128,7 +1179,7 @@ impl SilencePattern {
             SPA_AUDIO_FORMAT_U32_LE => ([0x00, 0x00, 0x00, 0x80, 0, 0, 0, 0], 4),
             SPA_AUDIO_FORMAT_U32_BE => ([0x80, 0x00, 0x00, 0x00, 0, 0, 0, 0], 4),
             SPA_AUDIO_FORMAT_ULAW => ([0xff, 0, 0, 0, 0, 0, 0, 0], 1),
-            SPA_AUDIO_FORMAT_ALAW => ([0xd5, 0, 0, 0, 0, 0, 0, 0], 1),
+            SPA_AUDIO_FORMAT_ALAW => ([0x55, 0, 0, 0, 0, 0, 0, 0], 1),
             _ => ([0; 8], 1),
         };
         Self {
@@ -1139,15 +1190,25 @@ impl SilencePattern {
     }
 
     pub fn fill(self, output: &mut [u8]) {
+        self.fill_at(0, output);
+    }
+
+    /// Fill silence beginning at `frame_offset` bytes into an interleaved
+    /// frame. This is used when a short device write leaves a partial frame
+    /// whose remaining bytes must be completed without shifting a multibyte
+    /// unsigned sample's midpoint encoding.
+    pub fn fill_at(self, frame_offset: usize, output: &mut [u8]) {
         let pattern = &self.bytes[..self.len as usize];
-        for frame in output.chunks_mut(self.frame_multiple.max(1)) {
-            for (index, byte) in frame.iter_mut().enumerate() {
-                *byte = pattern[index % pattern.len()];
-            }
+        let frame_multiple = self.frame_multiple.max(1);
+        for (index, byte) in output.iter_mut().enumerate() {
+            let offset = (frame_offset + index) % frame_multiple;
+            *byte = pattern[offset % pattern.len()];
         }
     }
 
-    #[cfg(test)]
+    /// Return the repeated byte when this encoding's silence can be produced
+    /// by a byte fill. Concrete backends use this to detect native APIs whose
+    /// silence operation cannot express a multibyte midpoint pattern.
     pub fn uniform_byte(self) -> Option<u8> {
         let pattern = &self.bytes[..self.len as usize];
         pattern
@@ -1650,6 +1711,25 @@ mod tests {
     }
 
     #[test]
+    fn interleaved_sample_widths_cover_raw_audio_storage() {
+        assert_eq!(bytes_per_sample(SPA_AUDIO_FORMAT_S8), Some(1));
+        assert_eq!(bytes_per_sample(SPA_AUDIO_FORMAT_ULAW), Some(1));
+        assert_eq!(bytes_per_sample(SPA_AUDIO_FORMAT_ALAW), Some(1));
+        assert_eq!(bytes_per_sample(SPA_AUDIO_FORMAT_S16_LE), Some(2));
+        assert_eq!(bytes_per_sample(SPA_AUDIO_FORMAT_U16_LE), Some(2));
+        assert_eq!(bytes_per_sample(SPA_AUDIO_FORMAT_U16_BE), Some(2));
+        assert_eq!(bytes_per_sample(SPA_AUDIO_FORMAT_S24_BE), Some(3));
+        assert_eq!(bytes_per_sample(SPA_AUDIO_FORMAT_U24_LE), Some(3));
+        assert_eq!(bytes_per_sample(SPA_AUDIO_FORMAT_U24_BE), Some(3));
+        assert_eq!(bytes_per_sample(SPA_AUDIO_FORMAT_F32_LE), Some(4));
+        assert_eq!(bytes_per_sample(SPA_AUDIO_FORMAT_U32_LE), Some(4));
+        assert_eq!(bytes_per_sample(SPA_AUDIO_FORMAT_U32_BE), Some(4));
+        assert_eq!(bytes_per_sample(SPA_AUDIO_FORMAT_F64_BE), Some(8));
+        assert_eq!(bytes_per_sample(SPA_AUDIO_FORMAT_S16P), None);
+        assert_eq!(bytes_per_sample(SPA_AUDIO_FORMAT_ENCODED), None);
+    }
+
+    #[test]
     fn silence_pattern_is_format_correct_and_frame_tagged() {
         let mut config = StreamConfig {
             format: libspa::param::audio::AudioFormat::U8,
@@ -1674,11 +1754,14 @@ mod tests {
         let mut multibyte = [0xff; 8];
         config.silence_pattern().fill(&mut multibyte);
         assert_eq!(multibyte, [0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80]);
+        let mut tail = [0xff; 7];
+        config.silence_pattern().fill_at(1, &mut tail);
+        assert_eq!(tail, [0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80]);
 
         config.format = libspa::param::audio::AudioFormat(SPA_AUDIO_FORMAT_ULAW);
         config.stride = 1;
         assert_eq!(config.silence_pattern().uniform_byte(), Some(0xff));
         config.format = libspa::param::audio::AudioFormat(SPA_AUDIO_FORMAT_ALAW);
-        assert_eq!(config.silence_pattern().uniform_byte(), Some(0xd5));
+        assert_eq!(config.silence_pattern().uniform_byte(), Some(0x55));
     }
 }

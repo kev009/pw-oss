@@ -15,8 +15,9 @@ use super::identity::OssNodeProperties;
 use super::sys::LibcFd;
 use crate::backend::{
     BufferLayout, CaptureBufferGeometry, CaptureBufferRequest, CaptureRetune, DeliveryQuantum,
-    IoStatus, PlaybackBufferGeometry, PlaybackBufferRequest, PlaybackRetune, ReadOutcome,
-    StreamError, StreamIdentity, WakeBufferState, WakeError, WriteOutcome, XrunObservation,
+    IoStatus, PauseOutcome, PlaybackBufferGeometry, PlaybackBufferRequest, PlaybackRetune,
+    ReadOutcome, SilencePattern, StreamError, StreamIdentity, WakeBufferState, WakeError,
+    WriteOutcome, XrunObservation,
 };
 use crate::spa::Log;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,10 +65,6 @@ fn native_frame_stride(format: u32, channels: u32) -> u32 {
     afmt_frame_bytes(format)
         .max(1)
         .saturating_mul(channels.max(1))
-}
-
-fn native_silence_byte(format: u32) -> u8 {
-    if format == AFMT_U8 { 0x80 } else { 0 }
 }
 
 fn wake_threshold_changed(current: u32, desired: u32, quantum: u32) -> bool {
@@ -625,7 +622,7 @@ pub(crate) struct DspWriter {
     pause_shadowed: bool, // SILENCE saved bufsoft; Start must pair it with SKIP
     hw_caps: u32,         // best-effort per-open SNDCTL_DSP_GETCAPS snapshot
     stride: u32,          // negotiated frame bytes; the byte stream must stay frame-aligned
-    silence_byte: u8,     // 0x80 for biased U8 PCM; zero for every other supported format
+    silence_pattern: SilencePattern,
     playback_delay_eighths: u32,
     frame_off: u32, // bytes into a frame a short write left the stream at (0 = aligned)
     wake_threshold: Cell<u32>,
@@ -634,8 +631,14 @@ pub(crate) struct DspWriter {
     prev_ns: u64,
 }
 
+// Keep the dominant signed/float and U8 fills at the maximum ring size: prime
+// and recovery commonly need one write, and these live on the data-loop path.
 static ZERO_SILENCE: [u8; MAX_BUFFER_BYTES] = [0; MAX_BUFFER_BYTES];
 static U8_SILENCE: [u8; MAX_BUFFER_BYTES] = [0x80; MAX_BUFFER_BYTES];
+
+// Four KiB bounds stack use for the less common nonuniform encodings while
+// one core-owned, allocation-free pattern covers every configured format.
+const SILENCE_CHUNK_BYTES: usize = 4096;
 
 impl DspWriter {
     // Debug-build diagnostics for the FreeBSD scheduling class/priority the
@@ -747,7 +750,7 @@ impl DspWriter {
             pause_shadowed: false,
             hw_caps: 0,
             stride: 1,
-            silence_byte: 0,
+            silence_pattern: SilencePattern::zero(1),
             playback_delay_eighths: 10,
             frame_off: 0,
             wake_threshold: Cell::new(0),
@@ -817,12 +820,8 @@ impl DspWriter {
         driver.register_stream(fd.raw(), true, stream, buffer.frame_stride)
     }
 
-    fn silence_buffer(&self) -> &'static [u8; MAX_BUFFER_BYTES] {
-        if self.silence_byte == 0x80 {
-            &U8_SILENCE
-        } else {
-            &ZERO_SILENCE
-        }
+    pub(super) fn set_silence_pattern(&mut self, pattern: SilencePattern) {
+        self.silence_pattern = pattern;
     }
 
     pub(crate) fn open(&mut self) -> Result<(), Errno> {
@@ -877,17 +876,32 @@ impl DspWriter {
     /// hardware side to keep running while graph processing is stopped. The
     /// ioctl may wait for an in-progress channel write, so this is called only
     /// from the serialized Pause handoff, never from process().
-    pub(crate) fn pause(&mut self) -> Result<(), Errno> {
+    fn queued_pause_outcome(&self) -> PauseOutcome {
+        if self.silence_pattern.uniform_byte().is_some() {
+            PauseOutcome::Preserved
+        } else {
+            PauseOutcome::Reprime
+        }
+    }
+
+    pub(crate) fn pause(&mut self) -> Result<PauseOutcome, Errno> {
         self.pause_shadowed = false;
         if self.state != DspState::Running {
-            return Ok(());
+            return Ok(PauseOutcome::Preserved);
         }
         // FreeBSD refreshes the shadow length only when bufsoft has ready
         // bytes. Do not arm a later SKIP for an empty queue: there is no audio
         // to preserve, and the kernel shadow length may still describe an
         // older/reset buffer.
         if try_odelay(self.raw_fd())? <= 0 {
-            return Ok(());
+            return Ok(PauseOutcome::Preserved);
+        }
+        // FreeBSD implements SNDCTL_DSP_SILENCE with memset(zerodata). That is
+        // format-correct only when a repeated byte represents silence; for an
+        // unsigned multibyte midpoint it would play 0x8080... instead. Ask the
+        // shared Pause path to reset and re-prime those streams safely.
+        if self.queued_pause_outcome() == PauseOutcome::Reprime {
+            return Ok(PauseOutcome::Reprime);
         }
         if !shadow_pause(self.raw_fd()) {
             return Err(Errno::last());
@@ -896,7 +910,7 @@ impl DspWriter {
         // observation above and the ioctl. Only arm SKIP when the post-SILENCE
         // queue shows that FreeBSD actually installed the silence shadow.
         self.pause_shadowed = try_odelay(self.raw_fd())? > 0;
-        Ok(())
+        Ok(PauseOutcome::Preserved)
     }
 
     /// Restore the queued samples saved by `pause`. This intentionally pairs
@@ -937,7 +951,6 @@ impl DspWriter {
         let format = set_format(self.raw_fd(), format)?;
         let channels = set_channels(self.raw_fd(), channels)?;
         self.stride = native_frame_stride(format, channels);
-        self.silence_byte = native_silence_byte(format);
         if let Some(order) = channel_order {
             set_channel_order(self.raw_fd(), order)?;
         }
@@ -1202,16 +1215,72 @@ impl DspWriter {
     // Synthetic fill has no real continuation to retain. Close an open frame
     // with format silence before writing more silence; this path is used only
     // after recovery deliberately chose synthetic audio over continuity.
+    #[inline(never)]
     fn realign_with_silence(&mut self) -> Result<(), Option<Errno>> {
         if self.frame_off != 0 {
             let need = self.stride - self.frame_off;
-            let silence = self.silence_buffer();
+            let mut silence = [0; SILENCE_CHUNK_BYTES];
+            self.silence_pattern
+                .fill_at(self.frame_off as usize, &mut silence[..need as usize]);
             let result = self.write_exact(&silence[..need as usize]);
             if self.frame_off != 0 {
                 return Err(result.error);
             }
         }
         Ok(())
+    }
+
+    fn aligned_silence_chunk(&self, count: u32, buffer_len: usize) -> u32 {
+        let mut chunk = count.min(buffer_len as u32);
+        if chunk < count {
+            chunk -= (self.frame_off + chunk) % self.stride.max(1);
+        }
+        chunk
+    }
+
+    fn write_silence_chunk(&mut self, silence: &[u8]) -> Option<u32> {
+        let result = self.write_buffered(silence);
+        if result.bytes < 0 {
+            if let Some(errno) = result.error.filter(|errno| *errno != Errno::EAGAIN) {
+                // EAGAIN is just a full buffer; surface anything else.
+                eprintln!("{}: write_silence: {}", self.path, errno);
+            }
+            return None;
+        }
+        (result.bytes != 0).then_some(result.bytes as u32)
+    }
+
+    fn write_uniform_silence(&mut self, mut count: u32, silence: &'static [u8]) {
+        while count > 0 {
+            debug_assert_eq!((self.frame_off + count) % self.stride.max(1), 0);
+            let chunk = self.aligned_silence_chunk(count, silence.len());
+            if chunk == 0 {
+                break;
+            }
+            let Some(written) = self.write_silence_chunk(&silence[..chunk as usize]) else {
+                break;
+            };
+            count -= written;
+        }
+    }
+
+    // Keep the 4 KiB scratch frame out of the common zero/U8 call frame.
+    #[inline(never)]
+    fn write_pattern_silence(&mut self, mut count: u32) {
+        let mut generated = [0; SILENCE_CHUNK_BYTES];
+        while count > 0 {
+            debug_assert_eq!((self.frame_off + count) % self.stride.max(1), 0);
+            let chunk = self.aligned_silence_chunk(count, generated.len());
+            if chunk == 0 {
+                break;
+            }
+            self.silence_pattern
+                .fill_at(self.frame_off as usize, &mut generated[..chunk as usize]);
+            let Some(written) = self.write_silence_chunk(&generated[..chunk as usize]) else {
+                break;
+            };
+            count -= written;
+        }
     }
 
     /// End a retained input sequence before its backing buffer disappears.
@@ -1324,35 +1393,23 @@ impl DspWriter {
         if self.state == DspState::Setup {
             self.state = DspState::Running;
         }
-        if self.realign_with_silence().is_err() {
+        if self.frame_off != 0 && self.realign_with_silence().is_err() {
             return;
         }
         // whole frames only: callers derive `count` from byte-granular ioctls
         // (odelay through a vchan can sit mid-frame), and a split frame turns
         // every later sample into static
         count -= count % self.stride.max(1);
-        let silence = self.silence_buffer();
-        // Chunk from the static silence buffer (`count` can exceed its length).
         // The fd is O_NONBLOCK, so a
         // short write or EAGAIN is normal; prime best-effort rather than asserting and
         // panicking out of the `extern "C"` callback (which aborts the process).
         // An early break can leave a frame split; frame_off records it. A
         // later real write completes it from retained audio, while another
         // synthetic fill closes it with the format's silence value.
-        while count > 0 {
-            let chunk = count.min(silence.len() as u32);
-            let result = self.write_buffered(&silence[..chunk as usize]);
-            if result.bytes < 0 {
-                if let Some(errno) = result.error.filter(|errno| *errno != Errno::EAGAIN) {
-                    // EAGAIN is just a full buffer; surface anything else
-                    eprintln!("{}: write_silence: {}", self.path, errno);
-                }
-                break;
-            }
-            if result.bytes == 0 {
-                break;
-            }
-            count -= result.bytes as u32;
+        match self.silence_pattern.uniform_byte() {
+            Some(0) => self.write_uniform_silence(count, &ZERO_SILENCE),
+            Some(0x80) => self.write_uniform_silence(count, &U8_SILENCE),
+            _ => self.write_pattern_silence(count),
         }
     }
 
@@ -1391,7 +1448,7 @@ impl DspWriter {
             pause_shadowed: false,
             hw_caps: 0,
             stride,
-            silence_byte: 0,
+            silence_pattern: SilencePattern::zero(stride as usize),
             playback_delay_eighths: 10,
             frame_off: 0,
             wake_threshold: Cell::new(0),
@@ -1441,7 +1498,22 @@ mod wake_policy_tests {
 
 #[cfg(test)]
 mod playback_tests {
-    use crate::backend::test_transport::{drain, fill_pipe, free_space, pattern, pipe_pair};
+    use crate::backend::{
+        StreamConfig,
+        test_transport::{drain, fill_pipe, free_space, pattern, pipe_pair},
+    };
+
+    fn silence_pattern(format: u32, stride: u32) -> crate::backend::SilencePattern {
+        StreamConfig {
+            format: libspa::param::audio::AudioFormat(format),
+            rate: 48_000,
+            channels: 2,
+            positions: vec![],
+            flags: 0,
+            stride,
+        }
+        .silence_pattern()
+    }
 
     #[test]
     fn oss_underrun_threshold_tracks_delivery_and_lateness() {
@@ -1535,9 +1607,11 @@ mod playback_tests {
         // Apply the same state derived from a successful native readback; a
         // pipe cannot accept the configuration ioctls themselves.
         dsp.stride = super::native_frame_stride(super::AFMT_U8, 2);
-        dsp.silence_byte = super::native_silence_byte(super::AFMT_U8);
+        dsp.set_silence_pattern(silence_pattern(
+            libspa::sys::SPA_AUDIO_FORMAT_U8,
+            dsp.stride,
+        ));
         assert_eq!(dsp.stride, 2);
-        assert_eq!(dsp.silence_byte, 0x80);
         dsp.write_silence(8);
         assert_eq!(drain(r), vec![0x80; 8]);
 
@@ -1551,6 +1625,125 @@ mod playback_tests {
         let data = [0x91, 0x92];
         assert_eq!(dsp.write(&data).bytes, data.len());
         assert_eq!(drain(r), data);
+        unsafe { libc::close(r) };
+    }
+
+    #[test]
+    fn companded_silence_uses_pipewire_compatible_zero_codes() {
+        for (format, expected) in [(super::AFMT_MU_LAW, 0xff), (super::AFMT_A_LAW, 0x55)] {
+            let (r, w) = pipe_pair(true, true);
+            let mut dsp = super::DspWriter::test_on_fd(w, 2);
+            dsp.stride = super::native_frame_stride(format, 2);
+            let spa_format = if format == super::AFMT_MU_LAW {
+                libspa::sys::SPA_AUDIO_FORMAT_ULAW
+            } else {
+                libspa::sys::SPA_AUDIO_FORMAT_ALAW
+            };
+            dsp.set_silence_pattern(silence_pattern(spa_format, dsp.stride));
+            assert_eq!(dsp.stride, 2);
+            dsp.write_silence(8);
+            assert_eq!(drain(r), vec![expected; 8]);
+            unsafe { libc::close(r) };
+        }
+    }
+
+    #[test]
+    fn unsigned_multibyte_silence_and_partial_frame_repair_use_core_patterns() {
+        const FORMATS: &[(u32, u32, u32, &[u8])] = &[
+            (super::AFMT_S8, libspa::sys::SPA_AUDIO_FORMAT_S8, 2, &[0x00]),
+            (
+                super::AFMT_U16_LE,
+                libspa::sys::SPA_AUDIO_FORMAT_U16_LE,
+                4,
+                &[0x00, 0x80],
+            ),
+            (
+                super::AFMT_U16_BE,
+                libspa::sys::SPA_AUDIO_FORMAT_U16_BE,
+                4,
+                &[0x80, 0x00],
+            ),
+            (
+                super::AFMT_U24_LE,
+                libspa::sys::SPA_AUDIO_FORMAT_U24_LE,
+                6,
+                &[0x00, 0x00, 0x80],
+            ),
+            (
+                super::AFMT_U24_BE,
+                libspa::sys::SPA_AUDIO_FORMAT_U24_BE,
+                6,
+                &[0x80, 0x00, 0x00],
+            ),
+            (
+                super::AFMT_U32_LE,
+                libspa::sys::SPA_AUDIO_FORMAT_U32_LE,
+                8,
+                &[0x00, 0x00, 0x00, 0x80],
+            ),
+            (
+                super::AFMT_U32_BE,
+                libspa::sys::SPA_AUDIO_FORMAT_U32_BE,
+                8,
+                &[0x80, 0x00, 0x00, 0x00],
+            ),
+        ];
+
+        for &(native, spa, stride, expected) in FORMATS {
+            let (r, w) = pipe_pair(true, true);
+            let mut dsp = super::DspWriter::test_on_fd(w, stride);
+            assert_eq!(super::native_frame_stride(native, 2), stride);
+            dsp.set_silence_pattern(silence_pattern(spa, stride));
+            dsp.write_silence(stride * 2);
+            assert_eq!(
+                drain(r),
+                expected
+                    .iter()
+                    .copied()
+                    .cycle()
+                    .take((stride * 2) as usize)
+                    .collect::<Vec<_>>()
+            );
+            unsafe { libc::close(r) };
+        }
+
+        // The reusable fill chunk is not divisible by a three-byte sample or
+        // six-byte stereo frame. Crossing it must not restart the midpoint
+        // pattern in the middle of a sample.
+        let (r, w) = pipe_pair(true, true);
+        let mut dsp = super::DspWriter::test_on_fd(w, 6);
+        dsp.set_silence_pattern(silence_pattern(libspa::sys::SPA_AUDIO_FORMAT_U24_LE, 6));
+        dsp.write_silence(8_196);
+        let silence = drain(r);
+        assert_eq!(silence.len(), 8_196);
+        assert!(
+            silence
+                .iter()
+                .copied()
+                .eq([0x00, 0x00, 0x80].into_iter().cycle().take(8_196))
+        );
+        unsafe { libc::close(r) };
+
+        let (r, w) = pipe_pair(true, true);
+        let mut dsp = super::DspWriter::test_on_fd(w, 4);
+        dsp.set_silence_pattern(silence_pattern(libspa::sys::SPA_AUDIO_FORMAT_U16_LE, 4));
+        assert_eq!(dsp.write(&[0x42]).bytes, 1);
+        assert!(!dsp.end_buffer_sequence());
+        assert_eq!(drain(r), [0x42, 0x80, 0x00, 0x80]);
+        unsafe { libc::close(r) };
+    }
+
+    #[test]
+    fn multibyte_unsigned_queue_reprimes_before_kernel_byte_fill() {
+        let (r, w) = pipe_pair(true, true);
+        let mut dsp = super::DspWriter::test_on_fd(w, 4);
+        dsp.set_silence_pattern(silence_pattern(libspa::sys::SPA_AUDIO_FORMAT_U16_LE, 4));
+
+        assert_eq!(
+            dsp.queued_pause_outcome(),
+            crate::backend::PauseOutcome::Reprime
+        );
+        assert!(!dsp.pause_shadowed);
         unsafe { libc::close(r) };
     }
 

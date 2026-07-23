@@ -307,6 +307,7 @@ impl FakeStream {
     }
 
     pub fn configure(&mut self, config: &StreamConfig) -> ConfigureOutcome {
+        self.frame_stride = config.stride.max(1);
         self.config = Some(config.clone());
         ConfigureOutcome {
             actual_config: config.clone(),
@@ -330,6 +331,18 @@ impl FakeStream {
 
     pub fn push_capture(&mut self, bytes: &[u8]) {
         self.capture.extend(bytes.iter().copied());
+    }
+
+    fn silence_bytes_at(&self, frame_offset: usize, bytes: usize) -> Vec<u8> {
+        let mut silence = vec![0; bytes];
+        if let Some(config) = &self.config {
+            config.silence_pattern().fill_at(frame_offset, &mut silence);
+        }
+        silence
+    }
+
+    fn silence_bytes(&self, bytes: usize) -> Vec<u8> {
+        self.silence_bytes_at(0, bytes)
     }
 
     pub fn write(&mut self, bytes: &[u8]) -> WriteOutcome {
@@ -426,6 +439,17 @@ impl FakeStream {
                 }
             };
         }
+        while self.read_skip != 0 {
+            let count = (self.read_skip as usize).min(self.capture.len());
+            drop(self.capture.drain(..count));
+            self.read_skip -= count as u32;
+            if self.read_skip != 0 {
+                return ReadOutcome {
+                    bytes: 0,
+                    status: IoStatus::WouldBlock,
+                };
+            }
+        }
         let count = output.len().min(self.maximum_io).min(self.capture.len());
         for byte in &mut output[..count] {
             *byte = self
@@ -433,8 +457,12 @@ impl FakeStream {
                 .pop_front()
                 .expect("count is bounded by the queue");
         }
+        let remainder = count as u32 % self.frame_stride;
+        if remainder != 0 {
+            self.read_skip = self.frame_stride - remainder;
+        }
         ReadOutcome {
-            bytes: count,
+            bytes: count - remainder as usize,
             status: if count == 0 {
                 IoStatus::WouldBlock
             } else {
@@ -965,23 +993,15 @@ impl PlaybackOperations for FakeStream {
     fn write_silence(&mut self, bytes: u32) {
         if self.frame_off != 0 {
             let remaining = self.frame_stride - self.frame_off;
-            let silence = vec![0u8; remaining as usize];
+            let silence = self.silence_bytes_at(self.frame_off as usize, remaining as usize);
             let _ = self.write(&silence);
             if self.frame_off != 0 {
                 return;
             }
         }
         let bytes = bytes / self.frame_stride * self.frame_stride;
-        if self.fd.is_some() {
-            let silence = vec![0u8; bytes as usize];
-            let _ = self.write(&silence);
-            self.running = true;
-            return;
-        }
-        let available = self.capacity.saturating_sub(self.playback.len());
-        self.playback
-            .extend(std::iter::repeat_n(0, (bytes as usize).min(available)));
-        self.running = true;
+        let silence = self.silence_bytes(bytes as usize);
+        let _ = self.write(&silence);
     }
 
     fn end_buffer_sequence(&mut self) -> bool {
@@ -989,7 +1009,7 @@ impl PlaybackOperations for FakeStream {
             return false;
         }
         let remaining = self.frame_stride - self.frame_off;
-        let silence = vec![0u8; remaining as usize];
+        let silence = self.silence_bytes_at(self.frame_off as usize, remaining as usize);
         let outcome = self.write(&silence);
         if outcome.bytes == silence.len() {
             false
@@ -1025,8 +1045,8 @@ impl PlaybackOperations for FakeStream {
     ) {
     }
 
-    fn pause(&mut self) -> Result<(), StreamError> {
-        Ok(())
+    fn pause(&mut self) -> Result<PauseOutcome, StreamError> {
+        Ok(PauseOutcome::Preserved)
     }
 
     fn resume(&mut self) -> Result<(), StreamError> {
@@ -1051,7 +1071,18 @@ impl PlaybackOperations for FakeStream {
 fn fake_caps() -> StreamCaps {
     StreamCaps {
         configurations: vec![StreamConfiguration {
-            formats: vec![libspa::sys::SPA_AUDIO_FORMAT_S16_LE],
+            formats: vec![
+                libspa::sys::SPA_AUDIO_FORMAT_S16_LE,
+                libspa::sys::SPA_AUDIO_FORMAT_ULAW,
+                libspa::sys::SPA_AUDIO_FORMAT_ALAW,
+                libspa::sys::SPA_AUDIO_FORMAT_S8,
+                libspa::sys::SPA_AUDIO_FORMAT_U16_LE,
+                libspa::sys::SPA_AUDIO_FORMAT_U16_BE,
+                libspa::sys::SPA_AUDIO_FORMAT_U24_LE,
+                libspa::sys::SPA_AUDIO_FORMAT_U24_BE,
+                libspa::sys::SPA_AUDIO_FORMAT_U32_LE,
+                libspa::sys::SPA_AUDIO_FORMAT_U32_BE,
+            ],
             channels: ChannelSet::Range { min: 1, max: 8 },
             rates: RateSet::Range {
                 min: 8_000,
@@ -1109,10 +1140,6 @@ impl Backend for FakeBackend {
     const DEVICE_FACTORY_NAME: &'static std::ffi::CStr = c"fake.device";
     const SINK_FACTORY_NAME: &'static std::ffi::CStr = c"fake.sink";
     const SOURCE_FACTORY_NAME: &'static std::ffi::CStr = c"fake.source";
-
-    fn bytes_per_sample(format: u32) -> Option<u32> {
-        (format == libspa::sys::SPA_AUDIO_FORMAT_S16_LE).then_some(2)
-    }
 
     fn clock_name(stream_path: &str) -> std::ffi::CString {
         std::ffi::CString::new(stream_path).expect("fake paths contain no NUL")
@@ -1184,10 +1211,11 @@ mod tests {
         assert_eq!(stream.write(&[4, 5, 6, 7]).bytes, 3);
         assert!(stream.write(&[7]).would_block());
 
-        stream.push_capture(&[9, 8, 7]);
+        stream.set_maximum_io(usize::MAX);
+        stream.push_capture(&[9, 8, 7, 6]);
         let mut output = [0; 4];
-        assert_eq!(stream.read(&mut output).bytes, 3);
-        assert_eq!(&output[..3], &[9, 8, 7]);
+        assert_eq!(stream.read(&mut output).bytes, 4);
+        assert_eq!(output, [9, 8, 7, 6]);
 
         stream.inject_xruns(2);
         assert_eq!(stream.take_xruns(), 2);
@@ -1198,7 +1226,97 @@ mod tests {
         stream.detach();
         assert!(stream.is_closed());
         assert_eq!(stream.write(&[1]).status, IoStatus::Disconnected);
+        stream.write_silence(4);
+        assert!(!stream.is_running());
         assert_eq!(stream.read(&mut output).status, IoStatus::Disconnected);
+    }
+
+    #[test]
+    fn companded_formats_negotiate_with_format_correct_silence() {
+        for (format, silence) in [
+            (libspa::sys::SPA_AUDIO_FORMAT_ULAW, 0xff),
+            (libspa::sys::SPA_AUDIO_FORMAT_ALAW, 0x55),
+        ] {
+            assert!(fake_caps().admits(format, 2, None, 8_000));
+            let config = StreamConfig {
+                format: libspa::param::audio::AudioFormat(format),
+                rate: 8_000,
+                channels: 2,
+                positions: vec![],
+                flags: 0,
+                stride: 2,
+            };
+            let mut stream = FakeStream::new("fake://companded");
+            assert_eq!(stream.configure(&config).actual_config, config);
+            <FakeStream as PlaybackOperations>::write_silence(&mut stream, 8);
+            assert_eq!(stream.test_take_playback(), vec![silence; 8]);
+        }
+    }
+
+    #[test]
+    fn additional_raw_formats_negotiate_with_format_correct_silence() {
+        const FORMATS: &[(u32, u32, &[u8])] = &[
+            (libspa::sys::SPA_AUDIO_FORMAT_S8, 1, &[0x00]),
+            (libspa::sys::SPA_AUDIO_FORMAT_U16_LE, 2, &[0x00, 0x80]),
+            (libspa::sys::SPA_AUDIO_FORMAT_U16_BE, 2, &[0x80, 0x00]),
+            (libspa::sys::SPA_AUDIO_FORMAT_U24_LE, 3, &[0x00, 0x00, 0x80]),
+            (libspa::sys::SPA_AUDIO_FORMAT_U24_BE, 3, &[0x80, 0x00, 0x00]),
+            (
+                libspa::sys::SPA_AUDIO_FORMAT_U32_LE,
+                4,
+                &[0x00, 0x00, 0x00, 0x80],
+            ),
+            (
+                libspa::sys::SPA_AUDIO_FORMAT_U32_BE,
+                4,
+                &[0x80, 0x00, 0x00, 0x00],
+            ),
+        ];
+
+        for &(format, sample_bytes, silence) in FORMATS {
+            assert!(fake_caps().admits(format, 2, None, 48_000));
+            let config = StreamConfig {
+                format: libspa::param::audio::AudioFormat(format),
+                rate: 48_000,
+                channels: 2,
+                positions: vec![],
+                flags: 0,
+                stride: sample_bytes * 2,
+            };
+            let mut stream = FakeStream::new("fake://raw-formats");
+            assert_eq!(stream.configure(&config).actual_config, config);
+            <FakeStream as PlaybackOperations>::write_silence(&mut stream, config.stride * 2);
+            assert_eq!(
+                stream.test_take_playback(),
+                silence
+                    .iter()
+                    .copied()
+                    .cycle()
+                    .take((config.stride * 2) as usize)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn partial_unsigned_frame_is_repaired_at_the_sample_offset() {
+        let config = StreamConfig {
+            format: libspa::param::audio::AudioFormat(libspa::sys::SPA_AUDIO_FORMAT_U16_LE),
+            rate: 48_000,
+            channels: 2,
+            positions: vec![],
+            flags: 0,
+            stride: 4,
+        };
+        let mut stream = FakeStream::new("fake://partial-unsigned-frame");
+        stream.configure(&config);
+        stream.set_maximum_io(1);
+        assert_eq!(stream.write(&[0x42, 0x43]).bytes, 1);
+        stream.set_maximum_io(usize::MAX);
+        assert!(!<FakeStream as PlaybackOperations>::end_buffer_sequence(
+            &mut stream
+        ));
+        assert_eq!(stream.test_take_playback(), [0x42, 0x80, 0x00, 0x80]);
     }
 
     #[test]
@@ -1227,6 +1345,60 @@ mod tests {
         assert_eq!(stream.read_skip, 0);
         stream.close();
         unsafe { libc::close(write_fd) };
+    }
+
+    #[test]
+    fn buffered_capture_discards_a_torn_unsigned_frame_before_later_data() {
+        let config = StreamConfig {
+            format: libspa::param::audio::AudioFormat(libspa::sys::SPA_AUDIO_FORMAT_U24_LE),
+            rate: 48_000,
+            channels: 2,
+            positions: vec![],
+            flags: 0,
+            stride: 6,
+        };
+        let mut stream = FakeStream::test_buffered(config.stride);
+        stream.configure(&config);
+        let sequence = pattern(18, 11);
+        stream.push_capture(&sequence);
+        stream.set_maximum_io(8);
+
+        let mut output = [0u8; 12];
+        let first = stream.read(&mut output);
+        assert_eq!(first.bytes, 6);
+        assert_eq!(&output[..first.bytes], &sequence[..6]);
+        assert_eq!(stream.read_skip, 4);
+
+        stream.set_maximum_io(usize::MAX);
+        let second = stream.read(&mut output);
+        assert_eq!(second.bytes, 6);
+        assert_eq!(&output[..second.bytes], &sequence[12..]);
+        assert_eq!(stream.read_skip, 0);
+    }
+
+    #[test]
+    fn buffered_silence_obeys_io_limits_and_retains_u24_frame_phase() {
+        let config = StreamConfig {
+            format: libspa::param::audio::AudioFormat(libspa::sys::SPA_AUDIO_FORMAT_U24_LE),
+            rate: 48_000,
+            channels: 2,
+            positions: vec![],
+            flags: 0,
+            stride: 6,
+        };
+        let mut stream = FakeStream::test_buffered(config.stride);
+        stream.configure(&config);
+        stream.set_maximum_io(5);
+        <FakeStream as PlaybackOperations>::write_silence(&mut stream, 12);
+        assert_eq!(stream.frame_off, 5);
+        assert_eq!(stream.test_take_playback(), [0x00, 0x00, 0x80, 0x00, 0x00]);
+
+        stream.set_maximum_io(usize::MAX);
+        assert!(!<FakeStream as PlaybackOperations>::end_buffer_sequence(
+            &mut stream
+        ));
+        assert_eq!(stream.frame_off, 0);
+        assert_eq!(stream.test_take_playback(), [0x80]);
     }
 
     #[test]

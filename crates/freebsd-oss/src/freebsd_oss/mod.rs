@@ -11,10 +11,11 @@ mod native_tests;
 mod sys;
 
 use abi::{
-    AFMT_F32_BE, AFMT_F32_LE, AFMT_S16_BE, AFMT_S16_LE, AFMT_S24_BE, AFMT_S24_LE, AFMT_S32_BE,
-    AFMT_S32_LE, AFMT_U8, feeder_rate_round,
+    AFMT_A_LAW, AFMT_F32_BE, AFMT_F32_LE, AFMT_MU_LAW, AFMT_S8, AFMT_S16_BE, AFMT_S16_LE,
+    AFMT_S24_BE, AFMT_S24_LE, AFMT_S32_BE, AFMT_S32_LE, AFMT_U8, AFMT_U16_BE, AFMT_U16_LE,
+    AFMT_U24_BE, AFMT_U24_LE, AFMT_U32_BE, AFMT_U32_LE, feeder_rate_round,
 };
-pub(crate) use backend::{bytes_per_sample, fallback_caps, validate_config};
+pub(crate) use backend::{fallback_caps, validate_config};
 use buffer::MIN_BUFFER_BYTES;
 pub(crate) use devices::{DeviceCatalog, probe_caps};
 pub(crate) use dsp::{Dsp, DspWriter};
@@ -47,10 +48,6 @@ impl crate::backend::Backend for FreeBsdOss {
     const DEVICE_FACTORY_NAME: &'static std::ffi::CStr = DEVICE_FACTORY_NAME;
     const SINK_FACTORY_NAME: &'static std::ffi::CStr = SINK_FACTORY_NAME;
     const SOURCE_FACTORY_NAME: &'static std::ffi::CStr = SOURCE_FACTORY_NAME;
-
-    fn bytes_per_sample(format: u32) -> Option<u32> {
-        bytes_per_sample(format)
-    }
 
     fn clock_name(stream_path: &str) -> std::ffi::CString {
         clock_name(stream_path)

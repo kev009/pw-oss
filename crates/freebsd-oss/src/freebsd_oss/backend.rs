@@ -8,36 +8,50 @@ use crate::backend::{
     AdjustmentFlags, AppliedBufferGeometry, BufferConstraints, CaptureBufferGeometry,
     CaptureBufferRequest, CaptureOperations, CaptureRetune, ChannelLayout, ChannelMapError,
     ChannelSet, ConfigurationFlags, ConfigureOutcome, ConversionPath, DeliveryQuantum,
-    PlaybackBufferGeometry, PlaybackBufferRequest, PlaybackOperations, PlaybackRetune, RateSet,
-    ReadOutcome, StreamCaps, StreamConfig, StreamConfiguration, StreamError, StreamIdentity,
-    StreamLifecycle, WakeBufferState, WakeDiagnostic, WakeError, WriteOutcome, XrunObservation,
+    PauseOutcome, PlaybackBufferGeometry, PlaybackBufferRequest, PlaybackOperations,
+    PlaybackRetune, RateSet, ReadOutcome, StreamCaps, StreamConfig, StreamConfiguration,
+    StreamError, StreamIdentity, StreamLifecycle, WakeBufferState, WakeDiagnostic, WakeError,
+    WriteOutcome, XrunObservation,
 };
 
 use super::{Dsp, DspWriter, MIN_BUFFER_BYTES, OssNodeProperties, feeder_rate_round};
 
-// (FreeBSD AFMT, SPA format, bytes/sample), ordered by preference.
+// (FreeBSD AFMT, SPA format), ordered by preference. Sample storage is SPA
+// vocabulary owned by core; this table only translates the native ABI.
+// AFMT_*32 deliberately maps to SPA *32: FreeBSD's four-byte carrier keeps
+// meaningful 24-bit hardware data in the most-significant bits, whereas SPA
+// *_24_32 represents a low-aligned 24-bit integer and would shift amplitude.
 #[rustfmt::skip]
-const FORMAT_MAP: [(u32, u32, u32); 9] = [
-    (super::AFMT_S32_LE, SPA_AUDIO_FORMAT_S32_LE, 4),
-    (super::AFMT_S32_BE, SPA_AUDIO_FORMAT_S32_BE, 4),
-    (super::AFMT_F32_LE, SPA_AUDIO_FORMAT_F32_LE, 4),
-    (super::AFMT_F32_BE, SPA_AUDIO_FORMAT_F32_BE, 4),
-    (super::AFMT_S24_LE, SPA_AUDIO_FORMAT_S24_LE, 3),
-    (super::AFMT_S24_BE, SPA_AUDIO_FORMAT_S24_BE, 3),
-    (super::AFMT_S16_LE, SPA_AUDIO_FORMAT_S16_LE, 2),
-    (super::AFMT_S16_BE, SPA_AUDIO_FORMAT_S16_BE, 2),
-    (super::AFMT_U8,     SPA_AUDIO_FORMAT_U8,     1),
+const FORMAT_MAP: [(u32, u32); 18] = [
+    (super::AFMT_S32_LE, SPA_AUDIO_FORMAT_S32_LE),
+    (super::AFMT_S32_BE, SPA_AUDIO_FORMAT_S32_BE),
+    (super::AFMT_F32_LE, SPA_AUDIO_FORMAT_F32_LE),
+    (super::AFMT_F32_BE, SPA_AUDIO_FORMAT_F32_BE),
+    (super::AFMT_S24_LE, SPA_AUDIO_FORMAT_S24_LE),
+    (super::AFMT_S24_BE, SPA_AUDIO_FORMAT_S24_BE),
+    (super::AFMT_S16_LE, SPA_AUDIO_FORMAT_S16_LE),
+    (super::AFMT_S16_BE, SPA_AUDIO_FORMAT_S16_BE),
+    (super::AFMT_U8,     SPA_AUDIO_FORMAT_U8),
+    (super::AFMT_S8,     SPA_AUDIO_FORMAT_S8),
+    (super::AFMT_U16_LE, SPA_AUDIO_FORMAT_U16_LE),
+    (super::AFMT_U16_BE, SPA_AUDIO_FORMAT_U16_BE),
+    (super::AFMT_U24_LE, SPA_AUDIO_FORMAT_U24_LE),
+    (super::AFMT_U24_BE, SPA_AUDIO_FORMAT_U24_BE),
+    (super::AFMT_U32_LE, SPA_AUDIO_FORMAT_U32_LE),
+    (super::AFMT_U32_BE, SPA_AUDIO_FORMAT_U32_BE),
+    (super::AFMT_MU_LAW, SPA_AUDIO_FORMAT_ULAW),
+    (super::AFMT_A_LAW,  SPA_AUDIO_FORMAT_ALAW),
 ];
 
 pub(crate) fn all_formats() -> Vec<u32> {
-    FORMAT_MAP.iter().map(|(_, spa, _)| *spa).collect()
+    FORMAT_MAP.iter().map(|(_, spa)| *spa).collect()
 }
 
 pub(super) fn formats_from_native_mask(mask: u32, convertless: bool) -> Vec<u32> {
     let native = FORMAT_MAP
         .iter()
-        .filter(|(format, _, _)| mask & format != 0)
-        .map(|(_, spa, _)| *spa)
+        .filter(|(format, _)| mask & format != 0)
+        .map(|(_, spa)| *spa)
         .collect::<Vec<_>>();
     if !native.is_empty() || convertless {
         native
@@ -46,20 +60,21 @@ pub(super) fn formats_from_native_mask(mask: u32, convertless: bool) -> Vec<u32>
     }
 }
 
-fn native_format(spa_format: u32) -> Option<(u32, u32)> {
+fn native_format(spa_format: u32) -> Option<u32> {
     FORMAT_MAP
         .iter()
-        .find(|(_, spa, _)| *spa == spa_format)
-        .map(|(native, _, bytes)| (*native, *bytes))
+        .find(|(_, spa)| *spa == spa_format)
+        .map(|(native, _)| *native)
 }
 
 fn stream_config_from_native(
     requested: &StreamConfig,
     applied: super::dsp::AppliedNativeConfig,
 ) -> Option<StreamConfig> {
-    let (_, spa_format, bytes_per_sample) = FORMAT_MAP
+    let (_, spa_format) = FORMAT_MAP
         .iter()
-        .find(|(native, _, _)| *native == applied.format)?;
+        .find(|(native, _)| *native == applied.format)?;
+    let bytes_per_sample = crate::backend::bytes_per_sample(*spa_format)?;
     let mut actual = requested.clone();
     actual.format = libspa::param::audio::AudioFormat(*spa_format);
     actual.rate = applied.rate;
@@ -121,10 +136,6 @@ fn configure_outcome(
         },
         buffer_constraints,
     })
-}
-
-pub(crate) fn bytes_per_sample(spa_format: u32) -> Option<u32> {
-    native_format(spa_format).map(|(_, bytes)| bytes)
 }
 
 pub(crate) fn fallback_caps() -> StreamCaps {
@@ -294,7 +305,7 @@ pub(crate) fn configure_capture(
     properties: &OssNodeProperties,
     log: &Log,
 ) -> Result<ConfigureOutcome, c_int> {
-    let Some((format, _)) = native_format(config.format.0) else {
+    let Some(format) = native_format(config.format.0) else {
         return Err(-libc::ENOTSUP);
     };
     let Ok(channel_order) = native_channel_order(config.flags, &config.positions) else {
@@ -348,7 +359,7 @@ pub(crate) fn configure_playback(
     config: &StreamConfig,
     log: &Log,
 ) -> Result<ConfigureOutcome, c_int> {
-    let Some((format, _)) = native_format(config.format.0) else {
+    let Some(format) = native_format(config.format.0) else {
         return Err(-libc::ENOTSUP);
     };
     let Ok(channel_order) = native_channel_order(config.flags, &config.positions) else {
@@ -396,7 +407,10 @@ pub(crate) fn configure_playback(
     );
     stream.refresh_delivery_quantum();
     match configure_outcome(config, applied, stream.delivery_quantum()) {
-        Ok(outcome) => Ok(outcome),
+        Ok(outcome) => {
+            stream.set_silence_pattern(outcome.actual_config.silence_pattern());
+            Ok(outcome)
+        }
         Err(error) => {
             stream.close();
             Err(error)
@@ -610,7 +624,7 @@ impl PlaybackOperations for DspWriter {
         DspWriter::log_ignored_underruns(self, count, fill_bytes, recovery_threshold_bytes, log);
     }
 
-    fn pause(&mut self) -> Result<(), StreamError> {
+    fn pause(&mut self) -> Result<PauseOutcome, StreamError> {
         DspWriter::pause(self).map_err(|error| StreamError::from_native_code(error as i32))
     }
 
@@ -786,11 +800,37 @@ mod tests {
     }
 
     #[test]
-    fn native_sample_widths_match_the_supported_formats() {
-        assert_eq!(bytes_per_sample(SPA_AUDIO_FORMAT_F32_LE), Some(4));
-        assert_eq!(bytes_per_sample(SPA_AUDIO_FORMAT_S24_BE), Some(3));
-        assert_eq!(bytes_per_sample(SPA_AUDIO_FORMAT_S16_LE), Some(2));
-        assert_eq!(bytes_per_sample(SPA_AUDIO_FORMAT_U8), Some(1));
+    fn companded_spa_formats_map_to_the_oss_abi() {
+        assert_eq!(
+            native_format(SPA_AUDIO_FORMAT_ULAW),
+            Some(super::super::AFMT_MU_LAW)
+        );
+        assert_eq!(
+            native_format(SPA_AUDIO_FORMAT_ALAW),
+            Some(super::super::AFMT_A_LAW)
+        );
+        assert_eq!(
+            formats_from_native_mask(super::super::AFMT_MU_LAW | super::super::AFMT_A_LAW, true),
+            [SPA_AUDIO_FORMAT_ULAW, SPA_AUDIO_FORMAT_ALAW]
+        );
+    }
+
+    #[test]
+    fn remaining_raw_spa_formats_map_to_the_oss_abi() {
+        const FORMATS: &[(u32, u32)] = &[
+            (SPA_AUDIO_FORMAT_S8, super::super::AFMT_S8),
+            (SPA_AUDIO_FORMAT_U16_LE, super::super::AFMT_U16_LE),
+            (SPA_AUDIO_FORMAT_U16_BE, super::super::AFMT_U16_BE),
+            (SPA_AUDIO_FORMAT_U24_LE, super::super::AFMT_U24_LE),
+            (SPA_AUDIO_FORMAT_U24_BE, super::super::AFMT_U24_BE),
+            (SPA_AUDIO_FORMAT_U32_LE, super::super::AFMT_U32_LE),
+            (SPA_AUDIO_FORMAT_U32_BE, super::super::AFMT_U32_BE),
+        ];
+
+        for &(spa, native) in FORMATS {
+            assert_eq!(native_format(spa), Some(native));
+            assert_eq!(formats_from_native_mask(native, true), [spa]);
+        }
     }
 
     #[test]

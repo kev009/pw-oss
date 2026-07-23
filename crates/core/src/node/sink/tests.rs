@@ -2,8 +2,8 @@ use super::predicted_next_fill;
 use super::{
     RetuneOutcome, SinkDir as GenericSinkDir, SinkPortExt, consume_freewheel_input,
     detect_underrun, finish_input_sequence, follower_servo, level_correct, pending_write_offset,
-    prepare_pending_write, prime_playback, recover_or_hold, release_input, resume_playback,
-    retain_partial_write, retune_period, settle_target, write_retained_tail,
+    prepare_pending_write, prime_playback, recover_or_hold, release_input, reset_unpreserved_pause,
+    resume_playback, retain_partial_write, retune_period, settle_target, write_retained_tail,
 };
 use crate::backend::{
     self, IoStatus, StreamWake, WriteOutcome,
@@ -435,6 +435,34 @@ fn sequence_reset_preserves_a_fatal_rebuild_latch() {
     unsafe {
         libc::close(r);
     }
+}
+
+#[test]
+fn pause_reset_retries_a_partially_accepted_host_buffer_from_byte_zero() {
+    let mut port = buffered_test_port(5, 0, 8);
+    port.dsp.write_silence(0);
+    let data = pattern(8, 23);
+
+    assert_eq!(pending_write_offset(&mut port.ext, 7, data.len()), 0);
+    let first = port.dsp.write(&data);
+    assert_eq!(first.bytes, 5);
+    assert!(retain_partial_write(
+        &mut port.ext,
+        data.len() as u32,
+        first
+    ));
+    assert_eq!(port.ext.pending_offset, 5);
+
+    assert!(reset_unpreserved_pause(&mut port));
+    assert_eq!(port.ext.pending_buffer, None);
+    assert_eq!(port.ext.pending_offset, 0);
+    assert!(port.dsp.test_take_playback().is_empty());
+
+    port.dsp.set_capacity(data.len());
+    let retry = pending_write_offset(&mut port.ext, 7, data.len());
+    assert_eq!(retry, 0);
+    assert_eq!(port.dsp.write(&data[retry..]).bytes, data.len());
+    assert_eq!(port.dsp.test_take_playback(), data);
 }
 
 #[test]
