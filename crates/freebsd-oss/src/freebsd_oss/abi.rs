@@ -337,10 +337,11 @@ pub(super) const fn xrun_counter_bits(value: c_int) -> u32 {
 }
 
 // FreeBSD's paired pause operations: SILENCE saves the ready part of bufsoft
-// in its shadow buffer and substitutes format-correct silence; SKIP discards
-// the remaining pause silence and restores those saved samples. Keep the raw
-// no-argument ioctls here so callers cannot accidentally use generic OSS
-// SKIP's otherwise surprising "discard queued output" meaning on its own.
+// in its shadow buffer and substitutes the kernel's format-selected repeated
+// byte; SKIP discards the remaining pause fill and restores those saved
+// samples. Keep the raw no-argument ioctls here so callers cannot accidentally
+// use generic OSS SKIP's otherwise surprising "discard queued output" meaning
+// on its own.
 pub(super) fn shadow_pause(fd: c_int) -> bool {
     unsafe { libc::ioctl(fd, SNDCTL_DSP_SILENCE) != -1 }
 }

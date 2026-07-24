@@ -648,6 +648,12 @@ pub(crate) struct DspWriter {
 static ZERO_SILENCE: [u8; MAX_BUFFER_BYTES] = [0; MAX_BUFFER_BYTES];
 static U8_SILENCE: [u8; MAX_BUFFER_BYTES] = [0x80; MAX_BUFFER_BYTES];
 
+// Companded silence is also a repeated byte, but its low-bandwidth streams do
+// not justify another pair of maximum-ring statics. Reuse these small shared
+// blocks without regenerating them or allocating on the data loop.
+static ULAW_SILENCE: [u8; SILENCE_CHUNK_BYTES] = [0xff; SILENCE_CHUNK_BYTES];
+static ALAW_SILENCE: [u8; SILENCE_CHUNK_BYTES] = [0x55; SILENCE_CHUNK_BYTES];
+
 // Four KiB bounds stack use for the less common nonuniform encodings while
 // one core-owned, allocation-free pattern covers every configured format.
 const SILENCE_CHUNK_BYTES: usize = 4096;
@@ -1421,6 +1427,8 @@ impl DspWriter {
         match self.silence_pattern.uniform_byte() {
             Some(0) => self.write_uniform_silence(count, &ZERO_SILENCE),
             Some(0x80) => self.write_uniform_silence(count, &U8_SILENCE),
+            Some(0xff) => self.write_uniform_silence(count, &ULAW_SILENCE),
+            Some(0x55) => self.write_uniform_silence(count, &ALAW_SILENCE),
             _ => self.write_pattern_silence(count),
         }
     }
@@ -1653,8 +1661,9 @@ mod playback_tests {
             };
             dsp.set_silence_pattern(silence_pattern(spa_format, dsp.stride));
             assert_eq!(dsp.stride, 2);
-            dsp.write_silence(8);
-            assert_eq!(drain(r), vec![expected; 8]);
+            let count = super::SILENCE_CHUNK_BYTES as u32 * 2;
+            dsp.write_silence(count);
+            assert_eq!(drain(r), vec![expected; count as usize]);
             unsafe { libc::close(r) };
         }
     }
