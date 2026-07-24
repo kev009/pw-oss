@@ -71,16 +71,16 @@ struct MixerInfo {
 unsafe impl IoctlPod for MixerInfo {}
 
 fn read_req(dev: c_uint) -> c_ulong {
-    nix::request_code_read!(b'M', dev, size_of::<c_int>())
+    libc::_IOR::<c_int>(b'M' as c_ulong, dev as c_ulong)
 }
 
 // MIXER_WRITE is _IOWR but FreeBSD does NOT echo the stored value back
 // (only the read branch writes *arg_i, mixer.c); never read the buffer after
 fn write_req(dev: c_uint) -> c_ulong {
-    nix::request_code_readwrite!(b'M', dev, size_of::<c_int>())
+    libc::_IOWR::<c_int>(b'M' as c_ulong, dev as c_ulong)
 }
 
-const SOUND_MIXER_INFO: c_ulong = nix::request_code_read!(b'M', 101, size_of::<MixerInfo>());
+const SOUND_MIXER_INFO: c_ulong = libc::_IOR::<MixerInfo>(b'M' as c_ulong, 101);
 
 pub(crate) struct Mixer {
     fd: LibcFd,
