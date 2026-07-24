@@ -636,6 +636,7 @@ pub(crate) struct DspWriter {
     hw_caps: u32,         // best-effort per-open SNDCTL_DSP_GETCAPS snapshot
     stride: u32,          // negotiated frame bytes; the byte stream must stay frame-aligned
     silence_pattern: SilencePattern,
+    pattern_silence_cache: Option<Box<[u8]>>,
     playback_delay_eighths: u32,
     frame_off: u32, // bytes into a frame a short write left the stream at (0 = aligned)
     wake_threshold: Cell<u32>,
@@ -648,9 +649,9 @@ pub(crate) struct DspWriter {
 // and recovery commonly need substantial writes, and these live on the
 // data-loop path. This cache is intentionally independent of the kernel's
 // format- and rate-dependent ring capacity.
-const UNIFORM_SILENCE_BYTES: usize = 131_072;
-static ZERO_SILENCE: [u8; UNIFORM_SILENCE_BYTES] = [0; UNIFORM_SILENCE_BYTES];
-static U8_SILENCE: [u8; UNIFORM_SILENCE_BYTES] = [0x80; UNIFORM_SILENCE_BYTES];
+const BULK_SILENCE_BYTES: usize = 131_072;
+static ZERO_SILENCE: [u8; BULK_SILENCE_BYTES] = [0; BULK_SILENCE_BYTES];
+static U8_SILENCE: [u8; BULK_SILENCE_BYTES] = [0x80; BULK_SILENCE_BYTES];
 
 // Companded silence is also a repeated byte, but its low-bandwidth streams do
 // not justify another pair of maximum-ring statics. Reuse these small shared
@@ -658,8 +659,8 @@ static U8_SILENCE: [u8; UNIFORM_SILENCE_BYTES] = [0x80; UNIFORM_SILENCE_BYTES];
 static ULAW_SILENCE: [u8; SILENCE_CHUNK_BYTES] = [0xff; SILENCE_CHUNK_BYTES];
 static ALAW_SILENCE: [u8; SILENCE_CHUNK_BYTES] = [0x55; SILENCE_CHUNK_BYTES];
 
-// Four KiB bounds stack use for the less common nonuniform encodings while
-// one core-owned, allocation-free pattern covers every configured format.
+// Four KiB bounds stack use while repairing a partial frame. It is also ample
+// for the low-byte-rate companded formats.
 const SILENCE_CHUNK_BYTES: usize = 4096;
 
 impl DspWriter {
@@ -773,6 +774,7 @@ impl DspWriter {
             hw_caps: 0,
             stride: 1,
             silence_pattern: SilencePattern::zero(1),
+            pattern_silence_cache: None,
             playback_delay_eighths: 10,
             frame_off: 0,
             wake_threshold: Cell::new(0),
@@ -843,6 +845,14 @@ impl DspWriter {
     }
 
     pub(super) fn set_silence_pattern(&mut self, pattern: SilencePattern) {
+        self.pattern_silence_cache = if pattern.uniform_byte().is_none() {
+            let mut cache =
+                vec![0; BULK_SILENCE_BYTES.max(pattern.frame_multiple)].into_boxed_slice();
+            pattern.fill(&mut cache);
+            Some(cache)
+        } else {
+            None
+        };
         self.silence_pattern = pattern;
     }
 
@@ -1292,23 +1302,34 @@ impl DspWriter {
         }
     }
 
-    // Keep the 4 KiB scratch frame out of the common zero/U8 call frame.
+    // The nonuniform cache is allocated and filled during stream
+    // configuration. Move it out temporarily so the write path can mutably
+    // update stream state while borrowing the cached bytes.
     #[inline(never)]
     fn write_pattern_silence(&mut self, mut count: u32) {
-        let mut generated = [0; SILENCE_CHUNK_BYTES];
+        let cache = self
+            .pattern_silence_cache
+            .take()
+            .expect("nonuniform silence was cached during configuration");
         while count > 0 {
             debug_assert_eq!((self.frame_off + count) % self.stride.max(1), 0);
-            let chunk = self.aligned_silence_chunk(count, generated.len());
+            // A short native write can stop within a PCM frame. Resume at the
+            // corresponding offset in the cache so an unsigned midpoint
+            // pattern is never phase-shifted.
+            let start = self.frame_off as usize;
+            debug_assert!(start < cache.len());
+            let available = cache.len().saturating_sub(start);
+            let chunk = self.aligned_silence_chunk(count, available);
             if chunk == 0 {
                 break;
             }
-            self.silence_pattern
-                .fill_at(self.frame_off as usize, &mut generated[..chunk as usize]);
-            let Some(written) = self.write_silence_chunk(&generated[..chunk as usize]) else {
+            let end = start + chunk as usize;
+            let Some(written) = self.write_silence_chunk(&cache[start..end]) else {
                 break;
             };
             count -= written;
         }
+        self.pattern_silence_cache = Some(cache);
     }
 
     /// End a retained input sequence before its backing buffer disappears.
@@ -1479,6 +1500,7 @@ impl DspWriter {
             hw_caps: 0,
             stride,
             silence_pattern: SilencePattern::zero(stride as usize),
+            pattern_silence_cache: None,
             playback_delay_eighths: 10,
             frame_off: 0,
             wake_threshold: Cell::new(0),
@@ -1725,6 +1747,21 @@ mod playback_tests {
             let mut dsp = super::DspWriter::test_on_fd(w, stride);
             assert_eq!(super::native_frame_stride(native, 2), stride);
             dsp.set_silence_pattern(silence_pattern(spa, stride));
+            if expected.iter().all(|byte| *byte == expected[0]) {
+                assert!(dsp.pattern_silence_cache.is_none());
+            } else {
+                let cache = dsp
+                    .pattern_silence_cache
+                    .as_deref()
+                    .expect("nonuniform silence must be cached at configuration");
+                assert_eq!(cache.len(), super::BULK_SILENCE_BYTES);
+                assert!(
+                    cache
+                        .iter()
+                        .copied()
+                        .eq(expected.iter().copied().cycle().take(cache.len()))
+                );
+            }
             dsp.write_silence(stride * 2);
             assert_eq!(
                 drain(r),
@@ -1738,22 +1775,32 @@ mod playback_tests {
             unsafe { libc::close(r) };
         }
 
-        // The reusable fill chunk is not divisible by a three-byte sample or
-        // six-byte stereo frame. Crossing it must not restart the midpoint
-        // pattern in the middle of a sample.
-        let (r, w) = pipe_pair(true, true);
-        let mut dsp = super::DspWriter::test_on_fd(w, 6);
+        // The bulk cache is not divisible by a three-byte sample or six-byte
+        // stereo frame. Write through an anonymous regular file so pipe
+        // capacity cannot stop the fill before it crosses the cache boundary.
+        let file = unsafe { libc::tmpfile() };
+        assert!(!file.is_null());
+        let fd = unsafe { libc::dup(libc::fileno(file)) };
+        assert_ne!(fd, -1);
+        let mut dsp = super::DspWriter::test_on_fd(fd, 6);
         dsp.set_silence_pattern(silence_pattern(libspa::sys::SPA_AUDIO_FORMAT_U24_LE, 6));
-        dsp.write_silence(8_196);
-        let silence = drain(r);
-        assert_eq!(silence.len(), 8_196);
+        let count = super::BULK_SILENCE_BYTES as u32 + 4;
+        assert_eq!(
+            dsp.aligned_silence_chunk(count, super::BULK_SILENCE_BYTES),
+            131_070
+        );
+        dsp.write_silence(count);
+        assert_eq!(unsafe { libc::lseek(fd, 0, libc::SEEK_SET) }, 0);
+        let silence = drain(fd);
+        assert_eq!(silence.len(), count as usize);
         assert!(
             silence
                 .iter()
                 .copied()
-                .eq([0x00, 0x00, 0x80].into_iter().cycle().take(8_196))
+                .eq([0x00, 0x00, 0x80].into_iter().cycle().take(count as usize))
         );
-        unsafe { libc::close(r) };
+        drop(dsp);
+        assert_eq!(unsafe { libc::fclose(file) }, 0);
 
         let (r, w) = pipe_pair(true, true);
         let mut dsp = super::DspWriter::test_on_fd(w, 4);
