@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use super::abi::*;
 use super::buffer::{
-    MAX_BUFFER_BYTES, MIN_BUFFER_BYTES, capture_applied_geometry, capture_buffer_plan,
+    BUFFER_CAPACITY_MAX_BYTES, MIN_BUFFER_BYTES, capture_applied_geometry, capture_buffer_plan,
     playback_applied_geometry, playback_buffer_plan, playback_retuned_geometry,
 };
 use super::devices::delivery_quantum;
@@ -334,8 +334,9 @@ impl Dsp {
             return; // triggered channels can't retune; the next re-prime will
         }
         self.wake_threshold.set(0);
-        // max-then-min, not clamp: the kernel cap must win over the floor.
-        let ring = ring.max(MIN_BUFFER_BYTES).min(MAX_BUFFER_BYTES as u32);
+        // The planner applies the format/rate policy; retain the kernel's
+        // absolute bounds at the ioctl boundary.
+        let ring = ring.clamp(MIN_BUFFER_BYTES, BUFFER_CAPACITY_MAX_BYTES);
         if fragment == 0 {
             set_fragment(self.raw_fd(), (ring >> 10).min(u16::MAX as u32) as u16, 10);
         // 1 KiB fragments
@@ -643,10 +644,13 @@ pub(crate) struct DspWriter {
     prev_ns: u64,
 }
 
-// Keep the dominant signed/float and U8 fills at the maximum ring size: prime
-// and recovery commonly need one write, and these live on the data-loop path.
-static ZERO_SILENCE: [u8; MAX_BUFFER_BYTES] = [0; MAX_BUFFER_BYTES];
-static U8_SILENCE: [u8; MAX_BUFFER_BYTES] = [0x80; MAX_BUFFER_BYTES];
+// Keep the dominant signed/float and U8 fills in a large shared block: prime
+// and recovery commonly need substantial writes, and these live on the
+// data-loop path. This cache is intentionally independent of the kernel's
+// format- and rate-dependent ring capacity.
+const UNIFORM_SILENCE_BYTES: usize = 131_072;
+static ZERO_SILENCE: [u8; UNIFORM_SILENCE_BYTES] = [0; UNIFORM_SILENCE_BYTES];
+static U8_SILENCE: [u8; UNIFORM_SILENCE_BYTES] = [0x80; UNIFORM_SILENCE_BYTES];
 
 // Companded silence is also a repeated byte, but its low-bandwidth streams do
 // not justify another pair of maximum-ring statics. Reuse these small shared
@@ -1004,10 +1008,16 @@ impl DspWriter {
             // fragment is normalized by the backend to a power of two in
             // [64, 16384], keeping the selector inside the kernel's
             // RANGE(fragln, 4, 16) (dsp.c:1251); the count clamp mirrors the
-            // kernel's own bounds (min 2, total <= MAX_BUFFER_BYTES, dsp.c:1256-1259)
-            let count = len
-                .div_ceil(fragment)
-                .clamp(2, MAX_BUFFER_BYTES as u32 / fragment);
+            // kernel's own bounds (min 2, bounded total, dsp.c:1256-1259).
+            // FreeBSD treats a zero count as a "use the maximum" sentinel.
+            // Keep the request explicit at 65535 instead of encoding that
+            // special value; chn_resizebuf rounds it to 65536 and grants the
+            // same 4 MiB ring for 64-byte fragments.
+            let max_count = BUFFER_CAPACITY_MAX_BYTES
+                .checked_div(fragment)
+                .unwrap_or(2)
+                .min(u16::MAX as u32);
+            let count = len.div_ceil(fragment).clamp(2, max_count);
             set_fragment(
                 self.raw_fd(),
                 count as u16,

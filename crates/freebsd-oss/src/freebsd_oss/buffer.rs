@@ -8,17 +8,37 @@ use crate::backend::{
     CaptureBufferGeometry, CaptureBufferRequest, PlaybackBufferGeometry, PlaybackBufferRequest,
 };
 
-// sys/dev/sound/pcm/channel.h
-pub(crate) const MAX_BUFFER_BYTES: usize = 131_072;
+// sys/dev/sound/pcm/channel.h. The scaled policy first appears in package
+// build jails at 15.2 and at the first unambiguous post-change 16-CURRENT
+// osreldate; build.rs selects it from the target's <sys/param.h>.
+pub(crate) const BUFFER_CAPACITY_MIN_BYTES: u32 = 131_072;
+#[cfg(freebsd_scaled_secondary_buffer)]
+pub(crate) const BUFFER_CAPACITY_MAX_BYTES: u32 = 4 * 1024 * 1024;
+#[cfg(not(freebsd_scaled_secondary_buffer))]
+pub(crate) const BUFFER_CAPACITY_MAX_BYTES: u32 = BUFFER_CAPACITY_MIN_BYTES;
+#[cfg(freebsd_scaled_secondary_buffer)]
+const BUFFER_CAPACITY_TARGET_MS: u64 = 200;
 
 // Every ring request keeps at least this byte budget in both directions.
 pub(crate) const MIN_BUFFER_BYTES: u32 = 65_536;
 
 /// The kernel's per-channel soft-ring byte budget.
-///
-/// The FreeBSD PCM channel limit is independent of format and rate.
+#[cfg(freebsd_scaled_secondary_buffer)]
+pub(crate) fn buffer_capacity_limit(stride: u32, rate: u32) -> u32 {
+    (stride as u64)
+        .saturating_mul(rate as u64)
+        .saturating_mul(BUFFER_CAPACITY_TARGET_MS)
+        .saturating_div(1_000)
+        .clamp(
+            BUFFER_CAPACITY_MIN_BYTES as u64,
+            BUFFER_CAPACITY_MAX_BYTES as u64,
+        ) as u32
+}
+
+/// The kernel's historical fixed per-channel soft-ring byte budget.
+#[cfg(not(freebsd_scaled_secondary_buffer))]
 pub(crate) fn buffer_capacity_limit(_stride: u32, _rate: u32) -> u32 {
-    MAX_BUFFER_BYTES as u32
+    BUFFER_CAPACITY_MIN_BYTES
 }
 
 /// Normalize the public `oss.fragment` value to a conservative kernel request.
@@ -56,11 +76,11 @@ pub(crate) fn max_buffer_period_bytes(stride: u32, device_rate: u32, graph_rate:
 
 /// A node.max-latency cap when four graph periods would not fit the OSS ring.
 ///
-/// At fat strides (for example a 20-channel S32 interface), the fixed PCM
-/// soft-ring byte cap can hold fewer than two ordinary graph periods. Capture
-/// then has no arrival-jitter headroom and playback cannot retain both quanta
-/// plus its delay target. The 44.1 kHz comparison publishes a conservative
-/// time-domain cap before that geometry becomes structurally unsafe.
+/// At geometries where the PCM soft-ring byte cap holds fewer than two
+/// ordinary graph periods, capture has no arrival-jitter headroom and playback
+/// cannot retain both quanta plus its delay target. The 44.1 kHz comparison
+/// publishes a conservative time-domain cap before that geometry becomes
+/// structurally unsafe.
 pub(crate) fn advertised_quantum_cap_frames(stride: u32, rate: u32) -> Option<u32> {
     let stride = stride.max(1);
     let frames = buffer_capacity_limit(stride, rate) / stride / 4;
@@ -359,17 +379,50 @@ mod tests {
     fn maximum_period_respects_rate_scaling_and_ring_capacity() {
         assert_eq!(max_buffer_period_bytes(8, 48_000, 48_000), 16_384);
         assert_eq!(max_buffer_period_bytes(8, 96_000, 48_000), 32_768);
+        #[cfg(not(freebsd_scaled_secondary_buffer))]
         assert_eq!(max_buffer_period_bytes(40, 48_000, 48_000), 819 * 40);
+        #[cfg(freebsd_scaled_secondary_buffer)]
+        assert_eq!(max_buffer_period_bytes(40, 48_000, 48_000), 2_048 * 40);
         assert_eq!(max_buffer_period_bytes(8, 48_000, 0), 16_384);
     }
 
     #[test]
     fn advertised_quantum_cap_is_time_based() {
         assert_eq!(advertised_quantum_cap_frames(8, 48_000), None);
-        assert_eq!(advertised_quantum_cap_frames(8, 192_000), Some(4_096));
-        assert_eq!(advertised_quantum_cap_frames(8, 96_000), Some(4_096));
-        assert_eq!(advertised_quantum_cap_frames(40, 48_000), Some(819));
+        #[cfg(not(freebsd_scaled_secondary_buffer))]
+        {
+            assert_eq!(advertised_quantum_cap_frames(8, 192_000), Some(4_096));
+            assert_eq!(advertised_quantum_cap_frames(8, 96_000), Some(4_096));
+            assert_eq!(advertised_quantum_cap_frames(40, 48_000), Some(819));
+        }
+        #[cfg(freebsd_scaled_secondary_buffer)]
+        {
+            assert_eq!(advertised_quantum_cap_frames(8, 192_000), None);
+            assert_eq!(advertised_quantum_cap_frames(8, 96_000), None);
+            assert_eq!(advertised_quantum_cap_frames(40, 48_000), None);
+        }
         assert_eq!(advertised_quantum_cap_frames(8, 44_100), None);
+    }
+
+    #[test]
+    fn buffer_capacity_matches_the_build_jail_policy() {
+        assert_eq!(buffer_capacity_limit(8, 48_000), BUFFER_CAPACITY_MIN_BYTES);
+        #[cfg(not(freebsd_scaled_secondary_buffer))]
+        {
+            assert_eq!(buffer_capacity_limit(40, 48_000), BUFFER_CAPACITY_MIN_BYTES);
+            assert_eq!(
+                buffer_capacity_limit(u32::MAX, u32::MAX),
+                BUFFER_CAPACITY_MIN_BYTES
+            );
+        }
+        #[cfg(freebsd_scaled_secondary_buffer)]
+        {
+            assert_eq!(buffer_capacity_limit(40, 48_000), 384_000);
+            assert_eq!(
+                buffer_capacity_limit(u32::MAX, u32::MAX),
+                BUFFER_CAPACITY_MAX_BYTES
+            );
+        }
     }
 
     #[test]
@@ -456,7 +509,7 @@ mod tests {
         assert!(capture_buffer_request(64, 64, 8, 48_000) >= MIN_BUFFER_BYTES);
         assert_eq!(
             capture_buffer_request(65_536, 65_536, 8, 48_000),
-            MAX_BUFFER_BYTES as u32
+            buffer_capacity_limit(8, 48_000)
         );
     }
 
