@@ -223,6 +223,7 @@ pub struct FakeStream {
     retune_pending_responses: u32,
     overrun_recovery_after: u32,
     overrun_observations: u32,
+    pause_outcome: PauseOutcome,
     frame_off: u32,
     read_skip: u32,
 }
@@ -246,6 +247,7 @@ impl FakeStream {
             retune_pending_responses: 0,
             overrun_recovery_after: 0,
             overrun_observations: 0,
+            pause_outcome: PauseOutcome::Preserved,
             frame_off: 0,
             read_skip: 0,
         }
@@ -300,6 +302,11 @@ impl FakeStream {
     #[cfg(test)]
     pub fn test_overrun_observations(&self) -> u32 {
         self.overrun_observations
+    }
+
+    #[cfg(test)]
+    pub fn test_set_pause_outcome(&mut self, outcome: PauseOutcome) {
+        self.pause_outcome = outcome;
     }
 
     pub fn path(&self) -> &str {
@@ -1046,7 +1053,7 @@ impl PlaybackOperations for FakeStream {
     }
 
     fn pause(&mut self) -> Result<PauseOutcome, StreamError> {
-        Ok(PauseOutcome::Preserved)
+        Ok(self.pause_outcome)
     }
 
     fn resume(&mut self) -> Result<(), StreamError> {

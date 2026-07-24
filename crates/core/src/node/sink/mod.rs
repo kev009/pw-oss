@@ -333,6 +333,27 @@ fn reset_unpreserved_pause<B: backend::Backend>(port: &mut Port<SinkDir<B>>) -> 
     true
 }
 
+fn pause_playback<B: backend::Backend>(port: &mut Port<SinkDir<B>>, log: &Log) {
+    // When Pause preserves the native queue, Start resumes its accepted
+    // prefix and continues the retained host-buffer suffix.
+    match port.dsp.pause() {
+        Ok(backend::PauseOutcome::Preserved) => return,
+        Ok(backend::PauseOutcome::Reprime) => {}
+        Err(err) => crate::warn!(
+            log,
+            "{}: preserving playback for Pause: {}",
+            port.dsp.path(),
+            err
+        ),
+    }
+    // The backend cannot preserve this queue. Reset it so Start primes
+    // cleanly; if the device also refuses that, force replacement before
+    // another playback write.
+    if !reset_unpreserved_pause(port) {
+        port.ext.rebuild_after_start = true;
+    }
+}
+
 fn end_input_sequence<B: backend::Backend>(port: &mut Port<SinkDir<B>>) {
     // This buffer will no longer supply a retained suffix. Close any frame
     // that its accepted prefix left open before a different buffer arrives.
@@ -860,24 +881,7 @@ impl<B: backend::Backend> Direction for SinkDir<B> {
 
     fn on_pause_loop(state: &mut DataState<SinkDir<B>>) {
         for port in &mut state.ports {
-            // When Pause preserves the native queue, Start resumes its
-            // accepted prefix and continues the retained host-buffer suffix.
-            match port.dsp.pause() {
-                Ok(backend::PauseOutcome::Preserved) => continue,
-                Ok(backend::PauseOutcome::Reprime) => {}
-                Err(err) => crate::warn!(
-                    state.log,
-                    "{}: preserving playback for Pause: {}",
-                    port.dsp.path(),
-                    err
-                ),
-            }
-            // The backend cannot preserve this queue. Reset it so Start primes
-            // cleanly; if the device also refuses that, force replacement
-            // before another playback write.
-            if !reset_unpreserved_pause(port) {
-                port.ext.rebuild_after_start = true;
-            }
+            pause_playback(port, &state.log);
         }
     }
 

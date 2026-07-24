@@ -1,9 +1,10 @@
 use super::predicted_next_fill;
 use super::{
     RetuneOutcome, SinkDir as GenericSinkDir, SinkPortExt, consume_freewheel_input,
-    detect_underrun, finish_input_sequence, follower_servo, level_correct, pending_write_offset,
-    prepare_pending_write, prime_playback, recover_or_hold, release_input, reset_unpreserved_pause,
-    resume_playback, retain_partial_write, retune_period, settle_target, write_retained_tail,
+    detect_underrun, finish_input_sequence, follower_servo, level_correct, pause_playback,
+    pending_write_offset, prepare_pending_write, prime_playback, recover_or_hold, release_input,
+    reset_unpreserved_pause, resume_playback, retain_partial_write, retune_period, settle_target,
+    write_retained_tail,
 };
 use crate::backend::{
     self, IoStatus, StreamWake, WriteOutcome,
@@ -463,6 +464,37 @@ fn pause_reset_retries_a_partially_accepted_host_buffer_from_byte_zero() {
     assert_eq!(retry, 0);
     assert_eq!(port.dsp.write(&data[retry..]).bytes, data.len());
     assert_eq!(port.dsp.test_take_playback(), data);
+}
+
+#[test]
+fn reprime_pause_outcome_resets_the_fake_queue_through_the_shared_pause_path() {
+    let mut port = buffered_test_port(8, 0, 8);
+    port.dsp
+        .test_set_pause_outcome(backend::PauseOutcome::Reprime);
+    port.dsp.write_silence(0);
+    assert_eq!(port.dsp.write(&pattern(8, 31)).bytes, 8);
+    port.ext.pending_buffer = Some(7);
+    port.ext.pending_offset = 5;
+    port.rebuild_required = true;
+    port.stream_wake = Some(StreamWake {
+        stream: port.stream_identity(),
+        timing: backend::WakeTiming::Readiness,
+        ready_bytes: Some(8),
+        queue: None,
+        clock: None,
+        xruns: None,
+        state: backend::StreamWakeState::Active,
+    });
+
+    pause_playback(&mut port, &Log::test_null());
+
+    assert!(!port.dsp.is_running());
+    assert!(port.dsp.test_take_playback().is_empty());
+    assert_eq!(port.ext.pending_buffer, None);
+    assert_eq!(port.ext.pending_offset, 0);
+    assert!(port.rebuild_required);
+    assert!(port.stream_wake.is_none());
+    assert!(!port.ext.rebuild_after_start);
 }
 
 #[test]
