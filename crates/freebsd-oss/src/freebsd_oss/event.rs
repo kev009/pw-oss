@@ -764,15 +764,14 @@ mod tests {
     fn one_shot_timer_wakes_the_queue() {
         let driver = OssWakeDriver::new().unwrap();
         driver.arm_timer(1).unwrap();
-        let mut event = None;
-        for _ in 0..100 {
-            event = driver.next_event().unwrap();
-            if event.is_some() {
-                break;
-            }
-            std::thread::yield_now();
-        }
-        assert_eq!(event, Some(WakeEvent::Timer));
+        let mut pollfd = libc::pollfd {
+            fd: driver.notification_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 100) }, 1);
+        assert_ne!(pollfd.revents & libc::POLLIN, 0);
+        assert_eq!(driver.next_event().unwrap(), Some(WakeEvent::Timer));
         assert_eq!(driver.next_event().unwrap(), None);
     }
 
