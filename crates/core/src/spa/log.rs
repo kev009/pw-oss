@@ -19,6 +19,10 @@ pub struct Log {
 unsafe impl Send for Log {}
 
 impl Log {
+    /// # Safety
+    /// `log` may be null. Otherwise it must point to an initialized host logger
+    /// whose interface, method table, and optional `topic` remain valid for every
+    /// returned `Log` clone.
     pub(crate) unsafe fn wrap(
         log: *mut spa_log,
         topic: Option<std::ptr::NonNull<spa_log_topic>>,
@@ -26,7 +30,7 @@ impl Log {
         let logger = std::ptr::NonNull::new(log)?;
         // the vtable pointer is read once here; the vtable fields are read
         // per call through the raw pointer
-        let funcs = unsafe { (*log).iface.cb.funcs };
+        let funcs = unsafe { (*logger.as_ptr()).iface.cb.funcs };
         let methods = std::ptr::NonNull::new(funcs.cast::<spa_log_methods>().cast_mut())?;
         // no minimum-version assert: version 0 (predating the logt slot) is
         // accepted - log() gates every logt read on the vtable being v1+,

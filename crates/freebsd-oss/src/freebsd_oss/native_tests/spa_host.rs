@@ -1,5 +1,6 @@
 use std::ffi::{CStr, CString, c_int, c_void};
 use std::mem::{MaybeUninit, size_of};
+use std::ptr::NonNull;
 
 use libspa::pod::{Object, Property, Value, ValueArray};
 use libspa::sys::*;
@@ -272,21 +273,23 @@ struct FactoryHandle {
 
 impl FactoryHandle {
     unsafe fn new(
-        factory: *const spa_handle_factory,
+        factory: NonNull<spa_handle_factory>,
         info: &spa_dict,
         support: &[spa_support],
     ) -> Self {
-        let get_size = unsafe { (*factory).get_size }.expect("factory must publish get_size");
-        let size = unsafe { get_size(factory, info) };
+        let factory_ptr = factory.as_ptr().cast_const();
+        let get_size =
+            unsafe { (*factory.as_ptr()).get_size }.expect("factory must publish get_size");
+        let size = unsafe { get_size(factory_ptr, info) };
         let words = size.div_ceil(size_of::<u128>()).max(1);
         let mut this = Self {
             storage: vec![MaybeUninit::uninit(); words],
             initialized: false,
         };
-        let init = unsafe { (*factory).init }.expect("factory must publish init");
+        let init = unsafe { (*factory.as_ptr()).init }.expect("factory must publish init");
         let result = unsafe {
             init(
-                factory,
+                factory_ptr,
                 this.raw(),
                 info,
                 support.as_ptr(),
@@ -302,7 +305,7 @@ impl FactoryHandle {
         self.storage.as_mut_ptr().cast()
     }
 
-    unsafe fn node(&mut self) -> *mut spa_node {
+    unsafe fn node(&mut self) -> NonNull<spa_node> {
         let handle = self.raw();
         let get_interface = unsafe { (*handle).get_interface }
             .expect("initialized handle must publish get_interface");
@@ -315,7 +318,8 @@ impl FactoryHandle {
             )
         };
         assert_eq!(result, 0, "sink factory did not provide spa_node");
-        interface.cast()
+        NonNull::new(interface.cast())
+            .expect("successful get_interface must provide a non-null spa_node")
     }
 }
 
@@ -478,7 +482,7 @@ pub(super) fn run_sink_smoke(path: &str) {
 
 pub(super) fn run_sink_smoke_at(path: &str, rate: u32) {
     let mut index = 0;
-    let mut sink_factory = std::ptr::null();
+    let mut sink_factory = None;
     let mut names = Vec::new();
     loop {
         let mut factory = std::ptr::null();
@@ -487,10 +491,12 @@ pub(super) fn run_sink_smoke_at(path: &str, rate: u32) {
             break;
         }
         assert_eq!(result, 1);
-        let name = unsafe { CStr::from_ptr((*factory).name) };
+        let factory = NonNull::new(factory.cast_mut())
+            .expect("successful enumeration must provide a non-null factory");
+        let name = unsafe { CStr::from_ptr((*factory.as_ptr()).name) };
         names.push(name.to_string_lossy().into_owned());
         if name == c"freebsd-oss.sink" {
-            sink_factory = factory;
+            sink_factory = Some(factory);
         }
     }
     assert_eq!(
@@ -502,7 +508,7 @@ pub(super) fn run_sink_smoke_at(path: &str, rate: u32) {
             "freebsd-oss.source",
         ]
     );
-    assert!(!sink_factory.is_null());
+    let sink_factory = sink_factory.expect("factory enumeration omitted freebsd-oss.sink");
 
     let path = CString::new(path).expect("the device path cannot contain NUL");
     let items = [
@@ -524,8 +530,8 @@ pub(super) fn run_sink_smoke_at(path: &str, rate: u32) {
     let support = host.support();
     let mut handle = unsafe { FactoryHandle::new(sink_factory, &info, &support) };
     let node = unsafe { handle.node() };
-    let methods = unsafe { (*node).iface.cb.funcs.cast::<spa_node_methods>() };
-    let object = unsafe { (*node).iface.cb.data };
+    let methods = unsafe { (*node.as_ptr()).iface.cb.funcs.cast::<spa_node_methods>() };
+    let object = unsafe { (*node.as_ptr()).iface.cb.data };
 
     let format = AlignedPod::format(rate as i32);
     let set_format = unsafe { (*methods).port_set_param }.expect("node must set port params");
