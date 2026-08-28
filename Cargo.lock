@@ -388,7 +388,7 @@ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
 name = "spa-kitchen-sink-core"
-version = "0.9.11"
+version = "0.9.12"
 dependencies = [
  "libc",
  "libspa",
@@ -396,7 +396,7 @@ dependencies = [
 
 [[package]]
 name = "spa-kitchen-sink-freebsd-oss"
-version = "0.9.11"
+version = "0.9.12"
 dependencies = [
  "cc",
  "libc",
