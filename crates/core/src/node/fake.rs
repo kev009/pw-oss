@@ -2,8 +2,6 @@
 
 use std::ffi::c_int;
 
-use libspa::sys::*;
-
 use super::*;
 use crate::backend;
 use crate::spa::{IoArea, Log, Loop, LoopSource, System};

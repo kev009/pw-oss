@@ -57,7 +57,9 @@ impl BackendProperties for FakeProperties {
             return Vec::new();
         };
         values
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .filter_map(|pair| match (&pair[0], &pair[1]) {
                 (Value::String(key), Value::Int(value))
                     if key == FAKE_PROPERTY.key && *value >= 0 =>
