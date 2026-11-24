@@ -389,10 +389,7 @@ fn merge_catalog_signal(
 }
 
 fn decode_catalog_signal(line: &str) -> Option<CatalogSignal> {
-    static RE: std::sync::LazyLock<regex::Regex> =
-        std::sync::LazyLock::new(|| regex::Regex::new(r"^([\+-])((?:pcm|uaudio)\d+)").unwrap());
-
-    let groups = RE.captures(line)?;
+    let groups = regex::regex!(r"^([\+-])((?:pcm|uaudio)\d+)").captures(line)?;
     if groups.get(1)?.as_str() == "-" {
         Some(CatalogSignal::Detached(groups.get(2)?.as_str().to_string()))
     } else {
@@ -406,11 +403,8 @@ fn decode_catalog_signal(line: &str) -> Option<CatalogSignal> {
 // are indistinguishable. The mixer policy therefore treats it solely as an
 // immediate route-poll nudge; route availability remains unchanged.
 fn decode_mixer_event(line: &str) -> Option<u32> {
-    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"^!system=SND subsystem=CONN type=(?:IN|OUT) cdev=dsp([0-9]+)").unwrap()
-    });
-
-    RE.captures(line)
+    regex::regex!(r"^!system=SND subsystem=CONN type=(?:IN|OUT) cdev=dsp([0-9]+)")
+        .captures(line)
         .and_then(|groups| groups[1].parse::<u32>().ok())
 }
 

@@ -475,10 +475,8 @@ pub(crate) fn read_pcm_device_description(sysctl: &mut SysctlReader, index: u32)
         && let Ok(desc) = sysctl.read_string(format!("dev.uaudio.{unit}.%desc"), 1024)
     {
         // let's get rid of ", class %d/%d, rev %x.%02x/%x.%02x, addr %d" suffix
-        static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-            regex::Regex::new(r"^(.*?), class \d+/\d+, rev [^\s]+, addr \d$").unwrap()
-        });
-        if let Some(groups) = RE.captures(&desc)
+        if let Some(groups) =
+            regex::regex!(r"^(.*?), class \d+/\d+, rev [^\s]+, addr \d$").captures(&desc)
             && let Some(prefix) = groups.get(1)
         {
             return Some(prefix.as_str().to_string());
