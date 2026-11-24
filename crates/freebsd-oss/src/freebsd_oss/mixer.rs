@@ -284,11 +284,11 @@ fn set_native_levels(volume: &mut RouteVolume, levels: (u32, u32)) {
 
 fn selected_recording_sources(recmask: u32, recsrc: u32) -> u32 {
     let selected = recsrc & recmask;
-    if selected != 0 || recmask == 0 {
+    if selected != 0 {
         selected
     } else {
         // Match the kernel's non-empty fallback for a non-empty recmask.
-        1 << recmask.trailing_zeros()
+        recmask.isolate_lowest_one()
     }
 }
 
@@ -948,6 +948,7 @@ mod tests {
 
     #[test]
     fn recording_source_masks_preserve_every_active_bit() {
+        assert_eq!(selected_recording_sources(0, u32::MAX), 0);
         assert_eq!(selected_recording_sources(0b1110, 0b1010), 0b1010);
         assert_eq!(
             selected_recording_sources(0b1110, 0),

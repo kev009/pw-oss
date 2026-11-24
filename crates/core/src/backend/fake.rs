@@ -1173,7 +1173,6 @@ impl Backend for FakeBackend {
             (!config.positions.is_empty()).then_some(config.positions.as_slice()),
             config.rate,
         )
-        .then_some(())
         .ok_or(ChannelMapError::Unsupported)
     }
 

@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     env:
-      RUSTUP_TOOLCHAIN: "1.96.0"
+      RUSTUP_TOOLCHAIN: "1.98.0"
     steps:
       - uses: actions/checkout@v7
       - name: Install the workspace MSRV

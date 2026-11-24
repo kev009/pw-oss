@@ -1,3 +1,4 @@
+use core::fmt::NumBuffer;
 use nix::errno::Errno;
 use std::collections::BTreeMap;
 use std::ffi::{CString, c_char, c_int};
@@ -602,19 +603,20 @@ pub(crate) fn device_snapshot(indexes: &[u32]) -> Option<DeviceSnapshot> {
     })
 }
 
-fn group_snapshot(key: String, indexes: Vec<u32>) -> Option<CatalogGroupSnapshot> {
-    let object_id = *indexes.first()?;
-    let indexes_value = indexes
-        .iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
+fn group_snapshot(key: &str, indexes: &[u32]) -> Option<CatalogGroupSnapshot> {
+    let (&object_id, remaining) = indexes.split_first()?;
+    let mut buffer = NumBuffer::new();
+    let mut indexes_value = object_id.format_into(&mut buffer).to_owned();
+    for index in remaining {
+        indexes_value.push(',');
+        indexes_value.push_str(index.format_into(&mut buffer));
+    }
     Some(CatalogGroupSnapshot {
         properties: vec![
-            (super::identity::PARENT_DEVICE.to_string(), key.clone()),
+            (super::identity::PARENT_DEVICE.to_string(), key.to_owned()),
             (super::identity::DEVICE_INDEXES.to_string(), indexes_value),
         ],
-        key: DeviceKey::qualified(super::identity::DEVICE_API, &key),
+        key: DeviceKey::qualified(super::identity::DEVICE_API, key),
         object_id,
     })
 }
@@ -641,7 +643,7 @@ impl DeviceCatalog {
     pub(crate) fn snapshots(&self) -> Vec<CatalogGroupSnapshot> {
         self.groups
             .iter()
-            .filter_map(|(key, indexes)| group_snapshot(key.clone(), indexes.clone()))
+            .filter_map(|(key, indexes)| group_snapshot(key, indexes))
             .collect()
     }
 
@@ -706,7 +708,7 @@ impl DeviceCatalog {
         }
         for (key, indexes) in &self.groups {
             if old_groups.get(key) != Some(indexes)
-                && let Some(snapshot) = group_snapshot(key.clone(), indexes.clone())
+                && let Some(snapshot) = group_snapshot(key, indexes)
             {
                 changes.push(CatalogChange::Added {
                     snapshot,
@@ -948,6 +950,18 @@ mod tests {
         assert_eq!(super::afmt_frame_bytes(super::AFMT_U32_BE | STEREO), 8);
         assert_eq!(super::afmt_frame_bytes(super::AFMT_F32_LE), 4);
         assert_eq!(super::afmt_frame_bytes(super::AFMT_F32_BE | STEREO), 8);
+    }
+
+    #[test]
+    fn group_snapshot_serializes_pcm_indexes_in_order() {
+        assert!(super::group_snapshot("usb-dac", &[]).is_none());
+        for (indexes, expected) in [(&[0][..], "0"), (&[12, 0, u32::MAX][..], "12,0,4294967295")] {
+            let snapshot = super::group_snapshot("usb-dac", indexes).unwrap();
+            assert_eq!(snapshot.object_id, indexes[0]);
+            assert!(snapshot.properties.iter().any(|(key, value)| {
+                key == crate::freebsd_oss::identity::DEVICE_INDEXES && value == expected
+            }));
+        }
     }
 
     #[test]

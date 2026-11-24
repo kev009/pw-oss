@@ -46,7 +46,7 @@ pub(crate) fn normalize_fragment(value: u32) -> u32 {
     if value == 0 {
         0
     } else {
-        (1u32 << (31 - value.leading_zeros())).clamp(64, 16_384)
+        value.isolate_highest_one().clamp(64, 16_384)
     }
 }
 
@@ -222,8 +222,7 @@ pub(crate) fn capture_buffer_plan(
 ) -> (u32, u32) {
     let max_period =
         max_buffer_period_bytes(request.stride, request.device_rate, request.graph_rate);
-    let m = request.period_bytes.max(1_024);
-    let fragment_cap = 1u32 << (31 - m.leading_zeros());
+    let fragment_cap = request.period_bytes.max(1_024).isolate_highest_one();
     let fragment = if fragment_bytes == 0 {
         1_024
     } else {

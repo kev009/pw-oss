@@ -170,11 +170,10 @@ fn write_sysctl(key: &str, value: &str) -> Result<(), String> {
         .arg(assignment)
         .output()
         .map_err(|error| format!("executing sysctl: {error}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
-    }
+    output
+        .status
+        .success()
+        .ok_or_else(|| String::from_utf8_lossy(&output.stderr).trim().to_string())
 }
 
 struct PcmModeGuard {
